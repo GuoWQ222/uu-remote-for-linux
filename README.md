@@ -1,6 +1,6 @@
 **English** | [简体中文](README.zh-CN.md)
 
-# UU Remote Linux Controller
+# UU Remote for Linux
 
 An unofficial Linux compatibility wrapper that runs the official Windows
 NetEase UU Remote client in a dedicated Wine prefix. The current scope is the
@@ -48,7 +48,7 @@ connected to UU because the project does not currently provide a VA-API bridge.
 ## Install
 
 Download the latest `.deb` from
-[GitHub Releases](https://github.com/GuoWQ222/uuyc-linux-controller/releases/latest),
+[GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest),
 then run:
 
 ```bash
@@ -69,8 +69,8 @@ You remain subject to the
 ### Install from source
 
 ```bash
-git clone https://github.com/GuoWQ222/uuyc-linux-controller.git
-cd uuyc-linux-controller
+git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
+cd uu-remote-for-linux
 ./scripts/install-user.sh
 ~/.local/bin/uuyc-linux-controller --accept-eula --setup-only
 ```

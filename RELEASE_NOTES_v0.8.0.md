@@ -1,4 +1,4 @@
-# UU Remote Linux Controller v0.8.0
+# UU Remote for Linux v0.8.0
 
 This is the first public GitHub release of the independent, unofficial Linux
 controller compatibility project.

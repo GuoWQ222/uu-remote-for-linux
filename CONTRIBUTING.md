@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for improving UU Remote Linux Controller.
+Thank you for improving UU Remote for Linux.
 
 ## Development workflow
 

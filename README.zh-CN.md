@@ -1,6 +1,6 @@
 [English](README.md) | **简体中文**
 
-# 网易 UU 远程 Linux 主控端兼容层
+# UU 远程（Linux 版本）
 
 > [!IMPORTANT]
 > 本项目是社区维护的非官方兼容层，与网易及网易 UU 远程没有隶属、认可或
@@ -163,7 +163,7 @@ Ubuntu 24.04 自带仓库的 Wine 9.0 版本过低。请按照
 ## 从源码运行
 
 ```bash
-cd uuyc-linux-controller
+cd uu-remote-for-linux
 ./bin/uuyc-linux-controller --diagnose
 ./bin/uuyc-linux-controller --accept-eula --setup-only
 ./bin/uuyc-linux-controller
