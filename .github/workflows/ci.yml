@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install validation tools
         run: |
@@ -39,7 +39,7 @@ jobs:
         run: make deb
 
       - name: Upload Debian package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: uuyc-linux-controller-deb
           path: dist/uuyc-linux-controller_*_amd64.deb

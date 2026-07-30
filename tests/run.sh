@@ -130,6 +130,7 @@ check "hardware bridge manifest" bash -c \
 check "nvcuda bridge is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB shared object"' _ \
     "$project_root/lib/uuyc-linux-controller/hwdecode/wine/x86_64-unix/nvcuda.dll.so"
+# shellcheck disable=SC2016
 check "DXVK d3d11 is PE DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
     "$project_root/lib/uuyc-linux-controller/hwdecode/dxvk/x64/d3d11.dll"
