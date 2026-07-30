@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
-Maintainer: UU Remote Linux Controller Contributors
+Maintainer: UU Remote for Linux Contributors
 Depends: bash, ca-certificates, coreutils, curl, ethtool, findutils, gir1.2-appindicator3-0.1, gir1.2-gtk-3.0, iproute2, libglib2.0-bin, libx11-6, network-manager, policykit-1, python3, python3-gi, systemd, tar, util-linux
 Recommends: wine (>= 11.1) | winehq-stable (>= 11.1) | winehq-devel (>= 11.1) | winehq-staging (>= 11.1), libnotify-bin, zenity, pciutils
 Suggests: vainfo

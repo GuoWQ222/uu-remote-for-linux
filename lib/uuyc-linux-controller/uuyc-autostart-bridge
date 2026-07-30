@@ -125,12 +125,12 @@ write_native_autostart() {
             '[Desktop Entry]' \
             'Type=Application' \
             'Version=1.0' \
-            'Name=NetEase UU Remote Controller (Wine)' \
-            'Name[zh_CN]=网易 UU 远程 Linux 主控端' \
+            'Name=UU Remote for Linux' \
+            'Name[zh_CN]=UU 远程（Linux 版本）' \
             'Comment=Start UU Remote after logging in' \
             'Comment[zh_CN]=登录 Linux 后自动启动网易 UU 远程' \
             "Exec=$exec_argument --autostart" \
-            'Icon=preferences-desktop-remote-desktop' \
+            'Icon=uuyc-linux-controller' \
             'Terminal=false' \
             'StartupNotify=false' \
             'X-GNOME-Autostart-enabled=true' \

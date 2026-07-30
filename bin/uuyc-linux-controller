@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly app_id="uuyc-linux-controller"
-readonly app_name="网易 UU 远程 Linux 主控端验证版"
+readonly app_name="UU 远程（Linux 版本）"
 readonly min_wine_version="11.1"
 readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
 readonly eula_url="https://uuyc.163.com/contact/20240402/40294_1146065.html"

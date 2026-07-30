@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=NetEase UU Remote Controller (Wine)
-Name[zh_CN]=网易 UU 远程 Linux 主控端（验证版）
+Name=UU Remote for Linux
+Name[zh_CN]=UU 远程（Linux 版本）
 GenericName=Remote Desktop Controller
 GenericName[zh_CN]=远程桌面主控端
 Comment=Control Windows and macOS devices through UU Remote under Wine
