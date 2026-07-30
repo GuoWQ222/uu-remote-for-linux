@@ -16,6 +16,10 @@
 它不是网易发布的原生 Linux 客户端，也不承诺 Linux 被控、无人值守、
 登录界面控制、隐私屏、虚拟显示器、HDR 或 4K/144Hz。
 
+0.8.1 将项目与应用公开展示名称统一为中文“UU 远程（Linux 版本）”、
+英文“UU Remote for Linux”，并让无桌面的 GitHub Runner 也能完整验证
+托盘、ShellCheck 和 Debian 包构建。
+
 0.8.0 修复 X11 下远控窗口收不到 `Win+Space` 的问题。GNOME 和 IBus
 会在 Wine/UU 的全局键盘钩子之前占用该组合键；Linux 键盘桥现在识别
 真正获得焦点的 `GameViewer.exe` 远控画面，只在聚焦期间临时移除
@@ -404,7 +408,7 @@ UU streamer 选择 NVDEC(33) → NVDEC → CUDA 显存
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./dist/uuyc-linux-controller_0.8.0_amd64.deb
+sudo apt install ./dist/uuyc-linux-controller_0.8.1_amd64.deb
 uuyc-linux-controller --accept-eula --setup-only
 ```
 

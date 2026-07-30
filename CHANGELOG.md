@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.1] - 2026-07-30
+
+- Renamed the public project and application display name to **UU Remote for
+  Linux** / **UU 远程（Linux 版本）**.
+- Made tray and lint validation portable to headless GitHub-hosted runners.
+
 ## [0.8.0] - 2026-07-30
 
 - Added an X11 focus-aware keyboard bridge for `Super+Space`.

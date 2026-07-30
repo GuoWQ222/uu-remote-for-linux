@@ -22,6 +22,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.8.1" date="2026-07-30">
+      <description>
+        <p>Rename the public application to UU Remote for Linux and make validation portable to headless CI runners.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-07-30">
       <description>
         <p>Forward Super+Space to the focused Wine remote-control window by temporarily releasing conflicting GNOME and IBus shortcuts, with exact focus-loss and crash recovery.</p>

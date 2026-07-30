@@ -52,7 +52,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uuyc-linux-controller_0.8.0_amd64.deb
+sudo apt install ./uuyc-linux-controller_0.8.1_amd64.deb
 uuyc-linux-controller --accept-eula --setup-only
 uuyc-linux-controller --diagnose
 uuyc-linux-controller
