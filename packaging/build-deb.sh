@@ -6,9 +6,9 @@ readonly project_root
 version=$(<"$project_root/VERSION")
 readonly version
 readonly arch="amd64"
-readonly package_name="uuyc-linux-controller"
+readonly artifact_name="uu-remote-for-linux"
 readonly output_dir="$project_root/dist"
-readonly output_file="$output_dir/${package_name}_${version}_${arch}.deb"
+readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
 
 [[ -r "$project_root/lib/uuyc-linux-controller/wevtapi.dll" ]] || {
     printf '缺少预构建的 wevtapi.dll；请先运行 make shim。\n' >&2

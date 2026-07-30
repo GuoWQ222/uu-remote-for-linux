@@ -41,6 +41,6 @@ jobs:
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
-          name: uuyc-linux-controller-deb
-          path: dist/uuyc-linux-controller_*_amd64.deb
+          name: uu-remote-for-linux-deb
+          path: dist/uu-remote-for-linux_*_amd64.deb
           if-no-files-found: error

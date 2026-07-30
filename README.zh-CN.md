@@ -25,7 +25,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uuyc-linux-controller_0.8.1_amd64.deb
+sudo apt install ./uu-remote-for-linux_0.8.1_amd64.deb
 uuyc-linux-controller --accept-eula --setup-only
 ```
 

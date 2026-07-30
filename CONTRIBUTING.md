@@ -16,8 +16,8 @@ Thank you for improving UU Remote for Linux.
 
    ```bash
    make deb
-   dpkg-deb --info dist/uuyc-linux-controller_*_amd64.deb
-   dpkg-deb --contents dist/uuyc-linux-controller_*_amd64.deb
+   dpkg-deb --info dist/uu-remote-for-linux_*_amd64.deb
+   dpkg-deb --contents dist/uu-remote-for-linux_*_amd64.deb
    ```
 
 5. Describe manual controller-side testing and the exact UU/Wine versions in
