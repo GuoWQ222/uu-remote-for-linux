@@ -143,6 +143,8 @@ write_registry_off
 wait_for "监视器删除自启动项" test ! -e "$desktop"
 
 rm -f -- "$launcher"
+# The nested shell intentionally expands its positional argument.
+# shellcheck disable=SC2016
 wait_for "启动器删除后监视器退出" bash -c '! kill -0 "$1" 2>/dev/null' _ \
     "$watcher_pid"
 wait "$watcher_pid"

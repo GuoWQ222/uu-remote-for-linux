@@ -24,11 +24,16 @@ jobs:
             binutils \
             desktop-file-utils \
             file \
+            gir1.2-appindicator3-0.1 \
+            gir1.2-gtk-3.0 \
+            libx11-6 \
             libxml2-utils \
-            shellcheck
+            python3-gi \
+            shellcheck \
+            xvfb
 
       - name: Run offline tests
-        run: make test
+        run: xvfb-run -a make test
 
       - name: Build Debian package
         run: make deb

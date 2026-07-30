@@ -121,9 +121,12 @@ check "shim exports" bash -c \
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe"
+# The snippets intentionally defer "$1" expansion to the nested shell.
+# shellcheck disable=SC2016
 check "hardware bridge manifest" bash -c \
     'cd "$1" && sha256sum --check MANIFEST.sha256' _ \
     "$project_root/lib/uuyc-linux-controller/hwdecode"
+# shellcheck disable=SC2016
 check "nvcuda bridge is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB shared object"' _ \
     "$project_root/lib/uuyc-linux-controller/hwdecode/wine/x86_64-unix/nvcuda.dll.so"

@@ -91,7 +91,9 @@ readonly keyboard_bridge_log="$state_dir/keyboard-bridge.log"
 readonly keyboard_bridge_lock="$state_dir/keyboard-bridge.lock"
 readonly keyboard_bridge_status="$state_dir/keyboard-bridge-status.json"
 readonly keyboard_bridge_interval="${UUYC_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
-readonly local_appdata="$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer"
+current_user=$(id -un)
+readonly current_user
+readonly local_appdata="$prefix/drive_c/users/$current_user/AppData/Local/GameViewer"
 readonly client_setting_file="$local_appdata/setting.ini"
 readonly update_bridge_log="$state_dir/update-bridge.log"
 readonly update_bridge_lock="$state_dir/update-bridge.lock"
@@ -1002,6 +1004,9 @@ start_keyboard_bridge() {
         fi
         printf '警告：无法创建键盘桥用户服务，改用兼容后台进程。\n' >&2
     fi
+    # The bridge writes structured state to this log while its uncaught
+    # stdout/stderr are appended to the same file as a crash fallback.
+    # shellcheck disable=SC2094
     nohup "$keyboard_bridge" watch \
         "$state_dir" \
         "$keyboard_bridge_log" \

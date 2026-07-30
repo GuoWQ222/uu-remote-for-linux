@@ -87,12 +87,16 @@ write_log "$log_dir/log_2.txt" 2147483648
 wait_for "关闭时释放休眠抑制器" trace_has '^RELEASE '
 
 write_log "$log_dir/log_2.txt" 2147483651
+# The nested shell intentionally expands its positional argument.
+# shellcheck disable=SC2016
 wait_for "远控连接时重新创建休眠抑制器" \
     bash -c 'test "$(grep -c "^ACQUIRE " "$1")" -eq 2' _ "$inhibit_trace"
 
 kill "$watcher_pid"
 wait "$watcher_pid"
 watcher_pid=""
+# The nested shell intentionally expands its positional argument.
+# shellcheck disable=SC2016
 wait_for "监视器退出时释放休眠抑制器" \
     bash -c 'test "$(grep -c "^RELEASE " "$1")" -eq 2' _ "$inhibit_trace"
 

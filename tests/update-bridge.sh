@@ -43,6 +43,8 @@ write_setting true
 {
     printf '#!/usr/bin/env bash\n'
     printf 'printf "%%s\\n" "$*" >>%q\n' "$trace"
+    # Generate a launcher that removes itself at runtime.
+    # shellcheck disable=SC2016
     printf 'rm -f -- "$0"\n'
 } >"$launcher"
 chmod 0755 "$launcher"
