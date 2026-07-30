@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+用法：
+  uuyc-update-bridge setting-enabled SETTING_INI
+  uuyc-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL]
+EOF
+}
+
+auto_update_enabled() {
+    local setting_file=$1 line key value
+    local in_settings=false
+
+    [[ -r $setting_file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        if [[ $line == \[*\] ]]; then
+            if [[ ${line,,} == "[settingcenter]" ||
+                ${line,,} == "[global]" ]]; then
+                in_settings=true
+            else
+                in_settings=false
+            fi
+            continue
+        fi
+        $in_settings || continue
+        [[ $line == *=* ]] || continue
+        key=${line%%=*}
+        value=${line#*=}
+        key=${key//[[:space:]]/}
+        value=${value//[[:space:]]/}
+        if [[ ${key,,} == autoupdate ]]; then
+            [[ $value == 1 || ${value,,} == true ]]
+            return
+        fi
+    done <"$setting_file"
+    return 1
+}
+
+log_message() {
+    local log_file=$1
+    shift
+
+    mkdir -p -- "${log_file%/*}"
+    printf '[%(%FT%T%z)T] %s\n' -1 "$*" >>"$log_file"
+}
+
+watch_auto_update() {
+    local setting_file=$1 launcher=$2 log_file=$3 lock_file=$4
+    local interval=${5:-21600}
+    local state=disabled previous_state=""
+
+    [[ $interval =~ ^[1-9][0-9]*$ ]] || {
+        printf '无效的更新检查间隔：%s\n' "$interval" >&2
+        return 2
+    }
+    [[ $launcher == /* && -x $launcher ]] || {
+        printf '启动器必须是可执行的绝对路径：%s\n' "$launcher" >&2
+        return 2
+    }
+
+    mkdir -p -- "${lock_file%/*}" "${log_file%/*}"
+    exec 8>"$lock_file"
+    flock -n 8 || return 0
+    # The launcher starts this watcher through nohup.  Keep nohup's inherited
+    # SIGHUP ignore disposition so a short-lived terminal/launcher cannot tear
+    # down automatic checks; still honor explicit INT/TERM shutdown.
+    trap 'exit 0' INT TERM
+
+    log_message "$log_file" "自动更新兼容桥开始监视 UU 设置"
+    while [[ -x $launcher ]]; do
+        if auto_update_enabled "$setting_file"; then
+            state=enabled
+        else
+            state=disabled
+        fi
+        if [[ $state != "$previous_state" ]]; then
+            log_message "$log_file" "UU 自动更新开关：$state"
+            previous_state=$state
+        fi
+        if [[ $state == enabled ]]; then
+            if ! "$launcher" --auto-update-check \
+                >>"$log_file" 2>&1; then
+                log_message "$log_file" \
+                    "本次自动更新检查未完成；现有客户端与兼容桥保持不变"
+            fi
+        fi
+
+        # React to a switch change quickly without hitting the release endpoint
+        # every few seconds.  One second slices also make TERM responsive.
+        for ((remaining = interval; remaining > 0; remaining--)); do
+            [[ -x $launcher ]] || break 2
+            sleep 1
+            if auto_update_enabled "$setting_file"; then
+                [[ $state == enabled ]] || break
+            else
+                [[ $state == disabled ]] || break
+            fi
+        done
+    done
+    log_message "$log_file" "启动器已移除，自动更新兼容桥退出"
+}
+
+mode=${1:-}
+case $mode in
+    setting-enabled)
+        (($# == 2)) || {
+            usage >&2
+            exit 2
+        }
+        auto_update_enabled "$2"
+        ;;
+    watch)
+        (($# == 5 || $# == 6)) || {
+            usage >&2
+            exit 2
+        }
+        watch_auto_update "$2" "$3" "$4" "$5" "${6:-21600}"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

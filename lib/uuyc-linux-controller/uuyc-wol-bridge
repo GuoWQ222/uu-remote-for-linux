@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly patch_offset="${UUYC_WOL_PATCH_OFFSET:-$((0x40df20))}"
+readonly original_bytes="48895c"
+readonly patched_bytes="b001c3"
+
+usage() {
+    cat <<'EOF'
+用法：
+  uuyc-wol-bridge detect
+  uuyc-wol-bridge patch SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uuyc-wol-bridge restore SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uuyc-wol-bridge patched SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uuyc-wol-bridge cloud-state CLIENT_LOG_DIR
+EOF
+}
+
+file_sha256() {
+    local output
+
+    output=$(sha256sum "$1") || return
+    printf '%s\n' "${output%% *}"
+}
+
+bytes_at_patch() {
+    od -An -tx1 -j "$patch_offset" -N 3 "$1" 2>/dev/null |
+        tr -d ' \n'
+}
+
+detect_interface() {
+    local route_line interface gateway connection mac nm_wol power_wakeup type
+
+    route_line=$(ip -4 route show default 2>/dev/null | head -n 1) || true
+    [[ -n $route_line && $route_line =~ [[:space:]]dev[[:space:]]([^[:space:]]+) ]] ||
+        return 1
+    interface=${BASH_REMATCH[1]}
+    [[ -e /sys/class/net/"$interface"/device ]] || return 1
+    type=$(nmcli -g GENERAL.TYPE device show "$interface" 2>/dev/null || true)
+    [[ $type == ethernet ]] || return 1
+    connection=$(nmcli -g GENERAL.CONNECTION device show "$interface" 2>/dev/null || true)
+    [[ -n $connection && $connection != -- ]] || return 1
+    mac=$(<"/sys/class/net/$interface/address")
+    gateway="unknown"
+    if [[ $route_line =~ [[:space:]]via[[:space:]]([^[:space:]]+) ]]; then
+        gateway=${BASH_REMATCH[1]}
+    fi
+    nm_wol=$(nmcli -g 802-3-ethernet.wake-on-lan \
+        connection show "$connection" 2>/dev/null || printf 'unknown')
+    power_wakeup=$(cat "/sys/class/net/$interface/device/power/wakeup" \
+        2>/dev/null || printf 'unavailable')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$interface" "$connection" "$mac" "$gateway" "$nm_wol" "$power_wakeup"
+}
+
+wol_patch_ready() {
+    local server=$1 backup=$2 original_sha=$3 patched_sha=$4
+
+    [[ -f $server && -f $backup ]] &&
+        [[ $(file_sha256 "$server") == "$patched_sha" ]] &&
+        [[ $(file_sha256 "$backup") == "$original_sha" ]] &&
+        [[ $(bytes_at_patch "$server") == "$patched_bytes" ]]
+}
+
+patch_server() {
+    local server=$1 backup=$2 original_sha=$3 patched_sha=$4
+    local current_sha temp
+
+    if wol_patch_ready "$server" "$backup" "$original_sha" "$patched_sha"; then
+        return
+    fi
+    [[ -f $server ]] || {
+        printf 'UU GameViewerServer.exe 不存在：%s\n' "$server" >&2
+        return 1
+    }
+    current_sha=$(file_sha256 "$server")
+    [[ $current_sha == "$original_sha" ]] || {
+        printf '不支持当前 GameViewerServer.exe：%s\n' "$current_sha" >&2
+        return 1
+    }
+    [[ $(bytes_at_patch "$server") == "$original_bytes" ]] || {
+        printf 'WOL 补丁位置原始字节不匹配，拒绝修改。\n' >&2
+        return 1
+    }
+    if [[ -e $backup ]]; then
+        [[ $(file_sha256 "$backup") == "$original_sha" ]] || {
+            printf 'WOL 原版备份校验失败：%s\n' "$backup" >&2
+            return 1
+        }
+    else
+        install -m 0644 "$server" "$backup"
+    fi
+
+    temp="${server}.uuyc-wol-new"
+    install -m 0644 "$server" "$temp"
+    printf '\260\001\303' |
+        dd of="$temp" bs=1 seek="$patch_offset" conv=notrunc status=none
+    if [[ $(file_sha256 "$temp") != "$patched_sha" ]] ||
+        [[ $(bytes_at_patch "$temp") != "$patched_bytes" ]]; then
+        rm -f -- "$temp"
+        printf 'WOL 兼容补丁生成后校验失败。\n' >&2
+        return 1
+    fi
+    mv -f -- "$temp" "$server"
+}
+
+restore_server() {
+    local server=$1 backup=$2 original_sha=$3 patched_sha=$4 current_sha
+
+    [[ -f $server ]] || return 0
+    current_sha=$(file_sha256 "$server")
+    if [[ $current_sha == "$original_sha" ]]; then
+        if [[ -f $backup && $(file_sha256 "$backup") == "$original_sha" ]]; then
+            rm -f -- "$backup"
+        fi
+        return
+    fi
+    [[ $current_sha == "$patched_sha" ]] || {
+        printf 'GameViewerServer.exe 已被其他程序修改，未自动恢复。\n' >&2
+        return 1
+    }
+    [[ -f $backup && $(file_sha256 "$backup") == "$original_sha" ]] || {
+        printf '缺少可验证的 WOL 原版备份，未自动恢复。\n' >&2
+        return 1
+    }
+    mv -f -- "$backup" "$server"
+    [[ $(file_sha256 "$server") == "$original_sha" ]]
+}
+
+latest_client_log() {
+    local log_dir=$1 entry latest=""
+
+    [[ -d $log_dir ]] || return 1
+    while IFS= read -r entry; do
+        latest=${entry#* }
+        break
+    done < <(
+        find "$log_dir" -maxdepth 1 -type f -name 'log_*.txt' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr
+    )
+    [[ -n $latest ]] || return 1
+    printf '%s\n' "$latest"
+}
+
+cloud_wol_state() {
+    local log_dir=$1 latest line
+
+    latest=$(latest_client_log "$log_dir") || {
+        printf 'unknown\n'
+        return
+    }
+    while IFS= read -r line; do
+        if [[ $line == *'"support_wol":true'* ||
+            $line == *'\\"support_wol\\":true'* ]]; then
+            printf 'enabled\n'
+            return
+        fi
+        if [[ $line == *'"support_wol":false'* ||
+            $line == *'\\"support_wol\\":false'* ]]; then
+            printf 'disabled\n'
+            return
+        fi
+    done < <(tac "$latest" 2>/dev/null)
+    printf 'unknown\n'
+}
+
+mode=${1:-}
+case $mode in
+    detect)
+        (($# == 1)) || {
+            usage >&2
+            exit 2
+        }
+        detect_interface
+        ;;
+    patch)
+        (($# == 5)) || {
+            usage >&2
+            exit 2
+        }
+        patch_server "$2" "$3" "$4" "$5"
+        ;;
+    restore)
+        (($# == 5)) || {
+            usage >&2
+            exit 2
+        }
+        restore_server "$2" "$3" "$4" "$5"
+        ;;
+    patched)
+        (($# == 5)) || {
+            usage >&2
+            exit 2
+        }
+        wol_patch_ready "$2" "$3" "$4" "$5"
+        ;;
+    cloud-state)
+        (($# == 2)) || {
+            usage >&2
+            exit 2
+        }
+        cloud_wol_state "$2"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

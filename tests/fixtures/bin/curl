@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output_file=""
+head_only=false
+latest_version=${UUYC_FAKE_LATEST_VERSION:-4.34.0.8979}
+effective_url="https://a56.gdl.netease.com/UURemote_Setup_${latest_version}_0723104500_gwqd.exe?test=1"
+
+if [[ -e /proc/$$/fd/9 ]]; then
+    printf 'FD9_LEAK curl %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+fi
+
+while (($# > 0)); do
+    case $1 in
+        --head)
+            head_only=true
+            ;;
+        --output)
+            shift
+            output_file=${1:?}
+            ;;
+    esac
+    shift
+done
+
+if ! $head_only; then
+    [[ -n $output_file ]]
+    printf 'MZ' >"$output_file"
+    truncate -s 11534336 "$output_file"
+fi
+printf '%s' "$effective_url"

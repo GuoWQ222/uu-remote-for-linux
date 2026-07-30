@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible Linux wrapper or compatibility issue
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is an unofficial community project. Remove remote codes, device IDs,
+        cookies, tokens, phone numbers, public IP addresses, and confidential
+        screen contents before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Project version
+      placeholder: "0.8.0"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and architecture
+      placeholder: "Ubuntu 24.04 amd64"
+    validations:
+      required: true
+  - type: dropdown
+    id: session
+    attributes:
+      label: Desktop session
+      options:
+        - X11
+        - Wayland with XWayland
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: wine
+    attributes:
+      label: Wine version
+      placeholder: "wine-11.1"
+    validations:
+      required: true
+  - type: input
+    id: uu
+    attributes:
+      label: UU Remote version
+      placeholder: "4.34.0.8979"
+    validations:
+      required: true
+  - type: input
+    id: decoder
+    attributes:
+      label: Selected decoder
+      placeholder: "auto, cpu, or nvidia:0"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: State what you did, what happened, and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: Redacted diagnostic output
+      description: Paste `uuyc-linux-controller --diagnose` output after removing sensitive data.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Minimal redacted log excerpt
+      description: Include only the lines surrounding the failure, not complete client logs.
+      render: text

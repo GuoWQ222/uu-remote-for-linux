@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -e /proc/$$/fd/9 ]]; then
+    printf 'FD9_LEAK wineserver %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+fi
+
+printf 'WINESERVER %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"

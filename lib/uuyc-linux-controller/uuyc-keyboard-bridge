@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""Focus-aware X11 keyboard bridge for the UU Remote Wine client.
+
+GNOME and IBus reserve Super+Space before Wine can see it.  While a real
+GameViewer remote-control window owns the active X11 window, this helper
+temporarily removes only those conflicting desktop shortcuts.  It restores the
+exact serialized GSettings values on focus loss, normal shutdown, and the next
+startup after an unclean exit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import ctypes
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+APP_ID = "uuyc-linux-controller"
+STATE_VERSION = 1
+REMOTE_CLASS = "gameviewer.exe"
+MIN_REMOTE_WIDTH = 320
+MIN_REMOTE_HEIGHT = 240
+
+SETTINGS = {
+    "switch": (
+        "org.gnome.desktop.wm.keybindings",
+        "switch-input-source",
+    ),
+    "switch_backward": (
+        "org.gnome.desktop.wm.keybindings",
+        "switch-input-source-backward",
+    ),
+    "ibus_triggers": (
+        "org.freedesktop.ibus.general.hotkey",
+        "triggers",
+    ),
+    "overlay": (
+        "org.gnome.mutter",
+        "overlay-key",
+    ),
+}
+
+CONFLICTS = {
+    "switch": {"<super>space"},
+    "switch_backward": {"<shift><super>space", "<super><shift>space"},
+    "ibus_triggers": {
+        "<super>space",
+        "<shift><super>space",
+        "<super><shift>space",
+    },
+}
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class Logger:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def write(self, message: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+
+
+class SettingsController:
+    def __init__(self, binary: str, logger: Logger):
+        self.binary = binary
+        self.logger = logger
+        self.originals: dict[str, str] | None = None
+
+    def get(self, name: str) -> str:
+        schema, key = SETTINGS[name]
+        result = subprocess.run(
+            [self.binary, "get", schema, key],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip()
+
+    def set_serialized(self, name: str, serialized: str) -> None:
+        schema, key = SETTINGS[name]
+        subprocess.run(
+            [self.binary, "set", schema, key, serialized],
+            check=True,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def snapshot(self) -> dict[str, str]:
+        return {name: self.get(name) for name in SETTINGS}
+
+    @staticmethod
+    def shortcut_token(value: str) -> str:
+        return "".join(value.split()).casefold()
+
+    @staticmethod
+    def parse_string_array(serialized: str) -> list[str]:
+        parseable = serialized
+        if parseable.startswith("@as "):
+            parseable = parseable[4:]
+        value = ast.literal_eval(parseable)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError(f"不是字符串数组：{serialized}")
+        return value
+
+    def without_conflicts(self, name: str, serialized: str) -> str:
+        values = self.parse_string_array(serialized)
+        blocked = CONFLICTS[name]
+        filtered = [
+            value
+            for value in values
+            if self.shortcut_token(value) not in blocked
+        ]
+        if filtered == values:
+            return serialized
+        return repr(filtered)
+
+    def apply(self, recovery_path: Path) -> None:
+        originals = self.snapshot()
+        atomic_write_json(
+            recovery_path,
+            {
+                "version": STATE_VERSION,
+                "owner_pid": os.getpid(),
+                "applied": True,
+                "settings": originals,
+            },
+        )
+        changed: list[str] = []
+        try:
+            for name in ("switch", "switch_backward", "ibus_triggers"):
+                replacement = self.without_conflicts(name, originals[name])
+                if replacement != originals[name]:
+                    self.set_serialized(name, replacement)
+                    changed.append(name)
+            if originals["overlay"] != "''":
+                self.set_serialized("overlay", "''")
+                changed.append("overlay")
+        except Exception:
+            self.restore_values(originals)
+            recovery_path.unlink(missing_ok=True)
+            raise
+        self.originals = originals
+        self.logger.write(
+            "远控窗口获得焦点；已临时释放 Linux Super+Space"
+            f"（修改项：{','.join(changed) or '无需修改'}）"
+        )
+
+    def restore_values(self, originals: dict[str, str]) -> None:
+        errors: list[str] = []
+        for name, serialized in originals.items():
+            if name not in SETTINGS or not isinstance(serialized, str):
+                continue
+            try:
+                self.set_serialized(name, serialized)
+            except Exception as error:  # pragma: no cover - diagnostic path
+                errors.append(f"{name}: {error}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def restore(self, recovery_path: Path) -> bool:
+        originals = self.originals
+        if originals is None and recovery_path.is_file():
+            payload = json.loads(recovery_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("version") != STATE_VERSION
+                or payload.get("applied") is not True
+                or not isinstance(payload.get("settings"), dict)
+            ):
+                raise ValueError("键盘桥恢复文件格式无效")
+            originals = payload["settings"]
+        if originals is None:
+            recovery_path.unlink(missing_ok=True)
+            return False
+        self.restore_values(originals)
+        self.originals = None
+        recovery_path.unlink(missing_ok=True)
+        self.logger.write("远控窗口失去焦点；已恢复 Linux 原快捷键")
+        return True
+
+
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong),
+        ("window_class", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
+
+class XClassHint(ctypes.Structure):
+    _fields_ = [
+        ("res_name", ctypes.c_void_p),
+        ("res_class", ctypes.c_void_p),
+    ]
+
+
+class X11FocusDetector:
+    def __init__(self):
+        library_name = os.environ.get("UUYC_KEYBOARD_BRIDGE_X11_LIBRARY", "libX11.so.6")
+        self.x11 = ctypes.CDLL(library_name)
+        self._configure_signatures()
+        display_name = os.environ.get("DISPLAY")
+        encoded_display = display_name.encode() if display_name else None
+        self.display = self.x11.XOpenDisplay(encoded_display)
+        if not self.display:
+            raise RuntimeError(f"无法连接 X11 DISPLAY：{display_name or 'unset'}")
+        self.root = self.x11.XDefaultRootWindow(self.display)
+        self.active_atom = self.x11.XInternAtom(
+            self.display, b"_NET_ACTIVE_WINDOW", 0
+        )
+        self.name_atom = self.x11.XInternAtom(
+            self.display, b"_NET_WM_NAME", 0
+        )
+
+    def _configure_signatures(self) -> None:
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.x11.XInternAtom.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        self.x11.XInternAtom.restype = ctypes.c_ulong
+        self.x11.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_long,
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self.x11.XGetWindowProperty.restype = ctypes.c_int
+        self.x11.XGetClassHint.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(XClassHint),
+        ]
+        self.x11.XGetClassHint.restype = ctypes.c_int
+        self.x11.XGetWindowAttributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(XWindowAttributes),
+        ]
+        self.x11.XGetWindowAttributes.restype = ctypes.c_int
+        self.x11.XFree.argtypes = [ctypes.c_void_p]
+
+    def close(self) -> None:
+        if self.display:
+            self.x11.XCloseDisplay(self.display)
+            self.display = None
+
+    def property_bytes(self, window: int, atom: int) -> tuple[int, bytes]:
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        item_count = ctypes.c_ulong()
+        bytes_after = ctypes.c_ulong()
+        data = ctypes.c_void_p()
+        status = self.x11.XGetWindowProperty(
+            self.display,
+            window,
+            atom,
+            0,
+            4096,
+            0,
+            0,
+            ctypes.byref(actual_type),
+            ctypes.byref(actual_format),
+            ctypes.byref(item_count),
+            ctypes.byref(bytes_after),
+            ctypes.byref(data),
+        )
+        if status != 0 or not data.value:
+            return actual_format.value, b""
+        try:
+            if actual_format.value == 32:
+                values = ctypes.cast(
+                    data, ctypes.POINTER(ctypes.c_ulong)
+                )
+                raw = b"".join(
+                    int(values[index]).to_bytes(
+                        ctypes.sizeof(ctypes.c_ulong),
+                        sys.byteorder,
+                    )
+                    for index in range(item_count.value)
+                )
+                return actual_format.value, raw
+            size = item_count.value * max(actual_format.value // 8, 1)
+            return actual_format.value, ctypes.string_at(data, size)
+        finally:
+            self.x11.XFree(data)
+
+    def active_window(self) -> int:
+        actual_format, raw = self.property_bytes(self.root, self.active_atom)
+        if actual_format != 32 or len(raw) < ctypes.sizeof(ctypes.c_ulong):
+            return 0
+        return int.from_bytes(
+            raw[: ctypes.sizeof(ctypes.c_ulong)],
+            sys.byteorder,
+        )
+
+    def window_class(self, window: int) -> str:
+        hint = XClassHint()
+        if not self.x11.XGetClassHint(
+            self.display, window, ctypes.byref(hint)
+        ):
+            return ""
+        try:
+            pointer = hint.res_class or hint.res_name
+            if not pointer:
+                return ""
+            return ctypes.string_at(pointer).decode("utf-8", "replace")
+        finally:
+            if hint.res_name:
+                self.x11.XFree(hint.res_name)
+            if hint.res_class:
+                self.x11.XFree(hint.res_class)
+
+    def window_title(self, window: int) -> str:
+        actual_format, raw = self.property_bytes(window, self.name_atom)
+        if actual_format != 8:
+            return ""
+        return raw.rstrip(b"\0").decode("utf-8", "replace")
+
+    def window_attributes(self, window: int) -> XWindowAttributes | None:
+        attributes = XWindowAttributes()
+        if not self.x11.XGetWindowAttributes(
+            self.display, window, ctypes.byref(attributes)
+        ):
+            return None
+        return attributes
+
+    @staticmethod
+    def is_helper_title(title: str) -> bool:
+        normalized = title.strip().casefold()
+        if normalized in {"", "gameviewer", "default ime", "网易uu远程"}:
+            return True
+        return bool(
+            re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                r"[0-9a-f]{4}-[0-9a-f]{12}",
+                normalized,
+            )
+        )
+
+    def remote_focused(self) -> tuple[bool, dict[str, Any]]:
+        window = self.active_window()
+        if not window:
+            return False, {"window": "0x0", "title": "", "class": ""}
+        window_class = self.window_class(window)
+        title = self.window_title(window)
+        attributes = self.window_attributes(window)
+        remote = bool(
+            window_class.casefold() == REMOTE_CLASS
+            and not self.is_helper_title(title)
+            and attributes is not None
+            and attributes.map_state == 2
+            and attributes.width >= MIN_REMOTE_WIDTH
+            and attributes.height >= MIN_REMOTE_HEIGHT
+        )
+        return remote, {
+            "window": f"0x{window:x}",
+            "title": title,
+            "class": window_class,
+            "width": attributes.width if attributes else 0,
+            "height": attributes.height if attributes else 0,
+        }
+
+
+class FakeFocusDetector:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def close(self) -> None:
+        return
+
+    def remote_focused(self) -> tuple[bool, dict[str, Any]]:
+        try:
+            value = self.path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            value = "local"
+        return value == "remote", {
+            "window": "fake",
+            "title": "fake-remote" if value == "remote" else "fake-local",
+            "class": REMOTE_CLASS if value == "remote" else "other",
+            "width": 1920 if value == "remote" else 0,
+            "height": 1080 if value == "remote" else 0,
+        }
+
+
+def make_detector():
+    fake_focus = os.environ.get("UUYC_KEYBOARD_BRIDGE_FAKE_FOCUS_FILE")
+    if fake_focus:
+        return FakeFocusDetector(Path(fake_focus))
+    return X11FocusDetector()
+
+
+def paths(state_dir: Path) -> dict[str, Path]:
+    return {
+        "recovery": state_dir / "keyboard-bridge-restore.json",
+        "status": state_dir / "keyboard-bridge-status.json",
+    }
+
+
+def write_status(
+    status_path: Path,
+    state: str,
+    window: dict[str, Any] | None = None,
+    detail: str = "",
+) -> None:
+    atomic_write_json(
+        status_path,
+        {
+            "version": STATE_VERSION,
+            "pid": os.getpid(),
+            "state": state,
+            "window": window or {},
+            "detail": detail,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        },
+    )
+
+
+def make_controller(logger: Logger) -> SettingsController:
+    binary = os.environ.get("UUYC_KEYBOARD_BRIDGE_GSETTINGS_BIN", "gsettings")
+    return SettingsController(binary, logger)
+
+
+def restore_stale(state_dir: Path, logger: Logger) -> bool:
+    controller = make_controller(logger)
+    recovery_path = paths(state_dir)["recovery"]
+    restored = controller.restore(recovery_path)
+    if restored:
+        logger.write("已从恢复文件还原上次未正常退出的 Linux 快捷键")
+    return restored
+
+
+def watch(
+    state_dir: Path,
+    log_path: Path,
+    lock_path: Path,
+    interval: float,
+) -> int:
+    logger = Logger(log_path)
+    state_paths = paths(state_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    controller = make_controller(logger)
+    detector = None
+    running = True
+    last_remote: bool | None = None
+    last_status_write = 0.0
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGHUP, request_stop)
+
+    try:
+        controller.restore(state_paths["recovery"])
+        detector = make_detector()
+        logger.write("X11 远控键盘桥开始监视活动窗口")
+        while running:
+            remote, window = detector.remote_focused()
+            if remote and controller.originals is None:
+                controller.apply(state_paths["recovery"])
+            elif not remote and controller.originals is not None:
+                controller.restore(state_paths["recovery"])
+
+            now = time.monotonic()
+            if remote != last_remote or now - last_status_write >= 5:
+                write_status(
+                    state_paths["status"],
+                    "active" if remote else "idle",
+                    window,
+                )
+                last_remote = remote
+                last_status_write = now
+            time.sleep(interval)
+        return 0
+    except Exception as error:
+        logger.write(f"键盘桥异常：{error}")
+        write_status(state_paths["status"], "error", detail=str(error))
+        return 1
+    finally:
+        if controller.originals is not None or state_paths["recovery"].exists():
+            try:
+                controller.restore(state_paths["recovery"])
+            except Exception as error:
+                logger.write(f"退出时恢复 Linux 快捷键失败：{error}")
+        if detector is not None:
+            detector.close()
+        if running is False:
+            write_status(state_paths["status"], "stopped")
+            logger.write("X11 远控键盘桥已停止")
+        lock_handle.close()
+
+
+def check_environment() -> int:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
+    if session_type and session_type != "x11":
+        print("当前不是 X11 会话", file=sys.stderr)
+        return 1
+    logger = Logger(Path(os.devnull))
+    controller = make_controller(logger)
+    controller.snapshot()
+    detector = make_detector()
+    detector.remote_focused()
+    detector.close()
+    return 0
+
+
+def print_status(state_dir: Path) -> int:
+    status_path = paths(state_dir)["status"]
+    if not status_path.is_file():
+        print("not-running")
+        return 1
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        print(payload.get("state", "unknown"))
+    except (OSError, ValueError, TypeError):
+        print("invalid")
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    subparsers.add_parser("check")
+
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("state_dir", type=Path)
+    watch_parser.add_argument("log", type=Path)
+    watch_parser.add_argument("lock", type=Path)
+    watch_parser.add_argument("interval", nargs="?", type=float, default=0.15)
+
+    restore_parser = subparsers.add_parser("restore")
+    restore_parser.add_argument("state_dir", type=Path)
+    restore_parser.add_argument("log", type=Path)
+
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("state_dir", type=Path)
+
+    arguments = parser.parse_args()
+    if arguments.mode == "check":
+        return check_environment()
+    if arguments.mode == "watch":
+        if not 0.05 <= arguments.interval <= 10:
+            parser.error("interval 必须在 0.05 到 10 秒之间")
+        return watch(
+            arguments.state_dir,
+            arguments.log,
+            arguments.lock,
+            arguments.interval,
+        )
+    if arguments.mode == "restore":
+        logger = Logger(arguments.log)
+        try:
+            restore_stale(arguments.state_dir, logger)
+        except Exception as error:
+            logger.write(f"手动恢复 Linux 快捷键失败：{error}")
+            return 1
+        return 0
+    if arguments.mode == "status":
+        return print_status(arguments.state_dir)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

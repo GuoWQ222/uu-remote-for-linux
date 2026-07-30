@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly root="${UUYC_KEYBOARD_GSETTINGS_ROOT:?}"
+readonly trace="${UUYC_KEYBOARD_GSETTINGS_TRACE:-$root/trace.log}"
+
+mode=${1:-}
+schema=${2:-}
+key=${3:-}
+value=${4:-}
+
+case "$schema:$key" in
+    org.gnome.desktop.wm.keybindings:switch-input-source)
+        name=switch
+        ;;
+    org.gnome.desktop.wm.keybindings:switch-input-source-backward)
+        name=switch_backward
+        ;;
+    org.freedesktop.ibus.general.hotkey:triggers)
+        name=ibus_triggers
+        ;;
+    org.gnome.mutter:overlay-key)
+        name=overlay
+        ;;
+    *)
+        printf 'unknown setting: %s:%s\n' "$schema" "$key" >&2
+        exit 2
+        ;;
+esac
+
+mkdir -p "$root"
+printf '%s\t%s\t%s\n' "$mode" "$name" "$value" >>"$trace"
+
+case $mode in
+    get)
+        cat "$root/$name"
+        ;;
+    set)
+        printf '%s\n' "$value" >"$root/$name"
+        ;;
+    *)
+        printf 'unsupported mode: %s\n' "$mode" >&2
+        exit 2
+        ;;
+esac

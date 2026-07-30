@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'SYSTEMD_RUN %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+
+workdir=
+declare -a environment=()
+while (($# > 0)); do
+    case $1 in
+        --setenv=*)
+            environment+=("${1#--setenv=}")
+            shift
+            ;;
+        --working-directory=*)
+            workdir=${1#--working-directory=}
+            shift
+            ;;
+        --*)
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+((${#environment[@]} > 0)) || environment=()
+if [[ -n $workdir ]]; then
+    cd "$workdir"
+fi
+env "${environment[@]}" "$@"

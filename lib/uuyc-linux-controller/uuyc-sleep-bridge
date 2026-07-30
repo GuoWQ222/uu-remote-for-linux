@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly inhibitor_who="uuyc-linux-controller"
+readonly inhibitor_why="UU 防止电脑休眠已开启"
+readonly systemd_inhibit="${UUYC_SYSTEMD_INHIBIT_BIN:-systemd-inhibit}"
+readonly setsid_bin="${UUYC_SETSID_BIN:-setsid}"
+inhibitor_pid=""
+
+usage() {
+    cat <<'EOF'
+用法：
+  uuyc-sleep-bridge state LOG_DIR
+  uuyc-sleep-bridge inhibitor-active
+  uuyc-sleep-bridge watch LOG_DIR PREFIX LAUNCHER LOG LOCK [INTERVAL]
+EOF
+}
+
+latest_client_log() {
+    local log_dir=$1 entry latest=""
+
+    [[ -d $log_dir ]] || return 1
+    while IFS= read -r entry; do
+        latest=${entry#* }
+        break
+    done < <(
+        find "$log_dir" -maxdepth 1 -type f -name 'log_*.txt' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr
+    )
+    [[ -n $latest ]] || return 1
+    printf '%s\n' "$latest"
+}
+
+prevent_sleep_state() {
+    local log_dir=$1 latest line state_value
+
+    latest=$(latest_client_log "$log_dir") || {
+        printf 'unknown\n'
+        return
+    }
+    while IFS= read -r line; do
+        [[ $line == *"NewUi::HomePageMainWindow::preventSleep]"* &&
+            $line == *" state:"* ]] || continue
+        if [[ $line =~ [[:space:]]state:([0-9]+) ]]; then
+            state_value=${BASH_REMATCH[1]}
+            if ((state_value & 1)); then
+                printf 'enabled\n'
+            else
+                printf 'disabled\n'
+            fi
+            return
+        fi
+    done < <(tac "$latest" 2>/dev/null)
+    printf 'unknown\n'
+}
+
+wine_server_running() {
+    local prefix=$1 device inode runtime_root
+
+    if [[ ${UUYC_SLEEP_ASSUME_WINESERVER_RUNNING:-0} == 1 ]]; then
+        return
+    fi
+    read -r device inode < <(stat -Lc '%D %i' "$prefix" 2>/dev/null) ||
+        return 1
+    printf -v inode '%x' "$inode"
+    runtime_root=${UUYC_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
+    [[ -S $runtime_root/server-"$device"-"$inode"/socket ]]
+}
+
+inhibitor_active() {
+    local inhibitors
+
+    command -v "$systemd_inhibit" >/dev/null 2>&1 || return 1
+    inhibitors=$("$systemd_inhibit" --list --no-pager 2>/dev/null) || return 1
+    grep -Fq "$inhibitor_who" <<<"$inhibitors"
+}
+
+log_message() {
+    local log_file=$1
+    shift
+
+    mkdir -p -- "${log_file%/*}"
+    printf '[%(%FT%T%z)T] %s\n' -1 "$*" >>"$log_file"
+}
+
+stop_inhibitor() {
+    local log_file=$1 old_pid
+
+    [[ -n $inhibitor_pid ]] || return 0
+    old_pid=$inhibitor_pid
+    inhibitor_pid=""
+    kill -TERM -- "-$old_pid" 2>/dev/null || true
+    wait "$old_pid" 2>/dev/null || true
+    log_message "$log_file" "已释放 Linux sleep:idle 抑制器"
+}
+
+start_inhibitor() {
+    local log_file=$1
+
+    command -v "$systemd_inhibit" >/dev/null 2>&1 || {
+        log_message "$log_file" "无法启用防休眠：找不到 $systemd_inhibit"
+        return 1
+    }
+    command -v "$setsid_bin" >/dev/null 2>&1 || {
+        log_message "$log_file" "无法启用防休眠：找不到 $setsid_bin"
+        return 1
+    }
+
+    "$setsid_bin" "$systemd_inhibit" \
+        --what=sleep:idle \
+        --who="$inhibitor_who" \
+        --why="$inhibitor_why" \
+        --mode=block \
+        /bin/sleep infinity \
+        >>"$log_file" 2>&1 &
+    inhibitor_pid=$!
+    sleep 0.1
+    if ! kill -0 "$inhibitor_pid" 2>/dev/null; then
+        wait "$inhibitor_pid" 2>/dev/null || true
+        inhibitor_pid=""
+        log_message "$log_file" "systemd-logind 拒绝创建防休眠抑制器"
+        return 1
+    fi
+    log_message "$log_file" "已启用 Linux sleep:idle 抑制器"
+}
+
+watch_sleep_state() {
+    local log_dir=$1 prefix=$2 launcher=$3 log_file=$4 lock_file=$5
+    local interval=${6:-2}
+    local desired
+
+    [[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        printf '无效的轮询间隔：%s\n' "$interval" >&2
+        return 2
+    }
+    [[ $launcher == /* && -x $launcher ]] || {
+        printf '启动器必须是可执行的绝对路径：%s\n' "$launcher" >&2
+        return 2
+    }
+    mkdir -p -- "${lock_file%/*}" "${log_file%/*}"
+    exec 8>"$lock_file"
+    flock -n 8 || return 0
+    trap 'stop_inhibitor "$log_file"' EXIT
+    trap 'exit 0' INT TERM HUP
+
+    log_message "$log_file" "防休眠兼容桥开始监视 UU 客户端状态"
+    while [[ -x $launcher ]]; do
+        desired=$(prevent_sleep_state "$log_dir")
+        if [[ $desired == enabled ]] && wine_server_running "$prefix"; then
+            if [[ -z $inhibitor_pid ]] ||
+                ! kill -0 "$inhibitor_pid" 2>/dev/null; then
+                stop_inhibitor "$log_file"
+                start_inhibitor "$log_file" || true
+            fi
+        else
+            stop_inhibitor "$log_file"
+        fi
+        sleep "$interval"
+    done
+    log_message "$log_file" "启动器已移除，防休眠兼容桥退出"
+}
+
+mode=${1:-}
+case $mode in
+    state)
+        (($# == 2)) || {
+            usage >&2
+            exit 2
+        }
+        prevent_sleep_state "$2"
+        ;;
+    inhibitor-active)
+        (($# == 1)) || {
+            usage >&2
+            exit 2
+        }
+        inhibitor_active
+        ;;
+    watch)
+        (($# == 6 || $# == 7)) || {
+            usage >&2
+            exit 2
+        }
+        watch_sleep_state "$2" "$3" "$4" "$5" "$6" "${7:-2}"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

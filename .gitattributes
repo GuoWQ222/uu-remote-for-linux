@@ -1,0 +1,7 @@
+* text=auto
+*.dll binary
+*.exe binary
+*.so binary
+*.xz binary
+*.png binary
+lib/uuyc-linux-controller/hwdecode/licenses/*.txt -whitespace

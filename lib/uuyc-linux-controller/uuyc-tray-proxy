@@ -1,0 +1,698 @@
+#!/usr/bin/python3
+"""Native Linux tray proxy for the UU Remote Wine client.
+
+The Windows client publishes a legacy XEmbed icon through Wine explorer.exe.
+GNOME has to synthesize pointer events for that icon and Wine renders its
+tooltip with a Latin-only system font.  This proxy publishes a native
+StatusNotifierItem and removes only the matching prefix's XEmbed icon.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import logging
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from typing import Iterator
+
+
+APP_ID = "uuyc-linux-controller"
+TITLE = "网易 UU 远程"
+LEGACY_SCAN_INTERVAL_MS = 750
+CLIENT_MISSING_GRACE_TICKS = 8
+
+
+class XClassHint(ctypes.Structure):
+    _fields_ = [
+        ("res_name", ctypes.c_void_p),
+        ("res_class", ctypes.c_void_p),
+    ]
+
+
+class X11:
+    """Small libX11 binding used only for targeted legacy icon removal."""
+
+    def __init__(self, display_name: str | None):
+        self.lib = ctypes.CDLL("libX11.so.6")
+        self._configure_prototypes()
+        encoded = display_name.encode() if display_name else None
+        self.display = self.lib.XOpenDisplay(encoded)
+        if not self.display:
+            raise RuntimeError(
+                f"无法打开 X11 DISPLAY：{display_name or '(unset)'}"
+            )
+        self.root = self.lib.XDefaultRootWindow(self.display)
+        self.pid_atom = self.lib.XInternAtom(
+            self.display, b"_NET_WM_PID", False
+        )
+        self.xembed_atom = self.lib.XInternAtom(
+            self.display, b"_XEMBED_INFO", False
+        )
+
+    def _configure_prototypes(self) -> None:
+        lib = self.lib
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XInternAtom.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.XQueryTree.restype = ctypes.c_int
+        lib.XGetClassHint.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(XClassHint),
+        ]
+        lib.XGetClassHint.restype = ctypes.c_int
+        lib.XGetGeometry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.XGetGeometry.restype = ctypes.c_int
+        lib.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_long,
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+        lib.XGetWindowProperty.restype = ctypes.c_int
+        lib.XDestroyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        lib.XDestroyWindow.restype = ctypes.c_int
+        lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XFree.argtypes = [ctypes.c_void_p]
+
+    def close(self) -> None:
+        if self.display:
+            self.lib.XCloseDisplay(self.display)
+            self.display = None
+
+    def _children(self, window: int) -> list[int]:
+        root = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        count = ctypes.c_uint()
+        ok = self.lib.XQueryTree(
+            self.display,
+            window,
+            ctypes.byref(root),
+            ctypes.byref(parent),
+            ctypes.byref(children),
+            ctypes.byref(count),
+        )
+        if not ok:
+            return []
+        try:
+            return [int(children[index]) for index in range(count.value)]
+        finally:
+            if children:
+                self.lib.XFree(children)
+
+    def windows(self) -> Iterator[int]:
+        pending = [int(self.root)]
+        while pending:
+            window = pending.pop()
+            children = self._children(window)
+            pending.extend(children)
+            yield from children
+
+    def window_class(self, window: int) -> tuple[str, str] | None:
+        hint = XClassHint()
+        if not self.lib.XGetClassHint(
+            self.display, window, ctypes.byref(hint)
+        ):
+            return None
+        try:
+            name = (
+                ctypes.cast(hint.res_name, ctypes.c_char_p)
+                .value.decode(errors="replace")
+                if hint.res_name
+                else ""
+            )
+            klass = (
+                ctypes.cast(hint.res_class, ctypes.c_char_p)
+                .value.decode(errors="replace")
+                if hint.res_class
+                else ""
+            )
+            return name, klass
+        finally:
+            if hint.res_name:
+                self.lib.XFree(hint.res_name)
+            if hint.res_class:
+                self.lib.XFree(hint.res_class)
+
+    def property_first_cardinal(self, window: int, atom: int) -> int | None:
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        item_count = ctypes.c_ulong()
+        remaining = ctypes.c_ulong()
+        data = ctypes.POINTER(ctypes.c_ubyte)()
+        status = self.lib.XGetWindowProperty(
+            self.display,
+            window,
+            atom,
+            0,
+            2,
+            False,
+            0,
+            ctypes.byref(actual_type),
+            ctypes.byref(actual_format),
+            ctypes.byref(item_count),
+            ctypes.byref(remaining),
+            ctypes.byref(data),
+        )
+        if status != 0 or not actual_type.value or not item_count.value:
+            if data:
+                self.lib.XFree(data)
+            return None
+        try:
+            if actual_format.value == 32:
+                return int(
+                    ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0]
+                )
+            if actual_format.value == 16:
+                return int(
+                    ctypes.cast(data, ctypes.POINTER(ctypes.c_ushort))[0]
+                )
+            return int(data[0])
+        finally:
+            self.lib.XFree(data)
+
+    def geometry(self, window: int) -> tuple[int, int] | None:
+        root = ctypes.c_ulong()
+        x = ctypes.c_int()
+        y = ctypes.c_int()
+        width = ctypes.c_uint()
+        height = ctypes.c_uint()
+        border = ctypes.c_uint()
+        depth = ctypes.c_uint()
+        if not self.lib.XGetGeometry(
+            self.display,
+            window,
+            ctypes.byref(root),
+            ctypes.byref(x),
+            ctypes.byref(y),
+            ctypes.byref(width),
+            ctypes.byref(height),
+            ctypes.byref(border),
+            ctypes.byref(depth),
+        ):
+            return None
+        return int(width.value), int(height.value)
+
+    def destroy(self, window: int) -> None:
+        self.lib.XDestroyWindow(self.display, window)
+        self.lib.XSync(self.display, False)
+
+
+def canonical_path(value: str) -> str:
+    return os.path.realpath(os.path.expanduser(value))
+
+
+def process_environment(pid: int) -> dict[str, str] | None:
+    try:
+        payload = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    environment: dict[str, str] = {}
+    for entry in payload.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        environment[key.decode(errors="replace")] = value.decode(
+            errors="replace"
+        )
+    return environment
+
+
+def process_name(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return ""
+
+
+def process_matches_prefix(pid: int, prefix: str) -> bool:
+    environment = process_environment(pid)
+    if not environment:
+        return False
+    candidate = environment.get("WINEPREFIX")
+    return bool(candidate and canonical_path(candidate) == prefix)
+
+
+def prefix_processes(prefix: str, executable: str) -> set[int]:
+    result: set[int] = set()
+    executable = executable.casefold()
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+        pid = int(proc_entry.name)
+        if process_name(pid).casefold() != executable:
+            continue
+        if process_matches_prefix(pid, prefix):
+            result.add(pid)
+    return result
+
+
+class TrayProxy:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.prefix = canonical_path(args.prefix)
+        self.launcher = canonical_path(args.launcher)
+        self.state_dir = Path(args.state_dir)
+        self.status_file = self.state_dir / "tray-proxy-status"
+        self.log_file = Path(args.log_file)
+        self.x11: X11 | None = None
+        self.indicator = None
+        self.decoder_item = None
+        self.decoder_process: subprocess.Popen | None = None
+        self.Gtk = None
+        self.GLib = None
+        self.ever_saw_client = False
+        self.client_missing_ticks = 0
+        self.removed_icons = 0
+
+    def write_status(self, status: str, detail: str = "") -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.status_file.with_suffix(f".tmp.{os.getpid()}")
+        temporary.write_text(
+            "\n".join(
+                [
+                    "version=1",
+                    f"status={status}",
+                    "backend=StatusNotifierItem/AppIndicator3",
+                    f"title={TITLE}",
+                    f"pid={os.getpid()}",
+                    f"legacy_icons_removed={self.removed_icons}",
+                    f"detail={detail.replace(chr(10), ' ')}",
+                    f"updated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+                    "",
+                ]
+            )
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.status_file)
+
+    def import_ui(self) -> None:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3, GLib, Gtk
+
+        self.AppIndicator3 = AppIndicator3
+        self.GLib = GLib
+        self.Gtk = Gtk
+
+    def build_indicator(self) -> None:
+        category = self.AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        self.indicator = self.AppIndicator3.Indicator.new(
+            APP_ID, self.args.icon, category
+        )
+        self.indicator.set_title(TITLE)
+        if self.args.icon_theme_path:
+            self.indicator.set_icon_theme_path(self.args.icon_theme_path)
+        self.indicator.set_icon_full(self.args.icon, TITLE)
+        self.indicator.set_status(
+            self.AppIndicator3.IndicatorStatus.ACTIVE
+        )
+
+        menu = self.Gtk.Menu()
+        show_item = self.Gtk.MenuItem.new_with_label("显示主界面")
+        show_item.connect("activate", self.show_main_window)
+        menu.append(show_item)
+
+        self.decoder_item = self.Gtk.MenuItem.new_with_label("选择解码器…")
+        self.decoder_item.connect(
+            "activate", self.select_decoder_and_restart
+        )
+        menu.append(self.decoder_item)
+
+        menu.append(self.Gtk.SeparatorMenuItem())
+
+        exit_item = self.Gtk.MenuItem.new_with_label("退出")
+        exit_item.connect("activate", self.exit_uuyc)
+        menu.append(exit_item)
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def command_log_handle(self):
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        return self.log_file.open("ab", buffering=0)
+
+    def show_main_window(self, *_unused) -> None:
+        logging.info("请求显示 UU 主界面")
+        environment = os.environ.copy()
+        environment["UUYC_TRAY_PROXY_CHILD"] = "1"
+        log_handle = self.command_log_handle()
+        try:
+            subprocess.Popen(
+                [self.launcher, "--show"],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        finally:
+            log_handle.close()
+
+    def select_decoder_and_restart(self, *_unused) -> None:
+        if (
+            self.decoder_process is not None
+            and self.decoder_process.poll() is None
+        ):
+            logging.info("解码设备选择窗口已经打开")
+            return
+
+        logging.info("请求选择解码设备并在保存后重启 UU")
+        environment = os.environ.copy()
+        environment.pop("UUYC_TRAY_PROXY_CHILD", None)
+        log_handle = self.command_log_handle()
+        if self.decoder_item is not None:
+            self.decoder_item.set_sensitive(False)
+        try:
+            self.decoder_process = subprocess.Popen(
+                [self.launcher, "--select-decoder-and-restart"],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception:
+            logging.exception("无法启动解码设备选择窗口")
+            self.decoder_process = None
+            if self.decoder_item is not None:
+                self.decoder_item.set_sensitive(True)
+            return
+        finally:
+            log_handle.close()
+        self.GLib.timeout_add(500, self.decoder_action_check)
+
+    def decoder_action_check(self) -> bool:
+        if (
+            self.decoder_process is not None
+            and self.decoder_process.poll() is None
+        ):
+            return True
+        if self.decoder_process is not None:
+            logging.info(
+                "解码设备选择流程结束：returncode=%s",
+                self.decoder_process.returncode,
+            )
+        self.decoder_process = None
+        if self.decoder_item is not None:
+            self.decoder_item.set_sensitive(True)
+        return False
+
+    def exit_uuyc(self, *_unused) -> None:
+        logging.info("请求退出 UU")
+        if self.indicator is not None:
+            self.indicator.set_status(
+                self.AppIndicator3.IndicatorStatus.PASSIVE
+            )
+        command = [self.launcher, "--stop"]
+        log_handle = self.command_log_handle()
+        try:
+            if (
+                shutil_which("systemd-run")
+                and shutil_which("systemctl")
+                and subprocess.run(
+                    ["systemctl", "--user", "show-environment"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "stop",
+                        f"{APP_ID}-tray-exit.service",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
+                result = subprocess.run(
+                    [
+                        "systemd-run",
+                        "--user",
+                        f"--unit={APP_ID}-tray-exit",
+                        "--collect",
+                        "--quiet",
+                        *command,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    timeout=10,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    logging.error(
+                        "无法创建独立退出服务，保留托盘以便重试"
+                    )
+                    self.indicator.set_status(
+                        self.AppIndicator3.IndicatorStatus.ACTIVE
+                    )
+                    return
+            else:
+                subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        finally:
+            log_handle.close()
+        self.write_status("stopping", "用户从原生托盘选择退出")
+        self.Gtk.main_quit()
+
+    def remove_legacy_icons(self) -> int:
+        if self.x11 is None:
+            return 0
+        explorer_pids = prefix_processes(self.prefix, "explorer.exe")
+        if not explorer_pids:
+            return 0
+        removed = 0
+        for window in list(self.x11.windows()):
+            window_class = self.x11.window_class(window)
+            if not window_class:
+                continue
+            if all(value.casefold() != "explorer.exe" for value in window_class):
+                continue
+            pid = self.x11.property_first_cardinal(window, self.x11.pid_atom)
+            if pid not in explorer_pids:
+                continue
+            if (
+                self.x11.property_first_cardinal(window, self.x11.xembed_atom)
+                is None
+            ):
+                continue
+            geometry = self.x11.geometry(window)
+            if not geometry:
+                continue
+            width, height = geometry
+            if not (8 <= width <= 128 and 8 <= height <= 128):
+                continue
+            logging.info(
+                "移除 UU Wine 旧托盘图标：window=0x%x pid=%d size=%dx%d",
+                window,
+                pid,
+                width,
+                height,
+            )
+            try:
+                self.x11.destroy(window)
+            except Exception:
+                logging.exception("移除旧托盘图标失败：0x%x", window)
+                continue
+            removed += 1
+        self.removed_icons += removed
+        return removed
+
+    def periodic_check(self) -> bool:
+        removed = self.remove_legacy_icons()
+        client_running = bool(prefix_processes(self.prefix, "GameViewer.exe"))
+        decoder_workflow_running = (
+            self.decoder_process is not None
+            and self.decoder_process.poll() is None
+        )
+        if client_running:
+            self.ever_saw_client = True
+            self.client_missing_ticks = 0
+        elif decoder_workflow_running:
+            self.client_missing_ticks = 0
+        elif self.ever_saw_client:
+            self.client_missing_ticks += 1
+        if removed:
+            self.write_status("active", "Windows XEmbed 托盘已由原生托盘替代")
+        if (
+            self.ever_saw_client
+            and self.client_missing_ticks >= CLIENT_MISSING_GRACE_TICKS
+        ):
+            logging.info("UU 客户端已退出，结束原生托盘代理")
+            self.write_status("stopped", "UU 客户端已退出")
+            self.Gtk.main_quit()
+            return False
+        return True
+
+    def run(self) -> int:
+        self.import_ui()
+        self.build_indicator()
+        self.x11 = X11(os.environ.get("DISPLAY"))
+        self.remove_legacy_icons()
+        self.write_status("active", "原生托盘已注册")
+        self.GLib.timeout_add(LEGACY_SCAN_INTERVAL_MS, self.periodic_check)
+
+        def stop_proxy(_signum, _frame):
+            self.write_status("stopped", "收到终止信号")
+            self.Gtk.main_quit()
+
+        signal.signal(signal.SIGTERM, stop_proxy)
+        signal.signal(signal.SIGINT, stop_proxy)
+        try:
+            self.Gtk.main()
+        finally:
+            if self.indicator is not None:
+                self.indicator.set_status(
+                    self.AppIndicator3.IndicatorStatus.PASSIVE
+                )
+            if self.x11 is not None:
+                self.x11.close()
+            if self.status_file.exists():
+                self.write_status("stopped", "代理进程结束")
+        return 0
+
+
+def shutil_which(command: str) -> str | None:
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def dependency_check() -> int:
+    failures: list[str] = []
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3, Gtk  # noqa: F401
+    except (ImportError, ValueError) as error:
+        failures.append(f"GTK/AppIndicator3: {error}")
+    try:
+        ctypes.CDLL("libX11.so.6")
+    except OSError as error:
+        failures.append(f"libX11: {error}")
+    if failures:
+        for failure in failures:
+            print(f"missing={failure}")
+        return 1
+    print("backend=StatusNotifierItem/AppIndicator3")
+    print("x11=ready")
+    print(f"title={TITLE}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--prefix")
+    parser.add_argument("--launcher")
+    parser.add_argument("--state-dir")
+    parser.add_argument("--log-file")
+    parser.add_argument("--icon", default=APP_ID)
+    parser.add_argument("--icon-theme-path", default="")
+    args = parser.parse_args()
+    if not args.check:
+        missing = [
+            name
+            for name in ("prefix", "launcher", "state_dir", "log_file")
+            if not getattr(args, name)
+        ]
+        if missing:
+            missing_options = ", ".join(
+                f"--{name.replace('_', '-')}" for name in missing
+            )
+            parser.error("缺少参数：" + missing_options)
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if args.check:
+        return dependency_check()
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "tray-proxy.lock"
+    lock_handle = lock_path.open("a+")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    try:
+        return TrayProxy(args).run()
+    except Exception as error:
+        logging.exception("原生托盘代理异常退出")
+        try:
+            TrayProxy(args).write_status("error", str(error))
+        except Exception:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

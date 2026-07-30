@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=NetEase UU Remote Controller (Wine)
+Name[zh_CN]=网易 UU 远程 Linux 主控端（验证版）
+GenericName=Remote Desktop Controller
+GenericName[zh_CN]=远程桌面主控端
+Comment=Control Windows and macOS devices through UU Remote under Wine
+Comment[zh_CN]=通过 Wine 使用 UU 远程控制 Windows 和 macOS
+Exec=uuyc-linux-controller %u
+TryExec=uuyc-linux-controller
+Icon=uuyc-linux-controller
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;controller;Wine;UU Remote;UU远程;网易;
+MimeType=x-scheme-handler/uuremote;
+StartupNotify=true
+StartupWMClass=gameviewer.exe
+Actions=SelectDecoder;
+
+[Desktop Action SelectDecoder]
+Name=Select decoder device
+Name[zh_CN]=选择解码设备
+Exec=uuyc-linux-controller --select-decoder
+Icon=video-display

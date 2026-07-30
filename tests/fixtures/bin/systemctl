@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'SYSTEMCTL %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+
+case "$*" in
+    *" show-environment")
+        exit 0
+        ;;
+    *" show --property=LoadState --value uuyc-linux-controller-client.service")
+        printf 'not-found\n'
+        exit 0
+        ;;
+    *" is-active "*)
+        exit 1
+        ;;
+    *)
+        exit 0
+        ;;
+esac

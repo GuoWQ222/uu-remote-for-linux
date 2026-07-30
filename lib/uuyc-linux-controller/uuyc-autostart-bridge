@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly managed_marker='X-UUYC-Autostart-Bridge=true'
+readonly run_section='[Software\\Microsoft\\Windows\\CurrentVersion\\Run]'
+
+usage() {
+    cat <<'EOF'
+用法：
+  uuyc-autostart-bridge registry-enabled REGISTRY
+  uuyc-autostart-bridge native-enabled DESKTOP
+  uuyc-autostart-bridge sync REGISTRY DESKTOP LAUNCHER LOG
+  uuyc-autostart-bridge watch REGISTRY DESKTOP LAUNCHER LOG LOCK [INTERVAL]
+EOF
+}
+
+windows_autostart_enabled() {
+    local registry=$1 line
+    local in_run_section=false
+
+    [[ -r $registry ]] || return 1
+    while IFS= read -r line; do
+        if [[ $line == "$run_section"* ]]; then
+            in_run_section=true
+            continue
+        fi
+        if $in_run_section && [[ $line == \[* ]]; then
+            break
+        fi
+        # This is an isolated UU Wine prefix. Any value in its Run key is
+        # managed by UU; matching the assignment also handles REG_EXPAND_SZ
+        # values whose command is stored as UTF-16 hexadecimal data.
+        if $in_run_section && [[ $line == \"*\"=* ]]; then
+            return 0
+        fi
+    done <"$registry"
+    return 1
+}
+
+effective_autostart_enabled() {
+    local registry=$1 prefix wine_bin output line
+
+    prefix=${registry%/user.reg}
+    wine_bin=${UUYC_WINE_BIN:-wine}
+    if [[ $prefix != "$registry" && -f $prefix/system.reg ]] &&
+        {
+            [[ ${UUYC_AUTOSTART_ASSUME_WINESERVER_RUNNING:-0} == 1 ]] ||
+                wine_server_running "$prefix"
+        } &&
+        command -v "$wine_bin" >/dev/null 2>&1; then
+        if output=$(
+            WINEPREFIX="$prefix" WINEDEBUG=-all "$wine_bin" reg query \
+                'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' \
+                9>&- 2>/dev/null
+        ); then
+            while IFS= read -r line; do
+                line=${line%$'\r'}
+                [[ $line == *REG_* ]] && return 0
+            done <<<"$output"
+            return 1
+        fi
+    fi
+    windows_autostart_enabled "$registry"
+}
+
+wine_server_running() {
+    local prefix=$1 device inode runtime_root
+
+    read -r device inode < <(stat -Lc '%D %i' "$prefix" 2>/dev/null) ||
+        return 1
+    printf -v inode '%x' "$inode"
+    runtime_root=${UUYC_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
+    [[ -S $runtime_root/server-"$device"-"$inode"/socket ]]
+}
+
+native_autostart_enabled() {
+    local desktop=$1
+
+    [[ -r $desktop ]] && grep -Fqx "$managed_marker" "$desktop"
+}
+
+log_message() {
+    local log_file=$1
+    shift
+
+    mkdir -p -- "${log_file%/*}"
+    printf '[%(%FT%T%z)T] %s\n' -1 "$*" >>"$log_file"
+}
+
+desktop_exec_argument() {
+    local value=$1
+
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\`/\\\`}
+    value=${value//\$/\\\$}
+    printf '"%s"' "$value"
+}
+
+write_native_autostart() {
+    local desktop=$1 launcher=$2 log_file=$3
+    local desktop_dir temp_file exec_argument
+
+    [[ $desktop == /* && $launcher == /* ]] || {
+        log_message "$log_file" \
+            "拒绝创建自启动项：桌面文件和启动器都必须是绝对路径"
+        return 1
+    }
+    [[ -x $launcher ]] || {
+        log_message "$log_file" "拒绝创建自启动项：启动器不可执行：$launcher"
+        return 1
+    }
+    if [[ -e $desktop ]] && ! native_autostart_enabled "$desktop"; then
+        log_message "$log_file" "保留非本项目管理的自启动文件：$desktop"
+        return 1
+    fi
+
+    desktop_dir=${desktop%/*}
+    mkdir -p -- "$desktop_dir"
+    temp_file=$(mktemp "$desktop_dir/.uuyc-autostart.XXXXXX")
+    trap 'rm -f -- "$temp_file"' RETURN
+    exec_argument=$(desktop_exec_argument "$launcher")
+    {
+        printf '%s\n' \
+            '[Desktop Entry]' \
+            'Type=Application' \
+            'Version=1.0' \
+            'Name=NetEase UU Remote Controller (Wine)' \
+            'Name[zh_CN]=网易 UU 远程 Linux 主控端' \
+            'Comment=Start UU Remote after logging in' \
+            'Comment[zh_CN]=登录 Linux 后自动启动网易 UU 远程' \
+            "Exec=$exec_argument --autostart" \
+            'Icon=preferences-desktop-remote-desktop' \
+            'Terminal=false' \
+            'StartupNotify=false' \
+            'X-GNOME-Autostart-enabled=true' \
+            'X-GNOME-Autostart-Delay=3' \
+            "$managed_marker"
+    } >"$temp_file"
+    chmod 0644 "$temp_file"
+
+    if [[ -r $desktop ]] && cmp -s "$temp_file" "$desktop"; then
+        rm -f -- "$temp_file"
+        trap - RETURN
+        return
+    fi
+    mv -f -- "$temp_file" "$desktop"
+    trap - RETURN
+    log_message "$log_file" "已启用 Linux 登录自启动：$desktop"
+}
+
+remove_native_autostart() {
+    local desktop=$1 log_file=$2
+
+    [[ -e $desktop ]] || return 0
+    if ! native_autostart_enabled "$desktop"; then
+        log_message "$log_file" "保留非本项目管理的自启动文件：$desktop"
+        return 1
+    fi
+    rm -f -- "$desktop"
+    log_message "$log_file" "已关闭 Linux 登录自启动：$desktop"
+}
+
+sync_autostart() {
+    local registry=$1 desktop=$2 launcher=$3 log_file=$4
+
+    if effective_autostart_enabled "$registry"; then
+        apply_autostart_state enabled "$desktop" "$launcher" "$log_file"
+    else
+        apply_autostart_state disabled "$desktop" "$launcher" "$log_file"
+    fi
+}
+
+apply_autostart_state() {
+    local state=$1 desktop=$2 launcher=$3 log_file=$4
+
+    if [[ $state == enabled ]]; then
+        write_native_autostart "$desktop" "$launcher" "$log_file"
+    else
+        remove_native_autostart "$desktop" "$log_file"
+    fi
+}
+
+file_signature() {
+    local path=$1
+
+    stat -Lc '%y:%s:%i' "$path" 2>/dev/null || printf 'missing'
+}
+
+watch_autostart() {
+    local registry=$1 desktop=$2 launcher=$3 log_file=$4 lock_file=$5
+    local interval=${6:-2}
+    local previous_signature="" current_signature state
+
+    [[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        printf '无效的轮询间隔：%s\n' "$interval" >&2
+        return 2
+    }
+    mkdir -p -- "${lock_file%/*}"
+    exec 8>"$lock_file"
+    flock -n 8 || return 0
+
+    log_message "$log_file" "自启动兼容桥开始监视 UU 注册表"
+    while [[ -x $launcher ]]; do
+        if effective_autostart_enabled "$registry"; then
+            state=enabled
+        else
+            state=disabled
+        fi
+        current_signature="$(file_signature "$registry")|$(file_signature "$desktop")|$state"
+        if [[ $current_signature != "$previous_signature" ]]; then
+            if ! apply_autostart_state \
+                "$state" "$desktop" "$launcher" "$log_file"; then
+                log_message "$log_file" "自启动同步未完成；将等待下一次文件变化"
+            fi
+            previous_signature="$(file_signature "$registry")|$(file_signature "$desktop")|$state"
+        fi
+        sleep "$interval"
+    done
+    log_message "$log_file" "启动器已移除，自启动兼容桥退出"
+}
+
+mode=${1:-}
+case $mode in
+    registry-enabled)
+        (($# == 2)) || {
+            usage >&2
+            exit 2
+        }
+        effective_autostart_enabled "$2"
+        ;;
+    native-enabled)
+        (($# == 2)) || {
+            usage >&2
+            exit 2
+        }
+        native_autostart_enabled "$2"
+        ;;
+    sync)
+        (($# == 5)) || {
+            usage >&2
+            exit 2
+        }
+        sync_autostart "$2" "$3" "$4" "$5"
+        ;;
+    watch)
+        (($# == 6 || $# == 7)) || {
+            usage >&2
+            exit 2
+        }
+        watch_autostart "$2" "$3" "$4" "$5" "$6" "${7:-2}"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

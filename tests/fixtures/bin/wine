@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+trace_file=${UUYC_FAKE_TRACE:?}
+
+if [[ -e /proc/$$/fd/9 ]]; then
+    printf 'FD9_LEAK wine %s\n' "$*" >>"$trace_file"
+fi
+
+if [[ ${1:-} == --version ]]; then
+    printf 'wine-11.1\n'
+    exit 0
+fi
+
+prefix=${WINEPREFIX:?}
+install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
+webview_root="$prefix/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
+
+case ${1:-} in
+    tasklist)
+        printf 'Image Name                     PID Session Name        Session#    Mem Usage\n'
+        printf '========================= ======== ================ =========== ============\n'
+        if [[ -f "$install_dir/bin/.healthd-running" ]]; then
+            printf 'GameViewerHealthd.exe          380 Console                    1     47,320 K\n'
+        fi
+        if [[ -f "$install_dir/bin/.server-running" ]]; then
+            printf 'GameViewerServer.exe           420 Console                    1     81,920 K\n'
+        fi
+        exit 0
+        ;;
+    reg)
+        case ${2:-} in
+            query)
+                if [[ ${3:-} == *EdgeUpdate* && -f "$install_dir/bin/.webview-ready" ]]; then
+                    printf '    pv    REG_SZ    149.0.0.0\n'
+                    exit 0
+                fi
+                if [[ ${3:-} == *Netease*GameViewer* &&
+                    -f "$install_dir/bin/.app-installed" ]]; then
+                    installed_version=4.34.0.8979
+                    if [[ -r "$install_dir/bin/.installed-version" ]]; then
+                        installed_version=$(<"$install_dir/bin/.installed-version")
+                    fi
+                    printf '    Version    REG_SZ    %s\n' "$installed_version"
+                    exit 0
+                fi
+                if [[ ${3:-} == *GameViewerService* &&
+                    -f "$install_dir/bin/.app-installed" ]]; then
+                    printf 'HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\GameViewerService\n'
+                    exit 0
+                fi
+                exit 1
+                ;;
+            add)
+                exit 0
+                ;;
+        esac
+        ;;
+    sc)
+        case ${2:-} in
+            query)
+                printf '        STATE              : 4  RUNNING\n'
+                ;;
+            start)
+                printf 'SC START success\n'
+                ;;
+        esac
+        exit 0
+        ;;
+    start)
+        exit 0
+        ;;
+esac
+
+case ${1:-} in
+    *UURemote_Setup.exe)
+        install -Dm0644 /dev/null "$install_dir/GameViewer.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/GameViewer.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/GameViewerServer.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/GameViewerHealthd.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/Upgrade.exe"
+        truncate -s $((0x94e4ee + 3)) "$install_dir/bin/streamer.dll"
+        printf '\211\125\320' |
+            dd of="$install_dir/bin/streamer.dll" bs=1 seek=$((0x94dc03)) \
+                conv=notrunc status=none
+        printf '\213\105\320' |
+            dd of="$install_dir/bin/streamer.dll" bs=1 seek=$((0x94e4ee)) \
+                conv=notrunc status=none
+        if [[ ${UUYC_FAKE_CORRUPT_STREAMER:-0} == 1 ]]; then
+            printf '\001' |
+                dd of="$install_dir/bin/streamer.dll" bs=1 seek=0 \
+                    conv=notrunc status=none
+        fi
+        install -Dm0600 /dev/null \
+            "$install_dir/config/streamer/decoder_codec_capability_cache.json"
+        printf '{"mock":"original-cache"}\n' \
+            >"$install_dir/config/streamer/decoder_codec_capability_cache.json"
+        install -Dm0600 /dev/null \
+            "$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
+        printf '[settingCenter]\nAutoUpdate=1\n' \
+            >"$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
+        install -Dm0644 /dev/null "$install_dir/bin/MicrosoftEdgeWebview2Setup.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/.app-installed"
+        printf '%s\n' "${UUYC_FAKE_INSTALLER_VERSION:-4.34.0.8979}" \
+            >"$install_dir/bin/.installed-version"
+        printf 'INSTALL\n' >>"$trace_file"
+        exit 0
+        ;;
+    *MicrosoftEdgeWebview2Setup.exe)
+        install -Dm0644 /dev/null "$webview_root/149.0.0.0/msedgewebview2.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/.webview-ready"
+        printf 'WEBVIEW\n' >>"$trace_file"
+        exit 0
+        ;;
+    *GameViewerHealthd.exe)
+        install -Dm0644 /dev/null "$install_dir/bin/.healthd-running"
+        printf 'HEALTHD\n' >>"$trace_file"
+        exit 0
+        ;;
+    *GameViewerServer.exe)
+        install -Dm0644 /dev/null "$install_dir/bin/.server-running"
+        printf 'SERVER\n' >>"$trace_file"
+        exit 0
+        ;;
+    *GameViewer.exe)
+        if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
+            ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
+            printf 'HWDECODE_ENV\n' >>"$trace_file"
+        fi
+        printf 'CUDA_DEVICE=%s\n' "${UUYC_CUDA_DEVICE:-unset}" >>"$trace_file"
+        printf 'CLIENT\n' >>"$trace_file"
+        exit 0
+        ;;
+esac
+
+exit 0

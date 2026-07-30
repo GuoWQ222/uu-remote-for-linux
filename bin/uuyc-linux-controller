@@ -1,0 +1,2510 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly app_id="uuyc-linux-controller"
+readonly app_name="网易 UU 远程 Linux 主控端验证版"
+readonly min_wine_version="11.1"
+readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
+readonly eula_url="https://uuyc.163.com/contact/20240402/40294_1146065.html"
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+resolve_runtime_dir() {
+    local candidate
+
+    if [[ -n ${UUYC_CONTROLLER_RUNTIME_DIR:-} ]]; then
+        printf '%s\n' "$UUYC_CONTROLLER_RUNTIME_DIR"
+        return
+    fi
+
+    for candidate in \
+        "$script_dir/../lib/$app_id" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/../lib/$app_id" \
+        "$HOME/.local/lib/$app_id" \
+        "/usr/local/lib/$app_id" \
+        "/usr/lib/$app_id"; do
+        if [[ -r "$candidate/wevtapi.dll" && -r "$candidate/package-version" ]]; then
+            /usr/bin/readlink -f -- "$candidate"
+            return
+        fi
+    done
+
+    printf '%s\n' "$script_dir/../lib/$app_id"
+}
+
+runtime_dir=$(resolve_runtime_dir)
+readonly runtime_dir
+readonly shim_source="$runtime_dir/wevtapi.dll"
+readonly package_version_file="$runtime_dir/package-version"
+readonly decoder_selector="$runtime_dir/uuyc-decoder-selector"
+readonly tray_proxy="${UUYC_TRAY_PROXY_BIN:-$runtime_dir/uuyc-tray-proxy}"
+readonly autostart_bridge="$runtime_dir/uuyc-autostart-bridge"
+readonly sleep_bridge="$runtime_dir/uuyc-sleep-bridge"
+readonly keyboard_bridge="$runtime_dir/uuyc-keyboard-bridge"
+readonly wol_bridge="$runtime_dir/uuyc-wol-bridge"
+readonly wol_configure="$runtime_dir/uuyc-wol-configure"
+readonly update_bridge="$runtime_dir/uuyc-update-bridge"
+readonly update_blocker_source="$runtime_dir/uuyc-update-blocker.exe"
+readonly update_compatibility_profiles="${UUYC_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
+
+readonly data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+readonly state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+readonly cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+readonly data_dir="$data_home/$app_id"
+readonly state_dir="$state_home/$app_id"
+readonly cache_dir="$cache_home/$app_id"
+readonly prefix="${UUYC_WINE_PREFIX:-$data_dir/wineprefix}"
+readonly install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
+readonly client="$install_dir/GameViewer.exe"
+readonly client_image="$install_dir/bin/GameViewer.exe"
+readonly server="$install_dir/bin/GameViewerServer.exe"
+readonly wol_server_original="$install_dir/bin/GameViewerServer.uuyc-wol-original.exe"
+readonly healthd="$install_dir/bin/GameViewerHealthd.exe"
+readonly native_wevtapi="$install_dir/bin/wevtapi.dll"
+readonly native_upgrade="$install_dir/bin/Upgrade.exe"
+readonly native_upgrade_original="$install_dir/bin/Upgrade.uuyc-original.exe"
+readonly webview_setup="$install_dir/bin/MicrosoftEdgeWebview2Setup.exe"
+readonly webview_root="$prefix/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
+readonly webview_key='HKLM\Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+readonly service_name='GameViewerService'
+readonly service_key='HKLM\System\CurrentControlSet\Services\GameViewerService'
+readonly installed_version_key='HKCU\Software\Netease\GameViewer'
+readonly package_stamp="$prefix/.uuyc-linux-controller-package"
+readonly eula_stamp="$data_dir/eula-accepted"
+readonly installer="$cache_dir/UURemote_Setup.exe"
+readonly installer_version_file="$cache_dir/installer-version"
+readonly installer_metadata_file="$cache_dir/installer-metadata"
+readonly installer_archive_dir="$cache_dir/installers"
+readonly setup_log="$state_dir/setup.log"
+readonly runtime_log="$state_dir/runtime.log"
+readonly tray_proxy_log="$state_dir/tray-proxy.log"
+readonly tray_proxy_status="$state_dir/tray-proxy-status"
+readonly autostart_log="$state_dir/autostart-bridge.log"
+readonly autostart_lock="$state_dir/autostart-bridge.lock"
+readonly autostart_desktop="$config_home/autostart/$app_id.desktop"
+readonly autostart_interval="${UUYC_AUTOSTART_BRIDGE_INTERVAL:-2}"
+readonly sleep_bridge_log="$state_dir/sleep-bridge.log"
+readonly sleep_bridge_lock="$state_dir/sleep-bridge.lock"
+readonly sleep_bridge_interval="${UUYC_SLEEP_BRIDGE_INTERVAL:-2}"
+readonly keyboard_bridge_log="$state_dir/keyboard-bridge.log"
+readonly keyboard_bridge_lock="$state_dir/keyboard-bridge.lock"
+readonly keyboard_bridge_status="$state_dir/keyboard-bridge-status.json"
+readonly keyboard_bridge_interval="${UUYC_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
+readonly local_appdata="$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer"
+readonly client_setting_file="$local_appdata/setting.ini"
+readonly update_bridge_log="$state_dir/update-bridge.log"
+readonly update_bridge_lock="$state_dir/update-bridge.lock"
+readonly update_bridge_interval="${UUYC_UPDATE_BRIDGE_INTERVAL:-21600}"
+readonly update_status_file="$state_dir/update-status"
+readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
+readonly update_original_archive="$data_dir/update-originals"
+readonly update_rollback_dir="$cache_dir/update-rollback"
+readonly client_log_dir="$install_dir/log/client/Log"
+readonly wol_enabled_stamp="$data_dir/wol-enabled"
+readonly wol_server_original_sha="${UUYC_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
+readonly wol_server_patched_sha="${UUYC_WOL_SERVER_PATCHED_SHA:-886c0638717d80cc567f1e9fe05b0072065a6fd67d6d114446e44953cde2822a}"
+readonly decoder_selection_file="$data_dir/decoder-selection"
+readonly operation_lock_timeout="${UUYC_OPERATION_LOCK_TIMEOUT:-30}"
+readonly hwdecode_runtime_dir="$runtime_dir/hwdecode"
+readonly hwdecode_wine_dir="$hwdecode_runtime_dir/wine"
+readonly hwdecode_dxvk_dir="$hwdecode_runtime_dir/dxvk/x64"
+readonly hwdecode_enabled_stamp="$data_dir/hwdecode-enabled"
+readonly hwdecode_manifest="$data_dir/hwdecode-manifest"
+readonly hwdecode_d3d11="$install_dir/bin/d3d11.dll"
+readonly hwdecode_dxgi="$install_dir/bin/dxgi.dll"
+readonly hwdecode_nvcuda="$prefix/drive_c/windows/system32/nvcuda.dll"
+readonly hwdecode_nvcuvid="$prefix/drive_c/windows/system32/nvcuvid.dll"
+readonly streamer_dll="$install_dir/bin/streamer.dll"
+readonly streamer_original="$install_dir/bin/streamer.uuyc-original.dll"
+readonly streamer_archive="$data_dir/hwdecode-streamer-originals"
+readonly decoder_cache="$install_dir/config/streamer/decoder_codec_capability_cache.json"
+readonly decoder_cache_backup="$data_dir/decoder-cache-before-hwdecode.json"
+readonly streamer_patch_offset_1=$((0x94dc03))
+readonly streamer_patch_offset_2=$((0x94e4ee))
+readonly streamer_original_sha="${UUYC_HWDECODE_STREAMER_ORIGINAL_SHA:-2144cd9c199ee21ef55da984ef38d719e337a8202b26522458e56bff648ffb60}"
+readonly streamer_patched_sha="${UUYC_HWDECODE_STREAMER_PATCHED_SHA:-abf2e482c65397138aa69430e3413a10f80d942a28817c22f8f8ff78e3c5ca70}"
+
+readonly wine="${UUYC_WINE_BIN:-wine}"
+readonly wineboot="${UUYC_WINEBOOT_BIN:-wineboot}"
+readonly wineserver="${UUYC_WINESERVER_BIN:-wineserver}"
+readonly winecfg="${UUYC_WINECFG_BIN:-winecfg}"
+readonly server_runtime_unit="${app_id}-server"
+readonly healthd_runtime_unit="${app_id}-healthd"
+readonly client_runtime_unit="${app_id}-client"
+readonly update_runtime_unit="${app_id}-update"
+readonly keyboard_runtime_unit="${app_id}-keyboard"
+readonly tray_runtime_unit="${app_id}-tray"
+readonly tray_exit_runtime_unit="${app_id}-tray-exit"
+
+notify_status() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send --app-name="$app_name" "$app_name" "$1" >/dev/null 2>&1 || true
+    fi
+}
+
+die() {
+    notify_status "$1"
+    printf '错误：%s\n' "$1" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+用法：uuyc-linux-controller [选项] [客户端参数...]
+
+选项：
+  --accept-eula        接受网易 UU 远程许可协议后继续
+  --setup-only         安装或修复前缀，但不启动客户端
+  --repair             强制重新检查和修复前缀
+  --refresh-installer  从网易官方接口重新下载最新版安装程序
+  --check-update       立即检查并安全应用受支持的官方更新
+  --enable-hwdecode    启用 NVIDIA NVDEC→D3D11 实验兼容桥
+  --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
+  --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 识别桥
+  --disable-wol        关闭 UU WOL 识别桥（保留 Linux 网卡设置）
+  --select-decoder     打开 CPU/GPU 解码设备选择窗口
+  --select-decoder-and-restart
+                       选择解码设备，保存后自动重启 UU
+  --list-decoders      在终端列出检测到的解码设备与能力
+  --decoder ID         保存指定设备（auto、cpu 或 nvidia:N）
+  --show               显示已运行的 UU 主界面
+  --autostart          Linux 登录自启动入口（由兼容桥生成）
+  --stop               停止此独立 Wine 前缀
+  --diagnose           输出只读诊断信息
+  --uri URI            打开 uuremote: URI
+  --version            输出包装层版本
+  -h, --help           显示帮助
+EOF
+}
+
+setup_only=false
+repair=false
+refresh_installer=false
+update_check_requested=false
+automatic_update_check=false
+stop_requested=false
+diagnose_requested=false
+enable_hwdecode=false
+disable_hwdecode=false
+enable_wol=false
+disable_wol=false
+select_decoder_requested=false
+select_decoder_restart_requested=false
+restart_selected_decoder=false
+list_decoders_requested=false
+accept_eula=false
+autostart_launch=false
+show_requested=false
+decoder_direct_choice=""
+uri=""
+uri_requested=false
+client_args=()
+
+while (($# > 0)); do
+    case $1 in
+        --accept-eula)
+            accept_eula=true
+            ;;
+        --setup-only)
+            setup_only=true
+            ;;
+        --repair)
+            repair=true
+            ;;
+        --refresh-installer)
+            refresh_installer=true
+            ;;
+        --check-update)
+            update_check_requested=true
+            ;;
+        --auto-update-check)
+            update_check_requested=true
+            automatic_update_check=true
+            ;;
+        --stop)
+            stop_requested=true
+            ;;
+        --diagnose)
+            diagnose_requested=true
+            ;;
+        --enable-hwdecode)
+            enable_hwdecode=true
+            ;;
+        --disable-hwdecode)
+            disable_hwdecode=true
+            ;;
+        --enable-wol)
+            enable_wol=true
+            ;;
+        --disable-wol)
+            disable_wol=true
+            ;;
+        --select-decoder)
+            select_decoder_requested=true
+            ;;
+        --select-decoder-and-restart)
+            select_decoder_restart_requested=true
+            ;;
+        --restart-selected-decoder)
+            restart_selected_decoder=true
+            ;;
+        --list-decoders)
+            list_decoders_requested=true
+            ;;
+        --decoder)
+            shift
+            (($# > 0)) || die "--decoder 缺少设备 ID"
+            decoder_direct_choice=$1
+            ;;
+        --autostart)
+            autostart_launch=true
+            ;;
+        --show)
+            show_requested=true
+            ;;
+        --uri)
+            shift
+            (($# > 0)) || die "--uri 缺少参数"
+            [[ $1 == uuremote:* ]] || die "--uri 只接受 uuremote: URI"
+            uri_requested=true
+            uri=$1
+            ;;
+        --version)
+            if [[ -r $package_version_file ]]; then
+                printf '%s\n' "$(<"$package_version_file")"
+            else
+                printf 'development\n'
+            fi
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            client_args+=("$@")
+            break
+            ;;
+        uuremote:*)
+            uri_requested=true
+            uri=$1
+            ;;
+        *)
+            client_args+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if $enable_hwdecode && $disable_hwdecode; then
+    die "--enable-hwdecode 和 --disable-hwdecode 不能同时使用"
+fi
+if $enable_wol && $disable_wol; then
+    die "--enable-wol 和 --disable-wol 不能同时使用"
+fi
+
+if $autostart_launch && {
+    $setup_only || $repair || $refresh_installer || $update_check_requested ||
+        $stop_requested ||
+        $diagnose_requested || $enable_hwdecode || $disable_hwdecode ||
+        $enable_wol || $disable_wol ||
+        $select_decoder_requested || $select_decoder_restart_requested ||
+        $restart_selected_decoder ||
+        $list_decoders_requested ||
+        $accept_eula || [[ -n $decoder_direct_choice ]] ||
+        $show_requested || $uri_requested || ((${#client_args[@]} > 0));
+}; then
+    die "--autostart 不能和其他选项或客户端参数组合"
+fi
+
+if $restart_selected_decoder && {
+    $setup_only || $repair || $refresh_installer || $update_check_requested ||
+        $stop_requested || $diagnose_requested ||
+        $enable_hwdecode || $disable_hwdecode ||
+        $enable_wol || $disable_wol ||
+        $select_decoder_requested || $select_decoder_restart_requested ||
+        $list_decoders_requested || $accept_eula ||
+        [[ -n $decoder_direct_choice ]] ||
+        $autostart_launch || $show_requested || $uri_requested ||
+        ((${#client_args[@]} > 0));
+}; then
+    die "内部解码器重启入口不能和其他选项或客户端参数组合"
+fi
+
+if $stop_requested || $diagnose_requested || $update_check_requested ||
+    $enable_hwdecode || $disable_hwdecode ||
+    $enable_wol || $disable_wol ||
+    $select_decoder_requested || $select_decoder_restart_requested ||
+    $list_decoders_requested ||
+    [[ -n $decoder_direct_choice ]]; then
+    if $setup_only || $repair || $refresh_installer || $accept_eula ||
+        $show_requested || $uri_requested || ((${#client_args[@]} > 0)); then
+        die "维护选项不能和设置、启动或 URI 选项组合"
+    fi
+fi
+
+if $show_requested && {
+    $setup_only || $repair || $refresh_installer || $accept_eula ||
+        $uri_requested || ((${#client_args[@]} > 0));
+}; then
+    die "--show 不能和设置、维护、URI 或客户端参数组合"
+fi
+
+maintenance_action_count=0
+$stop_requested && maintenance_action_count=$((maintenance_action_count + 1))
+$diagnose_requested && maintenance_action_count=$((maintenance_action_count + 1))
+$update_check_requested &&
+    maintenance_action_count=$((maintenance_action_count + 1))
+$enable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
+$disable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
+$enable_wol && maintenance_action_count=$((maintenance_action_count + 1))
+$disable_wol && maintenance_action_count=$((maintenance_action_count + 1))
+if ((maintenance_action_count > 1)); then
+    die "--stop、--diagnose、更新检查、硬件解码和远程开机维护选项不能组合"
+fi
+
+maintenance_selection_count=0
+$select_decoder_requested && maintenance_selection_count=$((maintenance_selection_count + 1))
+$select_decoder_restart_requested &&
+    maintenance_selection_count=$((maintenance_selection_count + 1))
+$list_decoders_requested && maintenance_selection_count=$((maintenance_selection_count + 1))
+[[ -n $decoder_direct_choice ]] &&
+    maintenance_selection_count=$((maintenance_selection_count + 1))
+if ((maintenance_selection_count > 1)); then
+    die "解码设备选择、列表和直接指定选项不能组合"
+fi
+if ((maintenance_selection_count > 0)) &&
+    { $stop_requested || $diagnose_requested || $enable_hwdecode ||
+        $disable_hwdecode || $enable_wol || $disable_wol ||
+        $update_check_requested; }; then
+    die "解码设备选择选项不能和其他维护选项组合"
+fi
+
+package_version="development"
+if [[ -r $package_version_file ]]; then
+    package_version=$(<"$package_version_file")
+fi
+readonly package_version
+
+if $list_decoders_requested; then
+    [[ -x $decoder_selector ]] ||
+        die "缺少解码设备选择器：$decoder_selector"
+    decoder_table=$({
+        printf 'ID\t设备\t类型\t接入后端\t编码能力\t最高画质\t最高帧率\t最高解码率\t状态\t可选择\n'
+        "$decoder_selector" --list
+    })
+    if command -v column >/dev/null 2>&1; then
+        printf '%s\n' "$decoder_table" | column -t -s $'\t'
+    else
+        printf '%s\n' "$decoder_table"
+    fi
+    exit 0
+fi
+
+if $select_decoder_requested; then
+    [[ -x $decoder_selector ]] ||
+        die "缺少解码设备选择器：$decoder_selector"
+    "$decoder_selector" --select "$decoder_selection_file"
+    exit
+fi
+
+if [[ -n $decoder_direct_choice ]]; then
+    [[ -x $decoder_selector ]] ||
+        die "缺少解码设备选择器：$decoder_selector"
+    "$decoder_selector" --set "$decoder_selection_file" "$decoder_direct_choice"
+    printf '已保存解码设备：%s；重新启动 UU 后生效。\n' "$decoder_direct_choice"
+    exit 0
+fi
+
+version_at_least() {
+    local actual=$1
+    local required=$2
+
+    if command -v dpkg >/dev/null 2>&1; then
+        dpkg --compare-versions "$actual" ge "$required"
+        return
+    fi
+
+    [[ $(printf '%s\n%s\n' "$required" "$actual" | sort -V | tail -n 1) == "$actual" ]]
+}
+
+version_greater() {
+    local candidate=$1 installed=$2
+
+    version_at_least "$candidate" "$installed" &&
+        [[ $candidate != "$installed" ]]
+}
+
+official_latest_version() {
+    local source_url="${UUYC_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+    local effective_url clean_url filename
+
+    effective_url=$(curl --silent --show-error --fail --head --location \
+        --retry 2 --connect-timeout 15 --max-time 45 \
+        --output /dev/null --write-out '%{url_effective}' "$source_url" 9>&-) ||
+        return 1
+    clean_url=${effective_url%%\?*}
+    filename=${clean_url##*/}
+    if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    if [[ $filename =~ uuyc_([0-9]+([.][0-9]+){2,3})[.]exe ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    return 1
+}
+
+update_profile_value() {
+    local version=$1 field=$2
+    local row_version installer_sha streamer_sha wol_sha
+
+    [[ -r $update_compatibility_profiles ]] || return 1
+    while IFS=$'\t' read -r \
+        row_version installer_sha streamer_sha wol_sha; do
+        [[ -n $row_version && $row_version != \#* ]] || continue
+        [[ $row_version == "$version" ]] || continue
+        case $field in
+            installer)
+                printf '%s\n' "$installer_sha"
+                ;;
+            streamer)
+                printf '%s\n' "$streamer_sha"
+                ;;
+            wol)
+                printf '%s\n' "$wol_sha"
+                ;;
+            *)
+                return 2
+                ;;
+        esac
+        return
+    done <"$update_compatibility_profiles"
+    return 1
+}
+
+update_version_supported() {
+    local version=$1 installer_sha streamer_sha wol_sha
+
+    installer_sha=$(update_profile_value "$version" installer) || return 1
+    streamer_sha=$(update_profile_value "$version" streamer) || return 1
+    wol_sha=$(update_profile_value "$version" wol) || return 1
+    [[ $installer_sha =~ ^[[:xdigit:]]{64}$ &&
+        $streamer_sha =~ ^[[:xdigit:]]{64}$ &&
+        $wol_sha =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+write_update_status() {
+    local status=$1 installed=$2 latest=$3 message=$4 temp
+
+    temp=$(mktemp "$state_dir/.update-status.XXXXXX")
+    {
+        printf 'status=%s\n' "$status"
+        printf 'installed=%s\n' "$installed"
+        printf 'latest=%s\n' "$latest"
+        printf 'message=%s\n' "${message//$'\n'/ }"
+        printf 'checked_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$update_status_file"
+}
+
+update_status_label() {
+    local status="" latest="" message="" key value
+
+    [[ -r $update_status_file ]] || {
+        printf '尚未检查'
+        return
+    }
+    while IFS='=' read -r key value; do
+        case $key in
+            status)
+                status=$value
+                ;;
+            latest)
+                latest=$value
+                ;;
+            message)
+                message=$value
+                ;;
+        esac
+    done <"$update_status_file"
+    case $status in
+        up-to-date)
+            printf '已是最新版本（%s）' "$latest"
+            ;;
+        updated)
+            printf '已更新到 %s' "$latest"
+            ;;
+        paused)
+            printf '已暂缓 %s：%s' "$latest" "$message"
+            ;;
+        rolled-back)
+            printf '更新失败并已回滚：%s' "$message"
+            ;;
+        error)
+            printf '检查失败：%s' "$message"
+            ;;
+        *)
+            printf '%s' "${message:-状态未知}"
+            ;;
+    esac
+}
+
+uuyc_auto_update_enabled() {
+    [[ -x $update_bridge ]] &&
+        "$update_bridge" setting-enabled "$client_setting_file"
+}
+
+wine_version() {
+    local output
+
+    output=$("$wine" --version 2>/dev/null) || return 1
+    if [[ $output =~ ([0-9]+([.][0-9]+){1,3}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    return 1
+}
+
+check_base_requirements() {
+    local command_name
+    local detected_version
+
+    [[ $(uname -m) == x86_64 ]] ||
+        die "当前仅支持 x86_64/amd64，检测到：$(uname -m)"
+
+    for command_name in curl sha256sum stat od flock readlink tar \
+        systemctl systemd-run systemd-inhibit setsid; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "缺少必需命令：$command_name"
+    done
+
+    for command_name in "$wine" "$wineboot" "$wineserver" "$winecfg"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "缺少 Wine 命令：$command_name。需要 Wine $min_wine_version 或更高版本"
+    done
+
+    detected_version=$(wine_version) ||
+        die "无法识别 Wine 版本"
+    if ! version_at_least "$detected_version" "$min_wine_version"; then
+        if [[ ${UUYC_ALLOW_UNSUPPORTED_WINE:-0} != 1 ]]; then
+            die "Wine $detected_version 过旧；要求 $min_wine_version+。仅排错可设置 UUYC_ALLOW_UNSUPPORTED_WINE=1"
+        fi
+        printf '警告：正在使用未经支持的 Wine %s（最低要求 %s）\n' \
+            "$detected_version" "$min_wine_version" >&2
+    fi
+}
+
+registry_value() {
+    local key=$1
+    local value=$2
+    local output line
+
+    output=$("$wine" reg query "$key" /v "$value" 9>&- 2>/dev/null) ||
+        return 1
+    while IFS= read -r line; do
+        if [[ $line =~ ^[[:space:]]*${value}[[:space:]]+REG_[[:alnum:]_]+[[:space:]]+(.+)$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]%$'\r'}"
+            return
+        fi
+    done <<<"$output"
+    return 1
+}
+
+webview_ready() {
+    local version
+
+    version=$(registry_value "$webview_key" pv) || return 1
+    [[ -n $version && $version != 0.0.0.0 &&
+        -f "$webview_root/$version/msedgewebview2.exe" ]]
+}
+
+app_files_present() {
+    [[ -f $client && -f $client_image && -f $server && -f $healthd ]]
+}
+
+shim_ready() {
+    [[ -r $shim_source && -f $native_wevtapi ]] &&
+        cmp -s "$shim_source" "$native_wevtapi"
+}
+
+hwdecode_runtime_ready() {
+    [[ -r "$hwdecode_dxvk_dir/d3d11.dll" &&
+        -r "$hwdecode_dxvk_dir/dxgi.dll" &&
+        -r "$hwdecode_wine_dir/x86_64-unix/nvcuda.dll.so" &&
+        -r "$hwdecode_wine_dir/x86_64-unix/nvcuvid.dll.so" &&
+        -r "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll" &&
+        -r "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll" ]]
+}
+
+hwdecode_host_libraries_ready() {
+    local libraries
+
+    if [[ ${UUYC_HWDECODE_ASSUME_HOST_READY:-0} == 1 ]]; then
+        return
+    fi
+    libraries=$(ldconfig -p 2>/dev/null || true)
+    [[ $libraries == *"libcuda.so.1"* && $libraries == *"libnvcuvid.so.1"* ]]
+}
+
+hwdecode_enabled() {
+    [[ -r $hwdecode_enabled_stamp ]]
+}
+
+saved_decoder_selection() {
+    [[ -x $decoder_selector ]] || return
+    "$decoder_selector" --get "$decoder_selection_file" 2>/dev/null
+}
+
+write_decoder_selection() {
+    local selection=$1 temp
+
+    [[ $selection == auto || $selection == cpu ||
+        $selection =~ ^nvidia:[0-9]+$ ]] ||
+        die "拒绝保存无效的解码设备：$selection"
+    temp=$(mktemp "$data_dir/.decoder-selection.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'selection=%s\n' "$selection"
+        printf 'selected_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$decoder_selection_file"
+}
+
+effective_decoder_selection() {
+    local selection
+
+    selection=$(saved_decoder_selection || true)
+    if [[ $selection == auto ]]; then
+        "$decoder_selector" --best-id 2>/dev/null || printf 'cpu\n'
+    elif [[ -n $selection ]]; then
+        printf '%s\n' "$selection"
+    elif hwdecode_enabled; then
+        printf 'nvidia:0（旧配置）\n'
+    else
+        printf 'UU 默认/CPU 回退\n'
+    fi
+}
+
+file_sha256() {
+    local output
+
+    output=$(sha256sum "$1") || return
+    printf '%s\n' "${output%% *}"
+}
+
+streamer_bridge_ready() {
+    [[ -f $streamer_dll && -f $streamer_original ]] &&
+        [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]] &&
+        [[ $(file_sha256 "$streamer_original") == "$streamer_original_sha" ]]
+}
+
+hwdecode_files_deployed() {
+    hwdecode_runtime_ready &&
+        cmp -s "$hwdecode_dxvk_dir/d3d11.dll" "$hwdecode_d3d11" &&
+        cmp -s "$hwdecode_dxvk_dir/dxgi.dll" "$hwdecode_dxgi" &&
+        cmp -s "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll" "$hwdecode_nvcuda" &&
+        cmp -s "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll" "$hwdecode_nvcuvid" &&
+        streamer_bridge_ready
+}
+
+hwdecode_manifest_hash() {
+    local name=$1 key value
+
+    [[ -r $hwdecode_manifest ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ $key == "$name" && $value =~ ^[[:xdigit:]]{64}$ ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+    done <"$hwdecode_manifest"
+    return 1
+}
+
+hwdecode_file_owned() {
+    local name=$1 source=$2 target=$3 expected actual
+
+    [[ -f $target ]] || return 1
+    if [[ -r $source ]] && cmp -s "$source" "$target"; then
+        return
+    fi
+    expected=$(hwdecode_manifest_hash "$name") || return 1
+    actual=$(sha256sum "$target")
+    actual=${actual%% *}
+    [[ $actual == "$expected" ]]
+}
+
+update_blocker_manifest_hash() {
+    local key value
+
+    [[ -r $update_blocker_manifest ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ $key == original_sha256 &&
+            $value =~ ^[[:xdigit:]]{64}$ ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+    done <"$update_blocker_manifest"
+    return 1
+}
+
+update_blocker_ready() {
+    local expected actual
+
+    [[ -r $update_blocker_source &&
+        -f $native_upgrade &&
+        -f $native_upgrade_original ]] ||
+        return 1
+    cmp -s "$update_blocker_source" "$native_upgrade" || return 1
+    expected=$(update_blocker_manifest_hash) || return 1
+    actual=$(file_sha256 "$native_upgrade_original") || return 1
+    [[ $actual == "$expected" ]]
+}
+
+write_update_blocker_manifest() {
+    local original_sha=$1 app_version=$2 temp
+
+    temp=$(mktemp "$data_dir/.update-blocker-manifest.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'package_version=%s\n' "$package_version"
+        printf 'uu_version=%s\n' "$app_version"
+        printf 'original_sha256=%s\n' "$original_sha"
+        printf 'deployed_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$update_blocker_manifest"
+}
+
+archive_native_upgrade_original() {
+    local source=$1 hash archive
+
+    [[ -f $source ]] || return
+    hash=$(file_sha256 "$source")
+    archive="$update_original_archive/Upgrade-$hash.exe"
+    if [[ ! -e $archive ]]; then
+        install -Dm0600 "$source" "$archive" ||
+            die "无法归档旧版 UU Upgrade.exe"
+    fi
+}
+
+deploy_update_blocker() {
+    local original_sha app_version
+
+    [[ -r $update_blocker_source ]] ||
+        die "缺少自动更新保护程序：$update_blocker_source"
+    [[ -f $native_upgrade || -f $native_upgrade_original ]] ||
+        die "UU Upgrade.exe 缺失，无法启用安全更新桥"
+
+    if [[ -f $native_upgrade ]] &&
+        cmp -s "$update_blocker_source" "$native_upgrade"; then
+        [[ -f $native_upgrade_original ]] ||
+            die "UU 原版 Upgrade.exe 备份缺失；拒绝继续以避免破坏更新能力"
+    else
+        [[ -f $native_upgrade ]] ||
+            die "UU Upgrade.exe 缺失，且当前位置不是本项目占位程序"
+        if [[ -f $native_upgrade_original ]]; then
+            archive_native_upgrade_original "$native_upgrade_original"
+        fi
+        mv -f "$native_upgrade" "$native_upgrade_original" ||
+            die "无法保存 UU 原版 Upgrade.exe"
+        install -Dm0644 "$update_blocker_source" "$native_upgrade" ||
+            die "无法部署自动更新保护程序"
+    fi
+
+    original_sha=$(file_sha256 "$native_upgrade_original") ||
+        die "无法计算原版 Upgrade.exe 哈希"
+    app_version=$(registry_value "$installed_version_key" Version || true)
+    write_update_blocker_manifest "$original_sha" "${app_version:-unknown}"
+    update_blocker_ready ||
+        die "自动更新保护程序部署后校验失败"
+}
+
+resolve_launcher_path() {
+    local candidate
+
+    if [[ -n ${UUYC_AUTOSTART_LAUNCHER:-} ]]; then
+        candidate=$UUYC_AUTOSTART_LAUNCHER
+    elif [[ $0 == */* ]]; then
+        candidate=$(/usr/bin/readlink -f -- "$0")
+    else
+        candidate=$(command -v -- "$0" 2>/dev/null || true)
+    fi
+    [[ -n $candidate && $candidate == /* && -x $candidate ]] || return 1
+    printf '%s\n' "$candidate"
+}
+
+windows_autostart_enabled() {
+    [[ -x $autostart_bridge ]] &&
+        "$autostart_bridge" registry-enabled "$prefix/user.reg"
+}
+
+native_autostart_enabled() {
+    [[ -x $autostart_bridge ]] &&
+        "$autostart_bridge" native-enabled "$autostart_desktop"
+}
+
+sync_autostart_once() {
+    local launcher_path
+
+    launcher_path=$(resolve_launcher_path) || return 1
+    "$autostart_bridge" sync \
+        "$prefix/user.reg" \
+        "$autostart_desktop" \
+        "$launcher_path" \
+        "$autostart_log" \
+        9>&-
+}
+
+start_autostart_bridge() {
+    local launcher_path
+
+    [[ ${UUYC_DISABLE_AUTOSTART_WATCHER:-0} != 1 ]] || return 0
+    launcher_path=$(resolve_launcher_path) || {
+        printf '警告：无法确定启动器绝对路径，自启动兼容桥未运行。\n' >&2
+        return
+    }
+    nohup "$autostart_bridge" watch \
+        "$prefix/user.reg" \
+        "$autostart_desktop" \
+        "$launcher_path" \
+        "$autostart_log" \
+        "$autostart_lock" \
+        "$autostart_interval" \
+        9>&- </dev/null >/dev/null 2>&1 &
+}
+
+uuyc_prevent_sleep_state() {
+    [[ -x $sleep_bridge ]] || {
+        printf 'unknown\n'
+        return
+    }
+    "$sleep_bridge" state "$client_log_dir" 2>/dev/null || printf 'unknown\n'
+}
+
+uuyc_prevent_sleep_label() {
+    local state
+
+    state=$(uuyc_prevent_sleep_state)
+    case $state in
+        enabled)
+            printf '开启'
+            ;;
+        disabled)
+            printf '关闭'
+            ;;
+        *)
+            printf '未知（尚无客户端状态）'
+            ;;
+    esac
+}
+
+native_sleep_inhibition_active() {
+    [[ -x $sleep_bridge ]] && "$sleep_bridge" inhibitor-active
+}
+
+start_sleep_bridge() {
+    local launcher_path
+
+    [[ ${UUYC_DISABLE_SLEEP_WATCHER:-0} != 1 ]] || return 0
+    launcher_path=$(resolve_launcher_path) || {
+        printf '警告：无法确定启动器绝对路径，防休眠兼容桥未运行。\n' >&2
+        return
+    }
+    nohup "$sleep_bridge" watch \
+        "$client_log_dir" \
+        "$prefix" \
+        "$launcher_path" \
+        "$sleep_bridge_log" \
+        "$sleep_bridge_lock" \
+        "$sleep_bridge_interval" \
+        9>&- </dev/null >/dev/null 2>&1 &
+}
+
+keyboard_bridge_status_label() {
+    local state=""
+
+    if [[ ${XDG_SESSION_TYPE:-x11} != x11 ]]; then
+        printf '当前会话不支持（仅 X11）'
+    elif [[ ! -x $keyboard_bridge ]]; then
+        printf '缺失'
+    elif ! runtime_unit_active "$keyboard_runtime_unit"; then
+        printf '就绪（待应用启动）'
+    else
+        state=$("$keyboard_bridge" status "$state_dir" 2>/dev/null || true)
+        case $state in
+            active)
+                printf '正在接管远控窗口快捷键'
+                ;;
+            idle)
+                printf '监视中（当前远控窗口未聚焦）'
+                ;;
+            error)
+                printf '异常（详见日志）'
+                ;;
+            *)
+                printf '启动中'
+                ;;
+        esac
+    fi
+}
+
+start_keyboard_bridge() {
+    local variable
+    local -a command
+
+    [[ ${UUYC_DISABLE_KEYBOARD_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    if ! "$keyboard_bridge" check >>"$keyboard_bridge_log" 2>&1; then
+        printf '警告：X11 远控键盘桥依赖检查失败，详见 %s\n' \
+            "$keyboard_bridge_log" >&2
+        return 1
+    fi
+    if systemd_user_available; then
+        if runtime_unit_active "$keyboard_runtime_unit"; then
+            return
+        fi
+        systemctl --user reset-failed \
+            "$keyboard_runtime_unit.service" >/dev/null 2>&1 || true
+        command=(
+            systemd-run
+            --user
+            "--unit=$keyboard_runtime_unit"
+            --collect
+            --quiet
+            --property=Restart=on-failure
+            --property=RestartSec=1s
+            --property=TimeoutStopSec=5s
+            "--property=StandardOutput=append:$keyboard_bridge_log"
+            "--property=StandardError=append:$keyboard_bridge_log"
+        )
+        for variable in \
+            DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+            XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH; do
+            if [[ -v $variable ]]; then
+                command+=("--setenv=$variable=${!variable}")
+            fi
+        done
+        command+=(
+            "$keyboard_bridge" watch
+            "$state_dir"
+            "$keyboard_bridge_log"
+            "$keyboard_bridge_lock"
+            "$keyboard_bridge_interval"
+        )
+        if "${command[@]}" 9>&-; then
+            return
+        fi
+        printf '警告：无法创建键盘桥用户服务，改用兼容后台进程。\n' >&2
+    fi
+    nohup "$keyboard_bridge" watch \
+        "$state_dir" \
+        "$keyboard_bridge_log" \
+        "$keyboard_bridge_lock" \
+        "$keyboard_bridge_interval" \
+        9>&- </dev/null >>"$keyboard_bridge_log" 2>&1 &
+}
+
+start_update_bridge() {
+    local launcher_path
+
+    [[ ${UUYC_DISABLE_UPDATE_WATCHER:-0} != 1 ]] || return 0
+    launcher_path=$(resolve_launcher_path) || {
+        printf '警告：无法确定启动器绝对路径，自动更新兼容桥未运行。\n' >&2
+        return
+    }
+    if systemd_user_available; then
+        if runtime_unit_active "$update_runtime_unit"; then
+            return
+        fi
+        systemctl --user reset-failed \
+            "$update_runtime_unit.service" >/dev/null 2>&1 || true
+        if systemd-run \
+            --user \
+            "--unit=$update_runtime_unit" \
+            --collect \
+            --quiet \
+            --property=Restart=on-failure \
+            --property=RestartSec=5s \
+            "--property=StandardOutput=append:$update_bridge_log" \
+            "--property=StandardError=append:$update_bridge_log" \
+            "$update_bridge" watch \
+            "$client_setting_file" \
+            "$launcher_path" \
+            "$update_bridge_log" \
+            "$update_bridge_lock" \
+            "$update_bridge_interval" \
+            9>&-; then
+            return
+        fi
+        printf '警告：无法创建自动更新用户服务，改用兼容后台进程。\n' >&2
+    fi
+    nohup "$update_bridge" watch \
+        "$client_setting_file" \
+        "$launcher_path" \
+        "$update_bridge_log" \
+        "$update_bridge_lock" \
+        "$update_bridge_interval" \
+        9>&- </dev/null >/dev/null 2>&1 &
+}
+
+tray_proxy_dependencies_ready() {
+    [[ -x $tray_proxy ]] &&
+        "$tray_proxy" --check >/dev/null 2>&1
+}
+
+tray_proxy_status_label() {
+    local status="" backend="" detail="" key value
+
+    if [[ ! -x $tray_proxy ]]; then
+        printf '缺失'
+        return
+    fi
+    if ! tray_proxy_dependencies_ready; then
+        printf '依赖缺失'
+        return
+    fi
+    if runtime_unit_active "$tray_runtime_unit"; then
+        printf '生效中（原生 StatusNotifierItem）'
+        return
+    fi
+    if [[ -r $tray_proxy_status ]]; then
+        while IFS='=' read -r key value; do
+            case $key in
+                status)
+                    status=$value
+                    ;;
+                backend)
+                    backend=$value
+                    ;;
+                detail)
+                    detail=$value
+                    ;;
+            esac
+        done <"$tray_proxy_status"
+    fi
+    case $status in
+        active)
+            printf '生效中（%s）' "${backend:-原生托盘}"
+            ;;
+        error)
+            printf '异常：%s' "${detail:-详见日志}"
+            ;;
+        *)
+            printf '就绪（待应用启动）'
+            ;;
+    esac
+}
+
+start_tray_proxy() {
+    local launcher_path wine_path variable
+    local -a proxy_command systemd_command
+
+    [[ ${UUYC_DISABLE_TRAY_PROXY:-0} != 1 ]] || return 0
+    [[ ${UUYC_TRAY_PROXY_CHILD:-0} != 1 ]] || return 0
+    tray_proxy_dependencies_ready || {
+        printf '警告：原生托盘代理依赖不完整，详见诊断输出。\n' >&2
+        return 1
+    }
+    launcher_path=$(resolve_launcher_path) || {
+        printf '警告：无法确定启动器绝对路径，原生托盘代理未运行。\n' >&2
+        return 1
+    }
+    proxy_command=(
+        "$tray_proxy"
+        --prefix "$prefix"
+        --launcher "$launcher_path"
+        --state-dir "$state_dir"
+        --log-file "$tray_proxy_log"
+        --icon "$app_id"
+    )
+    if systemd_user_available; then
+        if runtime_unit_active "$tray_runtime_unit"; then
+            return
+        fi
+        systemctl --user stop \
+            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$tray_runtime_unit.service" \
+            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+        wine_path=$(command -v -- "$wine" || true)
+        systemd_command=(
+            systemd-run
+            --user
+            "--unit=$tray_runtime_unit"
+            --collect
+            --quiet
+            --property=Restart=on-failure
+            --property=RestartSec=2s
+            "--property=StandardOutput=append:$tray_proxy_log"
+            "--property=StandardError=append:$tray_proxy_log"
+            "--setenv=WINEPREFIX=$prefix"
+        )
+        for variable in \
+            DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+            DBUS_SESSION_BUS_ADDRESS XDG_CURRENT_DESKTOP PATH; do
+            if [[ -v $variable ]]; then
+                systemd_command+=("--setenv=$variable=${!variable}")
+            fi
+        done
+        [[ -n $wine_path ]] &&
+            systemd_command+=("--setenv=UUYC_WINE_BIN=$wine_path")
+        systemd_command+=("${proxy_command[@]}")
+        if "${systemd_command[@]}" 9>&-; then
+            return
+        fi
+        printf '警告：无法创建原生托盘用户服务，改用兼容后台进程。\n' >&2
+    fi
+    nohup "${proxy_command[@]}" 9>&- </dev/null \
+        >>"$tray_proxy_log" 2>&1 &
+}
+
+systemd_user_available() {
+    [[ ${UUYC_DISABLE_SYSTEMD_RUNTIME:-0} != 1 ]] &&
+        command -v systemctl >/dev/null 2>&1 &&
+        command -v systemd-run >/dev/null 2>&1 &&
+        timeout 3s systemctl --user show-environment >/dev/null 2>&1
+}
+
+runtime_unit_active() {
+    local unit=$1
+
+    systemd_user_available &&
+        systemctl --user is-active --quiet "$unit.service" >/dev/null 2>&1
+}
+
+runtime_supervisor_label() {
+    if ! systemd_user_available; then
+        printf '不可用（将使用兼容启动）'
+    elif runtime_unit_active "$server_runtime_unit" &&
+        runtime_unit_active "$healthd_runtime_unit"; then
+        printf 'Server/Healthd 生效中'
+    elif runtime_unit_active "$server_runtime_unit" ||
+        runtime_unit_active "$healthd_runtime_unit"; then
+        printf '部分生效'
+    else
+        printf '待应用启动'
+    fi
+}
+
+update_runtime_label() {
+    if [[ ! -x $update_bridge ]]; then
+        printf '缺失'
+    elif runtime_unit_active "$update_runtime_unit"; then
+        printf '监视中'
+    elif systemd_user_available; then
+        printf '就绪（待应用启动）'
+    else
+        printf '就绪（兼容后台模式）'
+    fi
+}
+
+stop_update_bridge_runtime() {
+    systemd_user_available || return 0
+    systemctl --user stop \
+        "$update_runtime_unit.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed \
+        "$update_runtime_unit.service" >/dev/null 2>&1 || true
+}
+
+stop_tray_proxy_runtime() {
+    local pid="" key value cmdline=""
+
+    if systemd_user_available; then
+        systemctl --user stop \
+            "$tray_runtime_unit.service" \
+            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$tray_runtime_unit.service" \
+            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+    fi
+    if [[ -r $tray_proxy_status ]]; then
+        while IFS='=' read -r key value; do
+            [[ $key == pid ]] && pid=$value
+        done <"$tray_proxy_status"
+    fi
+    [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] || return 0
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    if [[ $cmdline == *"$tray_proxy"* && $cmdline == *"$prefix"* ]]; then
+        kill "$pid" >/dev/null 2>&1 || true
+    fi
+}
+
+stop_managed_runtime_services() {
+    local pid="" cmdline=""
+
+    if systemd_user_available; then
+        systemctl --user stop \
+            "$client_runtime_unit.service" \
+            "$server_runtime_unit.service" \
+            "$healthd_runtime_unit.service" \
+            "$keyboard_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$client_runtime_unit.service" \
+            "$server_runtime_unit.service" \
+            "$healthd_runtime_unit.service" \
+            "$keyboard_runtime_unit.service" >/dev/null 2>&1 || true
+    fi
+    if [[ -r $keyboard_bridge_status ]]; then
+        pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+            "$keyboard_bridge_status" | head -n1)
+    fi
+    if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+        if [[ $cmdline == *"$keyboard_bridge"* ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
+    fi
+    if [[ -x $keyboard_bridge ]]; then
+        "$keyboard_bridge" restore \
+            "$state_dir" "$keyboard_bridge_log" >/dev/null 2>&1 || true
+    fi
+}
+
+start_systemd_decoder_restart() {
+    local launcher_path variable attempt load_state
+    local -a command
+
+    launcher_path=$(resolve_launcher_path) || return 1
+    systemctl --user stop \
+        "$client_runtime_unit.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed \
+        "$client_runtime_unit.service" >/dev/null 2>&1 || true
+    # A stopped transient unit can remain loaded until systemd finishes
+    # collecting its Wine cgroup.  TimeoutStopSec is 15 seconds, so wait
+    # longer than that before reusing the stable client unit name.
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        load_state=$(systemctl --user show \
+            --property=LoadState \
+            --value \
+            "$client_runtime_unit.service" 2>/dev/null || true)
+        if [[ -z $load_state || $load_state == not-found ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    ((attempt < 200)) || return 1
+
+    command=(
+        systemd-run
+        --user
+        "--unit=$client_runtime_unit"
+        --collect
+        --quiet
+        --property=ExitType=cgroup
+        --property=TimeoutStopSec=15s
+        "--property=StandardOutput=append:$runtime_log"
+        "--property=StandardError=append:$runtime_log"
+        "--working-directory=$install_dir"
+        "--setenv=WINEPREFIX=$WINEPREFIX"
+        "--setenv=WINEDEBUG=$WINEDEBUG"
+    )
+    for variable in \
+        DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+        DBUS_SESSION_BUS_ADDRESS XDG_CURRENT_DESKTOP PATH \
+        http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+        if [[ -v $variable ]]; then
+            command+=("--setenv=$variable=${!variable}")
+        fi
+    done
+    command+=("$launcher_path" --restart-selected-decoder)
+    "${command[@]}" 9>&-
+}
+
+wol_enabled() {
+    [[ -r $wol_enabled_stamp ]]
+}
+
+wol_patch_ready() {
+    [[ -x $wol_bridge ]] &&
+        "$wol_bridge" patched \
+            "$server" \
+            "$wol_server_original" \
+            "$wol_server_original_sha" \
+            "$wol_server_patched_sha"
+}
+
+wol_detect_row() {
+    [[ -x $wol_bridge ]] || return 1
+    "$wol_bridge" detect 2>/dev/null
+}
+
+wol_interface_label() {
+    local interface connection mac gateway nm_wol power_wakeup
+
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row) || {
+        printf '未检测到可用有线物理网卡'
+        return
+    }
+    printf '%s（%s）' "$interface" "$mac"
+}
+
+wol_native_label() {
+    local interface connection mac gateway nm_wol power_wakeup
+
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row) || {
+        printf '不可用'
+        return
+    }
+    if [[ $nm_wol == magic && $power_wakeup == enabled ]]; then
+        printf 'Magic Packet 已配置'
+    elif [[ $power_wakeup == enabled ]]; then
+        printf '驱动已启用；NetworkManager=%s' "$nm_wol"
+    else
+        printf '未完成（NetworkManager=%s，PCI=%s）' "$nm_wol" "$power_wakeup"
+    fi
+}
+
+wol_gateway_label() {
+    local interface connection mac gateway nm_wol power_wakeup
+
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row) || {
+        printf 'unknown'
+        return
+    }
+    printf '%s' "$gateway"
+}
+
+wol_cloud_label() {
+    local state
+
+    if [[ ! -x $wol_bridge ]]; then
+        printf '未知'
+        return
+    fi
+    state=$("$wol_bridge" cloud-state "$client_log_dir" 2>/dev/null ||
+        printf 'unknown')
+    case $state in
+        enabled)
+            printf '已开启'
+            ;;
+        disabled)
+            printf '未开启'
+            ;;
+        *)
+            printf '未知（尚无客户端状态）'
+            ;;
+    esac
+}
+
+configure_native_wol() {
+    local interface connection mac gateway nm_wol power_wakeup
+
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row) ||
+        die "未检测到使用默认路由的有线物理网卡"
+    if ((EUID == 0)); then
+        "$wol_configure" enable "$interface" "$connection"
+    else
+        command -v pkexec >/dev/null 2>&1 ||
+            die "缺少 pkexec，无法申请配置网卡所需权限"
+        pkexec "$wol_configure" enable "$interface" "$connection" ||
+            die "Linux 网卡 WOL 配置未完成"
+    fi
+}
+
+deploy_wol_bridge() {
+    local interface connection mac gateway nm_wol power_wakeup
+
+    configure_native_wol
+    "$wol_bridge" patch \
+        "$server" \
+        "$wol_server_original" \
+        "$wol_server_original_sha" \
+        "$wol_server_patched_sha" ||
+        die "UU WOL 识别补丁部署失败；Linux 网卡设置已保留"
+    wol_patch_ready || die "UU WOL 识别补丁写入后核验失败"
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row)
+    {
+        printf 'version=1\n'
+        printf 'package_version=%s\n' "$package_version"
+        printf 'interface=%s\n' "$interface"
+        printf 'connection=%s\n' "$connection"
+        printf 'mac=%s\n' "$mac"
+        printf 'configured_at=%(%FT%T%z)T\n' -1
+    } >"${wol_enabled_stamp}.tmp"
+    chmod 0600 "${wol_enabled_stamp}.tmp"
+    mv -f "${wol_enabled_stamp}.tmp" "$wol_enabled_stamp"
+}
+
+remove_wol_bridge() {
+    "$wol_bridge" restore \
+        "$server" \
+        "$wol_server_original" \
+        "$wol_server_original_sha" \
+        "$wol_server_patched_sha" ||
+        die "UU WOL 原版文件恢复失败"
+    rm -f -- "$wol_enabled_stamp"
+}
+
+print_diagnostics() {
+    local os_name="unknown"
+    local detected_wine="missing"
+    local app_version="not-installed"
+    local session_type="${XDG_SESSION_TYPE:-unknown}"
+    local display_value="${DISPLAY:-unset}"
+    local wayland_value="${WAYLAND_DISPLAY:-unset}"
+    local decoder_policy decoder_effective
+
+    decoder_policy=$(saved_decoder_selection || true)
+    [[ -n $decoder_policy ]] || decoder_policy="未设置（沿用现有硬解开关）"
+    decoder_effective=$(effective_decoder_selection)
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_name="${PRETTY_NAME:-${ID:-unknown}}"
+    fi
+    if command -v "$wine" >/dev/null 2>&1; then
+        detected_wine=$(wine_version 2>/dev/null || printf 'unrecognized')
+    fi
+
+    if [[ -f $prefix/system.reg && -x $(command -v "$wine" 2>/dev/null || true) ]]; then
+        export WINEPREFIX="$prefix"
+        export WINEDEBUG=-all
+        app_version=$(registry_value "$installed_version_key" Version || printf 'unknown')
+    fi
+
+    printf '%-24s %s\n' \
+        "项目版本" "$package_version" \
+        "系统" "$os_name" \
+        "架构" "$(uname -m)" \
+        "会话" "$session_type" \
+        "DISPLAY" "$display_value" \
+        "WAYLAND_DISPLAY" "$wayland_value" \
+        "Wine" "$detected_wine（要求 $min_wine_version+）" \
+        "运行库目录" "$runtime_dir" \
+        "Wine 前缀" "$prefix" \
+        "前缀状态" "$([[ -f $prefix/system.reg ]] && printf '存在' || printf '未创建')" \
+        "UU 版本" "$app_version" \
+        "客户端文件" "$(app_files_present && printf '完整' || printf '缺失')" \
+        "WebView2" "$(webview_ready && printf '就绪' || printf '未就绪/未安装')" \
+        "兼容 DLL" "$(shim_ready && printf '就绪' || printf '未安装/不匹配')" \
+        "Linux 原生托盘" "$(tray_proxy_status_label)" \
+        "原生托盘日志" "$tray_proxy_log" \
+        "远控键盘桥" "$(keyboard_bridge_status_label)" \
+        "键盘桥日志" "$keyboard_bridge_log" \
+        "NVIDIA 解码库" "$(hwdecode_host_libraries_ready && printf '就绪' || printf '缺失')" \
+        "解码设备策略" "$decoder_policy" \
+        "实际解码选择" "$decoder_effective" \
+        "UU 自启动开关" "$(windows_autostart_enabled && printf '开启' || printf '关闭')" \
+        "Linux 自启动项" "$(native_autostart_enabled && printf '已创建' || printf '未创建')" \
+        "自启动兼容桥" "$([[ -x $autostart_bridge ]] && printf '就绪' || printf '缺失')" \
+        "UU 防休眠开关" "$(uuyc_prevent_sleep_label)" \
+        "Linux 休眠抑制" "$(native_sleep_inhibition_active && printf '生效中' || printf '未生效')" \
+        "防休眠兼容桥" "$([[ -x $sleep_bridge ]] && printf '就绪' || printf '缺失')" \
+        "UU 自动更新开关" "$(uuyc_auto_update_enabled && printf '开启' || printf '关闭')" \
+        "安全更新状态" "$(update_status_label)" \
+        "自动更新兼容桥" "$(update_runtime_label)" \
+        "官方更新器保护" "$(update_blocker_ready && printf '完整' || printf '未安装/不匹配')" \
+        "UU 后台进程托管" "$(runtime_supervisor_label)" \
+        "WOL 有线网卡" "$(wol_interface_label)" \
+        "Linux WOL 状态" "$(wol_native_label)" \
+        "WOL 默认网关" "$(wol_gateway_label)" \
+        "UU 远程开机开关" "$(wol_cloud_label)" \
+        "UU WOL 兼容桥" "$(wol_enabled && printf '已启用' || printf '未启用')" \
+        "UU WOL 识别补丁" "$(wol_patch_ready && printf '完整' || printf '未安装/不匹配')" \
+        "硬解桥运行库" "$(hwdecode_runtime_ready && printf '完整' || printf '缺失')" \
+        "硬解桥开关" "$(hwdecode_enabled && printf '已启用' || printf '未启用')" \
+        "硬解桥注入" "$(hwdecode_files_deployed && printf '完整' || printf '未安装/不匹配')" \
+        "安装包缓存" "$([[ -f $installer ]] && printf '存在' || printf '不存在')" \
+        "设置日志" "$setup_log"
+
+    if [[ $session_type == wayland && -z ${DISPLAY:-} ]]; then
+        printf '\n警告：Wayland 会话未检测到 XWayland DISPLAY，Windows 客户端无法显示。\n'
+    fi
+    if [[ $detected_wine != missing && $detected_wine != unrecognized ]] &&
+        ! version_at_least "$detected_wine" "$min_wine_version"; then
+        printf '\n警告：Wine 版本过旧。\n'
+    fi
+}
+
+if $diagnose_requested; then
+    print_diagnostics
+    exit 0
+fi
+
+if $stop_requested; then
+    command -v "$wineserver" >/dev/null 2>&1 ||
+        die "找不到 wineserver"
+    stop_update_bridge_runtime
+    stop_tray_proxy_runtime
+    stop_managed_runtime_services
+    if [[ ! -f $prefix/system.reg ]]; then
+        printf '此前缀尚未创建，无需停止：%s\n' "$prefix"
+        exit 0
+    fi
+    WINEPREFIX="$prefix" WINEDEBUG=-all "$wineserver" -k >/dev/null 2>&1 || true
+    if ! WINEPREFIX="$prefix" WINEDEBUG=-all timeout 15s "$wineserver" -w; then
+        die "停止独立 Wine 前缀超时"
+    fi
+    printf '已停止：%s\n' "$prefix"
+    exit 0
+fi
+
+check_base_requirements
+
+[[ -r $shim_source ]] ||
+    die "缺少兼容 DLL：$shim_source。请重新安装本项目"
+[[ -r $package_version_file ]] ||
+    die "缺少版本文件：$package_version_file。请重新安装本项目"
+[[ -x $tray_proxy ]] ||
+    die "缺少 Linux 原生托盘代理：$tray_proxy。请重新安装本项目"
+[[ -x $autostart_bridge ]] ||
+    die "缺少自启动兼容桥：$autostart_bridge。请重新安装本项目"
+[[ -x $sleep_bridge ]] ||
+    die "缺少防休眠兼容桥：$sleep_bridge。请重新安装本项目"
+[[ -x $keyboard_bridge ]] ||
+    die "缺少 X11 远控键盘桥：$keyboard_bridge。请重新安装本项目"
+[[ -x $wol_bridge && -x $wol_configure ]] ||
+    die "缺少远程开机兼容桥：$wol_bridge。请重新安装本项目"
+[[ -x $update_bridge && -r $update_blocker_source &&
+    -r $update_compatibility_profiles ]] ||
+    die "缺少自动更新兼容桥或兼容档案。请重新安装本项目"
+
+mkdir -p "$data_dir" "$state_dir" "$cache_dir"
+
+if $accept_eula; then
+    {
+        printf 'accepted_at=%(%FT%T%z)T\n' -1
+        printf 'eula_url=%s\n' "$eula_url"
+    } >"${eula_stamp}.tmp"
+    mv -f "${eula_stamp}.tmp" "$eula_stamp"
+fi
+
+if [[ ! -r $eula_stamp ]]; then
+    die "首次设置前请阅读 $eula_url，然后运行：uuyc-linux-controller --accept-eula --setup-only"
+fi
+
+export WINEPREFIX="$prefix"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}wevtapi=n,b;winemenubuilder.exe=d"
+unset WINEARCH
+unset WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+unset WEBVIEW2_BROWSER_EXECUTABLE_FOLDER
+unset WEBVIEW2_CHANNEL_SEARCH_KIND
+unset WEBVIEW2_RELEASE_CHANNELS
+unset WEBVIEW2_USER_DATA_FOLDER
+
+[[ $operation_lock_timeout =~ ^[0-9]+$ ]] ||
+    die "UUYC_OPERATION_LOCK_TIMEOUT 必须是非负整数"
+exec 9>"$state_dir/operation.lock"
+if ! flock -w "$operation_lock_timeout" 9; then
+    die "另一个 UU 远程安装或启动操作仍在运行；等待 ${operation_lock_timeout} 秒后仍未获得操作锁"
+fi
+
+release_operation_lock() {
+    flock -u 9 || true
+    exec 9>&-
+}
+
+run_logged() {
+    {
+        printf '\n[%(%FT%T%z)T] ' -1
+        printf '%q ' "$@"
+        printf '\n'
+        "$@" 9>&-
+    } >>"$setup_log" 2>&1
+}
+
+download_installer() {
+    local temp_file effective_url clean_url filename version checksum size magic
+    local archive_file
+    local source_url="${UUYC_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+
+    temp_file=$(mktemp "$cache_dir/.UURemote_Setup.XXXXXX")
+    notify_status "正在从网易官方下载客户端"
+    printf '正在从网易官方下载 Windows 客户端……\n'
+    if ! effective_url=$(curl --fail --location --retry 3 --connect-timeout 15 \
+        --output "$temp_file" --write-out '%{url_effective}' "$source_url" 9>&-); then
+        rm -f -- "$temp_file"
+        die "官方安装包下载失败"
+    fi
+
+    size=$(stat -c '%s' "$temp_file")
+    magic=$(od -An -tx1 -N2 "$temp_file" | tr -d '[:space:]')
+    if ((size < 10485760)) || [[ $magic != 4d5a ]]; then
+        rm -f -- "$temp_file"
+        die "下载内容不是有效的 Windows 安装程序"
+    fi
+
+    clean_url=${effective_url%%\?*}
+    filename=${clean_url##*/}
+    version="unknown"
+    if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
+        version=${BASH_REMATCH[1]}
+    elif [[ $filename =~ uuyc_([0-9]+([.][0-9]+){2,3})[.]exe ]]; then
+        version=${BASH_REMATCH[1]}
+    fi
+    checksum=$(sha256sum "$temp_file")
+    checksum=${checksum%% *}
+
+    mkdir -p "$installer_archive_dir"
+    archive_file="$installer_archive_dir/${version}-${checksum}.exe"
+    if [[ -e $archive_file ]]; then
+        cmp -s "$temp_file" "$archive_file" || {
+            rm -f -- "$temp_file"
+            die "同版本同哈希的安装包归档发生冲突；拒绝覆盖缓存"
+        }
+    else
+        install -m0600 "$temp_file" "$archive_file" ||
+            die "无法归档官方安装包"
+    fi
+    mv -f "$temp_file" "$installer"
+    printf '%s\n' "$version" >"${installer_version_file}.tmp"
+    mv -f "${installer_version_file}.tmp" "$installer_version_file"
+    {
+        printf 'version=%s\n' "$version"
+        printf 'sha256=%s\n' "$checksum"
+        printf 'size=%s\n' "$size"
+        printf 'source=%s\n' "$source_url"
+        printf 'effective_url=%s\n' "$effective_url"
+        printf 'downloaded_at=%(%FT%T%z)T\n' -1
+    } >"${installer_metadata_file}.tmp"
+    mv -f "${installer_metadata_file}.tmp" "$installer_metadata_file"
+    printf '已缓存官方安装包：版本 %s，SHA-256 %s\n' "$version" "$checksum"
+}
+
+if $refresh_installer; then
+    download_installer
+    if app_files_present; then
+        refreshed_version=$(<"$installer_version_file")
+        installed_before_refresh=$(
+            registry_value "$installed_version_key" Version || true
+        )
+        if [[ -n $installed_before_refresh ]] &&
+            version_greater "$refreshed_version" "$installed_before_refresh" &&
+            { hwdecode_enabled || wol_enabled; } &&
+            ! update_version_supported "$refreshed_version"; then
+            write_update_status paused \
+                "$installed_before_refresh" \
+                "$refreshed_version" \
+                "当前 Linux 包尚无该版本的桥接兼容档案"
+            die "已缓存 UU $refreshed_version，但为保护已启用的兼容桥未安装；请等待 Linux 包提供该版本兼容档案"
+        fi
+    fi
+fi
+
+stop_prefix_for_setup() {
+    stop_managed_runtime_services
+    [[ -f $prefix/system.reg ]] || return 0
+    WINEPREFIX="$prefix" WINEDEBUG=-all "$wineserver" -k 9>&- \
+        >>"$setup_log" 2>&1 || true
+    WINEPREFIX="$prefix" WINEDEBUG=-all timeout 15s "$wineserver" -w \
+        9>&- >>"$setup_log" 2>&1 ||
+        die "更新前无法停止独立 Wine 前缀；请关闭 UU 远程后重试"
+}
+
+archive_streamer_original() {
+    local source=$1 hash archive
+
+    [[ -f $source ]] || return
+    hash=$(file_sha256 "$source")
+    archive="$streamer_archive/streamer-$hash.dll"
+    if [[ ! -e $archive ]]; then
+        install -Dm0600 "$source" "$archive" ||
+            die "无法归档旧版 UU streamer.dll：$source"
+    fi
+}
+
+streamer_bytes_at() {
+    local file=$1 offset=$2
+
+    dd if="$file" bs=1 skip="$offset" count=3 status=none |
+        od -An -tx1 -v | tr -d ' \n'
+}
+
+deploy_streamer_patch() {
+    local current_sha original_sha patched_temp
+
+    [[ -f $streamer_dll || -f $streamer_original ]] ||
+        die "UU streamer.dll 缺失，请先运行：uuyc-linux-controller --repair"
+
+    if [[ -f $streamer_original ]]; then
+        original_sha=$(file_sha256 "$streamer_original")
+        [[ $original_sha == "$streamer_original_sha" ]] ||
+            die "streamer.dll 原版备份不属于受支持的 UU 4.34.0.8979；拒绝覆盖"
+
+        if [[ -f $streamer_dll ]]; then
+            current_sha=$(file_sha256 "$streamer_dll")
+            if [[ $current_sha == "$streamer_patched_sha" ]]; then
+                return
+            fi
+            [[ $current_sha == "$streamer_original_sha" ]] ||
+                die "UU 已更新或 streamer.dll 被修改；当前版本尚无安全补丁，已保留所有文件"
+        else
+            install -Dm0644 "$streamer_original" "$streamer_dll" ||
+                die "无法从备份恢复 UU streamer.dll"
+        fi
+    else
+        [[ -f $streamer_dll ]] ||
+            die "UU streamer.dll 缺失，请先运行：uuyc-linux-controller --repair"
+        current_sha=$(file_sha256 "$streamer_dll")
+        if [[ $current_sha == "$streamer_patched_sha" ]]; then
+            die "发现已修改的 streamer.dll，但原版备份缺失；拒绝继续以避免数据丢失"
+        fi
+        [[ $current_sha == "$streamer_original_sha" ]] ||
+            die "当前 streamer.dll 不属于受支持的 UU 4.34.0.8979；未应用版本相关补丁"
+        mv "$streamer_dll" "$streamer_original" ||
+            die "无法备份原版 UU streamer.dll"
+    fi
+
+    [[ $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_1") == 8955d0 &&
+        $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_2") == 8b45d0 ]] ||
+        die "streamer.dll 补丁位置校验失败；未修改客户端"
+
+    patched_temp="${streamer_dll}.uuyc-new"
+    install -Dm0644 "$streamer_original" "$patched_temp" ||
+        die "无法暂存 UU streamer.dll"
+    printf '\262\041\220' |
+        dd of="$patched_temp" bs=1 seek="$streamer_patch_offset_1" conv=notrunc status=none ||
+        die "无法写入 NVDEC 选择补丁"
+    printf '\152\041\130' |
+        dd of="$patched_temp" bs=1 seek="$streamer_patch_offset_2" conv=notrunc status=none ||
+        die "无法写入 NVDEC 能力回填补丁"
+    [[ $(file_sha256 "$patched_temp") == "$streamer_patched_sha" ]] || {
+        rm -f -- "$patched_temp"
+        die "streamer.dll 补丁后哈希不匹配；未替换客户端文件"
+    }
+    mv -f "$patched_temp" "$streamer_dll" ||
+        die "无法安装已校验的 UU streamer.dll 补丁"
+
+    if [[ -f $decoder_cache ]]; then
+        if [[ ! -e $decoder_cache_backup ]]; then
+            install -Dm0600 "$decoder_cache" "$decoder_cache_backup" ||
+                die "无法备份 UU 解码能力缓存"
+        fi
+        rm -f -- "$decoder_cache"
+    fi
+}
+
+remove_streamer_patch() {
+    local current_sha original_sha
+
+    if [[ -f $streamer_original ]]; then
+        original_sha=$(file_sha256 "$streamer_original")
+        [[ $original_sha == "$streamer_original_sha" ]] ||
+            die "streamer.dll 原版备份无法验证；为避免数据丢失，未关闭硬解桥"
+
+        if [[ ! -f $streamer_dll ]]; then
+            mv "$streamer_original" "$streamer_dll" ||
+                die "无法恢复原版 UU streamer.dll"
+        else
+            current_sha=$(file_sha256 "$streamer_dll")
+            if [[ $current_sha == "$streamer_patched_sha" ]]; then
+                rm -f -- "$streamer_dll"
+                mv "$streamer_original" "$streamer_dll" ||
+                    die "无法恢复原版 UU streamer.dll"
+            else
+                # An official update has already replaced the patched file.
+                archive_streamer_original "$streamer_original"
+                rm -f -- "$streamer_original"
+            fi
+        fi
+    elif [[ -f $streamer_dll ]] &&
+        [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]]; then
+        die "已修改的 streamer.dll 缺少原版备份；为避免破坏客户端，未关闭硬解桥"
+    fi
+    rm -f -- "${streamer_dll}.uuyc-new"
+
+    rm -f -- "$decoder_cache"
+    if [[ -f $decoder_cache_backup ]]; then
+        install -Dm0600 "$decoder_cache_backup" "$decoder_cache" ||
+            die "无法恢复原版 UU 解码能力缓存"
+        rm -f -- "$decoder_cache_backup"
+    fi
+}
+
+deploy_hwdecode_bridge() {
+    local name source target temp_manifest hash i
+    local -a names sources targets
+
+    hwdecode_runtime_ready ||
+        die "软件包未包含完整硬件解码桥，请重新安装本项目"
+    hwdecode_host_libraries_ready ||
+        die "未找到 NVIDIA libcuda.so.1 和 libnvcuvid.so.1；请安装匹配当前内核的 NVIDIA 专有驱动"
+    app_files_present ||
+        die "UU 远程客户端尚未完整安装，请先运行：uuyc-linux-controller --setup-only"
+
+    names=(d3d11 dxgi nvcuda nvcuvid)
+    sources=(
+        "$hwdecode_dxvk_dir/d3d11.dll"
+        "$hwdecode_dxvk_dir/dxgi.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll"
+    )
+    targets=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwdecode_nvcuda"
+        "$hwdecode_nvcuvid"
+    )
+
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        name=${names[i]}
+        source=${sources[i]}
+        target=${targets[i]}
+        if [[ -e $target ]] && ! hwdecode_file_owned "$name" "$source" "$target"; then
+            die "发现非本项目管理的 $target；为避免覆盖，未启用硬件解码桥"
+        fi
+    done
+
+    deploy_streamer_patch
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        source=${sources[i]}
+        target=${targets[i]}
+        install -Dm0644 "$source" "${target}.uuyc-new" ||
+            die "无法暂存硬件解码 DLL：$target"
+        mv -f "${target}.uuyc-new" "$target" ||
+            die "无法安装硬件解码 DLL：$target"
+    done
+
+    temp_manifest=$(mktemp "$data_dir/.hwdecode-manifest.XXXXXX")
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        hash=$(sha256sum "${sources[i]}")
+        hash=${hash%% *}
+        printf '%s=%s\n' "${names[i]}" "$hash" >>"$temp_manifest"
+    done
+    mv -f "$temp_manifest" "$hwdecode_manifest"
+    printf '%s\n' "$package_version" >"${hwdecode_enabled_stamp}.tmp"
+    mv -f "${hwdecode_enabled_stamp}.tmp" "$hwdecode_enabled_stamp"
+
+    hwdecode_files_deployed ||
+        die "硬件解码桥写入后核验失败"
+}
+
+remove_hwdecode_bridge() {
+    local name source target i
+    local -a names sources targets
+
+    names=(d3d11 dxgi nvcuda nvcuvid)
+    sources=(
+        "$hwdecode_dxvk_dir/d3d11.dll"
+        "$hwdecode_dxvk_dir/dxgi.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll"
+    )
+    targets=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwdecode_nvcuda"
+        "$hwdecode_nvcuvid"
+    )
+
+    remove_streamer_patch
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        name=${names[i]}
+        source=${sources[i]}
+        target=${targets[i]}
+        if hwdecode_file_owned "$name" "$source" "$target"; then
+            rm -f -- "$target"
+        elif [[ -e $target ]]; then
+            printf '保留非本项目管理或已被修改的文件：%s\n' "$target" >&2
+        fi
+        rm -f -- "${target}.uuyc-new"
+    done
+    rm -f -- "$hwdecode_enabled_stamp" "$hwdecode_manifest"
+}
+
+configure_hwdecode_environment() {
+    export WINEDLLPATH="${hwdecode_wine_dir}${WINEDLLPATH:+:$WINEDLLPATH}"
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"
+    export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+}
+
+apply_decoder_selection() {
+    local requested effective cuda_index
+
+    requested=$(saved_decoder_selection || true)
+    [[ -n $requested ]] || return 0
+
+    effective=$requested
+    if [[ $requested == auto ]]; then
+        effective=$("$decoder_selector" --best-id 2>/dev/null || printf 'cpu')
+    fi
+
+    case $effective in
+        cpu)
+            if hwdecode_enabled || streamer_bridge_ready; then
+                stop_prefix_for_setup
+                remove_hwdecode_bridge
+                printf '已按设备策略切换到 UU CPU 解码路径。\n'
+            fi
+            ;;
+        nvidia:*)
+            cuda_index=${effective#nvidia:}
+            [[ $cuda_index =~ ^[0-9]+$ ]] ||
+                die "无效的 NVIDIA 解码设备：$effective"
+            "$decoder_selector" --supports-id "$effective" ||
+                die "选定的 NVIDIA 解码设备当前不可用：$effective。请重新运行 --select-decoder"
+            if ! hwdecode_enabled || ! hwdecode_files_deployed; then
+                stop_prefix_for_setup
+                deploy_hwdecode_bridge
+                printf '已按设备策略启用 NVIDIA NVDEC 桥。\n'
+            fi
+            export UUYC_CUDA_DEVICE="$cuda_index"
+            ;;
+        *)
+            die "不支持的解码设备选择：$effective"
+            ;;
+    esac
+}
+
+prepare_prefix() {
+    local wine_desktop wine_user
+
+    if [[ ! -f $prefix/system.reg ]]; then
+        mkdir -p "$prefix"
+        notify_status "正在创建独立 Wine 前缀"
+        if ! WINEARCH=win64 WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d' \
+            WINEDEBUG=-all "$wineboot" --init 9>&- >>"$setup_log" 2>&1; then
+            die "创建 Wine 前缀失败，详见 $setup_log"
+        fi
+    fi
+
+    wine_user=$(id -un)
+    wine_desktop="$prefix/drive_c/users/$wine_user/Desktop"
+    if [[ -L $wine_desktop ]]; then
+        rm -f -- "$wine_desktop"
+    fi
+    mkdir -p "$wine_desktop"
+
+    run_logged "$winecfg" -v win10 ||
+        die "无法把 Wine 前缀设置为 Windows 10"
+}
+
+install_or_update_app() {
+    local installed_version="" cached_version="unknown"
+    local install_required=false attempt
+
+    if app_files_present; then
+        installed_version=$(registry_value "$installed_version_key" Version || true)
+    fi
+    if [[ -r $installer_version_file ]]; then
+        cached_version=$(<"$installer_version_file")
+    fi
+
+    if ! app_files_present || [[ -z $installed_version ]]; then
+        install_required=true
+    elif [[ $cached_version != unknown ]] &&
+        ! version_at_least "$installed_version" "$cached_version"; then
+        install_required=true
+    fi
+
+    if ! $install_required; then
+        return
+    fi
+
+    if [[ ! -f $installer ]]; then
+        download_installer
+        cached_version=$(<"$installer_version_file")
+    fi
+
+    notify_status "正在安装网易 UU 远程 $cached_version"
+    printf '正在安装网易 UU 远程 %s……\n' "$cached_version"
+    if ! run_logged "$wine" "$installer" /S /launchapp=0 /autorun=0; then
+        printf '安装程序返回非零状态；继续核验已安装文件。\n' >>"$setup_log"
+    fi
+
+    for ((attempt = 0; attempt < 160; attempt++)); do
+        app_files_present && break
+        sleep 0.25
+    done
+    app_files_present ||
+        die "安装程序未生成预期的客户端和服务文件，详见 $setup_log"
+    rm -f -- "$prefix/drive_c/users/$(id -un)/Desktop/UU远程.lnk"
+}
+
+configure_compatibility() {
+    local attempt webview_version=""
+
+    install -m 0644 "$shim_source" "$native_wevtapi" ||
+        die "无法安装 Event Log 兼容 DLL"
+    deploy_update_blocker
+
+    run_logged "$wine" reg query "$service_key" ||
+        die "UU 远程未注册 $service_name"
+    run_logged "$wine" reg add "$service_key" /v Start /t REG_DWORD /d 2 /f ||
+        die "无法启用 $service_name"
+
+    if ! webview_ready; then
+        [[ -f $webview_setup ]] ||
+            die "官方客户端未包含 WebView2 安装程序"
+        notify_status "正在安装 Microsoft Edge WebView2"
+        printf '正在安装 Microsoft Edge WebView2……\n'
+        if ! run_logged "$wine" "$webview_setup" /silent /install; then
+            printf 'WebView2 安装程序返回非零状态；继续核验运行库。\n' >>"$setup_log"
+        fi
+        for ((attempt = 0; attempt < 180; attempt++)); do
+            webview_ready && break
+            sleep 0.5
+        done
+        webview_ready ||
+            die "WebView2 安装未完成，详见 $setup_log"
+    fi
+
+    run_logged "$wine" reg add \
+        'HKCU\Software\Wine\AppDefaults\msedgewebview2.exe' \
+        /v Version /t REG_SZ /d win8 /f ||
+        die "无法配置 WebView2 兼容模式"
+    run_logged "$wine" reg add 'HKCU\Software\Wine\X11 Driver' \
+        /v UseTakeFocus /t REG_SZ /d N /f ||
+        die "无法配置 Wine X11 焦点处理"
+    run_logged "$wine" reg add \
+        'HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
+        /v 'MS Shell Dlg' /t REG_SZ /d 'Noto Sans CJK SC' /f ||
+        die "无法配置 Wine 托盘中文字体回退"
+    run_logged "$wine" reg add \
+        'HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
+        /v 'MS Shell Dlg 2' /t REG_SZ /d 'Noto Sans CJK SC' /f ||
+        die "无法配置 Wine 托盘中文字体回退"
+
+    webview_version=$(registry_value "$webview_key" pv || true)
+    app_files_present || die "设置过程中客户端文件丢失"
+    shim_ready || die "Event Log 兼容 DLL 核验失败"
+    update_blocker_ready || die "自动更新保护程序核验失败"
+    [[ -n $webview_version &&
+        -f "$webview_root/$webview_version/msedgewebview2.exe" ]] ||
+        die "WebView2 核验失败"
+
+    printf '%s\n' "$package_version" >"${package_stamp}.tmp"
+    mv -f "${package_stamp}.tmp" "$package_stamp"
+}
+
+prefix_needs_configuration() {
+    app_files_present || return 0
+    webview_ready || return 0
+    shim_ready || return 0
+    update_blocker_ready || return 0
+    [[ -r $package_stamp && $(<"$package_stamp") == "$package_version" ]] || return 0
+    return 1
+}
+
+create_update_snapshot() {
+    local temp snapshot
+    local relative_install='drive_c/Program Files/Netease/GameViewer'
+    local -a paths
+
+    mkdir -p "$update_rollback_dir"
+    temp=$(mktemp "$update_rollback_dir/.snapshot.XXXXXX")
+    snapshot="$update_rollback_dir/pre-update.tar"
+    paths=("$relative_install")
+    [[ -f $prefix/system.reg ]] && paths+=("system.reg")
+    [[ -f $prefix/user.reg ]] && paths+=("user.reg")
+    [[ -f $prefix/userdef.reg ]] && paths+=("userdef.reg")
+    [[ -f $client_setting_file ]] &&
+        paths+=("drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini")
+    [[ -d "$local_appdata/upgrade" ]] &&
+        paths+=("drive_c/users/$(id -un)/AppData/Local/GameViewer/upgrade")
+
+    notify_status "正在创建更新回滚点"
+    if ! tar --format=pax -C "$prefix" -cf "$temp" "${paths[@]}"; then
+        rm -f -- "$temp"
+        die "无法创建更新回滚点；现有客户端未作修改"
+    fi
+    mv -f "$temp" "$snapshot"
+    printf '%s\n' "$snapshot"
+}
+
+restore_update_snapshot() {
+    local snapshot=$1 failed_dir
+
+    [[ -f $snapshot ]] || {
+        printf '回滚快照不存在：%s\n' "$snapshot" >&2
+        return 1
+    }
+    stop_prefix_for_setup
+    failed_dir="$update_rollback_dir/failed-install-$(date +%Y%m%d%H%M%S)"
+    if [[ -e $install_dir ]]; then
+        mv "$install_dir" "$failed_dir" || return 1
+    fi
+    if ! tar -C "$prefix" -xf "$snapshot"; then
+        printf '无法从更新快照恢复旧版 UU 文件。\n' >&2
+        return 1
+    fi
+    app_files_present &&
+        shim_ready &&
+        update_blocker_ready || return 1
+    if hwdecode_enabled; then
+        hwdecode_files_deployed || return 1
+    fi
+    if wol_enabled; then
+        wol_patch_ready || return 1
+    fi
+    printf '失败版本已保留用于排错：%s\n' "$failed_dir" >&2
+}
+
+restart_client_after_update() {
+    local launcher_path
+
+    [[ ${UUYC_UPDATE_NO_RESTART:-0} != 1 ]] || return 0
+    launcher_path=$(resolve_launcher_path) || return 1
+    (
+        cd "$data_dir"
+        nohup "$launcher_path" --autostart \
+            </dev/null >>"$update_bridge_log" 2>&1 &
+    )
+}
+
+run_supported_update_transaction() {
+    local latest=$1 expected_installer_sha actual_installer_sha
+    local snapshot installed_after
+
+    expected_installer_sha=$(update_profile_value "$latest" installer) ||
+        die "缺少 UU $latest 的安装包兼容哈希"
+
+    download_installer
+    [[ -r $installer_version_file &&
+        $(<"$installer_version_file") == "$latest" ]] ||
+        die "官方安装包版本与更新检查结果不一致；现有客户端未作修改"
+    actual_installer_sha=$(file_sha256 "$installer") ||
+        die "无法计算已下载安装包的哈希"
+    if [[ $actual_installer_sha != "$expected_installer_sha" ]]; then
+        write_update_status paused \
+            "$(registry_value "$installed_version_key" Version || printf unknown)" \
+            "$latest" \
+            "安装包 SHA-256 与兼容档案不匹配"
+        die "UU $latest 安装包已被重新发布或下载异常；已暂缓更新且未修改客户端"
+    fi
+
+    snapshot=$(create_update_snapshot)
+    if (
+        stop_prefix_for_setup
+        prepare_prefix
+        install_or_update_app
+        configure_compatibility
+
+        if wol_enabled; then
+            "$wol_bridge" patch \
+                "$server" \
+                "$wol_server_original" \
+                "$wol_server_original_sha" \
+                "$wol_server_patched_sha" ||
+                die "更新后 WOL 兼容补丁无法部署"
+        fi
+        apply_decoder_selection
+
+        installed_after=$(registry_value "$installed_version_key" Version || true)
+        [[ $installed_after == "$latest" ]] ||
+            die "更新后版本核验失败：${installed_after:-unknown}"
+        shim_ready || die "更新后 Event Log 兼容 DLL 核验失败"
+        update_blocker_ready ||
+            die "更新后官方更新器保护未恢复"
+        if hwdecode_enabled; then
+            hwdecode_files_deployed ||
+                die "更新后解码兼容 DLL 或 streamer 补丁核验失败"
+        fi
+        if wol_enabled; then
+            wol_patch_ready || die "更新后 WOL 兼容补丁核验失败"
+        fi
+    ); then
+        rm -f -- "$snapshot"
+        write_update_status updated "$latest" "$latest" \
+            "兼容 DLL 与版本补丁均已恢复并校验"
+        notify_status "UU 已安全更新到 $latest，兼容桥校验通过"
+        printf 'UU 已安全更新到 %s，所有已启用兼容桥均已重新部署并校验。\n' \
+            "$latest"
+        restart_client_after_update || true
+        return 0
+    fi
+
+    printf '更新事务失败，正在恢复更新前文件……\n' >&2
+    if restore_update_snapshot "$snapshot"; then
+        write_update_status rolled-back \
+            "$(registry_value "$installed_version_key" Version || printf unknown)" \
+            "$latest" \
+            "更新后兼容性核验失败，已恢复旧版"
+        notify_status "UU 更新未通过兼容性核验，已自动回滚"
+        restart_client_after_update || true
+        return 1
+    fi
+
+    write_update_status error unknown "$latest" \
+        "更新失败且自动回滚未完成，请保留现场并运行 --diagnose"
+    die "更新失败且回滚未完成；请勿启动远控并查看 $update_bridge_log"
+}
+
+perform_update_check() {
+    local installed latest
+
+    if $automatic_update_check && ! uuyc_auto_update_enabled; then
+        printf 'UU 自动更新开关已关闭；跳过检查。\n'
+        return
+    fi
+    app_files_present ||
+        die "UU 客户端尚未安装，无法检查更新"
+    installed=$(registry_value "$installed_version_key" Version || true)
+    [[ -n $installed ]] || die "无法读取当前 UU 版本"
+
+    notify_status "正在检查 UU 官方更新"
+    latest=$(official_latest_version) || {
+        write_update_status error "$installed" unknown "无法解析网易官方发布版本"
+        die "无法从网易官方接口解析最新版本；现有客户端未作修改"
+    }
+    if ! version_greater "$latest" "$installed"; then
+        write_update_status up-to-date "$installed" "$latest" "无需更新"
+        printf 'UU 当前版本 %s，官方版本 %s；无需更新。\n' \
+            "$installed" "$latest"
+        return
+    fi
+
+    if ! update_version_supported "$latest"; then
+        write_update_status paused "$installed" "$latest" \
+            "当前 Linux 包尚无该版本的桥接兼容档案"
+        notify_status "发现 UU $latest，已为保护解码桥暂缓安装"
+        printf '发现 UU %s；当前 Linux 包尚无对应桥接兼容档案，已暂缓安装。\n' \
+            "$latest"
+        printf '当前 %s 与全部兼容 DLL 保持原样。\n' "$installed"
+        return
+    fi
+
+    run_supported_update_transaction "$latest"
+}
+
+if $update_check_requested; then
+    perform_update_check
+    exit
+fi
+
+if $enable_hwdecode; then
+    stop_prefix_for_setup
+    deploy_hwdecode_bridge
+    write_decoder_selection "nvidia:0"
+    notify_status "NVIDIA 硬件解码桥已启用"
+    printf 'NVIDIA NVDEC→D3D11 硬件解码桥已启用。\n'
+    printf '解码设备已保存为 NVIDIA CUDA 设备 0。\n'
+    printf '这是 CPU 回拷兼容模式；可随时运行 --disable-hwdecode 回退。\n'
+    exit 0
+fi
+
+if $disable_hwdecode; then
+    stop_prefix_for_setup
+    remove_hwdecode_bridge
+    write_decoder_selection "cpu"
+    notify_status "硬件解码桥已关闭"
+    printf '硬件解码桥已关闭，项目管理的注入 DLL 已移除。\n'
+    printf '解码设备已切换到 UU CPU 解码路径。\n'
+    exit 0
+fi
+
+if $enable_wol; then
+    app_files_present ||
+        die "UU 远程客户端尚未完整安装，请先运行：uuyc-linux-controller --setup-only"
+    stop_prefix_for_setup
+    deploy_wol_bridge
+    notify_status "远程开机兼容桥已启用"
+    printf 'Linux Magic Packet 与 UU WOL 识别兼容桥已启用。\n'
+    printf '请重新启动 UU，在“允许通过远程开机启动”中继续配置辅助设备或路由器。\n'
+    exit 0
+fi
+
+if $disable_wol; then
+    stop_prefix_for_setup
+    remove_wol_bridge
+    notify_status "远程开机兼容桥已关闭"
+    printf 'UU WOL 识别兼容桥已关闭并恢复原版服务端文件。\n'
+    printf 'Linux 网卡的 Magic Packet 设置予以保留，不会影响正常联网。\n'
+    exit 0
+fi
+
+if $select_decoder_restart_requested; then
+    [[ -x $decoder_selector ]] ||
+        die "缺少解码设备选择器：$decoder_selector"
+    if ! selected_decoder=$(
+        UUYC_DECODER_RESTART_AFTER_SAVE=1 \
+            "$decoder_selector" --select "$decoder_selection_file"
+    ); then
+        die "解码设备选择失败；UU 保持原运行状态"
+    fi
+    if [[ -z $selected_decoder ]]; then
+        printf '已取消解码设备选择；UU 保持运行。\n'
+        exit 0
+    fi
+    printf '已保存解码设备：%s；正在重新启动 UU。\n' "$selected_decoder"
+    notify_status "解码设备已切换，正在重新启动 UU"
+    stop_prefix_for_setup
+    if systemd_user_available; then
+        release_operation_lock
+        start_systemd_decoder_restart ||
+            die "无法创建独立的 UU 重启服务；请运行 uuyc-linux-controller 重试"
+        exit 0
+    fi
+fi
+
+if $repair || $refresh_installer || prefix_needs_configuration; then
+    stop_prefix_for_setup
+    prepare_prefix
+    install_or_update_app
+    configure_compatibility
+    notify_status "主控端设置完成"
+    printf '主控端设置完成。\n'
+fi
+
+if wol_enabled; then
+    "$wol_bridge" patch \
+        "$server" \
+        "$wol_server_original" \
+        "$wol_server_original_sha" \
+        "$wol_server_patched_sha" ||
+        die "远程开机兼容桥已启用，但 UU 服务端文件版本不受支持"
+    wol_patch_ready ||
+        die "远程开机兼容桥已启用，但识别补丁缺失或不匹配"
+fi
+
+apply_decoder_selection
+
+if ! sync_autostart_once; then
+    printf '警告：UU 自启动设置未能同步到 Linux，详见 %s\n' \
+        "$autostart_log" >&2
+fi
+
+$setup_only && exit 0
+
+if hwdecode_enabled; then
+    hwdecode_runtime_ready ||
+        die "硬件解码桥已启用，但运行库不完整；请重新安装本项目"
+    hwdecode_host_libraries_ready ||
+        die "硬件解码桥已启用，但 NVIDIA CUDA/NVDEC 主机库不可用"
+    hwdecode_files_deployed ||
+        die "硬件解码桥注入文件缺失或版本不匹配；请运行：uuyc-linux-controller --enable-hwdecode"
+    configure_hwdecode_environment
+fi
+
+app_files_present ||
+    die "客户端文件不完整，请运行：uuyc-linux-controller --repair"
+
+service_running() {
+    local output line
+
+    output=$("$wine" sc query "$service_name" 9>&- 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        line=${line%$'\r'}
+        if [[ $line =~ ^[[:space:]]*STATE[[:space:]]*:[[:space:]]*4[[:space:]]+RUNNING[[:space:]]*$ ]]; then
+            return 0
+        fi
+    done <<<"$output"
+    return 1
+}
+
+ensure_service_running() {
+    local attempt
+
+    run_logged "$wine" sc start "$service_name" || true
+    for ((attempt = 0; attempt < 150; attempt++)); do
+        service_running && return
+        sleep 0.2
+    done
+    return 1
+}
+
+wine_image_running() {
+    local executable=$1 image output
+
+    image=${executable##*/}
+    output=$("$wine" tasklist /FI "IMAGENAME eq $image" 9>&- 2>/dev/null) ||
+        return 1
+    [[ $output == *"$image"* ]]
+}
+
+start_systemd_wine_image() {
+    local unit=$1 executable=$2
+    local wine_path variable
+    local -a command
+
+    wine_path=$(command -v -- "$wine") || return 1
+    systemctl --user stop "$unit.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit.service" >/dev/null 2>&1 || true
+
+    command=(
+        systemd-run
+        --user
+        "--unit=$unit"
+        --collect
+        --quiet
+        --property=Restart=on-failure
+        --property=RestartSec=2s
+        --property=TimeoutStopSec=15s
+        "--property=StandardOutput=append:$runtime_log"
+        "--property=StandardError=append:$runtime_log"
+        "--working-directory=$install_dir/bin"
+        "--setenv=WINEPREFIX=$WINEPREFIX"
+        "--setenv=WINEDEBUG=$WINEDEBUG"
+    )
+    for variable in \
+        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL UUYC_CUDA_DEVICE \
+        DISPLAY WAYLAND_DISPLAY XAUTHORITY \
+        http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+        if [[ -v $variable ]]; then
+            command+=("--setenv=$variable=${!variable}")
+        fi
+    done
+    command+=("$wine_path" "$executable")
+    "${command[@]}" 9>&-
+}
+
+ensure_wine_image_running() {
+    local unit=$1 executable=$2
+    local attempt
+    local launched=false
+
+    if ! wine_image_running "$executable"; then
+        if systemd_user_available; then
+            if runtime_unit_active "$unit"; then
+                launched=true
+            elif start_systemd_wine_image "$unit" "$executable"; then
+                launched=true
+            fi
+        fi
+        if ! $launched; then
+            (
+                cd "$install_dir/bin"
+                nohup "$wine" "$executable" 9>&- </dev/null \
+                    >>"$runtime_log" 2>&1 &
+            )
+        fi
+    fi
+    for ((attempt = 0; attempt < 60; attempt++)); do
+        wine_image_running "$executable" && return
+        sleep 0.2
+    done
+    return 1
+}
+
+ensure_service_running ||
+    die "$service_name 未进入 RUNNING 状态，详见 $setup_log"
+ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
+    die "GameViewerHealthd.exe 未能启动"
+ensure_wine_image_running "$server_runtime_unit" "$server" ||
+    die "GameViewerServer.exe 未能启动"
+
+sleep 1
+cd "$install_dir"
+release_operation_lock
+start_autostart_bridge
+start_sleep_bridge
+start_update_bridge
+start_keyboard_bridge ||
+    printf '警告：Linux 快捷键可能仍会拦截远控 Win 组合键。\n' >&2
+start_tray_proxy ||
+    die "Linux 原生托盘代理启动失败，详见 $tray_proxy_log"
+if $uri_requested; then
+    exec "$wine" start "$uri"
+fi
+if $restart_selected_decoder; then
+    exec "$wine" "$client"
+fi
+if $select_decoder_restart_requested; then
+    nohup "$wine" "$client" "${client_args[@]}" 9>&- </dev/null \
+        >>"$runtime_log" 2>&1 &
+    exit 0
+fi
+exec "$wine" "$client" "${client_args[@]}"

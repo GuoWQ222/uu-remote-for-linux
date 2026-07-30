@@ -1,0 +1,10 @@
+dist/
+**/__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.swp
+.cache/
+.env
+.env.*
+wineprefix/

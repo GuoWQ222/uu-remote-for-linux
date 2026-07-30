@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly trace=${UUYC_SLEEP_INHIBIT_TRACE:?}
+released=false
+
+release() {
+    $released && return
+    released=true
+    printf 'RELEASE %s\n' "$$" >>"$trace"
+}
+
+trap release EXIT
+trap 'exit 0' INT TERM HUP
+printf 'ACQUIRE %s\n' "$$" >>"$trace"
+while :; do
+    /bin/sleep 1
+done

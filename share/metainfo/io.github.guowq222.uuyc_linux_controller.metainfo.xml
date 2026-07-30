@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.guowq222.uuyc_linux_controller</id>
+  <name>NetEase UU Remote Controller (Wine)</name>
+  <summary>Unofficial Linux controller compatibility wrapper for UU Remote</summary>
+  <metadata_license>0BSD</metadata_license>
+  <project_license>LicenseRef-UU-Remote-EULA AND 0BSD</project_license>
+  <developer id="io.github.guowq222">
+    <name>GuoWQ222 and contributors</name>
+  </developer>
+  <description>
+    <p>
+      Runs the official Windows UU Remote client in a dedicated Wine prefix
+      for controller-side validation on Linux.
+    </p>
+    <p>
+      This is not a native client and does not claim Linux host support.
+    </p>
+  </description>
+  <launchable type="desktop-id">uuyc-linux-controller.desktop</launchable>
+  <url type="homepage">https://github.com/GuoWQ222/uuyc-linux-controller</url>
+  <url type="bugtracker">https://github.com/GuoWQ222/uuyc-linux-controller/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.8.0" date="2026-07-30">
+      <description>
+        <p>Forward Super+Space to the focused Wine remote-control window by temporarily releasing conflicting GNOME and IBus shortcuts, with exact focus-loss and crash recovery.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-07-30">
+      <description>
+        <p>Route upstream automatic updates through a hash-gated transaction that preserves compatibility DLLs and rolls back failed bridge validation.</p>
+      </description>
+    </release>
+    <release version="0.5.1" date="2026-07-30">
+      <description>
+        <p>Keep UU Server and Healthd attached to user-level systemd transient services so Wine cannot lose them when the launcher exits.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-07-30">
+      <description>
+        <p>Add native Ethernet Wake-on-LAN configuration and a version-locked UU network-card capability bridge.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-07-30">
+      <description>
+        <p>Bridge the upstream prevent-sleep switch to a native systemd-logind sleep and idle inhibitor.</p>
+      </description>
+    </release>
+    <release version="0.3.3" date="2026-07-30">
+      <description>
+        <p>Poll live Wine auto-start state while the prefix server is active, without restarting Wine after an explicit stop.</p>
+      </description>
+    </release>
+    <release version="0.3.2" date="2026-07-30">
+      <description>
+        <p>Synchronize the upstream Windows auto-start switch to XDG autostart using the live Wine registry state.</p>
+      </description>
+    </release>
+    <release version="0.3.1" date="2026-07-30">
+      <description>
+        <p>Bridge the upstream Windows auto-start setting to a managed XDG login autostart entry.</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-07-30">
+      <description>
+        <p>Add automatic CPU/GPU discovery, a graphical decoder selector, runtime NVDEC capability queries, and NVIDIA multi-GPU binding.</p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-07-30">
+      <description>
+        <p>Add an opt-in NVIDIA NVDEC to D3D11 CPU-bounce compatibility bridge.</p>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-07-30">
+      <description>
+        <p>Prevent persistent Wine processes from inheriting the operation lock.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-07-30">
+      <description>
+        <p>Initial Ubuntu/Debian controller validation build.</p>
+      </description>
+    </release>
+  </releases>
+</component>

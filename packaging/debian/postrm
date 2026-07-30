@@ -1,0 +1,24 @@
+#!/bin/bash
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t /usr/share/icons/hicolor \
+        >/dev/null 2>&1 || true
+fi
+
+if [[ ${1:-} == purge ]]; then
+    # Keep these paths literal so they can be evaluated in the affected user's
+    # shell instead of root's package-maintenance environment.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        'Per-user UU Remote Wine data was preserved intentionally.' \
+        'Review and remove these paths manually if they are no longer needed:' \
+        '  ${XDG_DATA_HOME:-$HOME/.local/share}/uuyc-linux-controller' \
+        '  ${XDG_CACHE_HOME:-$HOME/.cache}/uuyc-linux-controller' \
+        '  ${XDG_STATE_HOME:-$HOME/.local/state}/uuyc-linux-controller'
+fi
+
+exit 0

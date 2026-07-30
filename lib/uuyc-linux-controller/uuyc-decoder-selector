@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly script_dir
+readonly nvdec_probe="$script_dir/uuyc-nvdec-probe"
+
+sanitize_field() {
+    local value=$1
+
+    value=${value//$'\t'/ }
+    value=${value//$'\n'/ }
+    value=${value//$'\r'/ }
+    printf '%s' "$value"
+}
+
+emit_row() {
+    local id=$1 device=$2 type=$3 backend=$4 codecs=$5 quality=$6
+    local fps=$7 rate=$8 status=$9 selectable=${10}
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(sanitize_field "$id")" \
+        "$(sanitize_field "$device")" \
+        "$(sanitize_field "$type")" \
+        "$(sanitize_field "$backend")" \
+        "$(sanitize_field "$codecs")" \
+        "$(sanitize_field "$quality")" \
+        "$(sanitize_field "$fps")" \
+        "$(sanitize_field "$rate")" \
+        "$(sanitize_field "$status")" \
+        "$(sanitize_field "$selectable")"
+}
+
+cpu_name() {
+    local line
+
+    while IFS= read -r line; do
+        if [[ $line == "Model name:"* ]]; then
+            printf '%s\n' "${line#*:}"
+            return
+        fi
+    done < <(lscpu 2>/dev/null || true)
+    printf 'CPU\n'
+}
+
+nvdec_rows() {
+    local index name pci codecs driver_max
+    local probe_source
+
+    if [[ -n ${UUYC_NVDEC_PROBE_ROWS_FILE:-} ]]; then
+        [[ -r $UUYC_NVDEC_PROBE_ROWS_FILE ]] || return
+        probe_source=$UUYC_NVDEC_PROBE_ROWS_FILE
+    else
+        [[ -x $nvdec_probe ]] || return
+        probe_source=""
+    fi
+    while IFS=$'\t' read -r index name pci codecs driver_max; do
+        [[ $index =~ ^[0-9]+$ ]] || continue
+        if [[ $codecs == none || -z $codecs ]]; then
+            emit_row "nvidia:$index" "$name ($pci)" "NVIDIA 独显/移动 GPU" \
+                "NVDEC" "无 UU 可用 H.264/H.265" "不可用" "不可用" \
+                "驱动能力查询" "NVDEC 不支持所需编码" "no"
+        else
+            emit_row "nvidia:$index" "$name ($pci)" "NVIDIA 独显/移动 GPU" \
+                "NVDEC→CPU 回拷→D3D11" "$codecs" \
+                "最高 3840×2160（UU）；驱动上限 $driver_max" \
+                "最高 144fps（UU 选项，需实测）" "由实际码流基准确定" \
+                "可接入 UU" "yes"
+        fi
+    done < <(
+        if [[ -n $probe_source ]]; then
+            cat -- "$probe_source"
+        else
+            "$nvdec_probe" 2>/dev/null || true
+        fi
+    )
+}
+
+unbridged_gpu_rows() {
+    local pci_line pci type description
+
+    command -v lspci >/dev/null 2>&1 || return
+    while IFS= read -r pci_line; do
+        [[ $pci_line =~ ^([^[:space:]]+)[[:space:]]+(.+)$ ]] || continue
+        pci=${BASH_REMATCH[1]}
+        description=${BASH_REMATCH[2]}
+        if [[ $description == *"NVIDIA"* ]]; then
+            continue
+        elif [[ $description == *"Intel"* ]]; then
+            type="Intel 核显/独显"
+        elif [[ $description == *"AMD"* || $description == *"ATI"* ]]; then
+            type="AMD 核显/独显"
+        else
+            type="其他显示设备"
+        fi
+        emit_row "vaapi:$pci" "$description" "$type" "VA-API" \
+            "$(command -v vainfo >/dev/null 2>&1 &&
+                printf '驱动可查询' || printf '缺少 vainfo，能力未查询')" \
+            "驱动相关" "驱动相关" "尚未接入 UU" \
+            "已检测；UU VA-API 桥尚未实现" "no"
+    done < <(LC_ALL=C lspci -Dnn 2>/dev/null |
+        grep -Ei 'VGA compatible controller|3D controller|Display controller' || true)
+}
+
+list_devices() {
+    local cpu logical_cpus
+
+    emit_row "auto" "自动选择" "策略" "优先可用 NVDEC，否则 CPU" \
+        "按实际设备" "按实际设备" "按实际设备" "启动时重新探测" \
+        "推荐" "yes"
+
+    cpu=$(cpu_name)
+    cpu=${cpu#"${cpu%%[![:space:]]*}"}
+    logical_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '?')
+    emit_row "cpu" "$cpu（${logical_cpus} 线程）" "CPU" "UU OpenH264Decoder" \
+        "H264-8bit-420" "最高 1920×1080（UU CPU 路径）" \
+        "最高 60fps（取决于 CPU）" "需实际码流基准" "可接入 UU" "yes"
+
+    nvdec_rows
+    unbridged_gpu_rows
+}
+
+device_is_selectable() {
+    local wanted=$1 id device type backend codecs quality fps rate status selectable
+    local found=no
+
+    while IFS=$'\t' read -r id device type backend codecs quality fps rate status selectable; do
+        if [[ $id == "$wanted" && $selectable == yes ]]; then
+            found=yes
+        fi
+    done < <(list_devices)
+    [[ $found == yes ]]
+}
+
+best_device() {
+    local id device type backend codecs quality fps rate status selectable
+    local selected=""
+
+    while IFS=$'\t' read -r id device type backend codecs quality fps rate status selectable; do
+        if [[ -z $selected && $id == nvidia:* && $selectable == yes ]]; then
+            selected=$id
+        fi
+    done < <(list_devices)
+    printf '%s\n' "${selected:-cpu}"
+}
+
+read_selection() {
+    local config=$1 key value
+
+    [[ -r $config ]] || return
+    while IFS='=' read -r key value; do
+        if [[ $key == selection ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+    done <"$config"
+}
+
+write_selection() {
+    local config=$1 selection=$2 temp
+
+    mkdir -p "$(dirname -- "$config")"
+    temp=$(mktemp "$(dirname -- "$config")/.decoder-selection.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'selection=%s\n' "$selection"
+        printf 'selected_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$config"
+}
+
+select_graphically() {
+    local config=$1 current chosen id device type backend codecs quality fps rate
+    local status selectable marked prompt_text saved_text
+    local -a rows=()
+
+    command -v zenity >/dev/null 2>&1 ||
+        {
+            printf '错误：未安装 zenity；可先运行 --list-decoders 查看设备。\n' >&2
+            return 1
+        }
+    [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] ||
+        {
+            printf '错误：没有图形会话；可先运行 --list-decoders 查看设备。\n' >&2
+            return 1
+        }
+
+    current=$(read_selection "$config" || true)
+    [[ -n $current ]] || current=auto
+    if [[ ${UUYC_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
+        prompt_text='选择要交给 UU 使用的解码设备。保存后 UU 将自动重启；当前远控连接会短暂中断。'
+    else
+        prompt_text='选择 UU 下次启动使用的解码设备。应用选择不会中断当前远控；重启 UU 后生效。'
+    fi
+
+    while IFS=$'\t' read -r id device type backend codecs quality fps rate status selectable; do
+        marked=FALSE
+        [[ $id == "$current" ]] && marked=TRUE
+        rows+=("$marked" "$id" "$device" "$type" "$backend" "$codecs" \
+            "$quality" "$fps" "$rate" "$status")
+    done < <(list_devices)
+
+    chosen=$(zenity --list --radiolist \
+        --title='网易 UU 远程 — 解码设备选择' \
+        --text="$prompt_text" \
+        --width=1420 --height=650 \
+        --column='选择' --column='内部 ID' --column='设备' --column='类型' \
+        --column='接入后端' --column='编码能力' --column='最高画质' \
+        --column='最高帧率' --column='最高解码率' --column='状态' \
+        --hide-column=2 --print-column=2 \
+        "${rows[@]}") || return 0
+
+    [[ -n $chosen ]] || return 0
+    if ! device_is_selectable "$chosen"; then
+        zenity --warning --title='无法选择此设备' \
+            --text='该设备虽被系统检测到，但尚无可供 UU 使用的桥接后端，因此没有保存选择。'
+        return 1
+    fi
+
+    write_selection "$config" "$chosen"
+    if [[ ${UUYC_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
+        saved_text="已选择：$chosen"$'\n\n''网易 UU 远程将在关闭此提示后自动重启。'
+    else
+        saved_text="已选择：$chosen"$'\n\n''关闭并重新启动网易 UU 远程后生效。'
+    fi
+    zenity --info --title='解码设备选择已保存' \
+        --text="$saved_text"
+    printf '%s\n' "$chosen"
+}
+
+case ${1:---list} in
+    --list)
+        list_devices
+        ;;
+    --best-id)
+        best_device
+        ;;
+    --supports-id)
+        (($# == 2)) || exit 2
+        device_is_selectable "$2"
+        ;;
+    --select)
+        (($# == 2)) || exit 2
+        select_graphically "$2"
+        ;;
+    --get)
+        (($# == 2)) || exit 2
+        read_selection "$2"
+        ;;
+    --set)
+        (($# == 3)) || exit 2
+        device_is_selectable "$3" || {
+            printf '不可选择或未知设备：%s\n' "$3" >&2
+            exit 1
+        }
+        write_selection "$2" "$3"
+        ;;
+    *)
+        printf '未知操作：%s\n' "$1" >&2
+        exit 2
+        ;;
+esac

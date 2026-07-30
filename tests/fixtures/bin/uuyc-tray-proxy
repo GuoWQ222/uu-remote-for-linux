@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${1:-} == --check ]]; then
+    printf 'backend=StatusNotifierItem/AppIndicator3\n'
+    printf 'x11=ready\n'
+    exit 0
+fi
+
+printf 'TRAY_PROXY %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
