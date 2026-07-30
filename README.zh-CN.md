@@ -72,7 +72,7 @@ uuyc-linux-controller --stop
 |---|---:|---:|---|
 | CPU / OpenH264 | 是 | 已支持 | 上游路径：1080p/60 fps |
 | NVIDIA NVDEC | 逐 GPU 查询驱动 | 实验性支持 | UU 菜单最高 4K/144 fps；须以实际串流测试为准 |
-| Intel/AMD VA-API | PCI 设备发现 | 尚未实现 | 显示为不可用，绝不会静默选中 |
+| Intel/AMD VA-API | PCI 设备发现 | 尚未实现 | 不可用 |
 
 ## 许可证与署名
 

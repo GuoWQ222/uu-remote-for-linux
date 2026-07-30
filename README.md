@@ -75,7 +75,7 @@ uuyc-linux-controller --stop
 |---|---:|---:|---|
 | CPU / OpenH264 | Yes | Supported | Upstream path: 1080p/60 fps |
 | NVIDIA NVDEC | Per-GPU driver query | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
-| Intel/AMD VA-API | PCI discovery | Not implemented | Reported as unavailable, never silently selected |
+| Intel/AMD VA-API | PCI discovery | Not implemented | Unavailable |
 
 ## License and attribution
 
