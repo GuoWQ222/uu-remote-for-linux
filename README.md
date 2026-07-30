@@ -10,6 +10,7 @@
 ## Features
 
 - Graphical user interface (GUI).
+- Supports updates in sync with the Windows version of NetEase UU Remote.
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
