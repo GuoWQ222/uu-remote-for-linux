@@ -22,6 +22,12 @@ case "$schema:$key" in
     org.gnome.mutter:overlay-key)
         name=overlay
         ;;
+    org.gnome.desktop.input-sources:current)
+        name=current_input_source
+        ;;
+    org.gnome.desktop.input-sources:sources)
+        name=input_sources
+        ;;
     *)
         printf 'unknown setting: %s:%s\n' "$schema" "$key" >&2
         exit 2

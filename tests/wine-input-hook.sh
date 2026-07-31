@@ -91,6 +91,8 @@ readonly compiled_streamer_probe="$test_root/compiled-streamer.dll"
 readonly probe="$prefix/drive_c/GameViewerServer.exe"
 readonly streamer_probe="$prefix/drive_c/streamer.dll"
 readonly wol_status="$prefix/drive_c/uu-remote-wol-hook-status.ini"
+readonly frame_file="$prefix/drive_c/uu-remote-wayland-frame.bin"
+readonly frame_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 mkdir -p "$state_dir"
 export WINEDLLOVERRIDES='wevtapi=n'
 
@@ -114,6 +116,7 @@ export WINEDLLOVERRIDES='wevtapi=n'
     "${compile_flags[@]}" \
     -o "$compiled_probe" \
     "$project_root/tests/fixtures/input-hook-probe.c" \
+    -lgdi32 \
     -luser32 \
     -liphlpapi \
     -lwevtapi \
@@ -138,6 +141,37 @@ printf '%s\n' \
     'native_magic=1' \
     'native_power_wakeup=1' \
     >"$wol_config"
+/usr/bin/python3 - "$frame_file" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+width, height = 128, 72
+stride = width * 4
+size = stride * height
+header = struct.pack(
+    "<10I24x",
+    0x46575555,
+    1,
+    64,
+    width,
+    height,
+    stride,
+    size,
+    2,
+    1,
+    1,
+)
+frame = bytearray(size)
+for y in range(height):
+    for x in range(width):
+        offset = y * stride + x * 4
+        blue = x * 255 // (width - 1)
+        green = y * 255 // (height - 1)
+        frame[offset : offset + 4] = bytes((blue, green, 255 - blue, 0))
+path.write_bytes(header + bytes(size) + frame)
+PY
 
 UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" XDG_SESSION_TYPE=x11 \
     "$bridge" watch \
@@ -189,6 +223,9 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=8'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
+grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 
 kill "$bridge_pid" 2>/dev/null || true
 wait "$bridge_pid" 2>/dev/null || true
@@ -196,4 +233,4 @@ bridge_pid=
 kill "$injector_pid" 2>/dev/null || true
 wait "$injector_pid" 2>/dev/null || true
 injector_pid=
-printf 'Wine 启动前 DLL 预加载、输入截获和 WOL 网卡映射实测通过。\n'
+printf 'Wine DLL 预加载、共享帧 GDI 截获、输入和 WOL 映射实测通过。\n'

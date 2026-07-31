@@ -45,6 +45,7 @@ trap 'rm -rf -- "$temporary_dir"' EXIT
     "${extra_flags[@]}" \
     -o "$temporary" \
     "$source_file" \
+    -lgdi32 \
     -luser32 \
     -lws2_32
 

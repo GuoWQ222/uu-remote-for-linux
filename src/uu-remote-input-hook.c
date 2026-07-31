@@ -2,11 +2,12 @@
  * UU Remote Win64 input hook.
  *
  * GameViewerServer falls back to USER32.SendInput when its proprietary Windows
- * HID driver is unavailable.  Wine consumes that call inside the Windows
- * server and does not create a real Linux input event.  This DLL patches only
- * GameViewerServer.exe's main-module import table. It reroutes SendInput
- * packets to the authenticated native bridge and presents the native physical
- * Ethernet adapter through Wine's IP Helper API when Linux WOL is enabled.
+ * HID driver is unavailable. Wine consumes that call inside the Windows
+ * server and does not create a real Linux input event. This DLL patches the
+ * GameViewerServer.exe and streamer.dll import tables. It reroutes SendInput
+ * packets to the authenticated native bridge, supplies Portal frames to GDI
+ * capture on Wayland, and presents the native physical Ethernet adapter
+ * through Wine's IP Helper API when Linux WOL is enabled.
  * Keeping the compatibility changes process-local avoids changing Linux
  * routing and prevents duplicate relative mouse movement through Wine/XTest.
  *
@@ -32,11 +33,35 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 6u
+#define HOOK_VERSION 8u
+#define UUWF_MAGIC 0x46575555u
+#define UUWF_VERSION 1u
+#define UUWF_HEADER_SIZE 64u
+#define UUWF_BUFFER_COUNT 2u
+#define UUWF_STALE_TIMEOUT_MS 2000u
+#define FOCUS_UNHOOK_GRACE_MS 350u
+#define FOCUS_INTERNAL_GRACE_MS 700u
+
+enum hook_process_kind {
+    HOOK_PROCESS_NONE = 0,
+    HOOK_PROCESS_SERVER = 1,
+    HOOK_PROCESS_CONTROLLER = 2
+};
 
 typedef UINT(WINAPI *send_input_fn)(UINT, LPINPUT, int);
 typedef BOOL(WINAPI *get_cursor_info_fn)(PCURSORINFO);
 typedef BOOL(WINAPI *get_cursor_pos_fn)(LPPOINT);
+typedef BOOL(WINAPI *bit_blt_fn)(
+    HDC, int, int, int, int, HDC, int, int, DWORD
+);
+typedef BOOL(WINAPI *stretch_blt_fn)(
+    HDC, int, int, int, int, HDC, int, int, int, int, DWORD
+);
+typedef LRESULT(WINAPI *dispatch_message_w_fn)(const MSG *);
+typedef HHOOK(WINAPI *set_windows_hook_ex_w_fn)(
+    int, HOOKPROC, HINSTANCE, DWORD
+);
+typedef BOOL(WINAPI *unhook_windows_hook_ex_fn)(HHOOK);
 typedef ULONG(WINAPI *get_adapters_addresses_fn)(
     ULONG,
     ULONG,
@@ -50,6 +75,11 @@ typedef NETIO_STATUS(WINAPI *get_if_table2_fn)(PMIB_IF_TABLE2 *);
 static send_input_fn original_send_input;
 static get_cursor_info_fn original_get_cursor_info;
 static get_cursor_pos_fn original_get_cursor_pos;
+static bit_blt_fn original_bit_blt;
+static stretch_blt_fn original_stretch_blt;
+static dispatch_message_w_fn original_dispatch_message_w;
+static set_windows_hook_ex_w_fn original_set_windows_hook_ex_w;
+static unhook_windows_hook_ex_fn original_unhook_windows_hook_ex;
 static get_adapters_addresses_fn original_get_adapters_addresses;
 static get_adapters_info_fn original_get_adapters_info;
 static get_if_table2_fn original_get_if_table2;
@@ -57,6 +87,11 @@ static HMODULE hook_module;
 static WCHAR endpoint_path[MAX_PATH];
 static CHAR wol_config_path[MAX_PATH];
 static CHAR wol_status_path[MAX_PATH];
+static WCHAR frame_path[MAX_PATH];
+static CHAR frame_status_path[MAX_PATH];
+static CHAR focus_status_path[MAX_PATH];
+static WCHAR controller_root_path[MAX_PATH];
+static enum hook_process_kind process_kind;
 static INIT_ONCE winsock_once = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE wol_config_once = INIT_ONCE_STATIC_INIT;
 static SRWLOCK endpoint_lock = SRWLOCK_INIT;
@@ -70,9 +105,13 @@ static BOOL force_cursor_visible;
 static BOOL send_input_hooked;
 static BOOL cursor_info_hooked;
 static BOOL cursor_pos_hooked;
+static BOOL bit_blt_hooked;
+static BOOL stretch_blt_hooked;
 static HMODULE patched_streamer_module;
 static BOOL streamer_send_input_hooked;
 static BOOL streamer_cursor_info_hooked;
+static BOOL streamer_bit_blt_hooked;
+static BOOL streamer_stretch_blt_hooked;
 static BOOL adapters_addresses_hooked;
 static BOOL adapters_info_hooked;
 static BOOL if_table2_hooked;
@@ -86,6 +125,38 @@ static volatile LONG if_table2_patched;
 static SRWLOCK cursor_lock = SRWLOCK_INIT;
 static POINT tracked_cursor_position;
 static BOOL tracked_cursor_valid;
+static SRWLOCK frame_lock = SRWLOCK_INIT;
+static HANDLE frame_file = INVALID_HANDLE_VALUE;
+static HANDLE frame_mapping;
+static unsigned char *frame_view;
+static SIZE_T frame_view_size;
+static uint32_t frame_last_sequence;
+static ULONGLONG frame_sequence_changed_at;
+static volatile LONG frame_hook_calls;
+static volatile LONG frame_hook_rendered;
+static volatile LONG frame_hook_fallbacks;
+static BOOL controller_dispatch_hooked;
+static BOOL qt_dispatch_hooked;
+static BOOL controller_set_hook_hooked;
+static BOOL controller_unhook_hooked;
+static HANDLE focus_worker_event;
+static HANDLE focus_worker_thread;
+static SRWLOCK focus_keyboard_hook_lock = SRWLOCK_INIT;
+static HHOOK focus_keyboard_hook;
+static HOOKPROC focus_keyboard_proc;
+static HINSTANCE focus_keyboard_module;
+static DWORD focus_keyboard_thread_id;
+static BOOL focus_keyboard_unhook_pending;
+static ULONGLONG focus_keyboard_unhook_at;
+static volatile LONG focus_worker_running;
+static volatile LONG focus_suppressed_activate;
+static volatile LONG focus_suppressed_activate_app;
+static volatile LONG focus_stabilized_nonclient;
+static volatile LONG focus_keyboard_installed;
+static volatile LONG focus_keyboard_reused;
+static volatile LONG focus_keyboard_deferred;
+static volatile LONG focus_keyboard_released;
+static volatile LONG64 focus_last_internal_transition;
 
 static void write_wol_hook_status(void);
 
@@ -139,7 +210,25 @@ struct keyboard_packet {
     uint32_t time;
     uint64_t extra_info;
 };
+
+struct wayland_frame_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t frame_size;
+    uint32_t buffer_count;
+    volatile uint32_t active_buffer;
+    volatile uint32_t sequence;
+    unsigned char reserved[24];
+};
 #pragma pack(pop)
+
+typedef char wayland_frame_header_must_be_64_bytes[
+    sizeof(struct wayland_frame_header) == UUWF_HEADER_SIZE ? 1 : -1
+];
 
 static BOOL CALLBACK initialize_winsock(
     PINIT_ONCE once,
@@ -504,6 +593,379 @@ static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
         return TRUE;
     }
     return result;
+}
+
+static void close_frame_mapping(void) {
+    if (frame_view) {
+        UnmapViewOfFile(frame_view);
+        frame_view = NULL;
+    }
+    if (frame_mapping) {
+        CloseHandle(frame_mapping);
+        frame_mapping = NULL;
+    }
+    if (frame_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(frame_file);
+        frame_file = INVALID_HANDLE_VALUE;
+    }
+    frame_view_size = 0;
+    frame_last_sequence = 0;
+    frame_sequence_changed_at = 0;
+}
+
+static BOOL frame_header_valid(
+    const struct wayland_frame_header *header,
+    SIZE_T mapped_size
+) {
+    ULONGLONG required;
+    ULONGLONG calculated;
+    if (
+        !header ||
+        header->magic != UUWF_MAGIC ||
+        header->version != UUWF_VERSION ||
+        header->header_size != UUWF_HEADER_SIZE ||
+        header->width == 0 ||
+        header->height == 0 ||
+        header->width > 16384 ||
+        header->height > 16384 ||
+        header->stride < header->width * 4u ||
+        header->buffer_count != UUWF_BUFFER_COUNT
+    ) {
+        return FALSE;
+    }
+    calculated = (ULONGLONG)header->stride * header->height;
+    if (calculated != header->frame_size) {
+        return FALSE;
+    }
+    required = (ULONGLONG)header->header_size +
+        (ULONGLONG)header->buffer_count * header->frame_size;
+    return required <= mapped_size;
+}
+
+static BOOL open_frame_mapping(void) {
+    LARGE_INTEGER size;
+    HANDLE file;
+    HANDLE mapping;
+    unsigned char *view;
+
+    file = CreateFileW(
+        frame_path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    if (
+        !GetFileSizeEx(file, &size) ||
+        size.QuadPart < (LONGLONG)UUWF_HEADER_SIZE ||
+        size.QuadPart > (LONGLONG)(2u * 16384u * 16384u * 4u + 4096u)
+    ) {
+        CloseHandle(file);
+        return FALSE;
+    }
+    mapping = CreateFileMappingW(
+        file, NULL, PAGE_READONLY, 0, 0, NULL
+    );
+    if (!mapping) {
+        CloseHandle(file);
+        return FALSE;
+    }
+    view = (unsigned char *)MapViewOfFile(
+        mapping, FILE_MAP_READ, 0, 0, 0
+    );
+    if (
+        !view ||
+        !frame_header_valid(
+            (const struct wayland_frame_header *)view,
+            (SIZE_T)size.QuadPart
+        )
+    ) {
+        if (view) {
+            UnmapViewOfFile(view);
+        }
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return FALSE;
+    }
+    frame_file = file;
+    frame_mapping = mapping;
+    frame_view = view;
+    frame_view_size = (SIZE_T)size.QuadPart;
+    frame_last_sequence = 0;
+    frame_sequence_changed_at = GetTickCount64();
+    return TRUE;
+}
+
+static void write_frame_hook_status(void) {
+    CHAR value[32];
+    DWORD status = 0;
+
+    if (!frame_status_path[0]) {
+        return;
+    }
+    if (bit_blt_hooked) {
+        status |= 1u;
+    }
+    if (stretch_blt_hooked) {
+        status |= 2u;
+    }
+    if (streamer_bit_blt_hooked) {
+        status |= 4u;
+    }
+    if (streamer_stretch_blt_hooked) {
+        status |= 8u;
+    }
+    if (frame_view) {
+        status |= 16u;
+    }
+    wsprintfA(value, "%lu", (unsigned long)GetCurrentProcessId());
+    WritePrivateProfileStringA("hook", "pid", value, frame_status_path);
+    wsprintfA(value, "%lu", (unsigned long)HOOK_VERSION);
+    WritePrivateProfileStringA("hook", "version", value, frame_status_path);
+    wsprintfA(value, "%lu", (unsigned long)status);
+    WritePrivateProfileStringA("hook", "status_bits", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_hook_calls, 0, 0)
+    );
+    WritePrivateProfileStringA("capture", "calls", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_hook_rendered, 0, 0)
+    );
+    WritePrivateProfileStringA("capture", "rendered", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_hook_fallbacks, 0, 0)
+    );
+    WritePrivateProfileStringA("capture", "fallbacks", value, frame_status_path);
+    wsprintfA(value, "%lu", (unsigned long)frame_last_sequence);
+    WritePrivateProfileStringA("capture", "sequence", value, frame_status_path);
+}
+
+static BOOL refresh_frame_mapping(void) {
+    const struct wayland_frame_header *header;
+    uint32_t sequence;
+    ULONGLONG now = GetTickCount64();
+
+    if (!frame_view && !open_frame_mapping()) {
+        return FALSE;
+    }
+    header = (const struct wayland_frame_header *)frame_view;
+    if (!frame_header_valid(header, frame_view_size)) {
+        close_frame_mapping();
+        return FALSE;
+    }
+    MemoryBarrier();
+    sequence = header->sequence;
+    if (sequence && sequence != frame_last_sequence) {
+        frame_last_sequence = sequence;
+        frame_sequence_changed_at = now;
+        return TRUE;
+    }
+    if (
+        sequence &&
+        now - frame_sequence_changed_at <= UUWF_STALE_TIMEOUT_MS
+    ) {
+        return TRUE;
+    }
+    close_frame_mapping();
+    return FALSE;
+}
+
+static BOOL render_wayland_frame(
+    HDC destination,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    HDC source,
+    int source_x,
+    int source_y,
+    int source_width,
+    int source_height,
+    DWORD raster_operation
+) {
+    const struct wayland_frame_header *header;
+    const unsigned char *pixels;
+    BITMAPINFO bitmap;
+    uint32_t active;
+    int result;
+    LONG calls;
+
+    calls = InterlockedIncrement(&frame_hook_calls);
+    if (
+        !destination ||
+        !source ||
+        destination_width <= 0 ||
+        destination_height <= 0 ||
+        source_width <= 0 ||
+        source_height <= 0 ||
+        (raster_operation & 0x00ffffffu) != SRCCOPY ||
+        GetObjectType(source) != OBJ_DC ||
+        GetDeviceCaps(source, TECHNOLOGY) != DT_RASDISPLAY
+    ) {
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
+    }
+
+    AcquireSRWLockExclusive(&frame_lock);
+    if (!refresh_frame_mapping()) {
+        ReleaseSRWLockExclusive(&frame_lock);
+        InterlockedIncrement(&frame_hook_fallbacks);
+        if ((calls % 120) == 1) {
+            write_frame_hook_status();
+        }
+        return FALSE;
+    }
+    header = (const struct wayland_frame_header *)frame_view;
+    MemoryBarrier();
+    active = header->active_buffer;
+    if (
+        active >= header->buffer_count ||
+        source_x < 0 ||
+        source_y < 0 ||
+        source_x >= (int)header->width ||
+        source_y >= (int)header->height
+    ) {
+        ReleaseSRWLockExclusive(&frame_lock);
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
+    }
+    if (source_x + source_width > (int)header->width) {
+        source_width = (int)header->width - source_x;
+    }
+    if (source_y + source_height > (int)header->height) {
+        source_height = (int)header->height - source_y;
+    }
+    pixels = frame_view + header->header_size +
+        (SIZE_T)active * header->frame_size;
+    ZeroMemory(&bitmap, sizeof(bitmap));
+    bitmap.bmiHeader.biSize = sizeof(bitmap.bmiHeader);
+    bitmap.bmiHeader.biWidth = (LONG)header->width;
+    bitmap.bmiHeader.biHeight = -(LONG)header->height;
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    result = StretchDIBits(
+        destination,
+        destination_x,
+        destination_y,
+        destination_width,
+        destination_height,
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+        pixels,
+        &bitmap,
+        DIB_RGB_COLORS,
+        SRCCOPY
+    );
+    ReleaseSRWLockExclusive(&frame_lock);
+    if (result == (int)GDI_ERROR || result == 0) {
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
+    }
+    InterlockedIncrement(&frame_hook_rendered);
+    if ((calls % 120) == 1) {
+        write_frame_hook_status();
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI hooked_bit_blt(
+    HDC destination,
+    int destination_x,
+    int destination_y,
+    int width,
+    int height,
+    HDC source,
+    int source_x,
+    int source_y,
+    DWORD raster_operation
+) {
+    if (render_wayland_frame(
+            destination,
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source,
+            source_x,
+            source_y,
+            width,
+            height,
+            raster_operation
+        )) {
+        return TRUE;
+    }
+    return original_bit_blt
+        ? original_bit_blt(
+            destination,
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source,
+            source_x,
+            source_y,
+            raster_operation
+        )
+        : FALSE;
+}
+
+static BOOL WINAPI hooked_stretch_blt(
+    HDC destination,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    HDC source,
+    int source_x,
+    int source_y,
+    int source_width,
+    int source_height,
+    DWORD raster_operation
+) {
+    if (render_wayland_frame(
+            destination,
+            destination_x,
+            destination_y,
+            destination_width,
+            destination_height,
+            source,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            raster_operation
+        )) {
+        return TRUE;
+    }
+    return original_stretch_blt
+        ? original_stretch_blt(
+            destination,
+            destination_x,
+            destination_y,
+            destination_width,
+            destination_height,
+            source,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            raster_operation
+        )
+        : FALSE;
 }
 
 static int hex_value(CHAR character) {
@@ -966,6 +1428,408 @@ static BOOL patch_import(
     return FALSE;
 }
 
+static DWORD controller_focus_hook_status(void) {
+    DWORD status = 0;
+
+    if (controller_dispatch_hooked) {
+        status |= 1u;
+    }
+    if (qt_dispatch_hooked) {
+        status |= 2u;
+    }
+    if (controller_set_hook_hooked) {
+        status |= 4u;
+    }
+    if (controller_unhook_hooked) {
+        status |= 8u;
+    }
+    if (InterlockedCompareExchange(&focus_worker_running, 0, 0)) {
+        status |= 16u;
+    }
+    return status;
+}
+
+static void write_focus_hook_status(void) {
+    CHAR value[32];
+
+    if (!focus_status_path[0]) {
+        return;
+    }
+    wsprintfA(value, "%lu", (unsigned long)GetCurrentProcessId());
+    WritePrivateProfileStringA("hook", "pid", value, focus_status_path);
+    wsprintfA(value, "%lu", (unsigned long)HOOK_VERSION);
+    WritePrivateProfileStringA("hook", "version", value, focus_status_path);
+    wsprintfA(
+        value,
+        "%lu",
+        (unsigned long)controller_focus_hook_status()
+    );
+    WritePrivateProfileStringA(
+        "hook", "status_bits", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_suppressed_activate, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "focus", "suppressed_activate", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_suppressed_activate_app, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "focus", "suppressed_activate_app", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_stabilized_nonclient, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "focus", "stabilized_nonclient", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_keyboard_installed, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "keyboard_hook", "installed", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_keyboard_reused, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "keyboard_hook", "reused", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_keyboard_deferred, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "keyboard_hook", "deferred", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_keyboard_released, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "keyboard_hook", "released", value, focus_status_path
+    );
+}
+
+static BOOL process_belongs_to_controller(DWORD pid) {
+    HANDLE process;
+    WCHAR image_path[MAX_PATH];
+    DWORD image_size = MAX_PATH;
+    int root_length;
+    BOOL result = FALSE;
+
+    if (!pid) {
+        return FALSE;
+    }
+    if (pid == GetCurrentProcessId()) {
+        return TRUE;
+    }
+    if (!controller_root_path[0]) {
+        return FALSE;
+    }
+    process = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid
+    );
+    if (!process) {
+        return FALSE;
+    }
+    if (QueryFullProcessImageNameW(process, 0, image_path, &image_size)) {
+        root_length = lstrlenW(controller_root_path);
+        result = image_size > (DWORD)root_length &&
+            CompareStringOrdinal(
+                image_path,
+                root_length,
+                controller_root_path,
+                root_length,
+                TRUE
+            ) == CSTR_EQUAL &&
+            (image_path[root_length] == L'\\' ||
+                image_path[root_length] == L'/');
+    }
+    CloseHandle(process);
+    return result;
+}
+
+static BOOL window_belongs_to_controller(HWND window) {
+    DWORD pid = 0;
+
+    if (!window || !IsWindow(window)) {
+        return FALSE;
+    }
+    GetWindowThreadProcessId(window, &pid);
+    return process_belongs_to_controller(pid);
+}
+
+static BOOL thread_belongs_to_controller(DWORD thread_id) {
+    HANDLE thread;
+    DWORD pid;
+
+    if (!thread_id) {
+        return FALSE;
+    }
+    thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id);
+    if (!thread) {
+        return FALSE;
+    }
+    pid = GetProcessIdOfThread(thread);
+    CloseHandle(thread);
+    return process_belongs_to_controller(pid);
+}
+
+static BOOL focus_transition_is_internal(const MSG *message) {
+    HWND counterpart = NULL;
+    HWND foreground;
+    ULONGLONG last_transition;
+    ULONGLONG now;
+
+    if (message->message == WM_ACTIVATE && message->lParam) {
+        counterpart = (HWND)message->lParam;
+        return window_belongs_to_controller(counterpart);
+    }
+    if (message->message == WM_ACTIVATEAPP && message->lParam) {
+        return thread_belongs_to_controller((DWORD)message->lParam);
+    }
+    foreground = GetForegroundWindow();
+    if (foreground) {
+        return window_belongs_to_controller(foreground);
+    }
+    last_transition = (ULONGLONG)InterlockedCompareExchange64(
+        &focus_last_internal_transition, 0, 0
+    );
+    now = GetTickCount64();
+    return last_transition &&
+        now >= last_transition &&
+        now - last_transition <= FOCUS_INTERNAL_GRACE_MS;
+}
+
+static LRESULT WINAPI hooked_dispatch_message_w(const MSG *message) {
+    MSG adjusted;
+
+    if (!original_dispatch_message_w || !message) {
+        return 0;
+    }
+    if (
+        message->message == WM_ACTIVATE &&
+        LOWORD(message->wParam) == WA_INACTIVE &&
+        focus_transition_is_internal(message)
+    ) {
+        InterlockedIncrement(&focus_suppressed_activate);
+        return 0;
+    }
+    if (
+        message->message == WM_ACTIVATEAPP &&
+        !message->wParam &&
+        focus_transition_is_internal(message)
+    ) {
+        InterlockedIncrement(&focus_suppressed_activate_app);
+        return 0;
+    }
+    if (
+        message->message == WM_NCACTIVATE &&
+        !message->wParam &&
+        focus_transition_is_internal(message)
+    ) {
+        adjusted = *message;
+        adjusted.wParam = TRUE;
+        InterlockedIncrement(&focus_stabilized_nonclient);
+        return original_dispatch_message_w(&adjusted);
+    }
+    return original_dispatch_message_w(message);
+}
+
+static HHOOK WINAPI hooked_set_windows_hook_ex_w(
+    int hook_id,
+    HOOKPROC callback,
+    HINSTANCE module,
+    DWORD thread_id
+) {
+    HHOOK result;
+
+    if (!original_set_windows_hook_ex_w) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return NULL;
+    }
+    if (hook_id != WH_KEYBOARD_LL || !callback || thread_id != 0) {
+        return original_set_windows_hook_ex_w(
+            hook_id, callback, module, thread_id
+        );
+    }
+    InterlockedExchange64(
+        &focus_last_internal_transition, (LONG64)GetTickCount64()
+    );
+    AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
+    if (
+        focus_keyboard_hook &&
+        focus_keyboard_proc == callback &&
+        focus_keyboard_module == module &&
+        focus_keyboard_thread_id == thread_id
+    ) {
+        focus_keyboard_unhook_pending = FALSE;
+        result = focus_keyboard_hook;
+        InterlockedIncrement(&focus_keyboard_reused);
+        ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+        if (focus_worker_event) {
+            SetEvent(focus_worker_event);
+        }
+        return result;
+    }
+    ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+    result = original_set_windows_hook_ex_w(
+        hook_id, callback, module, thread_id
+    );
+    if (!result) {
+        return NULL;
+    }
+    AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
+    if (!focus_keyboard_hook) {
+        focus_keyboard_hook = result;
+        focus_keyboard_proc = callback;
+        focus_keyboard_module = module;
+        focus_keyboard_thread_id = thread_id;
+        focus_keyboard_unhook_pending = FALSE;
+        InterlockedIncrement(&focus_keyboard_installed);
+    }
+    ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+    return result;
+}
+
+static BOOL WINAPI hooked_unhook_windows_hook_ex(HHOOK hook) {
+    if (!original_unhook_windows_hook_ex) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
+    if (hook && hook == focus_keyboard_hook) {
+        focus_keyboard_unhook_pending = TRUE;
+        focus_keyboard_unhook_at =
+            GetTickCount64() + FOCUS_UNHOOK_GRACE_MS;
+        InterlockedExchange64(
+            &focus_last_internal_transition, (LONG64)GetTickCount64()
+        );
+        InterlockedIncrement(&focus_keyboard_deferred);
+        ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+        if (focus_worker_event) {
+            SetEvent(focus_worker_event);
+        }
+        return TRUE;
+    }
+    ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+    return original_unhook_windows_hook_ex(hook);
+}
+
+static void patch_controller_focus_imports(void) {
+    HMODULE main_module = GetModuleHandleW(NULL);
+    HMODULE qt_core = GetModuleHandleW(L"Qt5Core.dll");
+
+    if (!controller_dispatch_hooked) {
+        controller_dispatch_hooked = patch_import(
+            main_module,
+            "USER32.dll",
+            "DispatchMessageW",
+            (void *)hooked_dispatch_message_w,
+            (void **)&original_dispatch_message_w
+        );
+    }
+    if (!controller_set_hook_hooked) {
+        controller_set_hook_hooked = patch_import(
+            main_module,
+            "USER32.dll",
+            "SetWindowsHookExW",
+            (void *)hooked_set_windows_hook_ex_w,
+            (void **)&original_set_windows_hook_ex_w
+        );
+    }
+    if (!controller_unhook_hooked) {
+        controller_unhook_hooked = patch_import(
+            main_module,
+            "USER32.dll",
+            "UnhookWindowsHookEx",
+            (void *)hooked_unhook_windows_hook_ex,
+            (void **)&original_unhook_windows_hook_ex
+        );
+    }
+    if (qt_core && !qt_dispatch_hooked) {
+        qt_dispatch_hooked = patch_import(
+            qt_core,
+            "USER32.dll",
+            "DispatchMessageW",
+            (void *)hooked_dispatch_message_w,
+            (void **)&original_dispatch_message_w
+        );
+    }
+}
+
+static DWORD WINAPI focus_worker_main(LPVOID parameter) {
+    ULONGLONG last_status_write = 0;
+    (void)parameter;
+
+    for (;;) {
+        HHOOK release_hook = NULL;
+        ULONGLONG now;
+
+        WaitForSingleObject(focus_worker_event, 100);
+        patch_controller_focus_imports();
+        now = GetTickCount64();
+        AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
+        if (
+            focus_keyboard_hook &&
+            focus_keyboard_unhook_pending &&
+            now >= focus_keyboard_unhook_at
+        ) {
+            release_hook = focus_keyboard_hook;
+            focus_keyboard_hook = NULL;
+            focus_keyboard_proc = NULL;
+            focus_keyboard_module = NULL;
+            focus_keyboard_thread_id = 0;
+            focus_keyboard_unhook_pending = FALSE;
+        }
+        ReleaseSRWLockExclusive(&focus_keyboard_hook_lock);
+        if (release_hook && original_unhook_windows_hook_ex) {
+            original_unhook_windows_hook_ex(release_hook);
+            InterlockedIncrement(&focus_keyboard_released);
+        }
+        if (now - last_status_write >= 1000u) {
+            write_focus_hook_status();
+            last_status_write = now;
+        }
+    }
+    return 0;
+}
+
+static BOOL initialize_controller_focus_hook(void) {
+    patch_controller_focus_imports();
+    if (!focus_worker_event) {
+        focus_worker_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    }
+    if (
+        focus_worker_event &&
+        InterlockedCompareExchange(&focus_worker_running, 1, 0) == 0
+    ) {
+        focus_worker_thread = CreateThread(
+            NULL, 0, focus_worker_main, NULL, 0, NULL
+        );
+        if (!focus_worker_thread) {
+            InterlockedExchange(&focus_worker_running, 0);
+        }
+    }
+    write_focus_hook_status();
+    return (controller_focus_hook_status() & 31u) == 31u;
+}
+
 static BOOL patch_streamer_imports(void) {
     HMODULE module = GetModuleHandleW(L"streamer.dll");
 
@@ -976,6 +1840,8 @@ static BOOL patch_streamer_imports(void) {
         patched_streamer_module = module;
         streamer_send_input_hooked = FALSE;
         streamer_cursor_info_hooked = FALSE;
+        streamer_bit_blt_hooked = FALSE;
+        streamer_stretch_blt_hooked = FALSE;
     }
     if (!streamer_send_input_hooked) {
         streamer_send_input_hooked = patch_import(
@@ -995,20 +1861,70 @@ static BOOL patch_streamer_imports(void) {
             (void **)&original_get_cursor_info
         );
     }
-    return streamer_send_input_hooked && streamer_cursor_info_hooked;
+    if (!streamer_bit_blt_hooked) {
+        streamer_bit_blt_hooked = patch_import(
+            module,
+            "GDI32.dll",
+            "BitBlt",
+            (void *)hooked_bit_blt,
+            (void **)&original_bit_blt
+        );
+    }
+    if (!streamer_stretch_blt_hooked) {
+        streamer_stretch_blt_hooked = patch_import(
+            module,
+            "GDI32.dll",
+            "StretchBlt",
+            (void *)hooked_stretch_blt,
+            (void **)&original_stretch_blt
+        );
+    }
+    return streamer_send_input_hooked &&
+        streamer_cursor_info_hooked &&
+        streamer_bit_blt_hooked &&
+        streamer_stretch_blt_hooked;
 }
 
-static BOOL is_target_process(void) {
+static enum hook_process_kind identify_process(void) {
     WCHAR process_path[MAX_PATH];
     WCHAR *name;
+    WCHAR *directory;
     if (!GetModuleFileNameW(NULL, process_path, MAX_PATH)) {
-        return FALSE;
+        return HOOK_PROCESS_NONE;
     }
     name = process_path + lstrlenW(process_path);
     while (name > process_path && name[-1] != L'\\' && name[-1] != L'/') {
         --name;
     }
-    return lstrcmpiW(name, L"GameViewerServer.exe") == 0;
+    if (lstrcmpiW(name, L"GameViewerServer.exe") == 0) {
+        return HOOK_PROCESS_SERVER;
+    }
+    if (lstrcmpiW(name, L"GameViewer.exe") == 0) {
+        /*
+         * The installation root contains a small launcher with the same file
+         * name. Only the real Qt controller loads Qt5Core.dll; requiring it
+         * prevents the focus hook from attaching to that outer launcher.
+         */
+        if (!GetModuleHandleW(L"Qt5Core.dll")) {
+            return HOOK_PROCESS_NONE;
+        }
+        lstrcpynW(controller_root_path, process_path, MAX_PATH);
+        directory = controller_root_path +
+            (name - process_path > 0 ? (name - process_path - 1) : 0);
+        *directory = L'\0';
+        while (
+            directory > controller_root_path &&
+            directory[-1] != L'\\' && directory[-1] != L'/'
+        ) {
+            --directory;
+        }
+        if (lstrcmpiW(directory, L"bin") == 0 &&
+            directory > controller_root_path) {
+            directory[-1] = L'\0';
+        }
+        return HOOK_PROCESS_CONTROLLER;
+    }
+    return HOOK_PROCESS_NONE;
 }
 
 static void initialize_endpoint_path(void) {
@@ -1032,6 +1948,21 @@ static void initialize_endpoint_path(void) {
     lstrcpynA(
         wol_status_path,
         "C:\\uu-remote-wol-hook-status.ini",
+        MAX_PATH
+    );
+    lstrcpynW(
+        frame_path,
+        L"C:\\uu-remote-wayland-frame.bin",
+        MAX_PATH
+    );
+    lstrcpynA(
+        frame_status_path,
+        "C:\\uu-remote-wayland-frame-status.ini",
+        MAX_PATH
+    );
+    lstrcpynA(
+        focus_status_path,
+        "C:\\uu-remote-focus-hook-status.ini",
         MAX_PATH
     );
 }
@@ -1126,6 +2057,30 @@ __declspec(dllexport) DWORD WINAPI UURemoteWolHookStatus(void) {
     return wol_hook_status();
 }
 
+__declspec(dllexport) DWORD WINAPI UURemoteFrameHookStatus(void) {
+    DWORD status = 0;
+    if (bit_blt_hooked) {
+        status |= 1u;
+    }
+    if (stretch_blt_hooked) {
+        status |= 2u;
+    }
+    if (streamer_bit_blt_hooked) {
+        status |= 4u;
+    }
+    if (streamer_stretch_blt_hooked) {
+        status |= 8u;
+    }
+    if (frame_view) {
+        status |= 16u;
+    }
+    return status;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteFocusHookStatus(void) {
+    return controller_focus_hook_status();
+}
+
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(
     LPVOID unused
 ) {
@@ -1137,6 +2092,12 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     BOOL ready;
 
+    if (process_kind == HOOK_PROCESS_CONTROLLER) {
+        return initialize_controller_focus_hook() ? 1u : 0u;
+    }
+    if (process_kind != HOOK_PROCESS_SERVER) {
+        return 0u;
+    }
     if (unused) {
         hook_preloaded = TRUE;
     }
@@ -1148,6 +2109,7 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
         refresh_endpoint()
     );
     write_wol_hook_status();
+    write_frame_hook_status();
     return ready ? 1u : 0u;
 }
 
@@ -1159,10 +2121,14 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     }
     hook_module = instance;
     DisableThreadLibraryCalls(instance);
-    if (!is_target_process()) {
+    process_kind = identify_process();
+    if (process_kind == HOOK_PROCESS_NONE) {
         return TRUE;
     }
     initialize_endpoint_path();
+    if (process_kind == HOOK_PROCESS_CONTROLLER) {
+        return TRUE;
+    }
     main_module = GetModuleHandleW(NULL);
     send_input_hooked = patch_import(
         main_module,
@@ -1184,6 +2150,20 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         "GetCursorPos",
         (void *)hooked_get_cursor_pos,
         (void **)&original_get_cursor_pos
+    );
+    bit_blt_hooked = patch_import(
+        main_module,
+        "GDI32.dll",
+        "BitBlt",
+        (void *)hooked_bit_blt,
+        (void **)&original_bit_blt
+    );
+    stretch_blt_hooked = patch_import(
+        main_module,
+        "GDI32.dll",
+        "StretchBlt",
+        (void *)hooked_stretch_blt,
+        (void **)&original_stretch_blt
     );
     adapters_addresses_hooked = patch_import(
         main_module,

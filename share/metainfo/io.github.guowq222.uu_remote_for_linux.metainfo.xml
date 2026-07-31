@@ -11,12 +11,13 @@
   <description>
     <p>
       Runs the official Windows UU Remote client in a dedicated Wine prefix
-      with native Linux integration for controller and X11 or experimental
+      with native Linux integration for controller and X11 or Portal-bridged
       Wayland controlled-host workflows.
     </p>
     <p>
-      This is not a native client. The launcher selects XTest on X11 and the
-      RemoteDesktop portal on Wayland while Wine continues through XWayland.
+      This is not a native client. The launcher selects XTest on X11 and an
+      XDG RemoteDesktop/ScreenCast bridge on Wayland while the Wine UI remains
+      on XWayland.
     </p>
   </description>
   <launchable type="desktop-id">uu-remote-for-linux.desktop</launchable>
@@ -24,6 +25,26 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.4" date="2026-07-31">
+      <description>
+        <p>Stop controller-border flashing during live quality and frame-rate changes by grouping UU's Qt helper windows into one focus domain and debouncing its low-level keyboard hook under Wine/XWayland.</p>
+      </description>
+    </release>
+    <release version="1.1.3" date="2026-07-31">
+      <description>
+        <p>Prevent local IBus/Rime from toggling together with the remote IME by disabling Wine XIM for the UU controller executable while retaining raw keyboard events.</p>
+      </description>
+    </release>
+    <release version="1.1.2" date="2026-07-31">
+      <description>
+        <p>Fix Chinese typing from the Linux controller by pinning the local input source to a physical XKB keyboard while the viewer is focused, forwarding IME switching to the remote OS, and suppressing focus churn from Wine helper windows.</p>
+      </description>
+    </release>
+    <release version="1.1.1" date="2026-07-31">
+      <description>
+        <p>Fix black controlled-host video on Wayland by relaying authorized PipeWire screen frames through shared memory into a process-local Win64 GDI capture hook.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-07-31">
       <description>
         <p>Add an adaptive X11/Wayland launcher, native Wayland RemoteDesktop Portal input, persistent permission restoration, and XWayland-aware shortcut handling.</p>

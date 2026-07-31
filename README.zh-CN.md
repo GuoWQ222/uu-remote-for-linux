@@ -12,8 +12,18 @@
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
+- 切换画质或帧率时会把 UU 的 Qt 菜单、渲染辅助窗口和远控主窗口归为
+  同一焦点域，并对低级键盘钩子去抖；这能阻止 Wine/XWayland 下活动边框
+  频闪，同时保留真正切出 UU 时的正常失焦。
+- 主控端聚焦远控窗口时会临时固定本机为 XKB 物理键盘，并把
+  `Super+Space` 交给远端系统；因此中文由远端输入法完成，不再被本机
+  IBus/Rime 截获。Wine 的 UU 主控窗口同时禁用本地 XIM，避免同一个
+  快捷键又在 Wine 内启用雾凇。离开远控窗口后会恢复原输入源和快捷键。
 - Linux 作为被控端时支持原生鼠标、键盘和远端光标：X11 使用 XTest，
   Wayland 使用 RemoteDesktop Portal。
+- Wayland 画面通过 XDG ScreenCast/PipeWire 写入共享帧，由进程内 Win64
+  钩子直接提供给 UU 的 GDI 采集，使其读取真实 GNOME 桌面，而不是无法
+  读取的无根 XWayland 根窗口。
 - 支持自启动、防休眠、安全更新、Linux 系统代理、文件传输与远程开机兼容桥。
 
 ## 系统要求
@@ -30,13 +40,15 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.0_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.4_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
 ### 从源码安装（可选）
 
 ```bash
+sudo apt install python3-gi gir1.2-gstreamer-1.0 \
+  gstreamer1.0-pipewire gstreamer1.0-plugins-base
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
@@ -85,12 +97,23 @@ uu-remote-for-linux --stop
 | 会话 | Wine 界面 | 被控端输入 | 原生桌面采集 |
 |---|---|---|---|
 | X11 | Wine X11 驱动 | XTest | 现有 UU 路径已支持 |
-| Wayland | XWayland | XDG RemoteDesktop Portal | Portal 屏幕流已授权；UU 端到端采集仍为实验性 |
+| Wayland | XWayland | XDG RemoteDesktop Portal | ScreenCast/PipeWire → 共享帧 → 进程内 Win64 GDI 钩子 |
 
 在 Wayland 下，完成系统授权后，`uu-remote-for-linux --diagnose` 会显示
-`wayland-xwayland` 与 `wayland-portal`。Portal 授权是 Wayland 的安全边界，
-应用不能绕过。在网易专有采集模块完成原生 Wayland 窗口的端到端验收前，
-需要无人值守被控时仍建议使用 X11。
+`wayland-xwayland`、`wayland-portal`，并显示 `Wayland 画面桥` 已生效。
+Portal 授权是 Wayland 的安全边界，应用不能绕过。画面桥请求不内嵌鼠标的
+显示器画面，指针仍由 UU 的同步远端光标绘制。登录管理器和锁屏画面不属于
+已登录用户的 Portal 会话，因此需要登录前无人值守控制时，X11 仍更稳妥。
+
+## 主控端中文输入
+
+远控窗口只传输物理键盘事件，不会把 Linux IBus/Fcitx 的本地候选词提交
+当作远端按键。连接其他设备后，请保持远控窗口聚焦，使用
+`Super+Space`（键盘上的 Win+Space）切换**远端设备**的中文输入法，再
+输入拼音。1.1.3 起，启动器还会为 `gameviewer.exe` 设置 Wine 官方的
+`UseXIM=N` 应用级选项，彻底阻止 UU 主控窗口连接本机 IBus；键盘桥则在
+聚焦期间固定 XKB 并处理 Wine 辅助窗口的焦点抖动。切出远控窗口约
+0.75 秒后，Linux 原输入源会自动恢复。
 
 ## 许可证与署名
 

@@ -105,6 +105,8 @@ check "Wayland portal input bridge integration" \
 check "legacy project-name migration" \
     "$project_root/tests/legacy-name-migration.sh"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
+check "Wine controller focus stabilizer" \
+    "$project_root/tests/wine-focus-hook.sh"
 
 check "shim exists" test -s \
     "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
@@ -161,6 +163,12 @@ check "input hook is Win64 DLL" bash -c \
 # shellcheck disable=SC2016
 check "input hook exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputHookVersion"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+check "input hook exports Wayland frame status" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteFrameHookStatus"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+check "input hook exports controller focus status" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteFocusHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
 check "input hook exports WOL status" bash -c \
@@ -220,6 +228,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/input-bridge.sh" \
         "$project_root/tests/wayland-input-bridge.sh" \
         "$project_root/tests/wine-input-hook.sh" \
+        "$project_root/tests/wine-focus-hook.sh" \
         "$project_root/tests/powershell-bridge.sh" \
         "$project_root/tests/run.sh" \
         "$project_root/tests/fixtures/bin/curl" \

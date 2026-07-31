@@ -14,6 +14,7 @@ import ctypes
 import fcntl
 import hmac
 import json
+import mmap
 import os
 import secrets
 import signal
@@ -27,7 +28,7 @@ from typing import Any
 
 PROTOCOL_MAGIC = 0x50495555  # "UUIP" in little-endian byte order
 PROTOCOL_VERSION = 1
-MINIMUM_HOOK_VERSION = 6
+MINIMUM_HOOK_VERSION = 8
 PACKET_HELLO = 1
 PACKET_MOUSE = 2
 PACKET_KEYBOARD = 3
@@ -67,7 +68,7 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 DEFAULT_RELEASE_TIMEOUT = 15.0
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
@@ -79,9 +80,14 @@ PORTAL_SESSION = "org.freedesktop.portal.Session"
 PORTAL_DEVICE_KEYBOARD = 1
 PORTAL_DEVICE_POINTER = 2
 PORTAL_SOURCE_MONITOR = 1
-PORTAL_CURSOR_EMBEDDED = 2
+PORTAL_CURSOR_HIDDEN = 1
 PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
+CAPTURE_START_TIMEOUT_SECONDS = 10
+FRAME_MAGIC = 0x46575555  # "UUWF" in little-endian byte order
+FRAME_VERSION = 1
+FRAME_HEADER = struct.Struct("<10I24x")
+FRAME_BUFFERS = 2
 
 # Linux input-event codes consumed by RemoteDesktop.NotifyPointerButton.
 EVDEV_BUTTONS = {
@@ -396,15 +402,26 @@ class WaylandPortalBackend:
 
     name = "wayland-portal"
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(self, state_dir: Path, frame_path: Path) -> None:
         self.state_dir = state_dir
+        self.frame_path = frame_path
         self.restore_token_path = state_dir / "wayland-portal-restore-token"
         self.session_handle = ""
         self.stream_node = 0
         self.stream_width = 1
         self.stream_height = 1
+        self.capture_state = "inactive"
+        self.capture_pipeline = None
+        self.capture_pipewire_fd = -1
+        self.capture_frames = 0
+        self.capture_map = None
+        self.capture_frame_size = 0
+        self.capture_backing_path = None
         self.fake_trace = os.environ.get(
             "UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", ""
+        )
+        self.fake_video = os.environ.get(
+            "UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO", ""
         )
         self.connection = None
         self.x11 = None
@@ -412,9 +429,19 @@ class WaylandPortalBackend:
         if self.fake_trace:
             self.session_handle = "/org/freedesktop/portal/desktop/session/fake"
             self.stream_node = 77
-            self.stream_width = 1920
-            self.stream_height = 1080
-            self._fake_write("session authorized devices=3 stream=77 1920x1080")
+            self.stream_width = 128 if self.fake_video else 1920
+            self.stream_height = 72 if self.fake_video else 1080
+            self._fake_write(
+                "session authorized devices=3 stream=77 "
+                f"{self.stream_width}x{self.stream_height}"
+            )
+            if self.fake_video:
+                self._load_gio()
+                self._start_capture_bridge()
+            else:
+                self.capture_state = "active"
+                self.capture_frames = 120
+            self._fake_write("capture active transport=shared-frame")
             return
 
         self._load_gio()
@@ -423,19 +450,28 @@ class WaylandPortalBackend:
         )
         self._configure_x11_keymap()
         self._authorize()
+        try:
+            self._start_capture_bridge()
+        except Exception:
+            self.close()
+            raise
 
     @staticmethod
     def _load_gio_modules():
         try:
-            from gi.repository import Gio, GLib
+            import gi
+
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gio, GLib, Gst
         except (ImportError, ValueError) as error:
             raise RuntimeError(
-                "Wayland 输入桥需要系统 python3-gi（/usr/bin/python3）"
+                "Wayland 输入/画面桥需要 python3-gi 与 GStreamer GI"
             ) from error
-        return Gio, GLib
+        Gst.init(None)
+        return Gio, GLib, Gst
 
     def _load_gio(self) -> None:
-        self.Gio, self.GLib = self._load_gio_modules()
+        self.Gio, self.GLib, self.Gst = self._load_gio_modules()
 
     @classmethod
     def check_environment(cls) -> None:
@@ -444,7 +480,23 @@ class WaylandPortalBackend:
             return
         if not os.environ.get("WAYLAND_DISPLAY"):
             raise RuntimeError("WAYLAND_DISPLAY 未设置")
-        Gio, GLib = cls._load_gio_modules()
+        Gio, GLib, Gst = cls._load_gio_modules()
+        missing = [
+            name
+            for name in (
+                "pipewiresrc",
+                "queue",
+                "videoconvert",
+                "videoscale",
+                "capsfilter",
+                "appsink",
+            )
+            if Gst.ElementFactory.find(name) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "Wayland 画面桥缺少 GStreamer 元件：" + ", ".join(missing)
+            )
         connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         value = connection.call_sync(
             PORTAL_BUS_NAME,
@@ -585,7 +637,7 @@ class WaylandPortalBackend:
             "handle_token": self.GLib.Variant("s", self._token("sources")),
             "types": self.GLib.Variant("u", PORTAL_SOURCE_MONITOR),
             "multiple": self.GLib.Variant("b", False),
-            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_EMBEDDED),
+            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_HIDDEN),
         }
         if restore_token:
             device_options["restore_token"] = self.GLib.Variant(
@@ -649,6 +701,186 @@ class WaylandPortalBackend:
             self.stream_height = max(int(size[1]), 1)
         self._save_restore_token(str(result.get("restore_token", "")))
 
+    def _open_pipewire_remote(self) -> int:
+        result, descriptors = self.connection.call_with_unix_fd_list_sync(
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            PORTAL_SCREENCAST,
+            "OpenPipeWireRemote",
+            self.GLib.Variant("(oa{sv})", (self.session_handle, {})),
+            self.GLib.VariantType.new("(h)"),
+            self.Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+            None,
+        )
+        descriptor_index = int(result.unpack()[0])
+        descriptor = descriptors.get(descriptor_index)
+        if descriptor < 0:
+            raise RuntimeError("桌面门户未返回有效的 PipeWire 描述符")
+        return descriptor
+
+    def _start_capture_bridge(self) -> None:
+        self.capture_state = "starting"
+        stride = self.stream_width * 4
+        self.capture_frame_size = stride * self.stream_height
+        mapped_size = (
+            FRAME_HEADER.size + FRAME_BUFFERS * self.capture_frame_size
+        )
+        self.frame_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_text = os.environ.get("XDG_RUNTIME_DIR", "")
+        runtime_dir = Path(runtime_text) if runtime_text else self.state_dir
+        if not runtime_dir.is_dir() or not os.access(runtime_dir, os.W_OK):
+            runtime_dir = self.state_dir
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_backing_path = runtime_dir / (
+            f"uu-remote-wayland-frame-{os.getuid()}-{os.getpid()}-"
+            f"{secrets.token_hex(8)}.bin"
+        )
+        self.frame_path.unlink(missing_ok=True)
+        descriptor = os.open(
+            self.capture_backing_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.ftruncate(descriptor, mapped_size)
+            self.capture_map = mmap.mmap(
+                descriptor, mapped_size, access=mmap.ACCESS_WRITE
+            )
+        finally:
+            os.close(descriptor)
+        self.frame_path.symlink_to(self.capture_backing_path)
+        FRAME_HEADER.pack_into(
+            self.capture_map,
+            0,
+            FRAME_MAGIC,
+            FRAME_VERSION,
+            FRAME_HEADER.size,
+            self.stream_width,
+            self.stream_height,
+            stride,
+            self.capture_frame_size,
+            FRAME_BUFFERS,
+            0,
+            0,
+        )
+        if self.fake_video:
+            source = self.Gst.ElementFactory.make(
+                "videotestsrc", "portal-source"
+            )
+            source.set_property("is-live", True)
+            source.set_property("pattern", 0)
+        else:
+            self.capture_pipewire_fd = self._open_pipewire_remote()
+            source = self.Gst.ElementFactory.make(
+                "pipewiresrc", "portal-source"
+            )
+        queue = self.Gst.ElementFactory.make("queue", "frame-queue")
+        convert = self.Gst.ElementFactory.make("videoconvert", "frame-convert")
+        scale = self.Gst.ElementFactory.make("videoscale", "frame-scale")
+        caps_filter = self.Gst.ElementFactory.make("capsfilter", "frame-caps")
+        sink = self.Gst.ElementFactory.make("appsink", "capture-sink")
+        elements = (source, queue, convert, scale, caps_filter, sink)
+        if any(element is None for element in elements):
+            raise RuntimeError("无法创建 Wayland 画面桥 GStreamer 管线")
+        if not self.fake_video:
+            source.set_property("fd", self.capture_pipewire_fd)
+            source.set_property("path", str(self.stream_node))
+            source.set_property("do-timestamp", True)
+        queue.set_property("max-size-buffers", 2)
+        queue.set_property("leaky", 2)
+        scale.set_property("add-borders", False)
+        caps_filter.set_property(
+            "caps",
+            self.Gst.Caps.from_string(
+                "video/x-raw,format=BGRx,"
+                f"width={self.stream_width},height={self.stream_height},"
+                "pixel-aspect-ratio=1/1"
+            ),
+        )
+        sink.set_property("sync", False)
+        sink.set_property("emit-signals", True)
+        sink.set_property("max-buffers", 2)
+        sink.set_property("drop", True)
+        self.capture_pipeline = self.Gst.Pipeline.new("wayland-capture")
+        for element in elements:
+            self.capture_pipeline.add(element)
+        for first, second in zip(elements, elements[1:]):
+            if not first.link(second):
+                raise RuntimeError(
+                    f"无法连接 GStreamer 元件 {first.name} → {second.name}"
+                )
+
+        def write_frame(appsink) -> int:
+            sample = appsink.emit("pull-sample")
+            if sample is None or self.capture_map is None:
+                return self.Gst.FlowReturn.ERROR
+            buffer = sample.get_buffer()
+            mapped, info = buffer.map(self.Gst.MapFlags.READ)
+            if not mapped:
+                return self.Gst.FlowReturn.ERROR
+            try:
+                if len(info.data) < self.capture_frame_size:
+                    return self.Gst.FlowReturn.ERROR
+                sequence = self.capture_frames + 1
+                active = sequence % FRAME_BUFFERS
+                offset = FRAME_HEADER.size + active * self.capture_frame_size
+                self.capture_map[offset : offset + self.capture_frame_size] = \
+                    memoryview(info.data)[: self.capture_frame_size]
+                struct.pack_into("<I", self.capture_map, 32, active)
+                struct.pack_into("<I", self.capture_map, 36, sequence)
+                self.capture_frames = sequence
+            finally:
+                buffer.unmap(info)
+            return self.Gst.FlowReturn.OK
+
+        sink.connect("new-sample", write_frame)
+        if self.capture_pipeline.set_state(
+            self.Gst.State.PLAYING
+        ) == self.Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("Wayland 画面桥无法进入 PLAYING 状态")
+        bus = self.capture_pipeline.get_bus()
+        deadline = time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS
+        while self.capture_frames == 0 and time.monotonic() < deadline:
+            message = bus.timed_pop_filtered(
+                200 * self.Gst.MSECOND,
+                self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS,
+            )
+            if message is not None:
+                if message.type == self.Gst.MessageType.ERROR:
+                    error, debug = message.parse_error()
+                    raise RuntimeError(
+                        f"Wayland 画面桥 GStreamer 错误：{error}（{debug}）"
+                    )
+                raise RuntimeError("Wayland Portal 屏幕流意外结束")
+        if self.capture_frames == 0:
+            raise RuntimeError("Wayland Portal 在 10 秒内未产生画面帧")
+        self.ensure_healthy()
+        self.capture_state = "active"
+
+    def ensure_healthy(self) -> None:
+        if self.fake_trace:
+            return
+        if self.capture_pipeline is None:
+            raise RuntimeError("Wayland PipeWire 画面转发未启动")
+        message = self.capture_pipeline.get_bus().pop_filtered(
+            self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS
+        )
+        if message is not None:
+            if message.type == self.Gst.MessageType.ERROR:
+                error, debug = message.parse_error()
+                raise RuntimeError(
+                    f"Wayland 画面桥 GStreamer 错误：{error}（{debug}）"
+                )
+            raise RuntimeError("Wayland Portal 屏幕流已结束")
+        state_result, state, _pending = self.capture_pipeline.get_state(0)
+        if state_result == self.Gst.StateChangeReturn.FAILURE or state not in (
+            self.Gst.State.PAUSED,
+            self.Gst.State.PLAYING,
+        ):
+            raise RuntimeError("Wayland PipeWire 画面转发已停止")
+
     def _configure_x11_keymap(self) -> None:
         self.x11 = ctypes.CDLL("libX11.so.6")
         self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -686,8 +918,26 @@ class WaylandPortalBackend:
     def close(self) -> None:
         if self.fake_trace:
             self._fake_write("close")
-            return
-        if self.session_handle and self.connection is not None:
+        self.capture_state = "stopped"
+        if self.capture_pipeline is not None:
+            self.capture_pipeline.set_state(self.Gst.State.NULL)
+            self.capture_pipeline.get_state(5 * self.Gst.SECOND)
+            self.capture_pipeline = None
+        if self.capture_pipewire_fd >= 0:
+            os.close(self.capture_pipewire_fd)
+            self.capture_pipewire_fd = -1
+        if self.capture_map is not None:
+            self.capture_map.close()
+            self.capture_map = None
+        self.frame_path.unlink(missing_ok=True)
+        if self.capture_backing_path is not None:
+            self.capture_backing_path.unlink(missing_ok=True)
+            self.capture_backing_path = None
+        if (
+            not self.fake_trace
+            and self.session_handle
+            and self.connection is not None
+        ):
             try:
                 self.connection.call_sync(
                     PORTAL_BUS_NAME,
@@ -817,14 +1067,19 @@ def selected_backend() -> str:
     return "wayland" if session_type == "wayland" else "x11"
 
 
-def make_backend(state_dir: Path | None = None):
+def make_backend(
+    state_dir: Path | None = None,
+    frame_path: Path | None = None,
+):
     fake_trace = os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE")
     if fake_trace:
         return FakeBackend(Path(fake_trace))
     if selected_backend() == "wayland":
         if state_dir is None:
             raise RuntimeError("Wayland 输入桥缺少状态目录")
-        return WaylandPortalBackend(state_dir)
+        if frame_path is None:
+            raise RuntimeError("Wayland 画面桥缺少共享帧路径")
+        return WaylandPortalBackend(state_dir, frame_path)
     return XTestBackend()
 
 
@@ -1019,6 +1274,8 @@ def write_status(
     last_mouse_flags: int = 0,
     backend: str = "",
     portal_stream: int = 0,
+    capture_state: str = "inactive",
+    capture_frames: int = 0,
     detail: str = "",
 ) -> None:
     atomic_write_json(
@@ -1041,6 +1298,8 @@ def write_status(
             "last_mouse_flags": last_mouse_flags,
             "backend": backend,
             "portal_stream": portal_stream,
+            "capture_state": capture_state,
+            "capture_frames": capture_frames,
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
@@ -1113,10 +1372,14 @@ def watch(
     last_mouse_flags = 0
     backend_name = selected_backend()
     portal_stream = 0
+    capture_state = "inactive"
     last_event = 0.0
     last_status = 0.0
 
     def publish_status(state: str, detail: str = "") -> None:
+        current_capture_frames = int(
+            getattr(backend, "capture_frames", 0) if backend is not None else 0
+        )
         write_status(
             status_path,
             state,
@@ -1134,6 +1397,8 @@ def watch(
             last_mouse_flags=last_mouse_flags,
             backend=backend_name,
             portal_stream=portal_stream,
+            capture_state=capture_state,
+            capture_frames=current_capture_frames,
             detail=detail,
         )
 
@@ -1152,9 +1417,13 @@ def watch(
             if selected_backend() == "wayland"
             else "",
         )
-        backend = make_backend(state_dir)
+        backend = make_backend(
+            state_dir,
+            endpoint.parent / "uu-remote-wayland-frame.bin",
+        )
         backend_name = getattr(backend, "name", selected_backend())
         portal_stream = int(getattr(backend, "stream_node", 0))
+        capture_state = str(getattr(backend, "capture_state", "inactive"))
         controller = InputController(backend, logger)
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(("127.0.0.1", 0))
@@ -1221,6 +1490,8 @@ def watch(
                     logger.write(f"输入事件注入失败：{error}")
 
             now = time.monotonic()
+            if hasattr(backend, "ensure_healthy"):
+                backend.ensure_healthy()
             if (
                 last_event
                 and now - last_event >= release_timeout

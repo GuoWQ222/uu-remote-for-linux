@@ -23,12 +23,15 @@ readonly endpoint="$test_root/drive_c/uu-remote-input-bridge.endpoint"
 readonly log="$test_root/input-bridge.log"
 readonly lock="$test_root/input-bridge.lock"
 readonly trace="$test_root/portal.trace"
-mkdir -p "$state_dir"
+readonly runtime_dir="$test_root/runtime"
+mkdir -p "$state_dir" "$runtime_dir"
 
 export XDG_SESSION_TYPE=wayland
 export WAYLAND_DISPLAY=wayland-test-0
+export XDG_RUNTIME_DIR="$runtime_dir"
 export UU_REMOTE_DESKTOP_BACKEND=wayland-xwayland
 export UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE="$trace"
+export UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO=1
 
 [[ $("$bridge" check) == wayland-portal ]]
 "$bridge" watch \
@@ -66,7 +69,7 @@ def send(kind, sequence, payload):
         address,
     )
 
-send(1, 1, struct.pack("<II", 5151, 6))
+send(1, 1, struct.pack("<II", 5151, 8))
 send(2, 2, struct.pack("<iiIIIQ", 32768, 32768, 0, 0x8001, 0, 0))
 send(2, 3, struct.pack("<iiIIIQ", 5, -3, 0, 0x0001, 0, 0))
 send(2, 4, struct.pack("<iiIIIQ", 0, 0, 0, 0x0002, 0, 0))
@@ -82,7 +85,8 @@ for _ in {1..100}; do
     sleep 0.02
 done
 
-grep -q '^session authorized devices=3 stream=77 1920x1080$' "$trace"
+grep -q '^session authorized devices=3 stream=77 128x72$' "$trace"
+grep -q '^capture active transport=shared-frame$' "$trace"
 grep -q '^NotifyPointerMotionAbsolute 77 ' "$trace"
 grep -q '^NotifyPointerMotion 5.0 -3.0$' "$trace"
 grep -q '^NotifyPointerButton 272 1$' "$trace"
@@ -94,6 +98,11 @@ grep -q '"backend": "wayland-portal"' \
     "$state_dir/input-bridge-status.json"
 grep -q '"portal_stream": 77' \
     "$state_dir/input-bridge-status.json"
+grep -q '"capture_state": "active"' \
+    "$state_dir/input-bridge-status.json"
+grep -Eq '"capture_frames": [1-9][0-9]*' \
+    "$state_dir/input-bridge-status.json"
+test -s "$(dirname "$endpoint")/uu-remote-wayland-frame.bin"
 grep -q '"hook_pid": 5151' \
     "$state_dir/input-bridge-status.json"
 
@@ -101,6 +110,8 @@ kill "$bridge_pid"
 wait "$bridge_pid"
 bridge_pid=
 [[ $("$bridge" status "$state_dir") == stopped ]]
+[[ ! -e $(dirname "$endpoint")/uu-remote-wayland-frame.bin ]]
+[[ -z $(find "$runtime_dir" -type f -name 'uu-remote-wayland-frame-*' -print -quit) ]]
 grep -q '^close$' "$trace"
 
 printf 'Wayland Portal 后端选择、坐标、键鼠和滚轮映射检查通过。\n'

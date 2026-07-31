@@ -3,9 +3,11 @@
 
 GNOME and IBus reserve Super+Space before Wine can see it.  While a real
 GameViewer remote-control window owns the active X11/XWayland window, this helper
-temporarily removes only those conflicting desktop shortcuts.  It restores the
-exact serialized GSettings values on focus loss, normal shutdown, and the next
-startup after an unclean exit.
+temporarily removes only those conflicting desktop shortcuts and pins the local
+input source to a physical XKB keyboard.  The remote operating system can then
+receive every physical key and run its own IME.  It restores the exact serialized
+GSettings values on focus loss, normal shutdown, and the next startup after an
+unclean exit.
 """
 
 from __future__ import annotations
@@ -26,10 +28,11 @@ from typing import Any
 
 
 APP_ID = "uu-remote-for-linux"
-STATE_VERSION = 1
+STATE_VERSION = 2
 REMOTE_CLASS = "gameviewer.exe"
 MIN_REMOTE_WIDTH = 320
 MIN_REMOTE_HEIGHT = 240
+FOCUS_EXIT_GRACE_SECONDS = 0.75
 
 SETTINGS = {
     "switch": (
@@ -48,7 +51,16 @@ SETTINGS = {
         "org.gnome.mutter",
         "overlay-key",
     ),
+    "current_input_source": (
+        "org.gnome.desktop.input-sources",
+        "current",
+    ),
 }
+
+INPUT_SOURCES_SETTING = (
+    "org.gnome.desktop.input-sources",
+    "sources",
+)
 
 CONFLICTS = {
     "switch": {"<super>space"},
@@ -124,6 +136,16 @@ class SettingsController:
     def snapshot(self) -> dict[str, str]:
         return {name: self.get(name) for name in SETTINGS}
 
+    def get_serialized(self, schema: str, key: str) -> str:
+        result = subprocess.run(
+            [self.binary, "get", schema, key],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip()
+
     @staticmethod
     def shortcut_token(value: str) -> str:
         return "".join(value.split()).casefold()
@@ -152,6 +174,21 @@ class SettingsController:
             return serialized
         return repr(filtered)
 
+    def physical_input_source(self) -> tuple[int, str]:
+        serialized = self.get_serialized(*INPUT_SOURCES_SETTING)
+        sources = ast.literal_eval(serialized)
+        if not isinstance(sources, list):
+            raise ValueError(f"输入源列表格式无效：{serialized}")
+        for index, source in enumerate(sources):
+            if (
+                isinstance(source, tuple)
+                and len(source) == 2
+                and source[0] == "xkb"
+                and isinstance(source[1], str)
+            ):
+                return index, source[1]
+        raise RuntimeError("未找到可用于远控的 XKB 物理键盘输入源")
+
     def apply(self, recovery_path: Path) -> None:
         originals = self.snapshot()
         atomic_write_json(
@@ -173,13 +210,18 @@ class SettingsController:
             if originals["overlay"] != "''":
                 self.set_serialized("overlay", "''")
                 changed.append("overlay")
+            physical_index, physical_name = self.physical_input_source()
+            physical_value = f"uint32 {physical_index}"
+            if originals["current_input_source"] != physical_value:
+                self.set_serialized("current_input_source", physical_value)
+                changed.append(f"input_source={physical_name}")
         except Exception:
             self.restore_values(originals)
             recovery_path.unlink(missing_ok=True)
             raise
         self.originals = originals
         self.logger.write(
-            "远控窗口获得焦点；已临时释放 Linux Super+Space"
+            "远控窗口获得焦点；已释放 Linux Super+Space 并固定物理键盘输入源"
             f"（修改项：{','.join(changed) or '无需修改'}）"
         )
 
@@ -200,7 +242,7 @@ class SettingsController:
         if originals is None and recovery_path.is_file():
             payload = json.loads(recovery_path.read_text(encoding="utf-8"))
             if (
-                payload.get("version") != STATE_VERSION
+                payload.get("version") not in (1, STATE_VERSION)
                 or payload.get("applied") is not True
                 or not isinstance(payload.get("settings"), dict)
             ):
@@ -212,7 +254,7 @@ class SettingsController:
         self.restore_values(originals)
         self.originals = None
         recovery_path.unlink(missing_ok=True)
-        self.logger.write("远控窗口失去焦点；已恢复 Linux 原快捷键")
+        self.logger.write("远控窗口失去焦点；已恢复 Linux 原快捷键和输入源")
         return True
 
 
@@ -415,8 +457,9 @@ class X11FocusDetector:
         window_class = self.window_class(window)
         title = self.window_title(window)
         attributes = self.window_attributes(window)
+        related = window_class.casefold() == REMOTE_CLASS
         remote = bool(
-            window_class.casefold() == REMOTE_CLASS
+            related
             and not self.is_helper_title(title)
             and attributes is not None
             and attributes.map_state == 2
@@ -429,6 +472,7 @@ class X11FocusDetector:
             "class": window_class,
             "width": attributes.width if attributes else 0,
             "height": attributes.height if attributes else 0,
+            "related": related,
         }
 
 
@@ -447,9 +491,10 @@ class FakeFocusDetector:
         return value == "remote", {
             "window": "fake",
             "title": "fake-remote" if value == "remote" else "fake-local",
-            "class": REMOTE_CLASS if value == "remote" else "other",
-            "width": 1920 if value == "remote" else 0,
-            "height": 1080 if value == "remote" else 0,
+            "class": REMOTE_CLASS if value in ("remote", "helper") else "other",
+            "width": 1920 if value == "remote" else 1 if value == "helper" else 0,
+            "height": 1080 if value == "remote" else 1 if value == "helper" else 0,
+            "related": value in ("remote", "helper"),
         }
 
 
@@ -520,6 +565,7 @@ def watch(
     running = True
     last_remote: bool | None = None
     last_status_write = 0.0
+    focus_exit_started: float | None = None
 
     def request_stop(_signum, _frame) -> None:
         nonlocal running
@@ -534,13 +580,30 @@ def watch(
         detector = make_detector()
         logger.write("X11/XWayland 远控键盘桥开始监视活动窗口")
         while running:
-            remote, window = detector.remote_focused()
+            detected_remote, window = detector.remote_focused()
+            now = time.monotonic()
+            if detected_remote:
+                focus_exit_started = None
+                remote = True
+            elif controller.originals is not None and window.get("related"):
+                # Wine briefly focuses its tiny "Default IME" and other helper
+                # windows while the viewer is active.  They are part of the
+                # same controller, not a real focus loss.
+                focus_exit_started = None
+                remote = True
+            elif controller.originals is not None:
+                if focus_exit_started is None:
+                    focus_exit_started = now
+                remote = now - focus_exit_started < FOCUS_EXIT_GRACE_SECONDS
+            else:
+                focus_exit_started = None
+                remote = False
+
             if remote and controller.originals is None:
                 controller.apply(state_paths["recovery"])
             elif not remote and controller.originals is not None:
                 controller.restore(state_paths["recovery"])
 
-            now = time.monotonic()
             if remote != last_remote or now - last_status_write >= 5:
                 write_status(
                     state_paths["status"],

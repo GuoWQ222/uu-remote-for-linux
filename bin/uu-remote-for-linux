@@ -215,6 +215,7 @@ readonly webview_key='HKLM\Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3
 readonly service_name='GameViewerService'
 readonly service_key='HKLM\System\CurrentControlSet\Services\GameViewerService'
 readonly installed_version_key='HKCU\Software\Netease\GameViewer'
+readonly controller_xim_key='HKCU\Software\Wine\AppDefaults\gameviewer.exe\X11 Driver'
 readonly package_stamp="$prefix/.uu-remote-for-linux-package"
 readonly eula_stamp="$data_dir/eula-accepted"
 readonly installer="$cache_dir/UURemote_Setup.exe"
@@ -241,6 +242,8 @@ readonly keyboard_bridge_interval="${UU_REMOTE_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
 readonly input_bridge_log="$state_dir/input-bridge.log"
 readonly input_bridge_lock="$state_dir/input-bridge.lock"
 readonly input_bridge_status="$state_dir/input-bridge-status.json"
+readonly wayland_frame_hook_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
+readonly controller_focus_hook_status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
 readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
 readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
 readonly input_hook_preload="$install_dir/bin/uu-remote-input-hook.dll"
@@ -300,6 +303,7 @@ readonly update_runtime_unit="${app_id}-update"
 readonly keyboard_runtime_unit="${app_id}-keyboard"
 readonly input_runtime_unit="${app_id}-input"
 readonly input_injector_runtime_unit="${app_id}-input-injector"
+readonly focus_injector_runtime_unit="${app_id}-focus-injector"
 readonly tray_runtime_unit="${app_id}-tray"
 readonly tray_exit_runtime_unit="${app_id}-tray-exit"
 
@@ -818,6 +822,13 @@ registry_value() {
     return 1
 }
 
+controller_xim_disabled() {
+    local value
+
+    value=$(registry_value "$controller_xim_key" UseXIM) || return 1
+    [[ ${value^^} == N ]]
+}
+
 webview_ready() {
     local version
 
@@ -1243,16 +1254,112 @@ input_bridge_event_label() {
         "${keyboard_packets:-0}"
 }
 
+wayland_capture_status_label() {
+    local state="" bridge_state="" frames=""
+
+    if [[ $desktop_backend != wayland-xwayland ]]; then
+        printf 'X11 直接采集'
+    elif [[ ! -r $input_bridge_status ]]; then
+        printf '就绪（待应用启动）'
+    else
+        state=$(sed -n 's/.*"capture_state": "\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        bridge_state=$(sed -n 's/.*"state": "\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        frames=$(sed -n \
+            's/.*"capture_frames": \([0-9][0-9]*\).*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        if [[ $bridge_state == error ]]; then
+            printf '异常（详见输入桥日志）'
+            return
+        fi
+        case $state in
+            active)
+                printf '生效中（Portal → Win64 GDI；帧 %s）' \
+                    "${frames:-0}"
+                ;;
+            starting)
+                printf '启动中'
+                ;;
+            stopped)
+                printf '已停止'
+                ;;
+            *)
+                printf '未生效'
+                ;;
+        esac
+    fi
+}
+
+wayland_frame_hook_status_label() {
+    local version="" status_bits="" rendered="" calls=""
+
+    if [[ $desktop_backend != wayland-xwayland ]]; then
+        printf 'X11 无需桥接'
+        return
+    fi
+    if [[ ! -r $wayland_frame_hook_status ]]; then
+        printf '就绪（待远控采集）'
+        return
+    fi
+    version=$(ini_section_value "$wayland_frame_hook_status" hook version)
+    status_bits=$(ini_section_value \
+        "$wayland_frame_hook_status" hook status_bits)
+    calls=$(ini_section_value "$wayland_frame_hook_status" capture calls)
+    rendered=$(ini_section_value \
+        "$wayland_frame_hook_status" capture rendered)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 7 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 13) == 13 )); then
+        printf '完整（v%s；GDI %s/%s）' \
+            "$version" "${rendered:-0}" "${calls:-0}"
+    else
+        printf '未安装/不完整'
+    fi
+}
+
+controller_focus_hook_status_label() {
+    local version="" status_bits="" activate="" activate_app=""
+    local nonclient="" reused="" deferred=""
+
+    if [[ ! -r $controller_focus_hook_status ]]; then
+        printf '就绪（待主控窗口启动）'
+        return
+    fi
+    version=$(ini_section_value "$controller_focus_hook_status" hook version)
+    status_bits=$(ini_section_value \
+        "$controller_focus_hook_status" hook status_bits)
+    activate=$(ini_section_value \
+        "$controller_focus_hook_status" focus suppressed_activate)
+    activate_app=$(ini_section_value \
+        "$controller_focus_hook_status" focus suppressed_activate_app)
+    nonclient=$(ini_section_value \
+        "$controller_focus_hook_status" focus stabilized_nonclient)
+    reused=$(ini_section_value \
+        "$controller_focus_hook_status" keyboard_hook reused)
+    deferred=$(ini_section_value \
+        "$controller_focus_hook_status" keyboard_hook deferred)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 8 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 31) == 31 )); then
+        printf '生效中（v%s；焦点 %s/%s/%s，键盘钩子 %s/%s）' \
+            "$version" "${activate:-0}" "${activate_app:-0}" \
+            "${nonclient:-0}" "${reused:-0}" "${deferred:-0}"
+    else
+        printf '未注入/不完整'
+    fi
+}
+
 stop_input_bridge_runtime() {
     local pid="" cmdline=""
 
     if systemd_user_available; then
         systemctl --user stop \
             "$input_runtime_unit.service" \
-            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+            "$input_injector_runtime_unit.service" \
+            "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
             "$input_runtime_unit.service" \
-            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+            "$input_injector_runtime_unit.service" \
+            "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
     if [[ -r $input_bridge_status ]]; then
         pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
@@ -1366,7 +1473,8 @@ start_input_bridge() {
         [[ -s $input_bridge_endpoint ]] && return 0
         if [[ $desktop_backend == wayland-xwayland ]] &&
             runtime_unit_active "$input_runtime_unit"; then
-            # The portal authorization dialog may remain open while UU starts.
+            # Portal authorization can remain open while the controller UI
+            # starts; the GDI hook maps frames as soon as sharing is granted.
             return 0
         fi
         sleep 0.02
@@ -1388,7 +1496,7 @@ keyboard_bridge_status_label() {
         state=$("$keyboard_bridge" status "$state_dir" 2>/dev/null || true)
         case $state in
             active)
-                printf '正在接管远控窗口快捷键'
+                printf '正在接管远控键盘（物理输入源）'
                 ;;
             idle)
                 printf '监视中（当前远控窗口未聚焦）'
@@ -1699,14 +1807,16 @@ stop_managed_runtime_services() {
             "$healthd_runtime_unit.service" \
             "$keyboard_runtime_unit.service" \
             "$input_runtime_unit.service" \
-            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+            "$input_injector_runtime_unit.service" \
+            "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
             "$client_runtime_unit.service" \
             "$server_runtime_unit.service" \
             "$healthd_runtime_unit.service" \
             "$keyboard_runtime_unit.service" \
             "$input_runtime_unit.service" \
-            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+            "$input_injector_runtime_unit.service" \
+            "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
     if [[ -r $keyboard_bridge_status ]]; then
         pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
@@ -2215,10 +2325,14 @@ print_diagnostics() {
         "系统代理桥日志" "$system_proxy_bridge_log" \
         "Linux 原生托盘" "$(tray_proxy_status_label)" \
         "原生托盘日志" "$tray_proxy_log" \
+        "主控焦点稳定" "$(controller_focus_hook_status_label)" \
         "远控键盘桥" "$(keyboard_bridge_status_label)" \
+        "Wine 本地输入法" "$(controller_xim_disabled && printf '已禁用（远端输入法接管）' || printf '未禁用')" \
         "键盘桥日志" "$keyboard_bridge_log" \
         "被控端原生输入" "$(input_bridge_status_label)" \
         "被控端输入事件" "$(input_bridge_event_label)" \
+        "Wayland 画面桥" "$(wayland_capture_status_label)" \
+        "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
         "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
         "输入桥日志" "$input_bridge_log" \
@@ -2818,6 +2932,9 @@ configure_compatibility() {
     run_logged "$wine" reg add 'HKCU\Software\Wine\X11 Driver' \
         /v UseTakeFocus /t REG_SZ /d N /f ||
         die "无法配置 Wine X11 焦点处理"
+    run_logged "$wine" reg add "$controller_xim_key" \
+        /v UseXIM /t REG_SZ /d N /f ||
+        die "无法禁用 UU 主控窗口的 Wine 本地 XIM 输入法"
     run_logged "$wine" reg add \
         'HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
         /v 'MS Shell Dlg' /t REG_SZ /d 'Noto Sans CJK SC' /f ||
@@ -2832,6 +2949,7 @@ configure_compatibility() {
     shim_ready || die "Event Log 兼容 DLL 核验失败"
     input_hook_ready || die "Win64 输入钩子核验失败"
     update_blocker_ready || die "自动更新保护程序核验失败"
+    controller_xim_disabled || die "Wine 主控窗口 XIM 禁用设置核验失败"
     [[ -n $webview_version &&
         -f "$webview_root/$webview_version/msedgewebview2.exe" ]] ||
         die "WebView2 核验失败"
@@ -2845,6 +2963,7 @@ prefix_needs_configuration() {
     webview_ready || return 0
     shim_ready || return 0
     update_blocker_ready || return 0
+    controller_xim_disabled || return 0
     if wol_enabled; then
         wol_patch_ready || return 0
         wol_hook_config_ready || return 0
@@ -3301,6 +3420,41 @@ start_input_injector() {
         "$input_hook_windows"
 }
 
+start_focus_injector() {
+    local wine_path
+
+    [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
+    [[ -n ${DISPLAY:-} ]] || return 0
+    input_hook_ready || return 1
+    if systemd_user_available; then
+        if runtime_unit_active "$focus_injector_runtime_unit"; then
+            return 0
+        fi
+        rm -f -- "$controller_focus_hook_status"
+        start_systemd_wine_image \
+            "$focus_injector_runtime_unit" \
+            "$input_injector" \
+            --watch-module \
+            GameViewer.exe \
+            Qt5Core.dll \
+            "$input_hook_windows"
+        return
+    fi
+    wine_path=$(command -v -- "$wine") || return 1
+    rm -f -- "$controller_focus_hook_status"
+    (
+        cd "$install_dir/bin"
+        nohup env \
+            -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+            -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+            -u ALL_PROXY -u NO_PROXY \
+            "$wine_path" "$input_injector" \
+            --watch-module GameViewer.exe Qt5Core.dll \
+            "$input_hook_windows" 9>&- </dev/null \
+            >>"$runtime_log" 2>&1 &
+    )
+}
+
 wait_input_hook_active() {
     local attempt state
 
@@ -3315,9 +3469,10 @@ wait_input_hook_active() {
     return 1
 }
 
-start_input_bridge ||
+if ! start_input_bridge; then
     printf '警告：被控端原生键鼠输入不可用，详见 %s\n' \
         "$input_bridge_log" >&2
+fi
 ensure_service_running ||
     die "$service_name 未进入 RUNNING 状态，详见 $setup_log"
 ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
@@ -3330,6 +3485,8 @@ wait_input_hook_active ||
 start_input_injector ||
     printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
         "$runtime_log" >&2
+start_focus_injector ||
+    printf '警告：主控焦点稳定器未能启动，切换画质时可能闪烁。\n' >&2
 
 sleep 1
 cd "$install_dir"

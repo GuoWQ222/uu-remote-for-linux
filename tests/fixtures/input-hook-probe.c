@@ -8,7 +8,9 @@
 #include <netioapi.h>
 
 typedef int(WINAPI *probe_streamer_cursor_fn)(LONG, LONG, LONG, LONG);
+typedef int(WINAPI *probe_streamer_frame_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
+typedef DWORD(WINAPI *frame_hook_status_fn)(void);
 typedef HANDLE EVT_HANDLE;
 __declspec(dllimport) BOOL WINAPI EvtClose(EVT_HANDLE object);
 
@@ -172,6 +174,65 @@ static int close_enough(LONG actual, LONG expected) {
     return difference >= -1 && difference <= 1;
 }
 
+static int probe_frame_capture(BOOL stretch) {
+    const int width = 128;
+    const int height = 72;
+    BITMAPINFO info;
+    HDC screen = NULL;
+    HDC memory = NULL;
+    HBITMAP bitmap = NULL;
+    HGDIOBJ previous;
+    DWORD *pixels = NULL;
+    BOOL copied;
+    int result = 9;
+
+    ZeroMemory(&info, sizeof(info));
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    screen = GetDC(NULL);
+    memory = CreateCompatibleDC(screen);
+    bitmap = CreateDIBSection(
+        screen, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0
+    );
+    if (!screen || !memory || !bitmap || !pixels) {
+        goto cleanup;
+    }
+    previous = SelectObject(memory, bitmap);
+    copied = stretch
+        ? StretchBlt(
+            memory, 0, 0, width, height,
+            screen, 0, 0, width, height, SRCCOPY
+        )
+        : BitBlt(
+            memory, 0, 0, width, height,
+            screen, 0, 0, SRCCOPY | CAPTUREBLT
+        );
+    if (
+        copied &&
+        (pixels[0] & 0x00ffffffu) !=
+            (pixels[width * height - 1] & 0x00ffffffu)
+    ) {
+        result = 0;
+    }
+    SelectObject(memory, previous);
+
+cleanup:
+    if (bitmap) {
+        DeleteObject(bitmap);
+    }
+    if (memory) {
+        DeleteDC(memory);
+    }
+    if (screen) {
+        ReleaseDC(NULL, screen);
+    }
+    return result;
+}
+
 int WINAPI WinMain(
     HINSTANCE instance,
     HINSTANCE previous,
@@ -185,7 +246,9 @@ int WINAPI WinMain(
     LONG expected_y;
     HMODULE streamer;
     probe_streamer_cursor_fn probe_streamer_cursor;
+    probe_streamer_frame_fn probe_streamer_frame;
     wol_hook_status_fn wol_hook_status;
+    frame_hook_status_fn frame_hook_status;
     HMODULE hook;
     int streamer_result;
     int wol_result;
@@ -208,8 +271,14 @@ int WINAPI WinMain(
     wol_hook_status = (wol_hook_status_fn)GetProcAddress(
         hook, "UURemoteWolHookStatus"
     );
+    frame_hook_status = (frame_hook_status_fn)GetProcAddress(
+        hook, "UURemoteFrameHookStatus"
+    );
     if (!wol_hook_status || wol_hook_status() != 15u) {
         return 8;
+    }
+    if (!frame_hook_status || (frame_hook_status() & 3u) != 3u) {
+        return 9;
     }
     wol_result = probe_adapter_addresses();
     if (wol_result) {
@@ -231,12 +300,24 @@ int WINAPI WinMain(
     probe_streamer_cursor = (probe_streamer_cursor_fn)GetProcAddress(
         streamer, "ProbeStreamerCursor"
     );
-    if (!probe_streamer_cursor) {
+    probe_streamer_frame = (probe_streamer_frame_fn)GetProcAddress(
+        streamer, "ProbeStreamerFrame"
+    );
+    if (!probe_streamer_cursor || !probe_streamer_frame) {
         return 1;
     }
 
     /* Give the explicit watchdog time to initialize and patch streamer.dll. */
     Sleep(5000);
+
+    if (
+        probe_frame_capture(FALSE) ||
+        probe_frame_capture(TRUE) ||
+        probe_streamer_frame() ||
+        (frame_hook_status() & 31u) != 31u
+    ) {
+        return 9;
+    }
 
     ZeroMemory(&input, sizeof(input));
     input.type = INPUT_MOUSE;

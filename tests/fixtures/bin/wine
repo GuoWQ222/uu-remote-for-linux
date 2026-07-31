@@ -31,6 +31,12 @@ case ${1:-} in
     reg)
         case ${2:-} in
             query)
+                if [[ ${3:-} == *AppDefaults*gameviewer.exe*X11\ Driver* &&
+                    ${5:-} == UseXIM &&
+                    -f "$install_dir/bin/.controller-xim-disabled" ]]; then
+                    printf '    UseXIM    REG_SZ    N\n'
+                    exit 0
+                fi
                 if [[ ${3:-} == *EdgeUpdate* && -f "$install_dir/bin/.webview-ready" ]]; then
                     printf '    pv    REG_SZ    149.0.0.0\n'
                     exit 0
@@ -52,6 +58,12 @@ case ${1:-} in
                 exit 1
                 ;;
             add)
+                if [[ ${3:-} == *AppDefaults*gameviewer.exe*X11\ Driver* &&
+                    ${5:-} == UseXIM && ${9:-} == N ]]; then
+                    install -Dm0644 /dev/null \
+                        "$install_dir/bin/.controller-xim-disabled"
+                    printf 'REG_ADD_GAMEVIEWER_USEXIM=N\n' >>"$trace_file"
+                fi
                 exit 0
                 ;;
         esac

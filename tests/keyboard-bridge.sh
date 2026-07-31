@@ -38,6 +38,9 @@ reset_settings() {
         >"$settings_root/switch_backward"
     printf "%s\n" "['<Super>space']" >"$settings_root/ibus_triggers"
     printf "%s\n" "'Super_L'" >"$settings_root/overlay"
+    printf '%s\n' "[('ibus', 'rime'), ('xkb', 'us')]" \
+        >"$settings_root/input_sources"
+    printf '%s\n' 'uint32 0' >"$settings_root/current_input_source"
     printf '%s\n' local >"$focus"
 }
 
@@ -60,6 +63,7 @@ assert_originals() {
         "['<Shift><Super>space', '<Shift>XF86Keyboard']" ]]
     [[ $(<"$settings_root/ibus_triggers") == "['<Super>space']" ]]
     [[ $(<"$settings_root/overlay") == "'Super_L'" ]]
+    [[ $(<"$settings_root/current_input_source") == 'uint32 0' ]]
 }
 
 start_watcher() {
@@ -83,8 +87,16 @@ wait_for_value "$settings_root/switch" "['XF86Keyboard']"
 wait_for_value "$settings_root/switch_backward" "['<Shift>XF86Keyboard']"
 wait_for_value "$settings_root/ibus_triggers" "[]"
 wait_for_value "$settings_root/overlay" "''"
+wait_for_value "$settings_root/current_input_source" 'uint32 1'
 [[ -s $state_dir/keyboard-bridge-restore.json ]]
 [[ $("$bridge" status "$state_dir") == active ]]
+
+# Wine's tiny Default IME/helper window belongs to the remote controller.
+# It must not restore IBus or the desktop shortcuts between keystrokes.
+printf '%s\n' helper >"$focus"
+sleep 0.9
+[[ $(<"$settings_root/current_input_source") == 'uint32 1' ]]
+[[ $(<"$settings_root/switch") == "['XF86Keyboard']" ]]
 
 printf '%s\n' local >"$focus"
 wait_for_value "$settings_root/switch" \
@@ -119,6 +131,6 @@ watcher_pid=
 assert_originals
 [[ ! -e $state_dir/keyboard-bridge-restore.json ]]
 
-grep -q '已临时释放 Linux Super+Space' "$log"
-grep -q '已恢复 Linux 原快捷键' "$log"
-printf '键盘桥聚焦、恢复和崩溃恢复检查通过。\n'
+grep -q '已释放 Linux Super+Space 并固定物理键盘输入源' "$log"
+grep -q '已恢复 Linux 原快捷键和输入源' "$log"
+printf '键盘桥物理输入源接管、焦点迟滞、恢复和崩溃恢复检查通过。\n'

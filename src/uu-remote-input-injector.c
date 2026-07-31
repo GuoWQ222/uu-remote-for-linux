@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define INJECTOR_VERSION 2u
+#define INJECTOR_VERSION 3u
 #define WATCH_INTERVAL_MS 500u
 #define PRELOAD_MODULE_WAIT_MS 10000u
 
@@ -352,6 +352,108 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     return 0;
 }
 
+static int watch_process_with_module(
+    const WCHAR *image_name,
+    const WCHAR *required_module,
+    const WCHAR *dll_path
+) {
+    struct watched_process {
+        DWORD pid;
+        BOOL initialized;
+        BOOL seen;
+    } watched[32];
+    unsigned int watched_count = 0;
+
+    ZeroMemory(watched, sizeof(watched));
+    for (;;) {
+        HANDLE snapshot;
+        PROCESSENTRY32W entry;
+        unsigned int index;
+
+        for (index = 0; index < watched_count; ++index) {
+            watched[index].seen = FALSE;
+        }
+        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            ZeroMemory(&entry, sizeof(entry));
+            entry.dwSize = sizeof(entry);
+            if (Process32FirstW(snapshot, &entry)) {
+                do {
+                    struct watched_process *state = NULL;
+
+                    if (lstrcmpiW(entry.szExeFile, image_name) != 0) {
+                        continue;
+                    }
+                    if (!remote_module_info(
+                            entry.th32ProcessID, required_module, NULL
+                        )) {
+                        continue;
+                    }
+                    for (index = 0; index < watched_count; ++index) {
+                        if (watched[index].pid == entry.th32ProcessID) {
+                            state = &watched[index];
+                            break;
+                        }
+                    }
+                    if (!state && watched_count < 32u) {
+                        state = &watched[watched_count++];
+                        state->pid = entry.th32ProcessID;
+                        state->initialized = FALSE;
+                    }
+                    if (!state) {
+                        continue;
+                    }
+                    state->seen = TRUE;
+                    if (
+                        state->initialized &&
+                        !remote_module_info(
+                            state->pid,
+                            L"uu-remote-input-hook.dll",
+                            NULL
+                        )
+                    ) {
+                        state->initialized = FALSE;
+                    }
+                    if (!state->initialized) {
+                        state->initialized = inject_library(
+                            state->pid, dll_path, FALSE
+                        );
+                        if (state->initialized) {
+                            wprintf(
+                                L"injected pid=%lu module=%ls\n",
+                                (unsigned long)state->pid,
+                                required_module
+                            );
+                            fflush(stdout);
+                        } else {
+                            fwprintf(
+                                stderr,
+                                L"inject-retry pid=%lu module=%ls "
+                                L"error=%lu\n",
+                                (unsigned long)state->pid,
+                                required_module,
+                                (unsigned long)GetLastError()
+                            );
+                            fflush(stderr);
+                        }
+                    }
+                } while (Process32NextW(snapshot, &entry));
+            }
+            CloseHandle(snapshot);
+        }
+        for (index = 0; index < watched_count;) {
+            if (!watched[index].seen) {
+                watched[index] = watched[watched_count - 1u];
+                --watched_count;
+            } else {
+                ++index;
+            }
+        }
+        Sleep(WATCH_INTERVAL_MS);
+    }
+    return 0;
+}
+
 static int launch_suspended(
     const WCHAR *dll_path,
     const WCHAR *application_path,
@@ -494,6 +596,14 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputInjectorVersion(void) {
 
 int wmain(int argument_count, WCHAR **arguments) {
     if (
+        argument_count == 5 &&
+        lstrcmpiW(arguments[1], L"--watch-module") == 0
+    ) {
+        return watch_process_with_module(
+            arguments[2], arguments[3], arguments[4]
+        );
+    }
+    if (
         argument_count == 4 &&
         lstrcmpiW(arguments[1], L"--watch") == 0
     ) {
@@ -521,6 +631,8 @@ int wmain(int argument_count, WCHAR **arguments) {
         stderr,
         L"usage: uu-remote-input-injector.exe "
         L"(--watch|--once) IMAGE_NAME DLL_PATH\n"
+        L"       uu-remote-input-injector.exe "
+        L"--watch-module IMAGE_NAME REQUIRED_MODULE DLL_PATH\n"
         L"       uu-remote-input-injector.exe "
         L"(--launch|--launch-and-wait) DLL_PATH APPLICATION_PATH\n"
     );

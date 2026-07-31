@@ -80,11 +80,14 @@ grep -q '^version=4.34.0.8979$' "$cache_dir/installer-metadata"
 grep -q '^INSTALL$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE"
 test -f "$state_dir/setup.log"
+grep -q '^REG_ADD_GAMEVIEWER_USEXIM=N$' "$UU_REMOTE_FAKE_TRACE"
+"$launcher" --diagnose | grep -q \
+    'Wine 本地输入法.*已禁用（远端输入法接管）'
 
 printf '%s\r\n' \
     '[hook]' \
     'pid=948' \
-    'version=6' \
+    'version=8' \
     'status_bits=15' \
     'preloaded=1' \
     '[calls]' \
@@ -97,7 +100,7 @@ printf '%s\r\n' \
     'if_table2=1' \
     >"$prefix/drive_c/uu-remote-wol-hook-status.ini"
 "$launcher" --diagnose |
-    grep -q 'WOL 进程实测.*v6，地址 1/2，旧接口 0/0，网卡表 1/1'
+    grep -q 'WOL 进程实测.*v8，地址 1/2，旧接口 0/0，网卡表 1/1'
 
 install_count=$(grep -c '^INSTALL$' "$UU_REMOTE_FAKE_TRACE")
 webview_count=$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")

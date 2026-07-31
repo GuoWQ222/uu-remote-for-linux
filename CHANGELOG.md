@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.4] - 2026-07-31
+
+- Add a process-local controller focus stabilizer for `bin/GameViewer.exe`.
+  Intra-process transitions between the video window, quality/frame-rate
+  menus, Qt helper windows, and the D3D11 render surface no longer deactivate
+  the outer viewer under Wine/XWayland.
+- Debounce UU's low-level keyboard-hook teardown for 350 ms and reuse the
+  existing hook when focus immediately returns. A real departure from the UU
+  process still releases the hook after the grace interval.
+- Add a module-qualified injection watchdog, runtime diagnostics, and a real
+  Wine regression probe covering focus grouping, border activation, and hook
+  reuse/release behavior.
+
 ## [1.0.7] - 2026-07-31
 
 - Add a native Linux system-proxy bridge that maps active GNOME, KDE,
