@@ -23,6 +23,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
@@ -30,6 +31,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
@@ -56,6 +58,9 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridg
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" \
@@ -70,6 +75,8 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \

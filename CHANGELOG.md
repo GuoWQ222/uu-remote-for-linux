@@ -2,6 +2,83 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.7] - 2026-07-31
+
+- Add a native Linux system-proxy bridge that maps active GNOME, KDE,
+  environment-variable, PAC, and WPAD settings into Wine's standard Internet
+  Settings registry before UU starts.
+- Strip proxy credentials from bridge output and logs; authenticated proxy
+  users are directed to UU's existing manual proxy form.
+- Remove proxy environment variables from UU's Wine client, server, and health
+  processes so “No proxy”, “System proxy”, and “Manual” remain independent.
+
+## [1.0.6] - 2026-07-31
+
+- Make the native Linux tray follow UU's “Exit program” close policy even when
+  Wine leaves a stale `GameViewer.exe` wrapper process after the application
+  has completed its own shutdown.
+- Monitor UU's append-only client log for the confirmed
+  `quitApplication` event, then stop the isolated Wine prefix and remove the
+  StatusNotifierItem immediately. Decoder-selection restarts remain excluded
+  from this cleanup path.
+- Retain process-disappearance monitoring as a fallback and make it perform
+  full prefix cleanup whenever `CloseOption=1`.
+
+## [1.0.5] - 2026-07-31
+
+- Add a narrowly scoped Win64 PowerShell compatibility bridge for UU's
+  Windows-only `Get-NetAdapterPowerManagement`,
+  `Get-NetAdapterAdvancedProperty`, and WMI Wake-on-LAN checks. The bridge
+  reports enabled properties only after native Linux Magic Packet and PCI
+  wake-up have both been verified.
+- Deploy and verify the bridge during normal startup, repair, and safe updates,
+  and expose its actual query status through `--diagnose`.
+- Fix the guided remote-wake wizard incorrectly reporting “no wired adapter”
+  after IP Helper had already found a connected physical Ethernet interface.
+
+## [1.0.4] - 2026-07-31
+
+- Match UU's complete physical-Ethernet filter in the Win64 Wake-on-LAN
+  compatibility hook, including 802.3 media, hardware connector, access, and
+  connection fields returned by `GetIfTable2`.
+- Record real IP Helper API call and patch counts in `--diagnose`, so a loaded
+  hook can be distinguished from a WOL mapping that UU actually consumed.
+- Extend the Wine integration probe to enforce the same adapter criteria found
+  in UU's production `GetEthernetInterface` routine.
+
+## [1.0.3] - 2026-07-31
+
+- Complete the synthetic Win32 Ethernet adapter with a stable name,
+  description, IPv4 prefix, subnet mask, and default gateway. This matches
+  UU's real startup filter instead of only the basic IP Helper probe.
+- Detect long Wine process names through CSV task output, eliminating the
+  false “input injector failed to start” warning.
+- Make migration process cleanup race-safe and make receive-directory
+  diagnostics independent of an outer filesystem sandbox.
+
+## [1.0.2] - 2026-07-31
+
+- Preload the Win64 input/WOL hook as a static dependency of the Event Log
+  compatibility DLL, before `GameViewerServer.exe` executes its first
+  instruction. This removes the service-start injection race and makes UU see
+  the mapped physical Ethernet adapter during its initial WOL capability scan.
+- Stop stale autostart, sleep, update, keyboard, input, and tray helpers from
+  the previous project identity even after their data directories have already
+  been migrated. This releases inherited Linux sleep inhibitor locks.
+
+## [1.0.1] - 2026-07-31
+
+- Made the native sleep inhibitor follow `setting.ini` directly, so disabling
+  “Prevent computer sleep” releases the Linux inhibitor even when UU omits its
+  periodic state log.
+- Added process-local Win64 IP Helper API mapping for Wake-on-LAN. UU now sees
+  the physical Linux Ethernet MAC and gateway while retaining a Clash TUN
+  source address used by the active Windows-side route.
+- Added diagnostics for the WOL network mapping, drag-and-drop overlay,
+  writable mobile-file receive directory, and native close-to-tray takeover.
+- Added creation and permission validation for the mobile-file receive
+  directory during every compatibility repair.
+
 ## [1.0.0] - 2026-07-31
 
 - Renamed every project-owned command, runtime directory, helper, artifact,

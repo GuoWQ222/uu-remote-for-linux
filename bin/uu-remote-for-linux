@@ -41,10 +41,12 @@ readonly decoder_selector="$runtime_dir/uu-remote-decoder-selector"
 readonly tray_proxy="${UU_REMOTE_TRAY_PROXY_BIN:-$runtime_dir/uu-remote-tray-proxy}"
 readonly autostart_bridge="$runtime_dir/uu-remote-autostart-bridge"
 readonly sleep_bridge="$runtime_dir/uu-remote-sleep-bridge"
+readonly system_proxy_bridge="${UU_REMOTE_SYSTEM_PROXY_BRIDGE_BIN:-$runtime_dir/uu-remote-system-proxy-bridge}"
 readonly keyboard_bridge="$runtime_dir/uu-remote-keyboard-bridge"
 readonly input_bridge="$runtime_dir/uu-remote-input-bridge"
 readonly input_hook_source="$runtime_dir/uu-remote-input-hook.dll"
 readonly input_injector_source="$runtime_dir/uu-remote-input-injector.exe"
+readonly powershell_bridge_source="$runtime_dir/uu-remote-powershell-bridge.exe"
 readonly wol_bridge="$runtime_dir/uu-remote-wol-bridge"
 readonly wol_configure="$runtime_dir/uu-remote-wol-configure"
 readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
@@ -71,10 +73,53 @@ migrate_legacy_path() {
         "$source" "$target" >&2
 }
 
+cleanup_legacy_background_processes() {
+    local proc pid cmdline proc_uid current_uid
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop \
+            "$legacy_app_id-client.service" \
+            "$legacy_app_id-server.service" \
+            "$legacy_app_id-healthd.service" \
+            "$legacy_app_id-update.service" \
+            "$legacy_app_id-autostart.service" \
+            "$legacy_app_id-sleep.service" \
+            "$legacy_app_id-keyboard.service" \
+            "$legacy_app_id-input.service" \
+            "$legacy_app_id-input-injector.service" \
+            "$legacy_app_id-tray.service" \
+            "$legacy_app_id-tray-exit.service" >/dev/null 2>&1 || true
+    fi
+
+    current_uid=$(id -u)
+    for proc in /proc/[0-9]*; do
+        [[ -r $proc/status && -r $proc/cmdline ]] || continue
+        pid=${proc##*/}
+        [[ $pid != $$ && $pid != $PPID ]] || continue
+        proc_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "$proc/status" 2>/dev/null | head -n1)
+        [[ $proc_uid == "$current_uid" ]] || continue
+        cmdline=$(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)
+        [[ $cmdline == *"$legacy_app_id"* ]] || continue
+        case "$cmdline" in
+            *uuyc-autostart-bridge*|\
+            *uuyc-sleep-bridge*|\
+            *uuyc-update-bridge*|\
+            *uuyc-keyboard-bridge*|\
+            *uuyc-input-bridge*|\
+            *uuyc-tray-proxy*|\
+            *"systemd-inhibit "*"--who=$legacy_app_id"*)
+                kill "$pid" >/dev/null 2>&1 || true
+                ;;
+        esac
+    done
+}
+
 migrate_legacy_user_state() {
     local legacy_prefix migration_wineserver
 
     [[ ${UU_REMOTE_DISABLE_LEGACY_MIGRATION:-0} != 1 ]] || return 0
+    cleanup_legacy_background_processes
     legacy_prefix="$data_home/$legacy_app_id/wineprefix"
     if [[ ! -e $data_home/$legacy_app_id &&
         ! -e $state_home/$legacy_app_id &&
@@ -83,18 +128,6 @@ migrate_legacy_user_state() {
         return 0
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user stop \
-            "$legacy_app_id-client.service" \
-            "$legacy_app_id-server.service" \
-            "$legacy_app_id-healthd.service" \
-            "$legacy_app_id-update.service" \
-            "$legacy_app_id-keyboard.service" \
-            "$legacy_app_id-input.service" \
-            "$legacy_app_id-input-injector.service" \
-            "$legacy_app_id-tray.service" \
-            "$legacy_app_id-tray-exit.service" >/dev/null 2>&1 || true
-    fi
     migration_wineserver=${UU_REMOTE_WINESERVER_BIN:-wineserver}
     if [[ -f $legacy_prefix/system.reg ]] &&
         command -v "$migration_wineserver" >/dev/null 2>&1; then
@@ -157,6 +190,8 @@ readonly autostart_interval="${UU_REMOTE_AUTOSTART_BRIDGE_INTERVAL:-2}"
 readonly sleep_bridge_log="$state_dir/sleep-bridge.log"
 readonly sleep_bridge_lock="$state_dir/sleep-bridge.lock"
 readonly sleep_bridge_interval="${UU_REMOTE_SLEEP_BRIDGE_INTERVAL:-2}"
+readonly system_proxy_bridge_log="$state_dir/system-proxy-bridge.log"
+readonly system_proxy_bridge_status="$state_dir/system-proxy-bridge-status.json"
 readonly keyboard_bridge_log="$state_dir/keyboard-bridge.log"
 readonly keyboard_bridge_lock="$state_dir/keyboard-bridge.lock"
 readonly keyboard_bridge_status="$state_dir/keyboard-bridge-status.json"
@@ -166,8 +201,14 @@ readonly input_bridge_lock="$state_dir/input-bridge.lock"
 readonly input_bridge_status="$state_dir/input-bridge-status.json"
 readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
 readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
+readonly input_hook_preload="$install_dir/bin/uu-remote-input-hook.dll"
 readonly input_injector="$prefix/drive_c/uu-remote-input-injector.exe"
+readonly powershell_bridge="$install_dir/bin/powershell.exe"
+readonly powershell_bridge_client="$install_dir/powershell.exe"
 readonly input_bridge_endpoint="$prefix/drive_c/uu-remote-input-bridge.endpoint"
+readonly wol_hook_config="$prefix/drive_c/uu-remote-wol-bridge.ini"
+readonly wol_hook_status="$prefix/drive_c/uu-remote-wol-hook-status.ini"
+readonly powershell_bridge_status="$prefix/drive_c/uu-remote-wol-powershell-status.ini"
 readonly input_hook_windows='C:\uu-remote-input-hook.dll'
 current_user=$(id -un)
 readonly current_user
@@ -181,6 +222,7 @@ readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
 readonly update_original_archive="$data_dir/update-originals"
 readonly update_rollback_dir="$cache_dir/update-rollback"
 readonly client_log_dir="$install_dir/log/client/Log"
+readonly mobile_download_dir="$install_dir/Download"
 readonly wol_enabled_stamp="$data_dir/wol-enabled"
 readonly wol_server_original_sha="${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
 readonly wol_server_patched_sha="${UU_REMOTE_WOL_SERVER_PATCHED_SHA:-886c0638717d80cc567f1e9fe05b0072065a6fd67d6d114446e44953cde2822a}"
@@ -753,8 +795,10 @@ shim_ready() {
 
 input_hook_files_ready() {
     [[ -r $input_hook_source && -r $input_injector_source &&
-        -f $input_hook && -f $input_injector ]] &&
+        -f $input_hook && -f $input_hook_preload &&
+        -f $input_injector ]] &&
         cmp -s "$input_hook_source" "$input_hook" &&
+        cmp -s "$input_hook_source" "$input_hook_preload" &&
         cmp -s "$input_injector_source" "$input_injector"
 }
 
@@ -1015,7 +1059,9 @@ uu_remote_prevent_sleep_state() {
         printf 'unknown\n'
         return
     }
-    "$sleep_bridge" state "$client_log_dir" 2>/dev/null || printf 'unknown\n'
+    UU_REMOTE_SLEEP_SETTING_FILE="$client_setting_file" \
+        "$sleep_bridge" state "$client_log_dir" 2>/dev/null ||
+        printf 'unknown\n'
 }
 
 uu_remote_prevent_sleep_label() {
@@ -1047,6 +1093,7 @@ start_sleep_bridge() {
         printf '警告：无法确定启动器绝对路径，防休眠兼容桥未运行。\n' >&2
         return
     }
+    UU_REMOTE_SLEEP_SETTING_FILE="$client_setting_file" \
     nohup "$sleep_bridge" watch \
         "$client_log_dir" \
         "$prefix" \
@@ -1646,9 +1693,159 @@ wol_patch_ready() {
             "$wol_server_patched_sha"
 }
 
+powershell_bridge_ready() {
+    [[ -r $powershell_bridge_source &&
+        -f $powershell_bridge &&
+        -f $powershell_bridge_client ]] &&
+        cmp -s "$powershell_bridge_source" "$powershell_bridge" &&
+        cmp -s "$powershell_bridge_source" "$powershell_bridge_client"
+}
+
 wol_detect_row() {
     [[ -x $wol_bridge ]] || return 1
     "$wol_bridge" detect 2>/dev/null
+}
+
+wol_native_ipv4() {
+    local interface=$1 address
+
+    while IFS= read -r address; do
+        address=${address%%/*}
+        [[ $address =~ ^[0-9]+([.][0-9]+){3}$ ]] || continue
+        printf '%s\n' "$address"
+        return
+    done < <(
+        ip -4 -o address show dev "$interface" scope global 2>/dev/null |
+            awk '{print $4}'
+    )
+    return 1
+}
+
+wol_reference_ipv4() {
+    local route_line
+
+    route_line=$(ip -4 route get 223.5.5.5 2>/dev/null | head -n1) ||
+        return 1
+    if [[ $route_line =~ [[:space:]]src[[:space:]]([0-9]+([.][0-9]+){3}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    return 1
+}
+
+write_wol_hook_config() {
+    local interface connection mac gateway nm_wol power_wakeup
+    local native_ip reference_ip temp
+
+    IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
+        < <(wol_detect_row) || return 1
+    native_ip=$(wol_native_ipv4 "$interface") || return 1
+    reference_ip=$(wol_reference_ipv4 || true)
+    [[ -n $reference_ip ]] || reference_ip=$native_ip
+    [[ $gateway =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
+    [[ $mac =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$ ]] || return 1
+
+    mkdir -p -- "${wol_hook_config%/*}"
+    temp=$(mktemp "${wol_hook_config%/*}/.uu-remote-wol.XXXXXX")
+    {
+        printf '[wol]\n'
+        printf 'enabled=1\n'
+        printf 'interface=%s\n' "$interface"
+        printf 'reference_ip=%s\n' "$reference_ip"
+        printf 'native_ip=%s\n' "$native_ip"
+        printf 'gateway=%s\n' "$gateway"
+        printf 'mac=%s\n' "$mac"
+        if [[ $nm_wol == magic ]]; then
+            printf 'native_magic=1\n'
+        else
+            printf 'native_magic=0\n'
+        fi
+        if [[ $power_wakeup == enabled ]]; then
+            printf 'native_power_wakeup=1\n'
+        else
+            printf 'native_power_wakeup=0\n'
+        fi
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f -- "$temp" "$wol_hook_config"
+}
+
+wol_hook_config_ready() {
+    [[ -r $wol_hook_config ]] &&
+        grep -Fqx 'enabled=1' "$wol_hook_config" &&
+        grep -Eq '^reference_ip=[0-9]+([.][0-9]+){3}$' "$wol_hook_config" &&
+        grep -Eq '^native_ip=[0-9]+([.][0-9]+){3}$' "$wol_hook_config" &&
+        grep -Eq '^gateway=[0-9]+([.][0-9]+){3}$' "$wol_hook_config" &&
+        grep -Eiq '^mac=[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$' \
+            "$wol_hook_config" &&
+        grep -Fqx 'native_magic=1' "$wol_hook_config" &&
+        grep -Fqx 'native_power_wakeup=1' "$wol_hook_config"
+}
+
+ini_section_value() {
+    local file=$1 section=$2 key=$3
+
+    awk -F= -v wanted_section="$section" -v wanted_key="$key" '
+        {
+            sub(/\r$/, "")
+        }
+        /^\[/ {
+            active = ($0 == "[" wanted_section "]")
+            next
+        }
+        active && $1 == wanted_key {
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$file" 2>/dev/null
+}
+
+wol_hook_runtime_label() {
+    local version addresses addresses_patched info info_patched
+    local if_table2 if_table2_patched
+
+    [[ -r $wol_hook_status ]] || {
+        printf '尚无进程实测状态'
+        return
+    }
+    version=$(ini_section_value "$wol_hook_status" hook version)
+    addresses=$(ini_section_value "$wol_hook_status" calls addresses)
+    addresses_patched=$(ini_section_value "$wol_hook_status" patched addresses)
+    info=$(ini_section_value "$wol_hook_status" calls info)
+    info_patched=$(ini_section_value "$wol_hook_status" patched info)
+    if_table2=$(ini_section_value "$wol_hook_status" calls if_table2)
+    if_table2_patched=$(ini_section_value "$wol_hook_status" patched if_table2)
+    if [[ -z $version || -z $addresses || -z $addresses_patched ||
+        -z $info || -z $info_patched || -z $if_table2 ||
+        -z $if_table2_patched ]]; then
+        printf '旧版状态（请重启 UU）'
+        return
+    fi
+    printf 'v%s，地址 %s/%s，旧接口 %s/%s，网卡表 %s/%s（修补/调用）' \
+        "$version" "$addresses_patched" "$addresses" \
+        "$info_patched" "$info" "$if_table2_patched" "$if_table2"
+}
+
+powershell_bridge_runtime_label() {
+    local version query result
+
+    powershell_bridge_ready || {
+        printf '未安装/不匹配'
+        return
+    }
+    [[ -r $powershell_bridge_status ]] || {
+        printf '已部署，尚未调用'
+        return
+    }
+    version=$(ini_section_value "$powershell_bridge_status" bridge version)
+    query=$(ini_section_value "$powershell_bridge_status" bridge last_query)
+    result=$(ini_section_value "$powershell_bridge_status" bridge last_result)
+    if [[ -z $version || -z $query || -z $result ]]; then
+        printf '状态文件不完整'
+        return
+    fi
+    printf 'v%s，最近 %s=%s' "$version" "$query" "$result"
 }
 
 wol_interface_label() {
@@ -1728,6 +1925,18 @@ configure_native_wol() {
     fi
 }
 
+deploy_wol_powershell_bridge() {
+    [[ -r $powershell_bridge_source ]] ||
+        die "缺少 Win64 WOL 电源属性兼容桥"
+    install -m 0644 "$powershell_bridge_source" "$powershell_bridge" ||
+        die "无法部署 UU WOL PowerShell 电源属性兼容桥"
+    install -m 0644 \
+        "$powershell_bridge_source" "$powershell_bridge_client" ||
+        die "无法部署 UU 客户端 WOL PowerShell 电源属性兼容桥"
+    powershell_bridge_ready ||
+        die "UU WOL PowerShell 电源属性兼容桥部署后核验失败"
+}
+
 deploy_wol_bridge() {
     local interface connection mac gateway nm_wol power_wakeup
 
@@ -1739,6 +1948,9 @@ deploy_wol_bridge() {
         "$wol_server_patched_sha" ||
         die "UU WOL 识别补丁部署失败；Linux 网卡设置已保留"
     wol_patch_ready || die "UU WOL 识别补丁写入后核验失败"
+    write_wol_hook_config ||
+        die "无法生成 UU WOL 物理网卡映射；识别补丁已保留"
+    deploy_wol_powershell_bridge
     IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
         < <(wol_detect_row)
     {
@@ -1760,7 +1972,105 @@ remove_wol_bridge() {
         "$wol_server_original_sha" \
         "$wol_server_patched_sha" ||
         die "UU WOL 原版文件恢复失败"
-    rm -f -- "$wol_enabled_stamp"
+    local installed_bridge
+
+    for installed_bridge in \
+        "$powershell_bridge" "$powershell_bridge_client"; do
+        [[ -f $installed_bridge ]] || continue
+        if [[ -r $powershell_bridge_source ]] &&
+            cmp -s "$powershell_bridge_source" "$installed_bridge"; then
+            rm -f -- "$installed_bridge"
+        else
+            printf '警告：%s 不是本项目文件，已保留。\n' \
+                "$installed_bridge" >&2
+        fi
+    done
+    rm -f -- \
+        "$wol_enabled_stamp" \
+        "$wol_hook_config" \
+        "$powershell_bridge_status"
+}
+
+latest_client_log_file() {
+    local entry latest=""
+
+    [[ -d $client_log_dir ]] || return 1
+    while IFS= read -r entry; do
+        latest=${entry#* }
+        break
+    done < <(
+        find "$client_log_dir" -maxdepth 1 -type f -name 'log_*.txt' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr
+    )
+    [[ -n $latest ]] || return 1
+    printf '%s\n' "$latest"
+}
+
+drag_overlay_status_label() {
+    local latest
+
+    latest=$(latest_client_log_file) || {
+        printf '就绪（尚无远控会话记录）'
+        return
+    }
+    if grep -Eq \
+        'RegisterDragDrop failed|DragDropOverlay.*(failed|error)' \
+        "$latest" 2>/dev/null; then
+        printf '异常（最近一次初始化失败）'
+    elif grep -Fq 'DragDropOverlay prepared' "$latest" 2>/dev/null; then
+        printf '最近一次远控初始化成功'
+    else
+        printf '就绪（最近一次会话未触发）'
+    fi
+}
+
+system_proxy_bridge_label() {
+    if [[ ! -x $system_proxy_bridge ]]; then
+        printf '缺失'
+        return
+    fi
+    "$system_proxy_bridge" describe "$system_proxy_bridge_status" 2>/dev/null ||
+        printf '检测失败（详见日志）'
+}
+
+sync_linux_system_proxy() {
+    [[ ${UU_REMOTE_DISABLE_SYSTEM_PROXY_BRIDGE:-0} != 1 ]] || return 0
+    [[ -x $system_proxy_bridge ]] || return 1
+    "$system_proxy_bridge" sync \
+        "$prefix" \
+        "$wine" \
+        "$system_proxy_bridge_status" \
+        "$system_proxy_bridge_log" \
+        >>"$system_proxy_bridge_log" 2>&1
+}
+
+mobile_download_status_label() {
+    if path_writable_for_current_user "$mobile_download_dir"; then
+        printf '可用（%s）' "$mobile_download_dir"
+    elif [[ -e $mobile_download_dir ]]; then
+        printf '不可写（%s）' "$mobile_download_dir"
+    else
+        printf '缺失（%s）' "$mobile_download_dir"
+    fi
+}
+
+path_writable_for_current_user() {
+    local path=$1 mode owner group current_uid current_group
+
+    [[ -d $path ]] || return 1
+    [[ -w $path ]] && return 0
+    read -r mode owner group < <(stat -Lc '%a %u %g' "$path" 2>/dev/null) ||
+        return 1
+    current_uid=$(id -u)
+    if [[ $owner == "$current_uid" ]] && (( (8#$mode & 0200) != 0 )); then
+        return 0
+    fi
+    if (( (8#$mode & 0020) != 0 )); then
+        for current_group in $(id -G); do
+            [[ $group == "$current_group" ]] && return 0
+        done
+    fi
+    (( (8#$mode & 0002) != 0 ))
 }
 
 print_diagnostics() {
@@ -1806,6 +2116,8 @@ print_diagnostics() {
         "客户端文件" "$(app_files_present && printf '完整' || printf '缺失')" \
         "WebView2" "$(webview_ready && printf '就绪' || printf '未就绪/未安装')" \
         "兼容 DLL" "$(shim_ready && printf '就绪' || printf '未安装/不匹配')" \
+        "Linux 系统代理" "$(system_proxy_bridge_label)" \
+        "系统代理桥日志" "$system_proxy_bridge_log" \
         "Linux 原生托盘" "$(tray_proxy_status_label)" \
         "原生托盘日志" "$tray_proxy_log" \
         "远控键盘桥" "$(keyboard_bridge_status_label)" \
@@ -1827,6 +2139,9 @@ print_diagnostics() {
         "安全更新状态" "$(update_status_label)" \
         "自动更新兼容桥" "$(update_runtime_label)" \
         "官方更新器保护" "$(update_blocker_ready && printf '完整' || printf '未安装/不匹配')" \
+        "拖拽发送浮窗" "$(drag_overlay_status_label)" \
+        "移动文件接收目录" "$(mobile_download_status_label)" \
+        "关闭到托盘接管" "$(tray_proxy_status_label)" \
         "UU 后台进程托管" "$(runtime_supervisor_label)" \
         "WOL 有线网卡" "$(wol_interface_label)" \
         "Linux WOL 状态" "$(wol_native_label)" \
@@ -1834,6 +2149,9 @@ print_diagnostics() {
         "UU 远程开机开关" "$(wol_cloud_label)" \
         "UU WOL 兼容桥" "$(wol_enabled && printf '已启用' || printf '未启用')" \
         "UU WOL 识别补丁" "$(wol_patch_ready && printf '完整' || printf '未安装/不匹配')" \
+        "WOL Win32 网卡映射" "$(wol_hook_config_ready && printf '完整' || printf '未生成/不匹配')" \
+        "WOL 电源属性桥" "$(powershell_bridge_runtime_label)" \
+        "WOL 进程实测" "$(wol_hook_runtime_label)" \
         "硬解桥运行库" "$(hwdecode_runtime_ready && printf '完整' || printf '缺失')" \
         "硬解桥开关" "$(hwdecode_enabled && printf '已启用' || printf '未启用')" \
         "硬解桥注入" "$(hwdecode_files_deployed && printf '完整' || printf '未安装/不匹配')" \
@@ -1884,6 +2202,8 @@ check_base_requirements
     die "缺少自启动兼容桥：$autostart_bridge。请重新安装本项目"
 [[ -x $sleep_bridge ]] ||
     die "缺少防休眠兼容桥：$sleep_bridge。请重新安装本项目"
+[[ -x $system_proxy_bridge ]] ||
+    die "缺少 Linux 系统代理兼容桥：$system_proxy_bridge。请重新安装本项目"
 [[ -x $keyboard_bridge ]] ||
     die "缺少 X11 远控键盘桥：$keyboard_bridge。请重新安装本项目"
 [[ -x $input_bridge && -r $input_hook_source &&
@@ -1891,6 +2211,8 @@ check_base_requirements
     die "缺少 X11 原生输入桥或 Win64 输入钩子。请重新安装本项目"
 [[ -x $wol_bridge && -x $wol_configure ]] ||
     die "缺少远程开机兼容桥：$wol_bridge。请重新安装本项目"
+[[ -r $powershell_bridge_source ]] ||
+    die "缺少 Win64 WOL 电源属性兼容桥：$powershell_bridge_source。请重新安装本项目"
 [[ -x $update_bridge && -r $update_blocker_source &&
     -r $update_compatibility_profiles ]] ||
     die "缺少自动更新兼容桥或兼容档案。请重新安装本项目"
@@ -1911,7 +2233,7 @@ fi
 
 export WINEPREFIX="$prefix"
 export WINEDEBUG="${WINEDEBUG:--all}"
-export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}wevtapi=n,b;winemenubuilder.exe=d"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}wevtapi=n;winemenubuilder.exe=d"
 unset WINEARCH
 unset WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 unset WEBVIEW2_BROWSER_EXECUTABLE_FOLDER
@@ -2353,6 +2675,8 @@ deploy_input_hook() {
         die "缺少 Win64 输入钩子或注入监视器"
     install -m 0644 "$input_hook_source" "$input_hook" ||
         die "无法把 Win64 输入钩子部署到独立 Wine 前缀"
+    install -m 0644 "$input_hook_source" "$input_hook_preload" ||
+        die "无法把 Win64 输入钩子部署到服务端预加载目录"
     install -m 0644 "$input_injector_source" "$input_injector" ||
         die "无法把 Win64 输入注入监视器部署到独立 Wine 前缀"
     input_hook_ready || die "Win64 输入钩子部署后核验失败"
@@ -2361,6 +2685,10 @@ deploy_input_hook() {
 configure_compatibility() {
     local attempt webview_version=""
 
+    mkdir -p -- "$mobile_download_dir" ||
+        die "无法创建移动设备文件接收目录：$mobile_download_dir"
+    [[ -w $mobile_download_dir ]] ||
+        die "移动设备文件接收目录不可写：$mobile_download_dir"
     install -m 0644 "$shim_source" "$native_wevtapi" ||
         die "无法安装 Event Log 兼容 DLL"
     deploy_update_blocker
@@ -2421,6 +2749,12 @@ prefix_needs_configuration() {
     webview_ready || return 0
     shim_ready || return 0
     update_blocker_ready || return 0
+    if wol_enabled; then
+        wol_patch_ready || return 0
+        wol_hook_config_ready || return 0
+        powershell_bridge_ready || return 0
+    fi
+    [[ -d $mobile_download_dir && -w $mobile_download_dir ]] || return 0
     [[ -r $package_stamp && $(<"$package_stamp") == "$package_version" ]] || return 0
     return 1
 }
@@ -2474,7 +2808,9 @@ restore_update_snapshot() {
         hwdecode_files_deployed || return 1
     fi
     if wol_enabled; then
-        wol_patch_ready || return 1
+        wol_patch_ready &&
+            wol_hook_config_ready &&
+            powershell_bridge_ready || return 1
     fi
     printf '失败版本已保留用于排错：%s\n' "$failed_dir" >&2
 }
@@ -2526,6 +2862,9 @@ run_supported_update_transaction() {
                 "$wol_server_original_sha" \
                 "$wol_server_patched_sha" ||
                 die "更新后 WOL 兼容补丁无法部署"
+            write_wol_hook_config ||
+                die "更新后 WOL 物理网卡映射无法生成"
+            deploy_wol_powershell_bridge
         fi
         apply_decoder_selection
 
@@ -2541,6 +2880,10 @@ run_supported_update_transaction() {
         fi
         if wol_enabled; then
             wol_patch_ready || die "更新后 WOL 兼容补丁核验失败"
+            wol_hook_config_ready ||
+                die "更新后 WOL 物理网卡映射核验失败"
+            powershell_bridge_ready ||
+                die "更新后 WOL 电源属性兼容桥核验失败"
         fi
     ); then
         rm -f -- "$snapshot"
@@ -2699,9 +3042,17 @@ if wol_enabled; then
         die "远程开机兼容桥已启用，但 UU 服务端文件版本不受支持"
     wol_patch_ready ||
         die "远程开机兼容桥已启用，但识别补丁缺失或不匹配"
+    write_wol_hook_config ||
+        die "远程开机兼容桥已启用，但无法映射 Linux 物理网卡"
+    deploy_wol_powershell_bridge
 fi
 
 apply_decoder_selection
+
+if ! sync_linux_system_proxy; then
+    printf '警告：Linux 系统代理未能同步到 Wine，详见 %s\n' \
+        "$system_proxy_bridge_log" >&2
+fi
 
 if ! sync_autostart_once; then
     printf '警告：UU 自启动设置未能同步到 Linux，详见 %s\n' \
@@ -2726,7 +3077,10 @@ app_files_present ||
 service_running() {
     local output line
 
-    output=$("$wine" sc query "$service_name" 9>&- 2>/dev/null) || return 1
+    output=$(env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" sc query "$service_name" 9>&- 2>/dev/null) || return 1
     while IFS= read -r line; do
         line=${line%$'\r'}
         if [[ $line =~ ^[[:space:]]*STATE[[:space:]]*:[[:space:]]*4[[:space:]]+RUNNING[[:space:]]*$ ]]; then
@@ -2739,7 +3093,10 @@ service_running() {
 ensure_service_running() {
     local attempt
 
-    run_logged "$wine" sc start "$service_name" || true
+    run_logged env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" sc start "$service_name" || true
     for ((attempt = 0; attempt < 150; attempt++)); do
         service_running && return
         sleep 0.2
@@ -2751,7 +3108,11 @@ wine_image_running() {
     local executable=$1 image output
 
     image=${executable##*/}
-    output=$("$wine" tasklist /FI "IMAGENAME eq $image" 9>&- 2>/dev/null) ||
+    output=$(env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" tasklist /NH /FO CSV \
+            /FI "IMAGENAME eq $image" 9>&- 2>/dev/null) ||
         return 1
     [[ $output == *"$image"* ]]
 }
@@ -2783,13 +3144,17 @@ start_systemd_wine_image() {
     )
     for variable in \
         WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL UU_REMOTE_CUDA_DEVICE \
-        DISPLAY WAYLAND_DISPLAY XAUTHORITY \
-        http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+        DISPLAY WAYLAND_DISPLAY XAUTHORITY; do
         if [[ -v $variable ]]; then
             command+=("--setenv=$variable=${!variable}")
         fi
     done
-    command+=("$wine_path" "$executable" "$@")
+    command+=(
+        env
+        -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy -u no_proxy
+        -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY -u NO_PROXY
+        "$wine_path" "$executable" "$@"
+    )
     "${command[@]}" 9>&-
 }
 
@@ -2811,7 +3176,11 @@ ensure_wine_image_running() {
         if ! $launched; then
             (
                 cd "$install_dir/bin"
-                nohup "$wine" "$executable" "$@" 9>&- </dev/null \
+                nohup env \
+                    -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+                    -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+                    -u ALL_PROXY -u NO_PROXY \
+                    "$wine" "$executable" "$@" 9>&- </dev/null \
                     >>"$runtime_log" 2>&1 &
             )
         fi
@@ -2851,9 +3220,6 @@ wait_input_hook_active() {
 start_input_bridge ||
     printf '警告：被控端原生键鼠输入不可用，详见 %s\n' \
         "$input_bridge_log" >&2
-start_input_injector ||
-    printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
-        "$runtime_log" >&2
 ensure_service_running ||
     die "$service_name 未进入 RUNNING 状态，详见 $setup_log"
 ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
@@ -2863,6 +3229,9 @@ ensure_wine_image_running "$server_runtime_unit" "$server" ||
 wait_input_hook_active ||
     printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
         "$input_bridge_log" >&2
+start_input_injector ||
+    printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
+        "$runtime_log" >&2
 
 sleep 1
 cd "$install_dir"
@@ -2875,14 +3244,26 @@ start_keyboard_bridge ||
 start_tray_proxy ||
     die "Linux 原生托盘代理启动失败，详见 $tray_proxy_log"
 if $uri_requested; then
-    exec "$wine" start "$uri"
+    exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" start "$uri"
 fi
 if $restart_selected_decoder; then
-    exec "$wine" "$client"
+    exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" "$client"
 fi
 if $select_decoder_restart_requested; then
-    nohup "$wine" "$client" "${client_args[@]}" 9>&- </dev/null \
+    nohup env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" "$client" "${client_args[@]}" 9>&- </dev/null \
         >>"$runtime_log" 2>&1 &
     exit 0
 fi
-exec "$wine" "$client" "${client_args[@]}"
+exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+    -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+    -u ALL_PROXY -u NO_PROXY \
+    "$wine" "$client" "${client_args[@]}"

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${UU_REMOTE_SYSTEM_PROXY_GSETTINGS_ROOT:?}
+[[ ${1:-} == get && -n ${2:-} && -n ${3:-} ]] || exit 2
+
+case "$2:$3" in
+    org.gnome.system.proxy:mode)
+        key=mode
+        ;;
+    org.gnome.system.proxy:use-same-proxy)
+        key=use-same-proxy
+        ;;
+    org.gnome.system.proxy:ignore-hosts)
+        key=ignore-hosts
+        ;;
+    org.gnome.system.proxy:autoconfig-url)
+        key=autoconfig-url
+        ;;
+    org.gnome.system.proxy.http:host)
+        key=http-host
+        ;;
+    org.gnome.system.proxy.http:port)
+        key=http-port
+        ;;
+    org.gnome.system.proxy.https:host)
+        key=https-host
+        ;;
+    org.gnome.system.proxy.https:port)
+        key=https-port
+        ;;
+    org.gnome.system.proxy.ftp:host)
+        key=ftp-host
+        ;;
+    org.gnome.system.proxy.ftp:port)
+        key=ftp-port
+        ;;
+    org.gnome.system.proxy.socks:host)
+        key=socks-host
+        ;;
+    org.gnome.system.proxy.socks:port)
+        key=socks-port
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+
+cat "$root/$key"

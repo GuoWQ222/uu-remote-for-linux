@@ -30,6 +30,7 @@ readonly previous_scalable_icon_target="$user_prefix/share/icons/hicolor/scalabl
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
@@ -38,7 +39,8 @@ readonly previous_scalable_icon_target="$user_prefix/share/icons/hicolor/scalabl
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
-    -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" ]] || {
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
     exit 1
 }
@@ -58,6 +60,9 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridg
     "$runtime_target/uu-remote-autostart-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" \
     "$runtime_target/uu-remote-sleep-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge" \
+    "$runtime_target/uu-remote-system-proxy-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" \
     "$runtime_target/uu-remote-wol-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" \
@@ -72,6 +77,8 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
     "$runtime_target/uu-remote-input-hook.dll"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
     "$runtime_target/uu-remote-input-injector.exe"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" \
+    "$runtime_target/uu-remote-powershell-bridge.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" \
     "$runtime_target/uu-remote-update-blocker.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \

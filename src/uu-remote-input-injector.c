@@ -17,8 +17,9 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define INJECTOR_VERSION 1u
+#define INJECTOR_VERSION 2u
 #define WATCH_INTERVAL_MS 500u
+#define PRELOAD_MODULE_WAIT_MS 10000u
 
 static DWORD find_process(const WCHAR *image_name) {
     HANDLE snapshot;
@@ -86,7 +87,11 @@ static BOOL remote_module_info(
     return found;
 }
 
-static BOOL initialize_remote_hook(DWORD pid, const WCHAR *dll_path) {
+static BOOL initialize_remote_hook(
+    DWORD pid,
+    const WCHAR *dll_path,
+    BOOL preloaded
+) {
     uintptr_t remote_hook;
     HMODULE local_hook = NULL;
     FARPROC local_initialize;
@@ -128,7 +133,13 @@ static BOOL initialize_remote_hook(DWORD pid, const WCHAR *dll_path) {
         goto cleanup;
     }
     thread = CreateRemoteThread(
-        process, NULL, 0, remote_initialize, NULL, 0, NULL
+        process,
+        NULL,
+        0,
+        remote_initialize,
+        preloaded ? (LPVOID)(uintptr_t)1u : NULL,
+        0,
+        NULL
     );
     if (!thread) {
         goto cleanup;
@@ -156,7 +167,11 @@ cleanup:
     return success;
 }
 
-static BOOL inject_library(DWORD pid, const WCHAR *dll_path) {
+static BOOL inject_library(
+    DWORD pid,
+    const WCHAR *dll_path,
+    BOOL preloaded
+) {
     HANDLE process = NULL;
     HANDLE thread = NULL;
     void *remote_path = NULL;
@@ -170,7 +185,7 @@ static BOOL inject_library(DWORD pid, const WCHAR *dll_path) {
     BOOL success = FALSE;
 
     if (remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)) {
-        return initialize_remote_hook(pid, dll_path);
+        return initialize_remote_hook(pid, dll_path, preloaded);
     }
     if (!remote_module_info(pid, L"kernel32.dll", &remote_kernel32)) {
         SetLastError(ERROR_MOD_NOT_FOUND);
@@ -239,7 +254,7 @@ static BOOL inject_library(DWORD pid, const WCHAR *dll_path) {
         goto cleanup;
     }
     success = remote_module_info(pid, L"uu-remote-input-hook.dll", NULL) &&
-        initialize_remote_hook(pid, dll_path);
+        initialize_remote_hook(pid, dll_path, preloaded);
     if (!success) {
         SetLastError(ERROR_MOD_NOT_FOUND);
     }
@@ -263,7 +278,7 @@ static int inject_once(const WCHAR *image_name, const WCHAR *dll_path) {
         fwprintf(stderr, L"target-not-running image=%ls\n", image_name);
         return 2;
     }
-    if (!inject_library(pid, dll_path)) {
+    if (!inject_library(pid, dll_path, FALSE)) {
         fwprintf(
             stderr,
             L"inject-failed pid=%lu error=%lu\n",
@@ -279,25 +294,31 @@ static int inject_once(const WCHAR *image_name, const WCHAR *dll_path) {
 static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     DWORD last_pid = 0;
     BOOL last_injected = FALSE;
+    BOOL streamer_initialized = FALSE;
 
     for (;;) {
         DWORD pid = find_process(image_name);
         if (!pid) {
             last_pid = 0;
             last_injected = FALSE;
+            streamer_initialized = FALSE;
             Sleep(WATCH_INTERVAL_MS);
             continue;
         }
         if (pid != last_pid) {
             last_pid = pid;
             last_injected = FALSE;
+            streamer_initialized = FALSE;
         }
         if (
             !last_injected ||
             !remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)
         ) {
-            last_injected = inject_library(pid, dll_path);
+            last_injected = inject_library(pid, dll_path, FALSE);
             if (last_injected) {
+                streamer_initialized = remote_module_info(
+                    pid, L"streamer.dll", NULL
+                );
                 wprintf(L"injected pid=%lu\n", (unsigned long)pid);
                 fflush(stdout);
             } else {
@@ -310,9 +331,161 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                 fflush(stderr);
             }
         }
+        if (
+            last_injected &&
+            !streamer_initialized &&
+            remote_module_info(pid, L"streamer.dll", NULL)
+        ) {
+            streamer_initialized = initialize_remote_hook(
+                pid, dll_path, FALSE
+            );
+            if (streamer_initialized) {
+                wprintf(
+                    L"streamer-initialized pid=%lu\n",
+                    (unsigned long)pid
+                );
+                fflush(stdout);
+            }
+        }
         Sleep(WATCH_INTERVAL_MS);
     }
     return 0;
+}
+
+static int launch_suspended(
+    const WCHAR *dll_path,
+    const WCHAR *application_path,
+    BOOL wait_for_exit
+) {
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    DWORD exit_code = 1;
+    BOOL main_thread_resumed = FALSE;
+
+    ZeroMemory(&startup, sizeof(startup));
+    ZeroMemory(&process, sizeof(process));
+    startup.cb = sizeof(startup);
+    if (
+        !CreateProcessW(
+            application_path,
+            NULL,
+            NULL,
+            NULL,
+            FALSE,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            NULL,
+            NULL,
+            &startup,
+            &process
+        )
+    ) {
+        fwprintf(
+            stderr,
+            L"launch-failed application=%ls error=%lu\n",
+            application_path,
+            (unsigned long)GetLastError()
+        );
+        return 1;
+    }
+    if (!remote_module_info(process.dwProcessId, L"kernel32.dll", NULL)) {
+        /*
+         * Wine returns a suspended process before its PE loader has exposed
+         * imported modules through Toolhelp.  Let the new main thread advance
+         * through the loader and inject as soon as both kernel32 and iphlpapi
+         * become visible.  Do not suspend it again: a fixed-delay suspension
+         * can catch Wine while it owns the loader lock, which deadlocks the
+         * remote LoadLibrary thread and makes the hook appear only at process
+         * teardown.
+         */
+        DWORD waited = 0;
+
+        if (ResumeThread(process.hThread) == (DWORD)-1) {
+            TerminateProcess(process.hProcess, ERROR_DLL_INIT_FAILED);
+            WaitForSingleObject(process.hProcess, 10000);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            return 1;
+        }
+        main_thread_resumed = TRUE;
+        while (
+            waited < PRELOAD_MODULE_WAIT_MS &&
+            WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT &&
+            (
+                !remote_module_info(
+                    process.dwProcessId, L"kernel32.dll", NULL
+                ) ||
+                !remote_module_info(
+                    process.dwProcessId, L"iphlpapi.dll", NULL
+                )
+            )
+        ) {
+            Sleep(1);
+            ++waited;
+        }
+        if (
+            WaitForSingleObject(process.hProcess, 0) != WAIT_TIMEOUT ||
+            !remote_module_info(
+                process.dwProcessId, L"kernel32.dll", NULL
+            ) ||
+            !remote_module_info(
+                process.dwProcessId, L"iphlpapi.dll", NULL
+            )
+        ) {
+            fwprintf(
+                stderr,
+                L"preload-modules-timeout pid=%lu error=%lu\n",
+                (unsigned long)process.dwProcessId,
+                (unsigned long)GetLastError()
+            );
+            TerminateProcess(process.hProcess, ERROR_DLL_INIT_FAILED);
+            WaitForSingleObject(process.hProcess, 10000);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            return 1;
+        }
+    }
+    if (!inject_library(process.dwProcessId, dll_path, TRUE)) {
+        fwprintf(
+            stderr,
+            L"preload-failed pid=%lu error=%lu\n",
+            (unsigned long)process.dwProcessId,
+            (unsigned long)GetLastError()
+        );
+        TerminateProcess(process.hProcess, ERROR_DLL_INIT_FAILED);
+        WaitForSingleObject(process.hProcess, 10000);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 1;
+    }
+    if (
+        !main_thread_resumed &&
+        ResumeThread(process.hThread) == (DWORD)-1
+    ) {
+        fwprintf(
+            stderr,
+            L"resume-failed pid=%lu error=%lu\n",
+            (unsigned long)process.dwProcessId,
+            (unsigned long)GetLastError()
+        );
+        TerminateProcess(process.hProcess, ERROR_DLL_INIT_FAILED);
+        WaitForSingleObject(process.hProcess, 10000);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 1;
+    }
+    wprintf(L"preloaded pid=%lu\n", (unsigned long)process.dwProcessId);
+    fflush(stdout);
+    CloseHandle(process.hThread);
+    if (wait_for_exit) {
+        WaitForSingleObject(process.hProcess, INFINITE);
+        if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+            exit_code = 1;
+        }
+    } else {
+        exit_code = 0;
+    }
+    CloseHandle(process.hProcess);
+    return (int)exit_code;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputInjectorVersion(void) {
@@ -332,10 +505,24 @@ int wmain(int argument_count, WCHAR **arguments) {
     ) {
         return inject_once(arguments[2], arguments[3]);
     }
+    if (
+        argument_count == 4 &&
+        lstrcmpiW(arguments[1], L"--launch-and-wait") == 0
+    ) {
+        return launch_suspended(arguments[2], arguments[3], TRUE);
+    }
+    if (
+        argument_count == 4 &&
+        lstrcmpiW(arguments[1], L"--launch") == 0
+    ) {
+        return launch_suspended(arguments[2], arguments[3], FALSE);
+    }
     fwprintf(
         stderr,
         L"usage: uu-remote-input-injector.exe "
         L"(--watch|--once) IMAGE_NAME DLL_PATH\n"
+        L"       uu-remote-input-injector.exe "
+        L"(--launch|--launch-and-wait) DLL_PATH APPLICATION_PATH\n"
     );
     return 64;
 }

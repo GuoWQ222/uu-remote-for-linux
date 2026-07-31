@@ -14,6 +14,13 @@ set_last_error_and_fail:
 
 .globl DllMain
 DllMain:
+    cmpl $1, %edx
+    jne 1f
+    subq $40, %rsp
+    movl $1, %ecx
+    call UURemoteInputHookInitialize
+    addq $40, %rsp
+1:
     movl $1, %eax
     ret
 

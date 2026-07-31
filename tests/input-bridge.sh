@@ -69,7 +69,7 @@ def send(kind, sequence, payload, packet_token=token):
 
 # Rejected authentication attempt must never reach the fake XTest backend.
 send(2, 1, struct.pack("<iiIIIQ", 1, 1, 0, 1, 0, 0), b"\0" * 16)
-send(1, 2, struct.pack("<II", 4242, 3))
+send(1, 2, struct.pack("<II", 4242, 6))
 send(2, 3, struct.pack("<iiIIIQ", 32768, 32768, 0, 0x8001, 0, 0))
 send(2, 4, struct.pack("<iiIIIQ", 0, 0, 0, 0x0002, 0, 0))
 send(2, 5, struct.pack("<iiIIIQ", 0, 0, 0, 0x0004, 0, 0))
@@ -94,13 +94,13 @@ grep -q '^button 1 0$' "$trace"
 grep -q '^keycode 38 1$' "$trace"
 grep -q '^keycode 38 0$' "$trace"
 grep -q '"hook_pid": 4242' "$state_dir/input-bridge-status.json"
-grep -q '"hook_version": 3' "$state_dir/input-bridge-status.json"
+grep -q '"hook_version": 6' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_packets": 4' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_moves": 1' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_buttons": 3' "$state_dir/input-bridge-status.json"
 grep -q '"keyboard_packets": 2' "$state_dir/input-bridge-status.json"
 grep -q '"rejected": 1' "$state_dir/input-bridge-status.json"
-grep -q 'GameViewerServer 输入钩子已连接（PID 4242，v3）' "$log"
+grep -q 'GameViewerServer 输入钩子已连接（PID 4242，v6）' "$log"
 grep -q '安全释放 0 个按键和 1 个鼠标按钮（输入超时）' "$log"
 
 kill "$bridge_pid"

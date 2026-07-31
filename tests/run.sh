@@ -36,6 +36,9 @@ check "autostart bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
+check "system proxy bridge Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge"
 check "WOL bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 check "WOL root configurator syntax" bash -n \
@@ -52,12 +55,16 @@ check "zenity fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/zenity"
 check "keyboard gsettings fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/keyboard-gsettings"
+check "proxy gsettings fixture syntax" bash -n \
+    "$project_root/tests/fixtures/bin/proxy-gsettings"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \
     "$project_root/scripts/build-input-hook.sh"
+check "PowerShell bridge builder syntax" bash -n \
+    "$project_root/scripts/build-powershell-bridge.sh"
 check "user installer syntax" bash -n "$project_root/scripts/install-user.sh"
 check "shim builder syntax" bash -n "$project_root/scripts/build-wevtapi.sh"
 check "deb builder syntax" bash -n "$project_root/packaging/build-deb.sh"
@@ -84,7 +91,12 @@ check "mock Wine integration" "$project_root/tests/integration-mock.sh"
 check "native tray proxy" "$project_root/tests/tray-proxy.sh"
 check "autostart bridge integration" "$project_root/tests/autostart-bridge.sh"
 check "sleep bridge integration" "$project_root/tests/sleep-bridge.sh"
+check "system proxy bridge integration" \
+    "$project_root/tests/system-proxy-bridge.sh"
+check "Wine WinHTTP system proxy" \
+    "$project_root/tests/system-proxy-wine.sh"
 check "WOL bridge integration" "$project_root/tests/wol-bridge.sh"
+check "Wine WOL PowerShell bridge" "$project_root/tests/powershell-bridge.sh"
 check "update bridge integration" "$project_root/tests/update-bridge.sh"
 check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
@@ -102,6 +114,8 @@ check "autostart bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
+check "system proxy bridge exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge"
 check "WOL bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 check "WOL root configurator exists" test -x \
@@ -130,6 +144,10 @@ check "shim exports" bash -c \
     'objdump -p "$1" | grep -q "EvtOpenPublisherMetadata"' _ \
     "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 # shellcheck disable=SC2016
+check "shim preloads input hook" bash -c \
+    'objdump -p "$1" | grep -q "uu-remote-input-hook.dll"' _ \
+    "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
+# shellcheck disable=SC2016
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
@@ -143,6 +161,10 @@ check "input hook exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputHookVersion"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
+check "input hook exports WOL status" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteWolHookStatus"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input injector is Win64 PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
@@ -150,6 +172,10 @@ check "input injector is Win64 PE" bash -c \
 check "input injector exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputInjectorVersion"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
+# shellcheck disable=SC2016
+check "WOL PowerShell bridge is Win64 PE" bash -c \
+    'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "hardware bridge manifest" bash -c \
@@ -176,6 +202,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/build-nvdec-probe.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
+        "$project_root/scripts/build-powershell-bridge.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
         "$project_root/packaging/debian/postinst" \
@@ -183,11 +210,14 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/integration-mock.sh" \
         "$project_root/tests/autostart-bridge.sh" \
         "$project_root/tests/sleep-bridge.sh" \
+        "$project_root/tests/system-proxy-bridge.sh" \
+        "$project_root/tests/system-proxy-wine.sh" \
         "$project_root/tests/wol-bridge.sh" \
         "$project_root/tests/update-bridge.sh" \
         "$project_root/tests/keyboard-bridge.sh" \
         "$project_root/tests/input-bridge.sh" \
         "$project_root/tests/wine-input-hook.sh" \
+        "$project_root/tests/powershell-bridge.sh" \
         "$project_root/tests/run.sh" \
         "$project_root/tests/fixtures/bin/curl" \
         "$project_root/tests/fixtures/bin/autostart-wine" \
@@ -195,6 +225,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/fixtures/bin/uu-remote-tray-proxy" \
         "$project_root/tests/fixtures/bin/zenity" \
         "$project_root/tests/fixtures/bin/keyboard-gsettings" \
+        "$project_root/tests/fixtures/bin/proxy-gsettings" \
         "$project_root/tests/fixtures/bin/wine" \
         "$project_root/tests/fixtures/bin/wineboot" \
         "$project_root/tests/fixtures/bin/winecfg" \

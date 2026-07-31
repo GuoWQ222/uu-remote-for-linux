@@ -13,7 +13,7 @@
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
 - X11 会话下支持 Linux 作为被控端的原生鼠标、键盘和远端光标。
-- 支持自启动、防休眠、安全更新、文件传输与远程开机兼容桥。
+- 支持自启动、防休眠、安全更新、Linux 系统代理、文件传输与远程开机兼容桥。
 
 ## 系统要求
 
@@ -27,11 +27,11 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.0.0_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
-安装 1.0.0 时会替换旧的软件包标识。首次启动将把现有 Wine 前缀、登录
+安装 1.0.7 时会替换旧的软件包标识。首次启动将把现有 Wine 前缀、登录
 状态、设置、缓存、日志和自启动项迁移到新的 `uu-remote-for-linux`
 路径，不需要重新登录。
 

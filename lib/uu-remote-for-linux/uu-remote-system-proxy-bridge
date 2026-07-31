@@ -1,0 +1,669 @@
+#!/usr/bin/python3
+"""Synchronize the Linux desktop proxy with Wine Internet Settings.
+
+UU Remote asks WinHTTP for the Windows/IE system proxy.  Wine does not map
+GNOME or KDE proxy settings into that registry key, so the upstream
+"system proxy" option otherwise falls back to a direct connection.
+"""
+
+from __future__ import annotations
+
+import ast
+import configparser
+import dataclasses
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
+
+
+VERSION = 1
+REGISTRY_KEY = (
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+)
+REGISTRY_CONNECTIONS_KEY = REGISTRY_KEY + r"\Connections"
+PROXY_TYPE_DIRECT = 1
+PROXY_TYPE_PROXY = 2
+PROXY_USE_PAC_SCRIPT = 4
+PROXY_AUTODETECT_SETTINGS = 8
+PROXY_ENV_NAMES = (
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProxyEndpoint:
+    host: str
+    port: int
+
+    def registry_value(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
+
+
+@dataclasses.dataclass(frozen=True)
+class ProxyConfig:
+    mode: str
+    source: str
+    proxies: dict[str, ProxyEndpoint] = dataclasses.field(default_factory=dict)
+    bypass: tuple[str, ...] = ()
+    autoconfig_url: str = ""
+    autodetect: bool = False
+    authentication_required: bool = False
+
+    def proxy_server(self) -> str:
+        return ";".join(
+            f"{scheme}={endpoint.registry_value()}"
+            for scheme, endpoint in self.proxies.items()
+        )
+
+    def proxy_override(self) -> str:
+        return ";".join(self.bypass)
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "version": VERSION,
+            "mode": self.mode,
+            "source": self.source,
+            "proxy_server": self.proxy_server(),
+            "proxy_override": self.proxy_override(),
+            "autoconfig_url": self.autoconfig_url,
+            "autodetect": self.autodetect,
+            "authentication_required": self.authentication_required,
+        }
+
+
+def env_first(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def parse_gsettings_value(value: str):
+    value = value.strip()
+    try:
+        return ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return value.strip("'\"")
+
+
+def gsettings_get(schema: str, key: str):
+    binary = os.environ.get(
+        "UU_REMOTE_SYSTEM_PROXY_GSETTINGS_BIN", "gsettings"
+    )
+    try:
+        result = subprocess.run(
+            [binary, "get", schema, key],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_gsettings_value(result.stdout)
+
+
+def valid_port(value) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return port if 1 <= port <= 65535 else 0
+
+
+def endpoint_from_host_port(host, port) -> ProxyEndpoint | None:
+    host = str(host or "").strip().strip("[]")
+    port = valid_port(port)
+    if not host or not port or any(character.isspace() for character in host):
+        return None
+    return ProxyEndpoint(host=host, port=port)
+
+
+def endpoint_from_url(value: str) -> tuple[ProxyEndpoint | None, bool]:
+    value = value.strip()
+    if not value:
+        return None, False
+    candidate = value if "://" in value else f"http://{value}"
+    try:
+        parsed = urlsplit(candidate)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return None, False
+    if not port:
+        port = {
+            "http": 80,
+            "https": 443,
+            "socks": 1080,
+            "socks4": 1080,
+            "socks5": 1080,
+        }.get(parsed.scheme.lower(), 0)
+    endpoint = endpoint_from_host_port(host, port)
+    has_auth = parsed.username is not None or parsed.password is not None
+    return endpoint, has_auth
+
+
+def normalize_bypass(values) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raw_values = re.split(r"[,;]", values)
+    elif isinstance(values, (tuple, list)):
+        raw_values = [str(value) for value in values]
+    else:
+        raw_values = []
+
+    normalized: list[str] = []
+    needs_local = False
+    for raw in raw_values:
+        value = unquote(raw).strip()
+        if not value:
+            continue
+        if value in {"localhost", "127.0.0.1", "::1"}:
+            needs_local = True
+        value = value.lstrip(".") if value.startswith(".") else value
+        if value not in normalized:
+            normalized.append(value)
+    if needs_local and "<local>" not in normalized:
+        normalized.append("<local>")
+    return tuple(normalized)
+
+
+def detect_gnome() -> ProxyConfig | None:
+    mode = gsettings_get("org.gnome.system.proxy", "mode")
+    if mode not in {"none", "manual", "auto"}:
+        return None
+
+    if mode == "none":
+        return ProxyConfig(mode="none", source="gnome")
+
+    if mode == "auto":
+        url = str(
+            gsettings_get("org.gnome.system.proxy", "autoconfig-url") or ""
+        ).strip()
+        return ProxyConfig(
+            mode="auto",
+            source="gnome",
+            autoconfig_url=url,
+            autodetect=not bool(url),
+        )
+
+    proxies: dict[str, ProxyEndpoint] = {}
+    use_same = bool(
+        gsettings_get("org.gnome.system.proxy", "use-same-proxy")
+    )
+    http = endpoint_from_host_port(
+        gsettings_get("org.gnome.system.proxy.http", "host"),
+        gsettings_get("org.gnome.system.proxy.http", "port"),
+    )
+    if http:
+        proxies["http"] = http
+        if use_same:
+            proxies["https"] = http
+            proxies["ftp"] = http
+
+    if not use_same:
+        for scheme in ("https", "ftp"):
+            endpoint = endpoint_from_host_port(
+                gsettings_get(
+                    f"org.gnome.system.proxy.{scheme}", "host"
+                ),
+                gsettings_get(
+                    f"org.gnome.system.proxy.{scheme}", "port"
+                ),
+            )
+            if endpoint:
+                proxies[scheme] = endpoint
+
+    socks = endpoint_from_host_port(
+        gsettings_get("org.gnome.system.proxy.socks", "host"),
+        gsettings_get("org.gnome.system.proxy.socks", "port"),
+    )
+    if socks:
+        proxies["socks"] = socks
+
+    bypass = normalize_bypass(
+        gsettings_get("org.gnome.system.proxy", "ignore-hosts") or []
+    )
+    return ProxyConfig(
+        mode="manual" if proxies else "none",
+        source="gnome",
+        proxies=proxies,
+        bypass=bypass,
+    )
+
+
+def kde_config_path() -> Path:
+    override = os.environ.get("UU_REMOTE_SYSTEM_PROXY_KDE_CONFIG", "")
+    if override:
+        return Path(override)
+    config_home = Path(
+        os.environ.get(
+            "XDG_CONFIG_HOME", str(Path.home() / ".config")
+        )
+    )
+    return config_home / "kioslaverc"
+
+
+def detect_kde() -> ProxyConfig | None:
+    path = kde_config_path()
+    if not path.is_file():
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read(path, encoding="utf-8")
+        section = parser["Proxy Settings"]
+    except (OSError, KeyError, configparser.Error):
+        return None
+
+    lowered = {key.lower(): value for key, value in section.items()}
+    try:
+        proxy_type = int(lowered.get("proxytype", "0"))
+    except ValueError:
+        proxy_type = 0
+
+    if proxy_type == 0:
+        return ProxyConfig(mode="none", source="kde")
+    if proxy_type == 2:
+        script = lowered.get("proxy config script", "").strip()
+        return ProxyConfig(
+            mode="auto",
+            source="kde",
+            autoconfig_url=script,
+            autodetect=not bool(script),
+        )
+    if proxy_type == 3:
+        return ProxyConfig(mode="auto", source="kde", autodetect=True)
+    if proxy_type == 4:
+        return detect_environment(source="kde-environment")
+
+    proxies: dict[str, ProxyEndpoint] = {}
+    authenticated = False
+    for scheme, key in (
+        ("http", "httpproxy"),
+        ("https", "httpsproxy"),
+        ("ftp", "ftpproxy"),
+        ("socks", "socksproxy"),
+    ):
+        endpoint, has_auth = endpoint_from_url(lowered.get(key, ""))
+        if endpoint:
+            proxies[scheme] = endpoint
+        authenticated = authenticated or has_auth
+    return ProxyConfig(
+        mode="manual" if proxies else "none",
+        source="kde",
+        proxies=proxies,
+        bypass=normalize_bypass(lowered.get("noproxyfor", "")),
+        authentication_required=authenticated,
+    )
+
+
+def detect_environment(source: str = "environment") -> ProxyConfig:
+    proxies: dict[str, ProxyEndpoint] = {}
+    authenticated = False
+    for scheme, value in (
+        ("http", env_first("http_proxy", "HTTP_PROXY")),
+        ("https", env_first("https_proxy", "HTTPS_PROXY")),
+        ("ftp", env_first("ftp_proxy", "FTP_PROXY")),
+    ):
+        endpoint, has_auth = endpoint_from_url(value)
+        if endpoint:
+            proxies[scheme] = endpoint
+        authenticated = authenticated or has_auth
+
+    all_proxy = env_first("all_proxy", "ALL_PROXY")
+    endpoint, has_auth = endpoint_from_url(all_proxy)
+    if endpoint:
+        proxies["socks"] = endpoint
+    authenticated = authenticated or has_auth
+
+    return ProxyConfig(
+        mode="manual" if proxies else "none",
+        source=source,
+        proxies=proxies,
+        bypass=normalize_bypass(env_first("no_proxy", "NO_PROXY")),
+        authentication_required=authenticated,
+    )
+
+
+def detect_proxy() -> ProxyConfig:
+    forced = os.environ.get("UU_REMOTE_SYSTEM_PROXY_SOURCE", "").lower()
+    if forced == "none":
+        return ProxyConfig(mode="none", source="forced")
+    if forced == "environment":
+        return detect_environment()
+    if forced == "gnome":
+        return detect_gnome() or ProxyConfig(mode="none", source="gnome")
+    if forced == "kde":
+        return detect_kde() or ProxyConfig(mode="none", source="kde")
+
+    desktop = ":".join(
+        (
+            os.environ.get("XDG_CURRENT_DESKTOP", ""),
+            os.environ.get("DESKTOP_SESSION", ""),
+        )
+    ).lower()
+    if any(name in desktop for name in ("gnome", "ubuntu", "unity")):
+        detected = detect_gnome()
+        if detected:
+            return detected
+    if any(name in desktop for name in ("kde", "plasma")):
+        detected = detect_kde()
+        if detected:
+            return detected
+    return detect_environment()
+
+
+def wine_environment(prefix: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in PROXY_ENV_NAMES:
+        environment.pop(name, None)
+    environment["WINEPREFIX"] = str(prefix)
+    environment["WINEDEBUG"] = "-all"
+    return environment
+
+
+def wine_reg(
+    wine: str,
+    prefix: Path,
+    action: str,
+    name: str,
+    reg_type: str = "",
+    value: str = "",
+    *,
+    required: bool,
+    key: str = REGISTRY_KEY,
+) -> bool:
+    if action == "add":
+        command = [
+            wine,
+            "reg",
+            "add",
+            key,
+            "/v",
+            name,
+            "/t",
+            reg_type,
+            "/d",
+            value,
+            "/f",
+        ]
+    else:
+        command = [
+            wine,
+            "reg",
+            "delete",
+            key,
+            "/v",
+            name,
+            "/f",
+        ]
+    try:
+        result = subprocess.run(
+            command,
+            env=wine_environment(prefix),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        if required:
+            raise RuntimeError(f"无法运行 Wine 注册表命令：{error}") from error
+        return False
+    if required and result.returncode:
+        detail = result.stderr.strip()
+        raise RuntimeError(
+            f"Wine 注册表写入失败（{name}）：{detail or result.returncode}"
+        )
+    return result.returncode == 0
+
+
+def registry_add(
+    wine: str,
+    prefix: Path,
+    name: str,
+    reg_type: str,
+    value: str,
+    *,
+    key: str = REGISTRY_KEY,
+) -> None:
+    wine_reg(
+        wine,
+        prefix,
+        "add",
+        name,
+        reg_type,
+        value,
+        required=True,
+        key=key,
+    )
+
+
+def registry_delete(wine: str, prefix: Path, name: str) -> None:
+    wine_reg(wine, prefix, "delete", name, required=False)
+
+
+def connection_settings_blob(config: ProxyConfig) -> str:
+    flags = PROXY_TYPE_DIRECT
+    proxy = ""
+    bypass = ""
+    autoconfig_url = ""
+    if config.mode == "manual":
+        flags |= PROXY_TYPE_PROXY
+        proxy = config.proxy_server()
+        bypass = config.proxy_override()
+    elif config.mode == "auto":
+        if config.autoconfig_url:
+            flags |= PROXY_USE_PAC_SCRIPT
+            autoconfig_url = config.autoconfig_url
+        if config.autodetect:
+            flags |= PROXY_AUTODETECT_SETTINGS
+
+    fields: list[bytes] = []
+    for label, value in (
+        ("代理服务器", proxy),
+        ("代理绕过列表", bypass),
+        ("PAC URL", autoconfig_url),
+    ):
+        try:
+            fields.append(value.encode("ascii"))
+        except UnicodeEncodeError as error:
+            raise RuntimeError(f"{label}包含 Wine WinHTTP 不支持的非 ASCII 字符") from error
+
+    # Wine's WinHttpGetIEProxyConfigForCurrentUser reads only the
+    # Connections\\DefaultConnectionSettings binary blob.  The familiar
+    # ProxyEnable/ProxyServer values are used by WinINet but are not enough for
+    # this WinHTTP API.
+    blob = bytearray(struct.pack("<III", 0x46, 0, flags))
+    for field in fields:
+        blob.extend(struct.pack("<I", len(field)))
+        blob.extend(field)
+    return blob.hex()
+
+
+def apply_registry(config: ProxyConfig, wine: str, prefix: Path) -> None:
+    if not (prefix / "system.reg").is_file():
+        raise RuntimeError(f"Wine 前缀尚未创建：{prefix}")
+
+    registry_add(
+        wine,
+        prefix,
+        "DefaultConnectionSettings",
+        "REG_BINARY",
+        connection_settings_blob(config),
+        key=REGISTRY_CONNECTIONS_KEY,
+    )
+
+    if config.mode == "manual":
+        registry_add(wine, prefix, "ProxyEnable", "REG_DWORD", "1")
+        registry_add(
+            wine,
+            prefix,
+            "ProxyServer",
+            "REG_SZ",
+            config.proxy_server(),
+        )
+        if config.bypass:
+            registry_add(
+                wine,
+                prefix,
+                "ProxyOverride",
+                "REG_SZ",
+                config.proxy_override(),
+            )
+        else:
+            registry_delete(wine, prefix, "ProxyOverride")
+        registry_delete(wine, prefix, "AutoConfigURL")
+        registry_add(wine, prefix, "AutoDetect", "REG_DWORD", "0")
+        return
+
+    registry_add(wine, prefix, "ProxyEnable", "REG_DWORD", "0")
+    registry_delete(wine, prefix, "ProxyServer")
+    registry_delete(wine, prefix, "ProxyOverride")
+    if config.mode == "auto" and config.autoconfig_url:
+        registry_add(
+            wine,
+            prefix,
+            "AutoConfigURL",
+            "REG_SZ",
+            config.autoconfig_url,
+        )
+    else:
+        registry_delete(wine, prefix, "AutoConfigURL")
+    registry_add(
+        wine,
+        prefix,
+        "AutoDetect",
+        "REG_DWORD",
+        "1" if config.mode == "auto" and config.autodetect else "0",
+    )
+
+
+def atomic_json_write(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def append_log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def sync(prefix: Path, wine: str, status_path: Path, log_path: Path) -> None:
+    config = detect_proxy()
+    apply_registry(config, wine, prefix)
+    payload = config.public_dict()
+    fingerprint_source = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")
+    payload["fingerprint"] = hashlib.sha256(fingerprint_source).hexdigest()
+    payload["synced_at"] = datetime.now(timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
+    atomic_json_write(status_path, payload)
+    detail = (
+        config.proxy_server()
+        or config.autoconfig_url
+        or ("WPAD" if config.autodetect else "direct")
+    )
+    append_log(log_path, f"同步完成：{config.source}/{config.mode} {detail}")
+
+
+def describe(status_path: Path | None = None) -> str:
+    config = detect_proxy()
+    detail = config.proxy_server() or config.autoconfig_url
+    if config.mode == "none":
+        label = f"无代理（{config.source}）"
+    elif config.mode == "auto":
+        label = f"自动/PAC {detail or 'WPAD'}（{config.source}）"
+    else:
+        label = f"{detail}（{config.source}）"
+    if config.authentication_required:
+        label += "，需在 UU 手动填写认证"
+
+    if status_path and status_path.is_file():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            expected = config.public_dict()
+            matches = all(status.get(key) == value for key, value in expected.items())
+            label += "，已同步" if matches else "，设置已变化，待下次启动同步"
+        except (OSError, ValueError, TypeError):
+            label += "，同步状态损坏"
+    elif status_path:
+        label += "，尚未同步"
+    return label
+
+
+def usage() -> None:
+    print(
+        "用法：uu-remote-system-proxy-bridge "
+        "detect | describe [状态文件] | "
+        "sync <Wine前缀> <wine命令> <状态文件> <日志文件>",
+        file=sys.stderr,
+    )
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        usage()
+        return 2
+    command = argv[0]
+    try:
+        if command == "detect" and len(argv) == 1:
+            print(
+                json.dumps(
+                    detect_proxy().public_dict(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if command == "describe" and len(argv) in {1, 2}:
+            print(describe(Path(argv[1])) if len(argv) == 2 else describe())
+            return 0
+        if command == "sync" and len(argv) == 5:
+            sync(Path(argv[1]), argv[2], Path(argv[3]), Path(argv[4]))
+            return 0
+    except Exception as error:
+        print(f"系统代理桥失败：{error}", file=sys.stderr)
+        return 1
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -24,6 +24,41 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.0.7" date="2026-07-31">
+      <description>
+        <p>Make UU's system-proxy setting consume GNOME, KDE, environment, PAC, and WPAD configuration through Wine without leaking proxy state into the other modes.</p>
+      </description>
+    </release>
+    <release version="1.0.6" date="2026-07-31">
+      <description>
+        <p>Make “Exit program” remove the native tray immediately by following UU's confirmed shutdown event instead of stale Wine wrapper processes.</p>
+      </description>
+    </release>
+    <release version="1.0.5" date="2026-07-31">
+      <description>
+        <p>Fix UU's guided Wake-on-LAN check under Wine with a native-state-gated PowerShell network power-property bridge.</p>
+      </description>
+    </release>
+    <release version="1.0.4" date="2026-07-31">
+      <description>
+        <p>Match UU's complete physical-Ethernet Wake-on-LAN filter and expose real IP Helper hook call and patch counts in diagnostics.</p>
+      </description>
+    </release>
+    <release version="1.0.3" date="2026-07-31">
+      <description>
+        <p>Complete the synthetic Wake-on-LAN adapter with the fields used by UU's real startup filter and remove false process and directory diagnostics.</p>
+      </description>
+    </release>
+    <release version="1.0.2" date="2026-07-31">
+      <description>
+        <p>Preload the Win64 input and Wake-on-LAN hook before server initialization, and clean up stale background helpers left by the previous project identity.</p>
+      </description>
+    </release>
+    <release version="1.0.1" date="2026-07-31">
+      <description>
+        <p>Make sleep inhibition follow the UU setting directly, map the native physical Ethernet adapter into UU's Win64 Wake-on-LAN checks, and add general-settings diagnostics.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-07-31">
       <description>
         <p>Adopt the uu-remote-for-linux identity across all project-owned commands, runtime paths, helpers, source files, desktop metadata, and Debian packaging, with automatic migration from the previous local installation.</p>

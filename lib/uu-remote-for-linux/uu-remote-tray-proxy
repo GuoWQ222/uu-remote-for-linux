@@ -26,6 +26,9 @@ APP_ID = "uu-remote-for-linux"
 TITLE = "网易 UU 远程"
 LEGACY_SCAN_INTERVAL_MS = 750
 CLIENT_MISSING_GRACE_TICKS = 8
+CLIENT_QUIT_MARKER = (
+    "GameViewerApplication::quitApplication] Quit application"
+)
 
 
 class XClassHint(ctypes.Structure):
@@ -288,6 +291,35 @@ def prefix_processes(prefix: str, executable: str) -> set[int]:
     return result
 
 
+def exit_on_close_enabled(prefix: str) -> bool:
+    """Return the effective UU CloseOption without modifying its settings."""
+
+    users_dir = Path(prefix) / "drive_c" / "users"
+    if not users_dir.is_dir():
+        return False
+    for setting_file in users_dir.glob(
+        "*/AppData/Local/GameViewer/setting.ini"
+    ):
+        try:
+            lines = setting_file.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        in_setting_center = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                in_setting_center = (
+                    line[1:-1].strip().casefold() == "settingcenter"
+                )
+                continue
+            if not in_setting_center or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip().casefold() == "closeoption":
+                return value.strip() == "1"
+    return False
+
+
 class TrayProxy:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -305,6 +337,70 @@ class TrayProxy:
         self.ever_saw_client = False
         self.client_missing_ticks = 0
         self.removed_icons = 0
+        self.client_log_path: Path | None = None
+        self.client_log_offset = 0
+        self.client_log_tail = ""
+        self.exit_in_progress = False
+
+    @property
+    def client_log_dir(self) -> Path:
+        return (
+            Path(self.prefix)
+            / "drive_c"
+            / "Program Files"
+            / "Netease"
+            / "GameViewer"
+            / "log"
+            / "client"
+            / "Log"
+        )
+
+    def latest_client_log(self) -> Path | None:
+        try:
+            candidates = list(self.client_log_dir.glob("log_*.txt"))
+            return max(
+                candidates,
+                key=lambda path: path.stat().st_mtime_ns,
+                default=None,
+            )
+        except OSError:
+            return None
+
+    def prime_client_quit_monitor(self) -> None:
+        latest = self.latest_client_log()
+        self.client_log_path = latest
+        self.client_log_tail = ""
+        if latest is None:
+            self.client_log_offset = 0
+            return
+        try:
+            self.client_log_offset = latest.stat().st_size
+        except OSError:
+            self.client_log_offset = 0
+
+    def consume_client_quit_event(self) -> bool:
+        latest = self.latest_client_log()
+        if latest is None:
+            return False
+        if latest != self.client_log_path:
+            self.client_log_path = latest
+            self.client_log_offset = 0
+            self.client_log_tail = ""
+        try:
+            size = latest.stat().st_size
+            if size < self.client_log_offset:
+                self.client_log_offset = 0
+                self.client_log_tail = ""
+            with latest.open("r", errors="replace") as log_handle:
+                log_handle.seek(self.client_log_offset)
+                appended = log_handle.read()
+                self.client_log_offset = log_handle.tell()
+        except OSError:
+            return False
+        text = self.client_log_tail + appended
+        keep = max(len(CLIENT_QUIT_MARKER) - 1, 0)
+        self.client_log_tail = text[-keep:] if keep else ""
+        return CLIENT_QUIT_MARKER in text
 
     def write_status(self, status: str, detail: str = "") -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -442,8 +538,11 @@ class TrayProxy:
             self.decoder_item.set_sensitive(True)
         return False
 
-    def exit_uu_remote(self, *_unused) -> None:
-        logging.info("请求退出 UU")
+    def request_full_exit(self, detail: str) -> None:
+        if self.exit_in_progress:
+            return
+        self.exit_in_progress = True
+        logging.info("请求退出 UU：%s", detail)
         if self.indicator is not None:
             self.indicator.set_status(
                 self.AppIndicator3.IndicatorStatus.PASSIVE
@@ -496,6 +595,7 @@ class TrayProxy:
                     logging.error(
                         "无法创建独立退出服务，保留托盘以便重试"
                     )
+                    self.exit_in_progress = False
                     self.indicator.set_status(
                         self.AppIndicator3.IndicatorStatus.ACTIVE
                     )
@@ -511,8 +611,11 @@ class TrayProxy:
                 )
         finally:
             log_handle.close()
-        self.write_status("stopping", "用户从原生托盘选择退出")
+        self.write_status("stopping", detail)
         self.Gtk.main_quit()
+
+    def exit_uu_remote(self, *_unused) -> None:
+        self.request_full_exit("用户从原生托盘选择退出")
 
     def remove_legacy_icons(self) -> int:
         if self.x11 is None:
@@ -564,6 +667,19 @@ class TrayProxy:
             self.decoder_process is not None
             and self.decoder_process.poll() is None
         )
+        client_quit = self.consume_client_quit_event()
+        if (
+            client_quit
+            and not decoder_workflow_running
+            and exit_on_close_enabled(self.prefix)
+        ):
+            logging.info(
+                "检测到退出主程序完成事件，清理 Wine 残留进程与原生托盘"
+            )
+            self.request_full_exit(
+                "检测到退出主程序完成，正在清理 Wine 残留进程"
+            )
+            return False
         if client_running:
             self.ever_saw_client = True
             self.client_missing_ticks = 0
@@ -577,6 +693,14 @@ class TrayProxy:
             self.ever_saw_client
             and self.client_missing_ticks >= CLIENT_MISSING_GRACE_TICKS
         ):
+            if exit_on_close_enabled(self.prefix):
+                logging.info(
+                    "退出模式下客户端进程已消失，清理 Wine 前缀与原生托盘"
+                )
+                self.request_full_exit(
+                    "退出模式下客户端进程已结束，正在清理后台"
+                )
+                return False
             logging.info("UU 客户端已退出，结束原生托盘代理")
             self.write_status("stopped", "UU 客户端已退出")
             self.Gtk.main_quit()
@@ -588,6 +712,7 @@ class TrayProxy:
         self.build_indicator()
         self.x11 = X11(os.environ.get("DISPLAY"))
         self.remove_legacy_icons()
+        self.prime_client_quit_monitor()
         self.write_status("active", "原生托盘已注册")
         self.GLib.timeout_add(LEGACY_SCAN_INTERVAL_MS, self.periodic_check)
 

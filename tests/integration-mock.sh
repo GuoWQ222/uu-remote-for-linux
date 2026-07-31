@@ -23,6 +23,9 @@ export UU_REMOTE_DISABLE_KEYBOARD_BRIDGE=1
 export UU_REMOTE_DISABLE_INPUT_BRIDGE=1
 export UU_REMOTE_TRAY_PROXY_BIN="$fixture_bin/uu-remote-tray-proxy"
 export UU_REMOTE_UPDATE_NO_RESTART=1
+export UU_REMOTE_SYSTEM_PROXY_SOURCE=none
+export HTTP_PROXY=http://should-not-reach-wine.invalid:8888
+export HTTPS_PROXY=http://should-not-reach-wine.invalid:8888
 export DISPLAY=:99
 export XDG_SESSION_TYPE=x11
 
@@ -73,6 +76,24 @@ grep -q '^version=4.34.0.8979$' "$cache_dir/installer-metadata"
 grep -q '^INSTALL$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE"
 test -f "$state_dir/setup.log"
+
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=948' \
+    'version=6' \
+    'status_bits=15' \
+    'preloaded=1' \
+    '[calls]' \
+    'addresses=2' \
+    'info=0' \
+    'if_table2=1' \
+    '[patched]' \
+    'addresses=1' \
+    'info=0' \
+    'if_table2=1' \
+    >"$prefix/drive_c/uu-remote-wol-hook-status.ini"
+"$launcher" --diagnose |
+    grep -q 'WOL 进程实测.*v6，地址 1/2，旧接口 0/0，网卡表 1/1'
 
 install_count=$(grep -c '^INSTALL$' "$UU_REMOTE_FAKE_TRACE")
 webview_count=$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")
@@ -196,6 +217,11 @@ printf '4.34.0.8979\n' >"$install_dir/bin/.installed-version"
 grep -q '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^SERVER$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CLIENT$' "$UU_REMOTE_FAKE_TRACE"
+if grep -q '^PROXY_ENV_LEAK=' "$UU_REMOTE_FAKE_TRACE"; then
+    printf 'Wine 运行进程仍继承了 Linux 代理环境变量：\n' >&2
+    grep '^PROXY_ENV_LEAK=' "$UU_REMOTE_FAKE_TRACE" >&2
+    exit 1
+fi
 grep -q '^TRAY_PROXY ' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^HWDECODE_ENV$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CUDA_DEVICE=0$' "$UU_REMOTE_FAKE_TRACE"

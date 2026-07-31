@@ -32,7 +32,40 @@ latest_client_log() {
 }
 
 prevent_sleep_state() {
-    local log_dir=$1 latest line state_value
+    local log_dir=$1 latest line state_value setting_file
+
+    setting_file=${UU_REMOTE_SLEEP_SETTING_FILE:-}
+    if [[ -n $setting_file && -r $setting_file ]]; then
+        state_value=$(
+            awk '
+                BEGIN { section = "" }
+                /^[[:space:]]*\[/ {
+                    section = $0
+                    sub(/^[[:space:]]*\[/, "", section)
+                    sub(/\][[:space:]]*$/, "", section)
+                    next
+                }
+                section == "settingCenter" &&
+                    /^[[:space:]]*PreventSleep[[:space:]]*=/ {
+                    value = $0
+                    sub(/^[^=]*=[[:space:]]*/, "", value)
+                    sub(/[[:space:]]*$/, "", value)
+                    print tolower(value)
+                    exit
+                }
+            ' "$setting_file"
+        )
+        case $state_value in
+            1 | true | on | enabled)
+                printf 'enabled\n'
+                return
+                ;;
+            0 | false | off | disabled)
+                printf 'disabled\n'
+                return
+                ;;
+        esac
+    fi
 
     latest=$(latest_client_log "$log_dir") || {
         printf 'unknown\n'

@@ -23,7 +23,9 @@ readonly launcher="$test_root/launcher"
 readonly bridge_log="$test_root/state/sleep-bridge.log"
 readonly lock_file="$test_root/state/sleep-bridge.lock"
 readonly inhibit_trace="$test_root/state/inhibit.trace"
-mkdir -p -- "$log_dir" "$prefix" "${inhibit_trace%/*}"
+readonly setting_file="$test_root/users/test/AppData/Local/GameViewer/setting.ini"
+mkdir -p -- "$log_dir" "$prefix" "${inhibit_trace%/*}" \
+    "${setting_file%/*}"
 install -Dm0755 /dev/null "$launcher"
 
 write_log() {
@@ -32,6 +34,17 @@ write_log() {
     printf '%s\n' \
         "[Client.NewUI] [NewUi::HomePageMainWindow::preventSleep] prevent sleep connected_:0 state:$state execution_state:0" \
         >"$file"
+}
+
+write_setting() {
+    local state=$1
+
+    printf '%s\n' \
+        '[other]' \
+        'PreventSleep=1' \
+        '[settingCenter]' \
+        "PreventSleep=$state" \
+        >"$setting_file"
 }
 
 wait_for() {
@@ -70,23 +83,36 @@ sleep 0.02
 printf 'new log without state\n' >"$log_dir/log_2.txt"
 test "$("$bridge" state "$log_dir")" = unknown
 
-write_log "$log_dir/log_2.txt" 2147483648
+write_log "$log_dir/log_2.txt" 2147483649
+write_setting 0
+test "$(
+    UU_REMOTE_SLEEP_SETTING_FILE="$setting_file" \
+        "$bridge" state "$log_dir"
+)" = disabled
+write_setting 1
+test "$(
+    UU_REMOTE_SLEEP_SETTING_FILE="$setting_file" \
+        "$bridge" state "$log_dir"
+)" = enabled
+
+write_setting 0
 UU_REMOTE_SYSTEMD_INHIBIT_BIN="$fake_inhibit" \
 UU_REMOTE_SLEEP_INHIBIT_TRACE="$inhibit_trace" \
 UU_REMOTE_SLEEP_ASSUME_WINESERVER_RUNNING=1 \
+UU_REMOTE_SLEEP_SETTING_FILE="$setting_file" \
     "$bridge" watch \
     "$log_dir" "$prefix" "$launcher" "$bridge_log" "$lock_file" 0.05 &
 watcher_pid=$!
 sleep 0.15
 test ! -s "$inhibit_trace"
 
-write_log "$log_dir/log_2.txt" 2147483649
+write_setting 1
 wait_for "开启时创建休眠抑制器" trace_has '^ACQUIRE '
 
-write_log "$log_dir/log_2.txt" 2147483648
+write_setting 0
 wait_for "关闭时释放休眠抑制器" trace_has '^RELEASE '
 
-write_log "$log_dir/log_2.txt" 2147483651
+write_setting 1
 # The nested shell intentionally expands its positional argument.
 # shellcheck disable=SC2016
 wait_for "远控连接时重新创建休眠抑制器" \

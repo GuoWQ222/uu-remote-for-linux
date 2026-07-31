@@ -16,8 +16,8 @@
 - Native Linux tray menu with decoder selection and automatic restart.
 - Native mouse, keyboard, and remote-cursor support when Linux is controlled
   in an X11 session.
-- Compatibility bridges for autostart, sleep inhibition, safe updates, file
-  transfer, and Wake-on-LAN.
+- Compatibility bridges for autostart, sleep inhibition, safe updates, the
+  Linux system proxy, file transfer, and Wake-on-LAN.
 
 ## Requirements
 
@@ -33,11 +33,11 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.0.0_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
-Installing 1.0.0 replaces the previous package identity. On first launch it
+Installing 1.0.7 replaces the previous package identity. On first launch it
 moves the existing Wine prefix, login, settings, cache, logs, and autostart
 entry into the new `uu-remote-for-linux` paths.
 

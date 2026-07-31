@@ -5,10 +5,12 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 readonly source_file="$project_root/src/uu-remote-wevtapi.S"
 readonly def_file="$project_root/src/uu-remote-wevtapi.def"
+readonly input_hook_def="$project_root/src/uu-remote-input-hook.def"
 readonly output_file="$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 
 for command_name in \
     x86_64-w64-mingw32-as \
+    x86_64-w64-mingw32-dlltool \
     x86_64-w64-mingw32-ld \
     x86_64-w64-mingw32-strip; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -22,6 +24,9 @@ build_dir=$(mktemp -d)
 trap 'rm -rf -- "$build_dir"' EXIT
 
 x86_64-w64-mingw32-as --64 "$source_file" -o "$build_dir/uu-remote-wevtapi.o"
+x86_64-w64-mingw32-dlltool \
+    --def "$input_hook_def" \
+    --output-lib "$build_dir/libuu-remote-input-hook.dll.a"
 x86_64-w64-mingw32-ld \
     --dll \
     --no-insert-timestamp \
@@ -30,6 +35,7 @@ x86_64-w64-mingw32-ld \
     -o "$build_dir/wevtapi.dll" \
     "$build_dir/uu-remote-wevtapi.o" \
     "$def_file" \
+    "$build_dir/libuu-remote-input-hook.dll.a" \
     -lkernel32
 x86_64-w64-mingw32-strip --strip-unneeded "$build_dir/wevtapi.dll"
 

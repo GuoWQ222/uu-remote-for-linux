@@ -73,6 +73,63 @@ with tempfile.TemporaryDirectory() as prefix:
         child.terminate()
         child.wait()
 
+with tempfile.TemporaryDirectory() as prefix:
+    prefix_path = Path(prefix)
+    setting = (
+        prefix_path
+        / "drive_c/users/test/AppData/Local/GameViewer/setting.ini"
+    )
+    log_dir = (
+        prefix_path
+        / "drive_c/Program Files/Netease/GameViewer/log/client/Log"
+    )
+    setting.parent.mkdir(parents=True)
+    log_dir.mkdir(parents=True)
+    setting.write_text("[settingCenter]\nCloseOption=1\n")
+    assert namespace["exit_on_close_enabled"](prefix)
+
+    marker = namespace["CLIENT_QUIT_MARKER"]
+    client_log = log_dir / "log_20260731150000000_100.txt"
+    client_log.write_text(f"old event {marker}\n")
+    monitor = proxy_class.__new__(proxy_class)
+    monitor.prefix = namespace["canonical_path"](prefix)
+    monitor.client_log_path = None
+    monitor.client_log_offset = 0
+    monitor.client_log_tail = ""
+    monitor.prime_client_quit_monitor()
+    assert not monitor.consume_client_quit_event()
+
+    split = len(marker) // 2
+    with client_log.open("a") as log_handle:
+        log_handle.write(marker[:split])
+    assert not monitor.consume_client_quit_event()
+    with client_log.open("a") as log_handle:
+        log_handle.write(marker[split:] + "\n")
+    assert monitor.consume_client_quit_event()
+
+    exits = []
+    monitor.decoder_process = None
+    monitor.ever_saw_client = True
+    monitor.client_missing_ticks = 0
+    monitor.remove_legacy_icons = lambda: 0
+    monitor.request_full_exit = lambda detail: exits.append(detail)
+    with client_log.open("a") as log_handle:
+        log_handle.write(marker + "\n")
+    original_prefix_processes = namespace["prefix_processes"]
+    namespace["prefix_processes"].__globals__["prefix_processes"] = (
+        lambda *_args: {1234}
+    )
+    try:
+        assert not monitor.periodic_check()
+        assert exits
+    finally:
+        namespace["prefix_processes"].__globals__["prefix_processes"] = (
+            original_prefix_processes
+        )
+
+    setting.write_text("[settingCenter]\nCloseOption=0\n")
+    assert not namespace["exit_on_close_enabled"](prefix)
+
 display = os.environ.get("DISPLAY")
 if display:
     x11 = namespace["X11"](display)

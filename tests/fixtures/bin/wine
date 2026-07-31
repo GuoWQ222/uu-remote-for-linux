@@ -113,16 +113,37 @@ case ${1:-} in
         exit 0
         ;;
     *GameViewerHealthd.exe)
+        for proxy_variable in \
+            http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+            HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+            if [[ -v $proxy_variable ]]; then
+                printf 'PROXY_ENV_LEAK=%s\n' "$proxy_variable" >>"$trace_file"
+            fi
+        done
         install -Dm0644 /dev/null "$install_dir/bin/.healthd-running"
         printf 'HEALTHD\n' >>"$trace_file"
         exit 0
         ;;
     *GameViewerServer.exe)
+        for proxy_variable in \
+            http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+            HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+            if [[ -v $proxy_variable ]]; then
+                printf 'PROXY_ENV_LEAK=%s\n' "$proxy_variable" >>"$trace_file"
+            fi
+        done
         install -Dm0644 /dev/null "$install_dir/bin/.server-running"
         printf 'SERVER\n' >>"$trace_file"
         exit 0
         ;;
     *GameViewer.exe)
+        for proxy_variable in \
+            http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+            HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+            if [[ -v $proxy_variable ]]; then
+                printf 'PROXY_ENV_LEAK=%s\n' "$proxy_variable" >>"$trace_file"
+            fi
+        done
         if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
             ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
             printf 'HWDECODE_ENV\n' >>"$trace_file"
