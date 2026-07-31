@@ -29,6 +29,10 @@ export HTTPS_PROXY=http://should-not-reach-wine.invalid:8888
 export DISPLAY=:99
 export XDG_SESSION_TYPE=x11
 
+"$launcher" --diagnose | grep -q '桌面后端.*x11'
+XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
+    "$launcher" --diagnose | grep -q '桌面后端.*wayland-xwayland'
+
 nvdec_rows="$test_root/nvdec-rows.tsv"
 printf '0\tMock NVIDIA GPU\t0000:01:00.0\tH264-8bit-420,H265-8bit-420,H265-10bit-420\t8192x8192\n' \
     >"$nvdec_rows"

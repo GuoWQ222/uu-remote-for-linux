@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
-"""Authenticated Win32 SendInput to X11/XTest bridge for UU Remote.
+#!/usr/bin/python3
+"""Authenticated Win32 SendInput to native Linux input backends for UU Remote.
 
 The Windows hook writes compact, versioned UDP datagrams to a random loopback
 port.  The endpoint file is readable only by the current user and contains a
-fresh 128-bit token for each daemon lifetime.  Valid mouse and keyboard events
-are injected into the active X11 desktop with XTest.
+fresh 128-bit token for each daemon lifetime. Valid mouse and keyboard events
+are injected through XTest on X11 or the RemoteDesktop portal on Wayland.
 """
 
 from __future__ import annotations
@@ -67,8 +67,30 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_RELEASE_TIMEOUT = 15.0
+
+PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
+PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
+PORTAL_REMOTE_DESKTOP = "org.freedesktop.portal.RemoteDesktop"
+PORTAL_SCREENCAST = "org.freedesktop.portal.ScreenCast"
+PORTAL_REQUEST = "org.freedesktop.portal.Request"
+PORTAL_SESSION = "org.freedesktop.portal.Session"
+PORTAL_DEVICE_KEYBOARD = 1
+PORTAL_DEVICE_POINTER = 2
+PORTAL_SOURCE_MONITOR = 1
+PORTAL_CURSOR_EMBEDDED = 2
+PORTAL_PERSIST_APPLICATION = 2
+PORTAL_REQUEST_TIMEOUT_SECONDS = 180
+
+# Linux input-event codes consumed by RemoteDesktop.NotifyPointerButton.
+EVDEV_BUTTONS = {
+    1: 0x110,  # BTN_LEFT
+    2: 0x112,  # BTN_MIDDLE
+    3: 0x111,  # BTN_RIGHT
+    8: 0x113,  # BTN_SIDE
+    9: 0x114,  # BTN_EXTRA
+}
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -234,6 +256,8 @@ ASCII_KEYSYMS = {
 
 
 class XTestBackend:
+    name = "x11-xtest"
+
     def __init__(self) -> None:
         self.x11 = ctypes.CDLL(
             os.environ.get("UU_REMOTE_INPUT_BRIDGE_X11_LIBRARY", "libX11.so.6")
@@ -363,7 +387,388 @@ class XTestBackend:
         return int(self.x11.XKeysymToKeycode(self.display, keysym))
 
 
+class PortalRequestError(RuntimeError):
+    """A denied, cancelled, or failed desktop-portal request."""
+
+
+class WaylandPortalBackend:
+    """Wayland keyboard and pointer injection through XDG RemoteDesktop."""
+
+    name = "wayland-portal"
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.restore_token_path = state_dir / "wayland-portal-restore-token"
+        self.session_handle = ""
+        self.stream_node = 0
+        self.stream_width = 1
+        self.stream_height = 1
+        self.fake_trace = os.environ.get(
+            "UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", ""
+        )
+        self.connection = None
+        self.x11 = None
+        self.display = None
+        if self.fake_trace:
+            self.session_handle = "/org/freedesktop/portal/desktop/session/fake"
+            self.stream_node = 77
+            self.stream_width = 1920
+            self.stream_height = 1080
+            self._fake_write("session authorized devices=3 stream=77 1920x1080")
+            return
+
+        self._load_gio()
+        self.connection = self.Gio.bus_get_sync(
+            self.Gio.BusType.SESSION, None
+        )
+        self._configure_x11_keymap()
+        self._authorize()
+
+    @staticmethod
+    def _load_gio_modules():
+        try:
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError) as error:
+            raise RuntimeError(
+                "Wayland 输入桥需要系统 python3-gi（/usr/bin/python3）"
+            ) from error
+        return Gio, GLib
+
+    def _load_gio(self) -> None:
+        self.Gio, self.GLib = self._load_gio_modules()
+
+    @classmethod
+    def check_environment(cls) -> None:
+        fake_trace = os.environ.get("UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE")
+        if fake_trace:
+            return
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            raise RuntimeError("WAYLAND_DISPLAY 未设置")
+        Gio, GLib = cls._load_gio_modules()
+        connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        value = connection.call_sync(
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant("(ss)", (PORTAL_REMOTE_DESKTOP, "version")),
+            GLib.VariantType.new("(v)"),
+            Gio.DBusCallFlags.NONE,
+            3000,
+            None,
+        )
+        version = int(value.unpack()[0])
+        if version < 1:
+            raise RuntimeError("RemoteDesktop Portal 版本无效")
+
+    def _fake_write(self, event: str) -> None:
+        path = Path(self.fake_trace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(event + "\n")
+
+    @staticmethod
+    def _token(prefix: str) -> str:
+        return f"{prefix}_{os.getpid()}_{secrets.token_hex(8)}"
+
+    def _portal_request(self, interface: str, method: str, signature: str, values):
+        responses: dict[str, tuple[int, dict[str, Any]]] = {}
+        expected_path = ""
+        loop = self.GLib.MainLoop()
+        timed_out = False
+
+        def on_response(
+            _connection,
+            _sender,
+            object_path,
+            _interface,
+            _signal,
+            parameters,
+            _user_data,
+        ) -> None:
+            response, results = parameters.unpack()
+            responses[object_path] = (int(response), results)
+            if object_path == expected_path and loop.is_running():
+                loop.quit()
+
+        subscription = self.connection.signal_subscribe(
+            PORTAL_BUS_NAME,
+            PORTAL_REQUEST,
+            "Response",
+            None,
+            None,
+            self.Gio.DBusSignalFlags.NONE,
+            on_response,
+            None,
+        )
+        try:
+            returned = self.connection.call_sync(
+                PORTAL_BUS_NAME,
+                PORTAL_OBJECT_PATH,
+                interface,
+                method,
+                self.GLib.Variant(signature, values),
+                self.GLib.VariantType.new("(o)"),
+                self.Gio.DBusCallFlags.NONE,
+                10000,
+                None,
+            )
+            expected_path = returned.unpack()[0]
+            if expected_path not in responses:
+                def request_timeout() -> bool:
+                    nonlocal timed_out
+                    timed_out = True
+                    loop.quit()
+                    return self.GLib.SOURCE_REMOVE
+
+                timeout_id = self.GLib.timeout_add_seconds(
+                    PORTAL_REQUEST_TIMEOUT_SECONDS, request_timeout
+                )
+                loop.run()
+                if not timed_out:
+                    self.GLib.source_remove(timeout_id)
+            if timed_out or expected_path not in responses:
+                raise PortalRequestError(
+                    f"{method} 等待桌面授权超时"
+                )
+            response, results = responses[expected_path]
+            if response == 1:
+                raise PortalRequestError(f"{method} 已被用户取消")
+            if response != 0:
+                raise PortalRequestError(
+                    f"{method} 被桌面门户拒绝（代码 {response}）"
+                )
+            return results
+        finally:
+            self.connection.signal_unsubscribe(subscription)
+
+    def _restore_token(self) -> str:
+        try:
+            return self.restore_token_path.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            return ""
+
+    def _save_restore_token(self, token: str) -> None:
+        if token:
+            atomic_write(self.restore_token_path, token + "\n")
+
+    def _authorize(self) -> None:
+        options = {
+            "handle_token": self.GLib.Variant("s", self._token("create")),
+            "session_handle_token": self.GLib.Variant(
+                "s", self._token("session")
+            ),
+        }
+        result = self._portal_request(
+            PORTAL_REMOTE_DESKTOP,
+            "CreateSession",
+            "(a{sv})",
+            (options,),
+        )
+        self.session_handle = str(result.get("session_handle", ""))
+        if not self.session_handle:
+            raise PortalRequestError("桌面门户未返回会话句柄")
+
+        restore_token = self._restore_token()
+        device_options = {
+            "handle_token": self.GLib.Variant("s", self._token("devices")),
+            "types": self.GLib.Variant(
+                "u", PORTAL_DEVICE_KEYBOARD | PORTAL_DEVICE_POINTER
+            ),
+            "persist_mode": self.GLib.Variant(
+                "u", PORTAL_PERSIST_APPLICATION
+            ),
+        }
+        source_options = {
+            "handle_token": self.GLib.Variant("s", self._token("sources")),
+            "types": self.GLib.Variant("u", PORTAL_SOURCE_MONITOR),
+            "multiple": self.GLib.Variant("b", False),
+            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_EMBEDDED),
+        }
+        if restore_token:
+            device_options["restore_token"] = self.GLib.Variant(
+                "s", restore_token
+            )
+
+        try:
+            self._portal_request(
+                PORTAL_REMOTE_DESKTOP,
+                "SelectDevices",
+                "(oa{sv})",
+                (self.session_handle, device_options),
+            )
+        except Exception as error:
+            if "cannot persist" not in str(error).casefold():
+                raise
+            # GNOME 46 advertises RemoteDesktop v2 but deliberately rejects
+            # persistent sessions. Keep the secure interactive session usable.
+            device_options.pop("persist_mode", None)
+            device_options.pop("restore_token", None)
+            self.restore_token_path.unlink(missing_ok=True)
+            self._portal_request(
+                PORTAL_REMOTE_DESKTOP,
+                "SelectDevices",
+                "(oa{sv})",
+                (self.session_handle, device_options),
+            )
+        self._portal_request(
+            PORTAL_SCREENCAST,
+            "SelectSources",
+            "(oa{sv})",
+            (self.session_handle, source_options),
+        )
+        start_options = {
+            "handle_token": self.GLib.Variant("s", self._token("start")),
+        }
+        result = self._portal_request(
+            PORTAL_REMOTE_DESKTOP,
+            "Start",
+            "(osa{sv})",
+            (
+                self.session_handle,
+                os.environ.get("UU_REMOTE_PORTAL_PARENT_WINDOW", ""),
+                start_options,
+            ),
+        )
+        devices = int(result.get("devices", 0))
+        required = PORTAL_DEVICE_KEYBOARD | PORTAL_DEVICE_POINTER
+        if devices & required != required:
+            raise PortalRequestError(
+                "桌面门户未同时授权键盘和鼠标控制"
+            )
+        streams = result.get("streams", [])
+        if not streams:
+            raise PortalRequestError("桌面门户未返回屏幕坐标流")
+        self.stream_node = int(streams[0][0])
+        properties = streams[0][1]
+        size = properties.get("size", (1, 1))
+        if len(size) == 2:
+            self.stream_width = max(int(size[0]), 1)
+            self.stream_height = max(int(size[1]), 1)
+        self._save_restore_token(str(result.get("restore_token", "")))
+
+    def _configure_x11_keymap(self) -> None:
+        self.x11 = ctypes.CDLL("libX11.so.6")
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.x11.XStringToKeysym.restype = ctypes.c_ulong
+        self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        display_name = os.environ.get("DISPLAY")
+        encoded = display_name.encode() if display_name else None
+        self.display = self.x11.XOpenDisplay(encoded)
+        if not self.display:
+            raise RuntimeError(
+                "Wayland 分支需要 XWayland DISPLAY 承载 Wine 客户端"
+            )
+
+    def _notify(self, method: str, signature: str, values) -> None:
+        if self.fake_trace:
+            rendered = " ".join(str(value) for value in values[2:])
+            self._fake_write(f"{method} {rendered}".rstrip())
+            return
+        self.connection.call_sync(
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            PORTAL_REMOTE_DESKTOP,
+            method,
+            self.GLib.Variant(signature, values),
+            None,
+            self.Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+
+    def close(self) -> None:
+        if self.fake_trace:
+            self._fake_write("close")
+            return
+        if self.session_handle and self.connection is not None:
+            try:
+                self.connection.call_sync(
+                    PORTAL_BUS_NAME,
+                    self.session_handle,
+                    PORTAL_SESSION,
+                    "Close",
+                    None,
+                    None,
+                    self.Gio.DBusCallFlags.NONE,
+                    2000,
+                    None,
+                )
+            except Exception:
+                pass
+        if self.display and self.x11:
+            self.x11.XCloseDisplay(self.display)
+            self.display = None
+
+    def flush(self) -> None:
+        return
+
+    def motion(self, dx: int, dy: int, absolute: bool) -> None:
+        options = {}
+        if absolute:
+            x = max(0, min(dx, 65535)) * (self.stream_width - 1) / 65535
+            y = max(0, min(dy, 65535)) * (self.stream_height - 1) / 65535
+            self._notify(
+                "NotifyPointerMotionAbsolute",
+                "(oa{sv}udd)",
+                (self.session_handle, options, self.stream_node, x, y),
+            )
+        else:
+            self._notify(
+                "NotifyPointerMotion",
+                "(oa{sv}dd)",
+                (self.session_handle, options, float(dx), float(dy)),
+            )
+
+    def button(self, button: int, pressed: bool) -> None:
+        if button in (4, 5, 6, 7):
+            if not pressed:
+                return
+            axis = 0 if button in (4, 5) else 1
+            steps = -1 if button in (4, 6) else 1
+            self._notify(
+                "NotifyPointerAxisDiscrete",
+                "(oa{sv}ui)",
+                (self.session_handle, {}, axis, steps),
+            )
+            return
+        evdev_button = EVDEV_BUTTONS.get(button)
+        if evdev_button is None:
+            raise ValueError(f"Wayland 不支持鼠标按钮 {button}")
+        self._notify(
+            "NotifyPointerButton",
+            "(oa{sv}iu)",
+            (self.session_handle, {}, evdev_button, int(pressed)),
+        )
+
+    def keycode(self, keycode: int, pressed: bool) -> None:
+        evdev_keycode = keycode - 8
+        if not 0 <= evdev_keycode <= 767:
+            raise ValueError(f"无效 Wayland/evdev 键码：{evdev_keycode}")
+        self._notify(
+            "NotifyKeyboardKeycode",
+            "(oa{sv}iu)",
+            (self.session_handle, {}, evdev_keycode, int(pressed)),
+        )
+
+    def keysym_keycode(self, name: str) -> int:
+        if not self.display or not self.x11:
+            return 0
+        keysym = self.x11.XStringToKeysym(name.encode("ascii"))
+        if not keysym:
+            return 0
+        return int(self.x11.XKeysymToKeycode(self.display, keysym))
+
+
 class FakeBackend:
+    name = "fake-x11"
+
     def __init__(self, trace_path: Path):
         self.trace_path = trace_path
 
@@ -402,10 +807,24 @@ class FakeBackend:
         }.get(name, 90)
 
 
-def make_backend():
+def selected_backend() -> str:
+    configured = os.environ.get("UU_REMOTE_DESKTOP_BACKEND", "").casefold()
+    if configured in ("x11", "x11-xtest"):
+        return "x11"
+    if configured in ("wayland", "wayland-xwayland", "wayland-portal"):
+        return "wayland"
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
+    return "wayland" if session_type == "wayland" else "x11"
+
+
+def make_backend(state_dir: Path | None = None):
     fake_trace = os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE")
     if fake_trace:
         return FakeBackend(Path(fake_trace))
+    if selected_backend() == "wayland":
+        if state_dir is None:
+            raise RuntimeError("Wayland 输入桥缺少状态目录")
+        return WaylandPortalBackend(state_dir)
     return XTestBackend()
 
 
@@ -418,7 +837,7 @@ class InputController:
 
     def emit_keycode(self, keycode: int, pressed: bool) -> None:
         if not keycode:
-            raise ValueError("无法把 Windows 键映射到当前 X11 键盘布局")
+            raise ValueError("无法把 Windows 键映射到当前 Linux 键盘布局")
         self.backend.keycode(keycode, pressed)
         if pressed:
             self.pressed_keys.add(keycode)
@@ -598,6 +1017,8 @@ def write_status(
     last_mouse_dx: int = 0,
     last_mouse_dy: int = 0,
     last_mouse_flags: int = 0,
+    backend: str = "",
+    portal_stream: int = 0,
     detail: str = "",
 ) -> None:
     atomic_write_json(
@@ -618,6 +1039,8 @@ def write_status(
             "last_mouse_dx": last_mouse_dx,
             "last_mouse_dy": last_mouse_dy,
             "last_mouse_flags": last_mouse_flags,
+            "backend": backend,
+            "portal_stream": portal_stream,
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
@@ -688,6 +1111,8 @@ def watch(
     last_mouse_dx = 0
     last_mouse_dy = 0
     last_mouse_flags = 0
+    backend_name = selected_backend()
+    portal_stream = 0
     last_event = 0.0
     last_status = 0.0
 
@@ -707,6 +1132,8 @@ def watch(
             last_mouse_dx=last_mouse_dx,
             last_mouse_dy=last_mouse_dy,
             last_mouse_flags=last_mouse_flags,
+            backend=backend_name,
+            portal_stream=portal_stream,
             detail=detail,
         )
 
@@ -719,7 +1146,15 @@ def watch(
     signal.signal(signal.SIGHUP, request_stop)
 
     try:
-        backend = make_backend()
+        publish_status(
+            "authorizing" if selected_backend() == "wayland" else "starting",
+            "等待 Wayland 桌面控制授权"
+            if selected_backend() == "wayland"
+            else "",
+        )
+        backend = make_backend(state_dir)
+        backend_name = getattr(backend, "name", selected_backend())
+        portal_stream = int(getattr(backend, "stream_node", 0))
         controller = InputController(backend, logger)
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(("127.0.0.1", 0))
@@ -728,7 +1163,7 @@ def watch(
         atomic_write(endpoint, endpoint_content(port, token))
         publish_status("waiting-hook")
         logger.write(
-            f"X11 原生输入桥已启动，监听回环端口 {port}；"
+            f"{backend_name} 原生输入桥已启动，监听回环端口 {port}；"
             "等待 GameViewerServer 输入钩子"
         )
 
@@ -822,17 +1257,22 @@ def watch(
         remove_owned_endpoint(endpoint, token)
         if not running:
             publish_status("stopped")
-            logger.write("X11 原生输入桥已停止")
+            logger.write(f"{backend_name} 原生输入桥已停止")
         lock_handle.close()
 
 
 def check_environment() -> int:
+    if selected_backend() == "wayland":
+        WaylandPortalBackend.check_environment()
+        print("wayland-portal")
+        return 0
     session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
-    if session_type and session_type != "x11":
-        print("当前不是 X11 会话", file=sys.stderr)
+    if session_type and session_type not in ("x11", "wayland"):
+        print(f"不支持的桌面会话：{session_type}", file=sys.stderr)
         return 1
     backend = make_backend()
     backend.close()
+    print("x11-xtest")
     return 0
 
 

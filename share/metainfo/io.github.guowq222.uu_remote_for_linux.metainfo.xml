@@ -11,12 +11,12 @@
   <description>
     <p>
       Runs the official Windows UU Remote client in a dedicated Wine prefix
-      with native Linux integration for controller and X11 controlled-host
-      workflows.
+      with native Linux integration for controller and X11 or experimental
+      Wayland controlled-host workflows.
     </p>
     <p>
-      This is not a native client. Controlled-host input currently requires
-      an X11 session.
+      This is not a native client. The launcher selects XTest on X11 and the
+      RemoteDesktop portal on Wayland while Wine continues through XWayland.
     </p>
   </description>
   <launchable type="desktop-id">uu-remote-for-linux.desktop</launchable>
@@ -24,6 +24,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.0" date="2026-07-31">
+      <description>
+        <p>Add an adaptive X11/Wayland launcher, native Wayland RemoteDesktop Portal input, persistent permission restoration, and XWayland-aware shortcut handling.</p>
+      </description>
+    </release>
     <release version="1.0.7" date="2026-07-31">
       <description>
         <p>Make UU's system-proxy setting consume GNOME, KDE, environment, PAC, and WPAD configuration through Wine without leaking proxy state into the other modes.</p>

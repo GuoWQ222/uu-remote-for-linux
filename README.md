@@ -14,8 +14,8 @@
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
-- Native mouse, keyboard, and remote-cursor support when Linux is controlled
-  in an X11 session.
+- Native mouse, keyboard, and remote-cursor support when Linux is controlled:
+  XTest on X11, or the RemoteDesktop portal on Wayland.
 - Compatibility bridges for autostart, sleep inhibition, safe updates, the
   Linux system proxy, file transfer, and Wake-on-LAN.
 
@@ -23,8 +23,9 @@
 
 - Ubuntu 24.04 (tested)
 - Wine 11.1 or newer
-- An X11 session when Linux is the controlled host (native Wayland input is not
-  supported yet)
+- X11, or GNOME Wayland with XWayland and XDG Desktop Portal. The launcher
+  detects the current session automatically. The first Wayland controlled-host
+  start asks the user to authorize screen sharing and remote interaction.
 
 ## Install from Release (recommended)
 
@@ -33,7 +34,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.0_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
@@ -82,6 +83,19 @@ uu-remote-for-linux --stop
 | CPU / OpenH264 | Supported | Upstream path: 1080p/60 fps |
 | NVIDIA NVDEC | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
 | Intel/AMD VA-API | Not implemented | Unavailable |
+
+## Desktop backends
+
+| Session | Wine UI | Controlled-host input | Native desktop capture |
+|---|---|---|---|
+| X11 | Wine X11 driver | XTest | Supported by the existing UU path |
+| Wayland | XWayland | XDG RemoteDesktop Portal | Portal stream authorized; end-to-end UU capture remains experimental |
+
+On Wayland, `uu-remote-for-linux --diagnose` reports
+`wayland-xwayland` and `wayland-portal` after authorization. Portal permission
+is mandatory and cannot be bypassed by the application. X11 remains the stable
+choice for unattended controlled-host use until the proprietary UU capture
+module has been validated against native Wayland windows.
 
 ## License and attribution
 

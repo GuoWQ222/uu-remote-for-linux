@@ -69,6 +69,7 @@ start_watcher() {
 
 reset_settings
 "$bridge" check
+XDG_SESSION_TYPE=wayland "$bridge" check
 start_watcher
 for _ in {1..100}; do
     [[ $("$bridge" status "$state_dir" 2>/dev/null || true) == idle ]] && break

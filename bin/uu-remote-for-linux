@@ -53,6 +53,48 @@ readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
 readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
 readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
 
+detect_desktop_backend() {
+    case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
+        x11|x11-xtest)
+            printf 'x11\n'
+            return
+            ;;
+        wayland|wayland-xwayland|wayland-portal)
+            printf 'wayland-xwayland\n'
+            return
+            ;;
+        auto|'') ;;
+        *)
+            printf 'unsupported\n'
+            return
+            ;;
+    esac
+
+    case ${XDG_SESSION_TYPE:-} in
+        wayland)
+            if [[ -n ${WAYLAND_DISPLAY:-} && -n ${DISPLAY:-} ]]; then
+                printf 'wayland-xwayland\n'
+            else
+                printf 'wayland-incomplete\n'
+            fi
+            ;;
+        x11)
+            printf 'x11\n'
+            ;;
+        *)
+            if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+                printf 'wayland-xwayland\n'
+            else
+                # Preserve the historical headless/test default.
+                printf 'x11\n'
+            fi
+            ;;
+    esac
+}
+
+desktop_backend=$(detect_desktop_backend)
+readonly desktop_backend
+
 readonly data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -1117,10 +1159,12 @@ input_bridge_process_active() {
 }
 
 input_bridge_status_label() {
-    local state="" hook_pid="" hook_version=""
+    local state="" hook_pid="" hook_version="" backend=""
 
-    if [[ ${XDG_SESSION_TYPE:-x11} != x11 ]]; then
-        printf '当前会话不支持被控输入（仅 X11）'
+    if [[ $desktop_backend == wayland-incomplete ]]; then
+        printf 'Wayland 会话缺少 XWayland DISPLAY'
+    elif [[ $desktop_backend == unsupported ]]; then
+        printf '不支持的桌面后端'
     elif [[ ! -x $input_bridge || ! -r $input_hook_source ||
         ! -r $input_injector_source ]]; then
         printf '运行库缺失'
@@ -1136,10 +1180,31 @@ input_bridge_status_label() {
         hook_version=$(sed -n \
             's/.*"hook_version": \([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
+        backend=$(sed -n \
+            's/.*"backend": "\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        if [[ $desktop_backend == wayland-xwayland &&
+            $backend != wayland && $backend != wayland-portal ]]; then
+            printf '就绪（待 Wayland 授权）'
+            return
+        fi
+        if [[ $desktop_backend == x11 &&
+            -n $backend && $backend != x11 && $backend != x11-xtest &&
+            $backend != fake-x11 ]]; then
+            printf '就绪（待应用启动）'
+            return
+        fi
         case $state in
             active)
-                printf '生效中（GameViewerServer PID %s；钩子 v%s）' \
+                printf '生效中（%s；GameViewerServer PID %s；钩子 v%s）' \
+                    "${backend:-$desktop_backend}" \
                     "${hook_pid:-unknown}" "${hook_version:-unknown}"
+                ;;
+            authorizing)
+                printf '等待 Wayland 桌面控制授权'
+                ;;
+            starting)
+                printf '原生输入后端启动中'
                 ;;
             waiting-hook)
                 printf '原生守护进程已启动，等待 Windows 钩子'
@@ -1210,16 +1275,33 @@ stop_input_bridge_runtime() {
 }
 
 start_input_bridge() {
-    local variable attempt
+    local variable attempt restart_policy="on-failure"
+    local systemd_launched=false
     local -a command
 
     [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
-    if [[ ${XDG_SESSION_TYPE:-x11} != x11 || -z ${DISPLAY:-} ]]; then
-        printf '警告：原生被控端键鼠输入桥当前仅支持 X11 会话。\n' >&2
-        return 0
-    fi
+    case $desktop_backend in
+        x11)
+            [[ -n ${DISPLAY:-} ]] || {
+                printf '警告：X11 输入后端缺少 DISPLAY。\n' >&2
+                return 1
+            }
+            ;;
+        wayland-xwayland)
+            [[ -n ${WAYLAND_DISPLAY:-} && -n ${DISPLAY:-} &&
+                -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || {
+                printf '警告：Wayland 输入后端缺少 Wayland、XWayland 或会话 D-Bus 环境。\n' >&2
+                return 1
+            }
+            ;;
+        *)
+            printf '警告：当前桌面会话无法选择受支持的输入后端。\n' >&2
+            return 1
+            ;;
+    esac
     if ! "$input_bridge" check >>"$input_bridge_log" 2>&1; then
-        printf '警告：X11/XTest 输入桥依赖检查失败，详见 %s\n' \
+        printf '警告：%s 输入桥依赖检查失败，详见 %s\n' \
+            "$desktop_backend" \
             "$input_bridge_log" >&2
         return 1
     fi
@@ -1229,6 +1311,7 @@ start_input_bridge() {
     rm -f -- "$input_bridge_endpoint"
 
     if systemd_user_available; then
+        [[ $desktop_backend != wayland-xwayland ]] || restart_policy="no"
         systemctl --user stop \
             "$input_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
@@ -1239,20 +1322,21 @@ start_input_bridge() {
             "--unit=$input_runtime_unit"
             --collect
             --quiet
-            --property=Restart=on-failure
+            "--property=Restart=$restart_policy"
             --property=RestartSec=1s
             --property=TimeoutStopSec=5s
             "--property=StandardOutput=append:$input_bridge_log"
             "--property=StandardError=append:$input_bridge_log"
         )
         for variable in \
-            DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+            DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
             XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH; do
             if [[ -v $variable ]]; then
                 command+=("--setenv=$variable=${!variable}")
             fi
         done
         command+=(
+            "--setenv=UU_REMOTE_DESKTOP_BACKEND=$desktop_backend"
             "$input_bridge" watch
             "$state_dir"
             "$input_bridge_endpoint"
@@ -1260,13 +1344,16 @@ start_input_bridge() {
             "$input_bridge_lock"
             "$input_bridge_release_timeout"
         )
-        if ! "${command[@]}" 9>&-; then
+        if "${command[@]}" 9>&-; then
+            systemd_launched=true
+        else
             printf '警告：无法创建输入桥用户服务，改用兼容后台进程。\n' >&2
         fi
     fi
-    if ! runtime_unit_active "$input_runtime_unit"; then
+    if ! $systemd_launched && ! runtime_unit_active "$input_runtime_unit"; then
         # shellcheck disable=SC2094
-        nohup "$input_bridge" watch \
+        nohup env UU_REMOTE_DESKTOP_BACKEND="$desktop_backend" \
+            "$input_bridge" watch \
             "$state_dir" \
             "$input_bridge_endpoint" \
             "$input_bridge_log" \
@@ -1277,6 +1364,11 @@ start_input_bridge() {
 
     for ((attempt = 0; attempt < 100; attempt++)); do
         [[ -s $input_bridge_endpoint ]] && return 0
+        if [[ $desktop_backend == wayland-xwayland ]] &&
+            runtime_unit_active "$input_runtime_unit"; then
+            # The portal authorization dialog may remain open while UU starts.
+            return 0
+        fi
         sleep 0.02
     done
     return 1
@@ -1285,8 +1377,9 @@ start_input_bridge() {
 keyboard_bridge_status_label() {
     local state=""
 
-    if [[ ${XDG_SESSION_TYPE:-x11} != x11 ]]; then
-        printf '当前会话不支持（仅 X11）'
+    if [[ $desktop_backend != x11 &&
+        $desktop_backend != wayland-xwayland ]]; then
+        printf '当前会话不支持'
     elif [[ ! -x $keyboard_bridge ]]; then
         printf '缺失'
     elif ! runtime_unit_active "$keyboard_runtime_unit"; then
@@ -1315,9 +1408,10 @@ start_keyboard_bridge() {
     local -a command
 
     [[ ${UU_REMOTE_DISABLE_KEYBOARD_BRIDGE:-0} != 1 ]] || return 0
-    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
+    [[ -n ${DISPLAY:-} ]] || return 0
     if ! "$keyboard_bridge" check >>"$keyboard_bridge_log" 2>&1; then
-        printf '警告：X11 远控键盘桥依赖检查失败，详见 %s\n' \
+        printf '警告：X11/XWayland 远控键盘桥依赖检查失败，详见 %s\n' \
             "$keyboard_bridge_log" >&2
         return 1
     fi
@@ -1340,7 +1434,7 @@ start_keyboard_bridge() {
             "--property=StandardError=append:$keyboard_bridge_log"
         )
         for variable in \
-            DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+            DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
             XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH; do
             if [[ -v $variable ]]; then
                 command+=("--setenv=$variable=${!variable}")
@@ -2106,6 +2200,7 @@ print_diagnostics() {
         "系统" "$os_name" \
         "架构" "$(uname -m)" \
         "会话" "$session_type" \
+        "桌面后端" "$desktop_backend" \
         "DISPLAY" "$display_value" \
         "WAYLAND_DISPLAY" "$wayland_value" \
         "Wine" "$detected_wine（要求 $min_wine_version+）" \
@@ -2124,6 +2219,7 @@ print_diagnostics() {
         "键盘桥日志" "$keyboard_bridge_log" \
         "被控端原生输入" "$(input_bridge_status_label)" \
         "被控端输入事件" "$(input_bridge_event_label)" \
+        "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
         "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
         "输入桥日志" "$input_bridge_log" \
         "NVIDIA 解码库" "$(hwdecode_host_libraries_ready && printf '就绪' || printf '缺失')" \
@@ -2158,7 +2254,7 @@ print_diagnostics() {
         "安装包缓存" "$([[ -f $installer ]] && printf '存在' || printf '不存在')" \
         "设置日志" "$setup_log"
 
-    if [[ $session_type == wayland && -z ${DISPLAY:-} ]]; then
+    if [[ $desktop_backend == wayland-incomplete ]]; then
         printf '\n警告：Wayland 会话未检测到 XWayland DISPLAY，Windows 客户端无法显示。\n'
     fi
     if [[ $detected_wine != missing && $detected_wine != unrecognized ]] &&
@@ -2208,7 +2304,7 @@ check_base_requirements
     die "缺少 X11 远控键盘桥：$keyboard_bridge。请重新安装本项目"
 [[ -x $input_bridge && -r $input_hook_source &&
     -r $input_injector_source ]] ||
-    die "缺少 X11 原生输入桥或 Win64 输入钩子。请重新安装本项目"
+    die "缺少 Linux 原生输入桥或 Win64 输入钩子。请重新安装本项目"
 [[ -x $wol_bridge && -x $wol_configure ]] ||
     die "缺少远程开机兼容桥：$wol_bridge。请重新安装本项目"
 [[ -r $powershell_bridge_source ]] ||
@@ -3194,7 +3290,8 @@ ensure_wine_image_running() {
 
 start_input_injector() {
     [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
-    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
+    [[ -n ${DISPLAY:-} ]] || return 0
     input_hook_ready || return 1
     ensure_wine_image_running \
         "$input_injector_runtime_unit" \
@@ -3208,7 +3305,8 @@ wait_input_hook_active() {
     local attempt state
 
     [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
-    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
+    [[ -n ${DISPLAY:-} ]] || return 0
     for ((attempt = 0; attempt < 60; attempt++)); do
         state=$("$input_bridge" status "$state_dir" 2>/dev/null || true)
         [[ $state == active ]] && return 0

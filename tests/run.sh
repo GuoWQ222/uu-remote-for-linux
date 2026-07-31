@@ -100,6 +100,8 @@ check "Wine WOL PowerShell bridge" "$project_root/tests/powershell-bridge.sh"
 check "update bridge integration" "$project_root/tests/update-bridge.sh"
 check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
+check "Wayland portal input bridge integration" \
+    "$project_root/tests/wayland-input-bridge.sh"
 check "legacy project-name migration" \
     "$project_root/tests/legacy-name-migration.sh"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
@@ -216,6 +218,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/update-bridge.sh" \
         "$project_root/tests/keyboard-bridge.sh" \
         "$project_root/tests/input-bridge.sh" \
+        "$project_root/tests/wayland-input-bridge.sh" \
         "$project_root/tests/wine-input-hook.sh" \
         "$project_root/tests/powershell-bridge.sh" \
         "$project_root/tests/run.sh" \

@@ -12,14 +12,17 @@
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
-- X11 会话下支持 Linux 作为被控端的原生鼠标、键盘和远端光标。
+- Linux 作为被控端时支持原生鼠标、键盘和远端光标：X11 使用 XTest，
+  Wayland 使用 RemoteDesktop Portal。
 - 支持自启动、防休眠、安全更新、Linux 系统代理、文件传输与远程开机兼容桥。
 
 ## 系统要求
 
 - Ubuntu 24.04（已验证）
 - Wine 11.1 或更高版本
-- X11 会话（Linux 作为被控端时必需；Wayland 原生输入尚未支持）
+- X11，或带 XWayland 与 XDG Desktop Portal 的 GNOME Wayland。启动器会
+  自动识别当前会话。Wayland 首次作为被控端启动时，系统会要求用户授权
+  屏幕共享和远程交互。
 
 ## 从 Release 安装（推荐）
 
@@ -27,7 +30,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.0_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
@@ -76,6 +79,18 @@ uu-remote-for-linux --stop
 | CPU / OpenH264 | 已支持 | 上游路径：1080p/60 fps |
 | NVIDIA NVDEC | 实验性支持 | UU 菜单最高 4K/144 fps；须以实际串流测试为准 |
 | Intel/AMD VA-API | 尚未实现 | 不可用 |
+
+## 桌面后端
+
+| 会话 | Wine 界面 | 被控端输入 | 原生桌面采集 |
+|---|---|---|---|
+| X11 | Wine X11 驱动 | XTest | 现有 UU 路径已支持 |
+| Wayland | XWayland | XDG RemoteDesktop Portal | Portal 屏幕流已授权；UU 端到端采集仍为实验性 |
+
+在 Wayland 下，完成系统授权后，`uu-remote-for-linux --diagnose` 会显示
+`wayland-xwayland` 与 `wayland-portal`。Portal 授权是 Wayland 的安全边界，
+应用不能绕过。在网易专有采集模块完成原生 Wayland 窗口的端到端验收前，
+需要无人值守被控时仍建议使用 X11。
 
 ## 许可证与署名
 

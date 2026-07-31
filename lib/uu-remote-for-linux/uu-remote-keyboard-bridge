@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
-"""Focus-aware X11 keyboard bridge for the UU Remote Wine client.
+#!/usr/bin/python3
+"""Focus-aware X11/XWayland keyboard bridge for the UU Remote Wine client.
 
 GNOME and IBus reserve Super+Space before Wine can see it.  While a real
-GameViewer remote-control window owns the active X11 window, this helper
+GameViewer remote-control window owns the active X11/XWayland window, this helper
 temporarily removes only those conflicting desktop shortcuts.  It restores the
 exact serialized GSettings values on focus loss, normal shutdown, and the next
 startup after an unclean exit.
@@ -532,7 +532,7 @@ def watch(
     try:
         controller.restore(state_paths["recovery"])
         detector = make_detector()
-        logger.write("X11 远控键盘桥开始监视活动窗口")
+        logger.write("X11/XWayland 远控键盘桥开始监视活动窗口")
         while running:
             remote, window = detector.remote_focused()
             if remote and controller.originals is None:
@@ -565,14 +565,19 @@ def watch(
             detector.close()
         if running is False:
             write_status(state_paths["status"], "stopped")
-            logger.write("X11 远控键盘桥已停止")
+            logger.write("X11/XWayland 远控键盘桥已停止")
         lock_handle.close()
 
 
 def check_environment() -> int:
     session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
-    if session_type and session_type != "x11":
-        print("当前不是 X11 会话", file=sys.stderr)
+    if session_type and session_type not in ("x11", "wayland"):
+        print(f"不支持的桌面会话：{session_type}", file=sys.stderr)
+        return 1
+    if not os.environ.get("DISPLAY") and not os.environ.get(
+        "UU_REMOTE_KEYBOARD_BRIDGE_FAKE_FOCUS_FILE"
+    ):
+        print("X11/XWayland DISPLAY 未设置", file=sys.stderr)
         return 1
     logger = Logger(Path(os.devnull))
     controller = make_controller(logger)
