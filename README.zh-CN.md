@@ -31,10 +31,6 @@ sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
-安装 1.0.7 时会替换旧的软件包标识。首次启动将把现有 Wine 前缀、登录
-状态、设置、缓存、日志和自启动项迁移到新的 `uu-remote-for-linux`
-路径，不需要重新登录。
-
 ### 从源码安装（可选）
 
 ```bash

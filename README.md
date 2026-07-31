@@ -37,10 +37,6 @@ sudo apt install ./uu-remote-for-linux_1.0.7_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
-Installing 1.0.7 replaces the previous package identity. On first launch it
-moves the existing Wine prefix, login, settings, cache, logs, and autostart
-entry into the new `uu-remote-for-linux` paths.
-
 ### Install from source (optional)
 
 ```bash
