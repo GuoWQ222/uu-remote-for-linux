@@ -133,15 +133,20 @@ check "shim exports" bash -c \
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
+# The snippets intentionally defer "$1" expansion to the nested shell.
+# shellcheck disable=SC2016
 check "input hook is Win64 DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputHookVersion"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input injector is Win64 PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
+# shellcheck disable=SC2016
 check "input injector exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputInjectorVersion"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
