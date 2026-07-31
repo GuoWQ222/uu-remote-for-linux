@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly trace=${UUYC_SLEEP_INHIBIT_TRACE:?}
+readonly trace=${UU_REMOTE_SLEEP_INHIBIT_TRACE:?}
 released=false
 
 release() {

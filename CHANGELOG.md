@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.0] - 2026-07-31
+
+- Renamed every project-owned command, runtime directory, helper, artifact,
+  desktop file, application ID, source file, test fixture, environment
+  variable, and Debian package to the `uu-remote-for-linux` identity.
+- Added one-time migration of the previous Wine prefix, state, cache,
+  autostart entry, compatibility backups, and input-hook files.
+- Added Debian conflict/replacement metadata so installing the new package
+  safely replaces the former package identity.
+
 ## [0.9.2] - 2026-07-31
 
 - Fixed the remaining invisible-cursor path by patching the independent

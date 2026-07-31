@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ -e /proc/$$/fd/9 ]]; then
-    printf 'FD9_LEAK winecfg %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+    printf 'FD9_LEAK winecfg %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 fi
 
-printf 'WINECFG %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+printf 'WINECFG %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"

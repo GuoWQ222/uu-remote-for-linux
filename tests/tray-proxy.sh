@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly proxy="$project_root/lib/uuyc-linux-controller/uuyc-tray-proxy"
+readonly proxy="$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy"
 
 "$proxy" --check | grep -q '^backend=StatusNotifierItem/AppIndicator3$'
 "$proxy" --check | grep -q '^x11=ready$'

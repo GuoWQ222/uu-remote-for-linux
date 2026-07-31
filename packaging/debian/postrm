@@ -16,9 +16,9 @@ if [[ ${1:-} == purge ]]; then
     printf '%s\n' \
         'Per-user UU Remote Wine data was preserved intentionally.' \
         'Review and remove these paths manually if they are no longer needed:' \
-        '  ${XDG_DATA_HOME:-$HOME/.local/share}/uuyc-linux-controller' \
-        '  ${XDG_CACHE_HOME:-$HOME/.cache}/uuyc-linux-controller' \
-        '  ${XDG_STATE_HOME:-$HOME/.local/state}/uuyc-linux-controller'
+        '  ${XDG_DATA_HOME:-$HOME/.local/share}/uu-remote-for-linux' \
+        '  ${XDG_CACHE_HOME:-$HOME/.cache}/uu-remote-for-linux' \
+        '  ${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-for-linux'
 fi
 
 exit 0

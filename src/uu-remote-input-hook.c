@@ -611,16 +611,16 @@ static void initialize_endpoint_path(void) {
     }
     lstrcpynW(
         name,
-        L"uuyc-input-bridge.endpoint",
+        L"uu-remote-input-bridge.endpoint",
         (int)(MAX_PATH - (name - endpoint_path))
     );
 }
 
-__declspec(dllexport) DWORD WINAPI UUYCInputHookVersion(void) {
+__declspec(dllexport) DWORD WINAPI UURemoteInputHookVersion(void) {
     return HOOK_VERSION;
 }
 
-__declspec(dllexport) DWORD WINAPI UUYCInputHookInitialize(LPVOID unused) {
+__declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     (void)unused;
     return (
         send_input_hooked &&

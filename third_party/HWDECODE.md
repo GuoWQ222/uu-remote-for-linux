@@ -11,7 +11,7 @@ The optional bridge is an NVIDIA-only, correctness-first compatibility path:
 
 This removes the missing CUDA/D3D11 interop blocker. It is hardware decoding
 with CPU copyback, not a zero-copy implementation. The UU-specific v0.6 relay
-also accepts `UUYC_CUDA_DEVICE=<ordinal>` and binds the D3D11 CUDA-context
+also accepts `UU_REMOTE_CUDA_DEVICE=<ordinal>` and binds the D3D11 CUDA-context
 entry points to that enumerated CUDA device. Invalid ordinals fail explicitly.
 
 UU Remote 4.34.0.8979 currently auto-selects implementation 32 (DXVA11)
@@ -51,12 +51,12 @@ The complete modified nvcuda source and the corresponding nvcuvid source are
 included under `third_party/sources/`. Their archive SHA-256 values are:
 
 ```text
-1ba879e8cce534a3d7d6b48b0ad5900aac0ce2e4ca7ebd1ac16f8f4b94185d16  nvcuda-uuyc-v0.6.tar.xz
+db94af7278ff49d4a0551b9ef49d170e5cb6b881aae8c9081d68386e7b5a4ca0  nvcuda-uu-remote-v0.6.tar.xz
 e2b5e99ef3a849a8ed779ce8c786505578d82169b25b08e2a3905702550751be  nvenc-nvcuvid-v0.5.tar.xz
 ```
 
 Runtime binary checksums are in
-`lib/uuyc-linux-controller/hwdecode/MANIFEST.sha256`.
+`lib/uu-remote-for-linux/hwdecode/MANIFEST.sha256`.
 
 ## Rebuilding the modified relay
 
@@ -64,13 +64,13 @@ The source uses Meson and Wine's `winegcc`. With Wine development headers,
 Meson, and Ninja available:
 
 ```bash
-tar -xf third_party/sources/nvcuda-uuyc-v0.6.tar.xz
+tar -xf third_party/sources/nvcuda-uu-remote-v0.6.tar.xz
 meson setup \
-  --cross-file nvcuda-uuyc-v0.6/build-wine64.txt \
+  --cross-file nvcuda-uu-remote-v0.6/build-wine64.txt \
   --buildtype release \
   -Dfakedll=false \
   build-nvcuda \
-  nvcuda-uuyc-v0.6
+  nvcuda-uu-remote-v0.6
 ninja -C build-nvcuda
 ```
 

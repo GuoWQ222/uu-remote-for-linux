@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf 'SYSTEMD_RUN %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+printf 'SYSTEMD_RUN %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 
 workdir=
 declare -a environment=()

@@ -3,8 +3,9 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-launcher="$project_root/bin/uuyc-linux-controller"
+launcher="$project_root/bin/uu-remote-for-linux"
 readonly launcher
+export UU_REMOTE_DISABLE_LEGACY_MIGRATION=1
 
 failures=0
 
@@ -21,32 +22,32 @@ check() {
 
 check "launcher syntax" bash -n "$launcher"
 check "decoder selector syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-decoder-selector"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector"
 check "tray proxy Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
-    "$project_root/lib/uuyc-linux-controller/uuyc-tray-proxy"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy"
 check "keyboard bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
-    "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
 check "autostart bridge syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
 check "WOL bridge syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 check "WOL root configurator syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure"
 check "update bridge syntax" bash -n \
-    "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge"
 check "systemctl fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/systemctl"
 check "systemd-run fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/systemd-run"
 check "tray proxy fixture syntax" bash -n \
-    "$project_root/tests/fixtures/bin/uuyc-tray-proxy"
+    "$project_root/tests/fixtures/bin/uu-remote-tray-proxy"
 check "zenity fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/zenity"
 check "keyboard gsettings fixture syntax" bash -n \
@@ -63,16 +64,16 @@ check "deb builder syntax" bash -n "$project_root/packaging/build-deb.sh"
 check "postinst syntax" bash -n "$project_root/packaging/debian/postinst"
 check "postrm syntax" bash -n "$project_root/packaging/debian/postrm"
 check "desktop entry" desktop-file-validate \
-    "$project_root/share/applications/uuyc-linux-controller.desktop"
+    "$project_root/share/applications/uu-remote-for-linux.desktop"
 if command -v appstreamcli >/dev/null 2>&1; then
     check "AppStream metadata" appstreamcli validate --no-net \
-        "$project_root/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml"
+        "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
 else
     printf 'SKIP AppStream metadata（未安装 appstreamcli）\n'
 fi
 if command -v xmllint >/dev/null 2>&1; then
     check "AppStream XML" xmllint --noout \
-        "$project_root/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml"
+        "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
 else
     printf 'SKIP AppStream XML（未安装 xmllint）\n'
 fi
@@ -87,83 +88,85 @@ check "WOL bridge integration" "$project_root/tests/wol-bridge.sh"
 check "update bridge integration" "$project_root/tests/update-bridge.sh"
 check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
+check "legacy project-name migration" \
+    "$project_root/tests/legacy-name-migration.sh"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
 
 check "shim exists" test -s \
-    "$project_root/lib/uuyc-linux-controller/wevtapi.dll"
+    "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 check "decoder selector exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-decoder-selector"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector"
 check "native tray proxy exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-tray-proxy"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy"
 check "autostart bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
 check "WOL bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 check "WOL root configurator exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure"
 check "update bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge"
 check "keyboard bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 check "input bridge exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
 check "update compatibility profiles exist" test -s \
-    "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv"
+    "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
 check "NVDEC probe exists" test -x \
-    "$project_root/lib/uuyc-linux-controller/uuyc-nvdec-probe"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe"
 # shellcheck disable=SC2016
 check "NVDEC probe is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB.*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-nvdec-probe"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "shim is PE DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/wevtapi.dll"
+    "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 # shellcheck disable=SC2016
 check "shim exports" bash -c \
     'objdump -p "$1" | grep -q "EvtOpenPublisherMetadata"' _ \
-    "$project_root/lib/uuyc-linux-controller/wevtapi.dll"
+    "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 # shellcheck disable=SC2016
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
 check "input hook is Win64 DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 check "input hook exports version" bash -c \
-    'objdump -p "$1" | grep -q "UUYCInputHookVersion"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
+    'objdump -p "$1" | grep -q "UURemoteInputHookVersion"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 check "input injector is Win64 PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
 check "input injector exports version" bash -c \
-    'objdump -p "$1" | grep -q "UUYCInputInjectorVersion"' _ \
-    "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
+    'objdump -p "$1" | grep -q "UURemoteInputInjectorVersion"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "hardware bridge manifest" bash -c \
     'cd "$1" && sha256sum --check MANIFEST.sha256' _ \
-    "$project_root/lib/uuyc-linux-controller/hwdecode"
+    "$project_root/lib/uu-remote-for-linux/hwdecode"
 # shellcheck disable=SC2016
 check "nvcuda bridge is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB shared object"' _ \
-    "$project_root/lib/uuyc-linux-controller/hwdecode/wine/x86_64-unix/nvcuda.dll.so"
+    "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/nvcuda.dll.so"
 # shellcheck disable=SC2016
 check "DXVK d3d11 is PE DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
-    "$project_root/lib/uuyc-linux-controller/hwdecode/dxvk/x64/d3d11.dll"
+    "$project_root/lib/uu-remote-for-linux/hwdecode/dxvk/x64/d3d11.dll"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck" shellcheck \
         "$launcher" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-decoder-selector" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure" \
-        "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" \
         "$project_root/scripts/install-user.sh" \
         "$project_root/scripts/build-nvdec-probe.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
@@ -184,7 +187,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/fixtures/bin/curl" \
         "$project_root/tests/fixtures/bin/autostart-wine" \
         "$project_root/tests/fixtures/bin/sleep-systemd-inhibit" \
-        "$project_root/tests/fixtures/bin/uuyc-tray-proxy" \
+        "$project_root/tests/fixtures/bin/uu-remote-tray-proxy" \
         "$project_root/tests/fixtures/bin/zenity" \
         "$project_root/tests/fixtures/bin/keyboard-gsettings" \
         "$project_root/tests/fixtures/bin/wine" \

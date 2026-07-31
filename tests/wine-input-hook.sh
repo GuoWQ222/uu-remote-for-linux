@@ -3,23 +3,23 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
-readonly hook="$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
-readonly injector="$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
-readonly compiler="${UUYC_MINGW_CC:-x86_64-w64-mingw32-gcc}"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+readonly hook="$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+readonly injector="$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
+readonly compiler="${UU_REMOTE_MINGW_CC:-x86_64-w64-mingw32-gcc}"
 compile_flags=()
 
-[[ -z ${UUYC_MINGW_INCLUDE_DIR:-} ]] ||
-    compile_flags+=("-isystem" "$UUYC_MINGW_INCLUDE_DIR")
-[[ -z ${UUYC_MINGW_LIBRARY_DIR:-} ]] ||
+[[ -z ${UU_REMOTE_MINGW_INCLUDE_DIR:-} ]] ||
+    compile_flags+=("-isystem" "$UU_REMOTE_MINGW_INCLUDE_DIR")
+[[ -z ${UU_REMOTE_MINGW_LIBRARY_DIR:-} ]] ||
     compile_flags+=(
-        "-B$UUYC_MINGW_LIBRARY_DIR"
-        "-L$UUYC_MINGW_LIBRARY_DIR"
+        "-B$UU_REMOTE_MINGW_LIBRARY_DIR"
+        "-L$UU_REMOTE_MINGW_LIBRARY_DIR"
     )
-[[ -z ${UUYC_MINGW_RUNTIME_DIR:-} ]] ||
+[[ -z ${UU_REMOTE_MINGW_RUNTIME_DIR:-} ]] ||
     compile_flags+=(
-        "-B$UUYC_MINGW_RUNTIME_DIR"
-        "-L$UUYC_MINGW_RUNTIME_DIR"
+        "-B$UU_REMOTE_MINGW_RUNTIME_DIR"
+        "-L$UU_REMOTE_MINGW_RUNTIME_DIR"
     )
 
 for command_name in wine wineboot wineserver "$compiler"; do
@@ -58,7 +58,7 @@ trap cleanup EXIT
 
 readonly prefix="$test_root/prefix"
 readonly state_dir="$test_root/state"
-readonly endpoint="$prefix/drive_c/uuyc-input-bridge.endpoint"
+readonly endpoint="$prefix/drive_c/uu-remote-input-bridge.endpoint"
 readonly log="$test_root/input-bridge.log"
 readonly lock="$test_root/input-bridge.lock"
 readonly trace="$test_root/xtest.trace"
@@ -90,11 +90,11 @@ mkdir -p "$state_dir"
 
 WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
     >/dev/null 2>&1
-install -Dm0644 "$hook" "$prefix/drive_c/uuyc-input-hook.dll"
+install -Dm0644 "$hook" "$prefix/drive_c/uu-remote-input-hook.dll"
 install -Dm0644 "$injector" \
-    "$prefix/drive_c/uuyc-input-injector.exe"
+    "$prefix/drive_c/uu-remote-input-injector.exe"
 
-UUYC_INPUT_BRIDGE_FAKE_TRACE="$trace" XDG_SESSION_TYPE=x11 \
+UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" XDG_SESSION_TYPE=x11 \
     "$bridge" watch \
     "$state_dir" "$endpoint" "$log" "$lock" 2 &
 bridge_pid=$!
@@ -105,8 +105,8 @@ done
 [[ -s $endpoint ]]
 
 WINEPREFIX="$prefix" WINEDEBUG=-all \
-    wine 'C:\uuyc-input-injector.exe' \
-    --watch GameViewerServer.exe 'C:\uuyc-input-hook.dll' \
+    wine 'C:\uu-remote-input-injector.exe' \
+    --watch GameViewerServer.exe 'C:\uu-remote-input-hook.dll' \
     >"$test_root/injector.log" 2>&1 &
 WINEPREFIX="$prefix" WINEDEBUG=-all timeout 20s wine "$probe"
 for _ in {1..100}; do

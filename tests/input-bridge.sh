@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
 
 test_root=$(mktemp -d)
 bridge_pid=
@@ -19,13 +19,13 @@ cleanup() {
 trap cleanup EXIT
 
 readonly state_dir="$test_root/state"
-readonly endpoint="$test_root/drive_c/uuyc-input-bridge.endpoint"
+readonly endpoint="$test_root/drive_c/uu-remote-input-bridge.endpoint"
 readonly log="$test_root/input-bridge.log"
 readonly lock="$test_root/input-bridge.lock"
 readonly trace="$test_root/xtest.trace"
 mkdir -p "$state_dir"
 
-export UUYC_INPUT_BRIDGE_FAKE_TRACE="$trace"
+export UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace"
 export XDG_SESSION_TYPE=x11
 
 "$bridge" check

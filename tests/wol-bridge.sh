@@ -3,13 +3,13 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 
 readonly server="$test_root/GameViewerServer.exe"
-readonly backup="$test_root/GameViewerServer.uuyc-wol-original.exe"
+readonly backup="$test_root/GameViewerServer.uu-remote-wol-original.exe"
 readonly expected="$test_root/GameViewerServer.expected.exe"
 readonly log_dir="$test_root/client/Log"
 readonly patch_offset=4096
@@ -25,22 +25,22 @@ original_sha=${original_sha%% *}
 patched_sha=$(sha256sum "$expected")
 patched_sha=${patched_sha%% *}
 
-UUYC_WOL_PATCH_OFFSET="$patch_offset" \
+UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
     "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha"
-UUYC_WOL_PATCH_OFFSET="$patch_offset" \
+UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
     "$bridge" patched "$server" "$backup" "$original_sha" "$patched_sha"
 cmp -s "$server" "$expected"
 test "$(sha256sum "$backup" | cut -d' ' -f1)" = "$original_sha"
 
-UUYC_WOL_PATCH_OFFSET="$patch_offset" \
+UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
     "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha"
-UUYC_WOL_PATCH_OFFSET="$patch_offset" \
+UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
     "$bridge" restore "$server" "$backup" "$original_sha" "$patched_sha"
 test "$(sha256sum "$server" | cut -d' ' -f1)" = "$original_sha"
 test ! -e "$backup"
 
 printf '\001' | dd of="$server" bs=1 seek=12 conv=notrunc status=none
-if UUYC_WOL_PATCH_OFFSET="$patch_offset" \
+if UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
     "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha" \
     >"$test_root/reject.out" 2>"$test_root/reject.err"; then
     printf '未知服务端版本被意外修改。\n' >&2

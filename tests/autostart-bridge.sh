@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 
 test_root=$(mktemp -d)
 watcher_pid=""
@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT
 
 readonly registry="$test_root/user.reg"
-readonly desktop="$test_root/config/autostart/uuyc-linux-controller.desktop"
+readonly desktop="$test_root/config/autostart/uu-remote-for-linux.desktop"
 readonly launcher="$test_root/launcher with space"
 readonly log_file="$test_root/state/autostart-bridge.log"
 readonly lock_file="$test_root/state/autostart-bridge.lock"
@@ -76,7 +76,7 @@ write_registry_on
 "$bridge" native-enabled "$desktop"
 grep -Fqx "Exec=\"$launcher\" --autostart" "$desktop"
 grep -Fqx 'X-GNOME-Autostart-enabled=true' "$desktop"
-grep -Fqx 'X-UUYC-Autostart-Bridge=true' "$desktop"
+grep -Fqx 'X-UU-Remote-Autostart-Bridge=true' "$desktop"
 
 desktop_hash=$(sha256sum "$desktop")
 "$bridge" sync "$registry" "$desktop" "$launcher" "$log_file"
@@ -103,22 +103,22 @@ install -Dm0644 /dev/null "$live_prefix/system.reg"
 write_registry_off
 mv -f -- "$registry" "$live_registry"
 printf 'enabled\n' >"$live_state"
-UUYC_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
-UUYC_AUTOSTART_LIVE_STATE="$live_state" \
-UUYC_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
+UU_REMOTE_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
+UU_REMOTE_AUTOSTART_LIVE_STATE="$live_state" \
+UU_REMOTE_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
     "$bridge" sync "$live_registry" "$desktop" "$launcher" "$log_file"
 "$bridge" native-enabled "$desktop"
 printf 'disabled\n' >"$live_state"
-UUYC_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
-UUYC_AUTOSTART_LIVE_STATE="$live_state" \
-UUYC_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
+UU_REMOTE_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
+UU_REMOTE_AUTOSTART_LIVE_STATE="$live_state" \
+UU_REMOTE_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
     "$bridge" sync "$live_registry" "$desktop" "$launcher" "$log_file"
 test ! -e "$desktop"
 
 printf 'enabled\n' >"$live_state"
-UUYC_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
-UUYC_AUTOSTART_LIVE_STATE="$live_state" \
-UUYC_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
+UU_REMOTE_WINE_BIN="$project_root/tests/fixtures/bin/autostart-wine" \
+UU_REMOTE_AUTOSTART_LIVE_STATE="$live_state" \
+UU_REMOTE_AUTOSTART_ASSUME_WINESERVER_RUNNING=1 \
     "$bridge" watch \
     "$live_registry" "$desktop" "$launcher" "$log_file" \
     "$test_root/state/live-autostart-bridge.lock" 0.05 &

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf 'SYSTEMCTL %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+printf 'SYSTEMCTL %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 
 case "$*" in
     *" show-environment")
         exit 0
         ;;
-    *" show --property=LoadState --value uuyc-linux-controller-client.service")
+    *" show --property=LoadState --value uu-remote-for-linux-client.service")
         printf 'not-found\n'
         exit 0
         ;;

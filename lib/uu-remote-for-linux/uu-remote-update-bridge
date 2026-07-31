@@ -4,8 +4,8 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 用法：
-  uuyc-update-bridge setting-enabled SETTING_INI
-  uuyc-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL]
+  uu-remote-update-bridge setting-enabled SETTING_INI
+  uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL]
 EOF
 }
 

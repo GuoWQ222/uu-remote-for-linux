@@ -12,7 +12,7 @@
 
 ## 1. 安装与登录
 
-- [ ] `uuyc-linux-controller --diagnose` 无阻断项
+- [ ] `uu-remote-for-linux --diagnose` 无阻断项
 - [ ] `--accept-eula --setup-only` 首次设置成功
 - [ ] 第二次 `--setup-only` 不重复下载或安装
 - [ ] 客户端窗口可见且无持续白屏
@@ -68,7 +68,7 @@
 # Linux X11 被控端输入（0.9.2+）
 
 1. 确认登录会话为 X11，启动 UU 后运行
-   `uuyc-linux-controller --diagnose`。
+   `uu-remote-for-linux --diagnose`。
 2. 确认 `Win64 输入钩子` 为“完整”，`被控端原生输入` 为“生效中”，
    并显示“钩子 v3”。
 3. 从另一台电脑连接本机，确认远端鼠标可见且可移动。
@@ -77,12 +77,12 @@
    增长。
 6. 按住一个键或鼠标按钮后主动断开连接；最多等待 15 秒，确认本机没有
    遗留按下状态。
-7. 运行 `uuyc-linux-controller --stop`，确认输入桥停止并释放所有按键和
+7. 运行 `uu-remote-for-linux --stop`，确认输入桥停止并释放所有按键和
    鼠标按钮。
 # Linux 登录自启动（0.3.3+）
 
 1. 正常启动 UU，打开设置页并开启“开机自动启动”。
-2. 最多等待 2 秒，运行 `uuyc-linux-controller --diagnose`，确认：
+2. 最多等待 2 秒，运行 `uu-remote-for-linux --diagnose`，确认：
    - `UU 自启动开关` 为“开启”；
    - `Linux 自启动项` 为“已创建”；
    - `自启动兼容桥` 为“就绪”。
@@ -92,20 +92,20 @@
 # 防止电脑休眠（0.4.0+）
 
 1. 正常启动 UU，在设置页开启“防止电脑休眠”。
-2. 最多等待 2 秒，运行 `uuyc-linux-controller --diagnose`，确认：
+2. 最多等待 2 秒，运行 `uu-remote-for-linux --diagnose`，确认：
    - `UU 防休眠开关` 为“开启”；
    - `Linux 休眠抑制` 为“生效中”；
    - `防休眠兼容桥` 为“就绪”。
 3. 运行 `systemd-inhibit --list --no-pager`，确认存在
-   `uuyc-linux-controller` 的 `sleep:idle`、`block` 条目。
+   `uu-remote-for-linux` 的 `sleep:idle`、`block` 条目。
 4. 关闭 UU 开关，最多等待 2 秒，确认该 inhibitor 消失。
-5. 再次开启开关，然后执行 `uuyc-linux-controller --stop`，确认
+5. 再次开启开关，然后执行 `uu-remote-for-linux --stop`，确认
    inhibitor 在 2 秒内消失。
 
 # 允许远程开机（0.5.1+）
 
 1. 运行 `sudo ethtool <有线网卡>`，确认 `Supports Wake-on` 包含 `g`。
-2. 运行 `uuyc-linux-controller --enable-wol`，完成授权后检查诊断：
+2. 运行 `uu-remote-for-linux --enable-wol`，完成授权后检查诊断：
    - `Linux WOL 状态` 为“Magic Packet 已配置”；
    - `UU 后台进程托管` 为“Server/Healthd 生效中”；
    - `UU WOL 兼容桥` 为“已启用”；
@@ -118,13 +118,13 @@
 
 # 安全自动更新（0.6.0+）
 
-1. 在 UU 设置页开启“自动更新”，运行 `uuyc-linux-controller --diagnose`，
+1. 在 UU 设置页开启“自动更新”，运行 `uu-remote-for-linux --diagnose`，
    确认“UU 自动更新开关”为“开启”、“自动更新兼容桥”为“就绪”、
    “官方更新器保护”为“完整”。
-2. 运行 `uuyc-linux-controller --check-update`，当前已经是最新版时确认
+2. 运行 `uu-remote-for-linux --check-update`，当前已经是最新版时确认
    客户端保持运行且诊断显示“已是最新版本”。
 3. 检查安装目录中的 `Upgrade.exe` 与软件包内占位程序完全一致，并确认
-   `Upgrade.uuyc-original.exe` 仍存在。
+   `Upgrade.uu-remote-original.exe` 仍存在。
 4. 发现未收录的新版本时，确认诊断显示“已暂缓”，当前 UU 版本和
    `d3d11.dll`、`dxgi.dll`、`streamer.dll`、`GameViewerServer.exe`
    哈希均未变化。

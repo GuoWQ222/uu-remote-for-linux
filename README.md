@@ -33,9 +33,13 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_0.9.2_amd64.deb
-uuyc-linux-controller --accept-eula --setup-only
+sudo apt install ./uu-remote-for-linux_1.0.0_amd64.deb
+uu-remote-for-linux --accept-eula --setup-only
 ```
+
+Installing 1.0.0 replaces the previous package identity. On first launch it
+moves the existing Wine prefix, login, settings, cache, logs, and autostart
+entry into the new `uu-remote-for-linux` paths.
 
 ### Install from source (optional)
 
@@ -43,36 +47,36 @@ uuyc-linux-controller --accept-eula --setup-only
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
-~/.local/bin/uuyc-linux-controller --accept-eula --setup-only
+~/.local/bin/uu-remote-for-linux --accept-eula --setup-only
 ```
 
 ## Usage (command line)
 
 ```bash
 # Start UU Remote
-uuyc-linux-controller
+uu-remote-for-linux
 
 # Install or repair the isolated client
-uuyc-linux-controller --setup-only
-uuyc-linux-controller --repair
+uu-remote-for-linux --setup-only
+uu-remote-for-linux --repair
 
 # Inspect the installation without changing it
-uuyc-linux-controller --diagnose
+uu-remote-for-linux --diagnose
 
 # Run a safe, compatibility-gated update check
-uuyc-linux-controller --check-update
+uu-remote-for-linux --check-update
 
 # Select a decoder interactively, or list detected devices
-uuyc-linux-controller --select-decoder
-uuyc-linux-controller --list-decoders
+uu-remote-for-linux --select-decoder
+uu-remote-for-linux --list-decoders
 
 # Select a policy explicitly
-uuyc-linux-controller --decoder auto
-uuyc-linux-controller --decoder cpu
-uuyc-linux-controller --decoder nvidia:0
+uu-remote-for-linux --decoder auto
+uu-remote-for-linux --decoder cpu
+uu-remote-for-linux --decoder nvidia:0
 
 # Stop only this project's dedicated Wine prefix
-uuyc-linux-controller --stop
+uu-remote-for-linux --stop
 ```
 
 ## Linux controlled-host input
@@ -83,7 +87,7 @@ keyboard packets are passed to a native X11/XTest daemon. This avoids the
 unavailable proprietary Windows kernel HID driver and needs neither
 `/dev/uinput` nor root privileges.
 
-Run `uuyc-linux-controller --diagnose` and verify:
+Run `uu-remote-for-linux --diagnose` and verify:
 
 - `被控端原生输入` reports `生效中`;
 - `被控端输入事件` increases while the controller moves or clicks;

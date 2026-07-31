@@ -3,85 +3,101 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly user_prefix="${UUYC_USER_INSTALL_PREFIX:-$HOME/.local}"
-readonly launcher_target="$user_prefix/bin/uuyc-linux-controller"
-readonly runtime_target="$user_prefix/lib/uuyc-linux-controller"
-readonly desktop_target="$user_prefix/share/applications/uuyc-linux-controller.desktop"
-readonly metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml"
-readonly icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uuyc-linux-controller.png"
-readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uuyc-linux-controller.svg"
+readonly user_prefix="${UU_REMOTE_USER_INSTALL_PREFIX:-$HOME/.local}"
+readonly launcher_target="$user_prefix/bin/uu-remote-for-linux"
+readonly runtime_target="$user_prefix/lib/uu-remote-for-linux"
+readonly desktop_target="$user_prefix/share/applications/uu-remote-for-linux.desktop"
+readonly metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
+readonly icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
+readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-remote-for-linux.svg"
+readonly previous_launcher_target="$user_prefix/bin/uuyc-linux-controller"
+readonly previous_runtime_target="$user_prefix/lib/uuyc-linux-controller"
+readonly previous_desktop_target="$user_prefix/share/applications/uuyc-linux-controller.desktop"
+readonly previous_metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml"
+readonly previous_icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uuyc-linux-controller.png"
+readonly previous_scalable_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uuyc-linux-controller.svg"
 
-[[ -r "$project_root/lib/uuyc-linux-controller/wevtapi.dll" ]] || {
+[[ -r "$project_root/lib/uu-remote-for-linux/wevtapi.dll" ]] || {
     printf '缺少预构建的 wevtapi.dll；请先运行 make shim。\n' >&2
     exit 1
 }
-[[ -r "$project_root/lib/uuyc-linux-controller/hwdecode/dxvk/x64/d3d11.dll" ]] || {
+[[ -r "$project_root/lib/uu-remote-for-linux/hwdecode/dxvk/x64/d3d11.dll" ]] || {
     printf '缺少预构建的硬件解码桥；请检查源码包完整性。\n' >&2
     exit 1
 }
-[[ -x "$project_root/lib/uuyc-linux-controller/uuyc-decoder-selector" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-nvdec-probe" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-tray-proxy" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge" &&
-    -r "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe" &&
-    -r "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge" &&
-    -x "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge" &&
-    -r "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll" &&
-    -r "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe" ]] || {
+[[ -x "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
+    -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
     exit 1
 }
 
-install -Dm0755 "$project_root/bin/uuyc-linux-controller" "$launcher_target"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/wevtapi.dll" \
+install -Dm0755 "$project_root/bin/uu-remote-for-linux" "$launcher_target"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/wevtapi.dll" \
     "$runtime_target/wevtapi.dll"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/package-version" \
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/package-version" \
     "$runtime_target/package-version"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-decoder-selector" \
-    "$runtime_target/uuyc-decoder-selector"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-nvdec-probe" \
-    "$runtime_target/uuyc-nvdec-probe"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-tray-proxy" \
-    "$runtime_target/uuyc-tray-proxy"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge" \
-    "$runtime_target/uuyc-autostart-bridge"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge" \
-    "$runtime_target/uuyc-sleep-bridge"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-wol-bridge" \
-    "$runtime_target/uuyc-wol-bridge"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure" \
-    "$runtime_target/uuyc-wol-configure"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge" \
-    "$runtime_target/uuyc-update-bridge"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge" \
-    "$runtime_target/uuyc-keyboard-bridge"
-install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge" \
-    "$runtime_target/uuyc-input-bridge"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll" \
-    "$runtime_target/uuyc-input-hook.dll"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe" \
-    "$runtime_target/uuyc-input-injector.exe"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe" \
-    "$runtime_target/uuyc-update-blocker.exe"
-install -Dm0644 "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv" \
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector" \
+    "$runtime_target/uu-remote-decoder-selector"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe" \
+    "$runtime_target/uu-remote-nvdec-probe"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-tray-proxy" \
+    "$runtime_target/uu-remote-tray-proxy"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge" \
+    "$runtime_target/uu-remote-autostart-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge" \
+    "$runtime_target/uu-remote-sleep-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge" \
+    "$runtime_target/uu-remote-wol-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" \
+    "$runtime_target/uu-remote-wol-configure"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" \
+    "$runtime_target/uu-remote-update-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
+    "$runtime_target/uu-remote-keyboard-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
+    "$runtime_target/uu-remote-input-bridge"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" \
+    "$runtime_target/uu-remote-input-hook.dll"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
+    "$runtime_target/uu-remote-input-injector.exe"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" \
+    "$runtime_target/uu-remote-update-blocker.exe"
+install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
     "$runtime_target/update-compatibility.tsv"
 mkdir -p "$runtime_target/hwdecode"
-cp -a "$project_root/lib/uuyc-linux-controller/hwdecode/." \
+cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
     "$runtime_target/hwdecode/"
-install -Dm0644 "$project_root/share/applications/uuyc-linux-controller.desktop" \
+install -Dm0644 "$project_root/share/applications/uu-remote-for-linux.desktop" \
     "$desktop_target"
 install -Dm0644 \
-    "$project_root/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml" \
+    "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml" \
     "$metainfo_target"
 install -Dm0644 \
-    "$project_root/share/icons/hicolor/256x256/apps/uuyc-linux-controller.png" \
+    "$project_root/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" \
     "$icon_target"
 rm -f -- "$legacy_icon_target"
+rm -f -- \
+    "$previous_launcher_target" \
+    "$previous_desktop_target" \
+    "$previous_metainfo_target" \
+    "$previous_icon_target" \
+    "$previous_scalable_icon_target"
+if [[ -d $previous_runtime_target &&
+    $previous_runtime_target == "$user_prefix/lib/"* ]]; then
+    find "$previous_runtime_target" -depth -delete
+fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$user_prefix/share/applications" >/dev/null 2>&1 || true

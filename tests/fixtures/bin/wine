@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-trace_file=${UUYC_FAKE_TRACE:?}
+trace_file=${UU_REMOTE_FAKE_TRACE:?}
 
 if [[ -e /proc/$$/fd/9 ]]; then
     printf 'FD9_LEAK wine %s\n' "$*" >>"$trace_file"
@@ -86,7 +86,7 @@ case ${1:-} in
         printf '\213\105\320' |
             dd of="$install_dir/bin/streamer.dll" bs=1 seek=$((0x94e4ee)) \
                 conv=notrunc status=none
-        if [[ ${UUYC_FAKE_CORRUPT_STREAMER:-0} == 1 ]]; then
+        if [[ ${UU_REMOTE_FAKE_CORRUPT_STREAMER:-0} == 1 ]]; then
             printf '\001' |
                 dd of="$install_dir/bin/streamer.dll" bs=1 seek=0 \
                     conv=notrunc status=none
@@ -101,7 +101,7 @@ case ${1:-} in
             >"$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
         install -Dm0644 /dev/null "$install_dir/bin/MicrosoftEdgeWebview2Setup.exe"
         install -Dm0644 /dev/null "$install_dir/bin/.app-installed"
-        printf '%s\n' "${UUYC_FAKE_INSTALLER_VERSION:-4.34.0.8979}" \
+        printf '%s\n' "${UU_REMOTE_FAKE_INSTALLER_VERSION:-4.34.0.8979}" \
             >"$install_dir/bin/.installed-version"
         printf 'INSTALL\n' >>"$trace_file"
         exit 0
@@ -127,7 +127,7 @@ case ${1:-} in
             ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
             printf 'HWDECODE_ENV\n' >>"$trace_file"
         fi
-        printf 'CUDA_DEVICE=%s\n' "${UUYC_CUDA_DEVICE:-unset}" >>"$trace_file"
+        printf 'CUDA_DEVICE=%s\n' "${UU_REMOTE_CUDA_DEVICE:-unset}" >>"$trace_file"
         printf 'CLIENT\n' >>"$trace_file"
         exit 0
         ;;

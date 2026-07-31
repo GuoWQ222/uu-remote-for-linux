@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-sleep-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-sleep-bridge"
 readonly fake_inhibit="$project_root/tests/fixtures/bin/sleep-systemd-inhibit"
 
 test_root=$(mktemp -d)
@@ -71,9 +71,9 @@ printf 'new log without state\n' >"$log_dir/log_2.txt"
 test "$("$bridge" state "$log_dir")" = unknown
 
 write_log "$log_dir/log_2.txt" 2147483648
-UUYC_SYSTEMD_INHIBIT_BIN="$fake_inhibit" \
-UUYC_SLEEP_INHIBIT_TRACE="$inhibit_trace" \
-UUYC_SLEEP_ASSUME_WINESERVER_RUNNING=1 \
+UU_REMOTE_SYSTEMD_INHIBIT_BIN="$fake_inhibit" \
+UU_REMOTE_SLEEP_INHIBIT_TRACE="$inhibit_trace" \
+UU_REMOTE_SLEEP_ASSUME_WINESERVER_RUNNING=1 \
     "$bridge" watch \
     "$log_dir" "$prefix" "$launcher" "$bridge_log" "$lock_file" 0.05 &
 watcher_pid=$!

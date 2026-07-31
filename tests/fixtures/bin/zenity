@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf 'ZENITY' >>"${UUYC_FAKE_TRACE:?}"
-printf ' %q' "$@" >>"$UUYC_FAKE_TRACE"
-printf '\n' >>"$UUYC_FAKE_TRACE"
+printf 'ZENITY' >>"${UU_REMOTE_FAKE_TRACE:?}"
+printf ' %q' "$@" >>"$UU_REMOTE_FAKE_TRACE"
+printf '\n' >>"$UU_REMOTE_FAKE_TRACE"
 
 for argument in "$@"; do
     if [[ $argument == --list ]]; then
-        [[ ${UUYC_FAKE_ZENITY_CANCEL:-0} != 1 ]] || exit 1
-        printf '%s\n' "${UUYC_FAKE_ZENITY_CHOICE:-cpu}"
+        [[ ${UU_REMOTE_FAKE_ZENITY_CANCEL:-0} != 1 ]] || exit 1
+        printf '%s\n' "${UU_REMOTE_FAKE_ZENITY_CHOICE:-cpu}"
         exit 0
     fi
 done

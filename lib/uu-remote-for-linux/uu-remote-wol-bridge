@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly patch_offset="${UUYC_WOL_PATCH_OFFSET:-$((0x40df20))}"
+readonly patch_offset="${UU_REMOTE_WOL_PATCH_OFFSET:-$((0x40df20))}"
 readonly original_bytes="48895c"
 readonly patched_bytes="b001c3"
 
 usage() {
     cat <<'EOF'
 用法：
-  uuyc-wol-bridge detect
-  uuyc-wol-bridge patch SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
-  uuyc-wol-bridge restore SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
-  uuyc-wol-bridge patched SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
-  uuyc-wol-bridge cloud-state CLIENT_LOG_DIR
+  uu-remote-wol-bridge detect
+  uu-remote-wol-bridge patch SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uu-remote-wol-bridge restore SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uu-remote-wol-bridge patched SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uu-remote-wol-bridge cloud-state CLIENT_LOG_DIR
 EOF
 }
 
@@ -91,7 +91,7 @@ patch_server() {
         install -m 0644 "$server" "$backup"
     fi
 
-    temp="${server}.uuyc-wol-new"
+    temp="${server}.uu-remote-wol-new"
     install -m 0644 "$server" "$temp"
     printf '\260\001\303' |
         dd of="$temp" bs=1 seek="$patch_offset" conv=notrunc status=none

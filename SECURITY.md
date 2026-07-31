@@ -20,7 +20,7 @@ Before attaching diagnostics, screenshots, or logs, remove:
 - public IP addresses and private network topology;
 - file names or screen contents containing confidential information.
 
-Prefer the output of `uuyc-linux-controller --diagnose`, which is designed to
+Prefer the output of `uu-remote-for-linux --diagnose`, which is designed to
 report wrapper state without dumping account credentials. Do not upload the
 complete Wine prefix.
 

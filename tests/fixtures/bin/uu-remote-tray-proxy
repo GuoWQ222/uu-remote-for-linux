@@ -7,4 +7,4 @@ if [[ ${1:-} == --check ]]; then
     exit 0
 fi
 
-printf 'TRAY_PROXY %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+printf 'TRAY_PROXY %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"

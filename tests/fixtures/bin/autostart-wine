@@ -3,8 +3,8 @@ set -euo pipefail
 
 if [[ ${1:-} == reg && ${2:-} == query ]]; then
     printf 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n'
-    if [[ -r ${UUYC_AUTOSTART_LIVE_STATE:-} &&
-        $(<"$UUYC_AUTOSTART_LIVE_STATE") == enabled ]]; then
+    if [[ -r ${UU_REMOTE_AUTOSTART_LIVE_STATE:-} &&
+        $(<"$UU_REMOTE_AUTOSTART_LIVE_STATE") == enabled ]]; then
         printf '    GameViewer    REG_SZ    C:\\Program Files\\Netease\\GameViewer\\bin\\GameViewerLauncher.exe\n'
     fi
     exit 0

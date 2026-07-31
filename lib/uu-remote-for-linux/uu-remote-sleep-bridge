@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly inhibitor_who="uuyc-linux-controller"
+readonly inhibitor_who="uu-remote-for-linux"
 readonly inhibitor_why="UU 防止电脑休眠已开启"
-readonly systemd_inhibit="${UUYC_SYSTEMD_INHIBIT_BIN:-systemd-inhibit}"
-readonly setsid_bin="${UUYC_SETSID_BIN:-setsid}"
+readonly systemd_inhibit="${UU_REMOTE_SYSTEMD_INHIBIT_BIN:-systemd-inhibit}"
+readonly setsid_bin="${UU_REMOTE_SETSID_BIN:-setsid}"
 inhibitor_pid=""
 
 usage() {
     cat <<'EOF'
 用法：
-  uuyc-sleep-bridge state LOG_DIR
-  uuyc-sleep-bridge inhibitor-active
-  uuyc-sleep-bridge watch LOG_DIR PREFIX LAUNCHER LOG LOCK [INTERVAL]
+  uu-remote-sleep-bridge state LOG_DIR
+  uu-remote-sleep-bridge inhibitor-active
+  uu-remote-sleep-bridge watch LOG_DIR PREFIX LAUNCHER LOG LOCK [INTERVAL]
 EOF
 }
 
@@ -57,13 +57,13 @@ prevent_sleep_state() {
 wine_server_running() {
     local prefix=$1 device inode runtime_root
 
-    if [[ ${UUYC_SLEEP_ASSUME_WINESERVER_RUNNING:-0} == 1 ]]; then
+    if [[ ${UU_REMOTE_SLEEP_ASSUME_WINESERVER_RUNNING:-0} == 1 ]]; then
         return
     fi
     read -r device inode < <(stat -Lc '%D %i' "$prefix" 2>/dev/null) ||
         return 1
     printf -v inode '%x' "$inode"
-    runtime_root=${UUYC_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
+    runtime_root=${UU_REMOTE_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
     [[ -S $runtime_root/server-"$device"-"$inode"/socket ]]
 }
 

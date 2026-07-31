@@ -2,9 +2,9 @@
 set -euo pipefail
 
 if [[ -e /proc/$$/fd/9 ]]; then
-    printf 'FD9_LEAK wineboot %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+    printf 'FD9_LEAK wineboot %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 fi
 
 prefix=${WINEPREFIX:?}
 install -Dm0644 /dev/null "$prefix/system.reg"
-printf 'WINEBOOT %s\n' "$*" >>"${UUYC_FAKE_TRACE:?}"
+printf 'WINEBOOT %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"

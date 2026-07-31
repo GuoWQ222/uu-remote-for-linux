@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly managed_marker='X-UUYC-Autostart-Bridge=true'
+readonly managed_marker='X-UU-Remote-Autostart-Bridge=true'
 readonly run_section='[Software\\Microsoft\\Windows\\CurrentVersion\\Run]'
 
 usage() {
     cat <<'EOF'
 用法：
-  uuyc-autostart-bridge registry-enabled REGISTRY
-  uuyc-autostart-bridge native-enabled DESKTOP
-  uuyc-autostart-bridge sync REGISTRY DESKTOP LAUNCHER LOG
-  uuyc-autostart-bridge watch REGISTRY DESKTOP LAUNCHER LOG LOCK [INTERVAL]
+  uu-remote-autostart-bridge registry-enabled REGISTRY
+  uu-remote-autostart-bridge native-enabled DESKTOP
+  uu-remote-autostart-bridge sync REGISTRY DESKTOP LAUNCHER LOG
+  uu-remote-autostart-bridge watch REGISTRY DESKTOP LAUNCHER LOG LOCK [INTERVAL]
 EOF
 }
 
@@ -41,10 +41,10 @@ effective_autostart_enabled() {
     local registry=$1 prefix wine_bin output line
 
     prefix=${registry%/user.reg}
-    wine_bin=${UUYC_WINE_BIN:-wine}
+    wine_bin=${UU_REMOTE_WINE_BIN:-wine}
     if [[ $prefix != "$registry" && -f $prefix/system.reg ]] &&
         {
-            [[ ${UUYC_AUTOSTART_ASSUME_WINESERVER_RUNNING:-0} == 1 ]] ||
+            [[ ${UU_REMOTE_AUTOSTART_ASSUME_WINESERVER_RUNNING:-0} == 1 ]] ||
                 wine_server_running "$prefix"
         } &&
         command -v "$wine_bin" >/dev/null 2>&1; then
@@ -69,7 +69,7 @@ wine_server_running() {
     read -r device inode < <(stat -Lc '%D %i' "$prefix" 2>/dev/null) ||
         return 1
     printf -v inode '%x' "$inode"
-    runtime_root=${UUYC_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
+    runtime_root=${UU_REMOTE_WINE_RUNTIME_ROOT:-/tmp/.wine-$(id -u)}
     [[ -S $runtime_root/server-"$device"-"$inode"/socket ]]
 }
 
@@ -117,7 +117,7 @@ write_native_autostart() {
 
     desktop_dir=${desktop%/*}
     mkdir -p -- "$desktop_dir"
-    temp_file=$(mktemp "$desktop_dir/.uuyc-autostart.XXXXXX")
+    temp_file=$(mktemp "$desktop_dir/.uu-remote-autostart.XXXXXX")
     trap 'rm -f -- "$temp_file"' RETURN
     exec_argument=$(desktop_exec_argument "$launcher")
     {
@@ -130,7 +130,7 @@ write_native_autostart() {
             'Comment=Start UU Remote after logging in' \
             'Comment[zh_CN]=登录 Linux 后自动启动网易 UU 远程' \
             "Exec=$exec_argument --autostart" \
-            'Icon=uuyc-linux-controller' \
+            'Icon=uu-remote-for-linux' \
             'Terminal=false' \
             'StartupNotify=false' \
             'X-GNOME-Autostart-enabled=true' \

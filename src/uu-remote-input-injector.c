@@ -97,7 +97,7 @@ static BOOL initialize_remote_hook(DWORD pid, const WCHAR *dll_path) {
     BOOL success = FALSE;
 
     if (!remote_module_info(
-            pid, L"uuyc-input-hook.dll", &remote_hook
+            pid, L"uu-remote-input-hook.dll", &remote_hook
         )) {
         SetLastError(ERROR_MOD_NOT_FOUND);
         return FALSE;
@@ -109,7 +109,7 @@ static BOOL initialize_remote_hook(DWORD pid, const WCHAR *dll_path) {
         return FALSE;
     }
     local_initialize = GetProcAddress(
-        local_hook, "UUYCInputHookInitialize"
+        local_hook, "UURemoteInputHookInitialize"
     );
     if (!local_initialize) {
         SetLastError(ERROR_PROC_NOT_FOUND);
@@ -169,7 +169,7 @@ static BOOL inject_library(DWORD pid, const WCHAR *dll_path) {
     DWORD thread_exit = 0;
     BOOL success = FALSE;
 
-    if (remote_module_info(pid, L"uuyc-input-hook.dll", NULL)) {
+    if (remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)) {
         return initialize_remote_hook(pid, dll_path);
     }
     if (!remote_module_info(pid, L"kernel32.dll", &remote_kernel32)) {
@@ -238,7 +238,7 @@ static BOOL inject_library(DWORD pid, const WCHAR *dll_path) {
         SetLastError(ERROR_DLL_INIT_FAILED);
         goto cleanup;
     }
-    success = remote_module_info(pid, L"uuyc-input-hook.dll", NULL) &&
+    success = remote_module_info(pid, L"uu-remote-input-hook.dll", NULL) &&
         initialize_remote_hook(pid, dll_path);
     if (!success) {
         SetLastError(ERROR_MOD_NOT_FOUND);
@@ -294,7 +294,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
         }
         if (
             !last_injected ||
-            !remote_module_info(pid, L"uuyc-input-hook.dll", NULL)
+            !remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)
         ) {
             last_injected = inject_library(pid, dll_path);
             if (last_injected) {
@@ -315,7 +315,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     return 0;
 }
 
-__declspec(dllexport) DWORD WINAPI UUYCInputInjectorVersion(void) {
+__declspec(dllexport) DWORD WINAPI UURemoteInputInjectorVersion(void) {
     return INJECTOR_VERSION;
 }
 
@@ -334,7 +334,7 @@ int wmain(int argument_count, WCHAR **arguments) {
     }
     fwprintf(
         stderr,
-        L"usage: uuyc-input-injector.exe "
+        L"usage: uu-remote-input-injector.exe "
         L"(--watch|--once) IMAGE_NAME DLL_PATH\n"
     );
     return 64;

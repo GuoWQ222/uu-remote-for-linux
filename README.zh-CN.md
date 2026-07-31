@@ -27,9 +27,13 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_0.9.2_amd64.deb
-uuyc-linux-controller --accept-eula --setup-only
+sudo apt install ./uu-remote-for-linux_1.0.0_amd64.deb
+uu-remote-for-linux --accept-eula --setup-only
 ```
+
+安装 1.0.0 时会替换旧的软件包标识。首次启动将把现有 Wine 前缀、登录
+状态、设置、缓存、日志和自启动项迁移到新的 `uu-remote-for-linux`
+路径，不需要重新登录。
 
 ### 从源码安装（可选）
 
@@ -37,36 +41,36 @@ uuyc-linux-controller --accept-eula --setup-only
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
-~/.local/bin/uuyc-linux-controller --accept-eula --setup-only
+~/.local/bin/uu-remote-for-linux --accept-eula --setup-only
 ```
 
 ## 使用方法（命令行）
 
 ```bash
 # 启动 UU 远程
-uuyc-linux-controller
+uu-remote-for-linux
 
 # 安装或修复独立客户端
-uuyc-linux-controller --setup-only
-uuyc-linux-controller --repair
+uu-remote-for-linux --setup-only
+uu-remote-for-linux --repair
 
 # 在不做任何更改的情况下检查安装状态
-uuyc-linux-controller --diagnose
+uu-remote-for-linux --diagnose
 
 # 执行一次受兼容性限制的安全更新检查
-uuyc-linux-controller --check-update
+uu-remote-for-linux --check-update
 
 # 交互式选择解码器，或列出检测到的设备
-uuyc-linux-controller --select-decoder
-uuyc-linux-controller --list-decoders
+uu-remote-for-linux --select-decoder
+uu-remote-for-linux --list-decoders
 
 # 明确选择解码策略
-uuyc-linux-controller --decoder auto
-uuyc-linux-controller --decoder cpu
-uuyc-linux-controller --decoder nvidia:0
+uu-remote-for-linux --decoder auto
+uu-remote-for-linux --decoder cpu
+uu-remote-for-linux --decoder nvidia:0
 
 # 仅停止本项目的独立 Wine 前缀
-uuyc-linux-controller --stop
+uu-remote-for-linux --stop
 ```
 
 ## Linux 被控端输入
@@ -76,7 +80,7 @@ uuyc-linux-controller --stop
 守护进程。它不尝试加载网易的 Windows 内核 HID 驱动，也不需要
 `/dev/uinput` 或 root 权限。
 
-运行 `uuyc-linux-controller --diagnose`，确认：
+运行 `uu-remote-for-linux --diagnose`，确认：
 
 - `被控端原生输入` 为“生效中”；
 - 移动或点击时，`被控端输入事件` 的计数持续增加；

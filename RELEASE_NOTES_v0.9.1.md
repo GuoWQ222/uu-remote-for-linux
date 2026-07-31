@@ -18,7 +18,7 @@ The version-2 input hook now:
 - converts Windows normalized absolute coordinates to the capture desktop;
 - returns the tracked position through both cursor-query APIs;
 - keeps one authoritative XTest input path, avoiding duplicate movement;
-- exposes per-event counters in `uuyc-linux-controller --diagnose`.
+- exposes per-event counters in `uu-remote-for-linux --diagnose`.
 
 ## Validation
 

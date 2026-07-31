@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly app_id="uuyc-linux-controller"
+readonly app_id="uu-remote-for-linux"
+readonly legacy_app_id="uuyc-linux-controller"
 readonly app_name="UU 远程（Linux 版本）"
 readonly min_wine_version="11.1"
 readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
@@ -12,8 +13,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 resolve_runtime_dir() {
     local candidate
 
-    if [[ -n ${UUYC_CONTROLLER_RUNTIME_DIR:-} ]]; then
-        printf '%s\n' "$UUYC_CONTROLLER_RUNTIME_DIR"
+    if [[ -n ${UU_REMOTE_RUNTIME_DIR:-} ]]; then
+        printf '%s\n' "$UU_REMOTE_RUNTIME_DIR"
         return
     fi
 
@@ -36,44 +37,110 @@ runtime_dir=$(resolve_runtime_dir)
 readonly runtime_dir
 readonly shim_source="$runtime_dir/wevtapi.dll"
 readonly package_version_file="$runtime_dir/package-version"
-readonly decoder_selector="$runtime_dir/uuyc-decoder-selector"
-readonly tray_proxy="${UUYC_TRAY_PROXY_BIN:-$runtime_dir/uuyc-tray-proxy}"
-readonly autostart_bridge="$runtime_dir/uuyc-autostart-bridge"
-readonly sleep_bridge="$runtime_dir/uuyc-sleep-bridge"
-readonly keyboard_bridge="$runtime_dir/uuyc-keyboard-bridge"
-readonly input_bridge="$runtime_dir/uuyc-input-bridge"
-readonly input_hook_source="$runtime_dir/uuyc-input-hook.dll"
-readonly input_injector_source="$runtime_dir/uuyc-input-injector.exe"
-readonly wol_bridge="$runtime_dir/uuyc-wol-bridge"
-readonly wol_configure="$runtime_dir/uuyc-wol-configure"
-readonly update_bridge="$runtime_dir/uuyc-update-bridge"
-readonly update_blocker_source="$runtime_dir/uuyc-update-blocker.exe"
-readonly update_compatibility_profiles="${UUYC_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
+readonly decoder_selector="$runtime_dir/uu-remote-decoder-selector"
+readonly tray_proxy="${UU_REMOTE_TRAY_PROXY_BIN:-$runtime_dir/uu-remote-tray-proxy}"
+readonly autostart_bridge="$runtime_dir/uu-remote-autostart-bridge"
+readonly sleep_bridge="$runtime_dir/uu-remote-sleep-bridge"
+readonly keyboard_bridge="$runtime_dir/uu-remote-keyboard-bridge"
+readonly input_bridge="$runtime_dir/uu-remote-input-bridge"
+readonly input_hook_source="$runtime_dir/uu-remote-input-hook.dll"
+readonly input_injector_source="$runtime_dir/uu-remote-input-injector.exe"
+readonly wol_bridge="$runtime_dir/uu-remote-wol-bridge"
+readonly wol_configure="$runtime_dir/uu-remote-wol-configure"
+readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
+readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
+readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
 
 readonly data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 readonly cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+migrate_legacy_path() {
+    local source=$1 target=$2
+
+    [[ -e $source || -L $source ]] || return 0
+    if [[ -e $target || -L $target ]]; then
+        printf '警告：新旧项目路径同时存在，已保留旧路径：%s\n' \
+            "$source" >&2
+        return 0
+    fi
+    mkdir -p -- "$(dirname -- "$target")"
+    mv -- "$source" "$target"
+    printf '已迁移旧版项目数据：%s -> %s\n' \
+        "$source" "$target" >&2
+}
+
+migrate_legacy_user_state() {
+    local legacy_prefix migration_wineserver
+
+    [[ ${UU_REMOTE_DISABLE_LEGACY_MIGRATION:-0} != 1 ]] || return 0
+    legacy_prefix="$data_home/$legacy_app_id/wineprefix"
+    if [[ ! -e $data_home/$legacy_app_id &&
+        ! -e $state_home/$legacy_app_id &&
+        ! -e $cache_home/$legacy_app_id &&
+        ! -e $config_home/autostart/$legacy_app_id.desktop ]]; then
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop \
+            "$legacy_app_id-client.service" \
+            "$legacy_app_id-server.service" \
+            "$legacy_app_id-healthd.service" \
+            "$legacy_app_id-update.service" \
+            "$legacy_app_id-keyboard.service" \
+            "$legacy_app_id-input.service" \
+            "$legacy_app_id-input-injector.service" \
+            "$legacy_app_id-tray.service" \
+            "$legacy_app_id-tray-exit.service" >/dev/null 2>&1 || true
+    fi
+    migration_wineserver=${UU_REMOTE_WINESERVER_BIN:-wineserver}
+    if [[ -f $legacy_prefix/system.reg ]] &&
+        command -v "$migration_wineserver" >/dev/null 2>&1; then
+        WINEPREFIX="$legacy_prefix" WINEDEBUG=-all \
+            "$migration_wineserver" -k >/dev/null 2>&1 || true
+    fi
+
+    migrate_legacy_path \
+        "$data_home/$legacy_app_id" "$data_home/$app_id"
+    migrate_legacy_path \
+        "$state_home/$legacy_app_id" "$state_home/$app_id"
+    migrate_legacy_path \
+        "$cache_home/$legacy_app_id" "$cache_home/$app_id"
+    migrate_legacy_path \
+        "$config_home/autostart/$legacy_app_id.desktop" \
+        "$config_home/autostart/$app_id.desktop"
+    if [[ -f $config_home/autostart/$app_id.desktop ]]; then
+        sed -i \
+            -e "s/$legacy_app_id/$app_id/g" \
+            -e 's/X-UUYC-Autostart-Bridge/X-UU-Remote-Autostart-Bridge/g' \
+            "$config_home/autostart/$app_id.desktop"
+    fi
+}
+
+migrate_legacy_user_state
+
 readonly data_dir="$data_home/$app_id"
 readonly state_dir="$state_home/$app_id"
 readonly cache_dir="$cache_home/$app_id"
-readonly prefix="${UUYC_WINE_PREFIX:-$data_dir/wineprefix}"
+readonly prefix="${UU_REMOTE_WINE_PREFIX:-$data_dir/wineprefix}"
 readonly install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 readonly client="$install_dir/GameViewer.exe"
 readonly client_image="$install_dir/bin/GameViewer.exe"
 readonly server="$install_dir/bin/GameViewerServer.exe"
-readonly wol_server_original="$install_dir/bin/GameViewerServer.uuyc-wol-original.exe"
+readonly wol_server_original="$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
 readonly healthd="$install_dir/bin/GameViewerHealthd.exe"
 readonly native_wevtapi="$install_dir/bin/wevtapi.dll"
 readonly native_upgrade="$install_dir/bin/Upgrade.exe"
-readonly native_upgrade_original="$install_dir/bin/Upgrade.uuyc-original.exe"
+readonly native_upgrade_original="$install_dir/bin/Upgrade.uu-remote-original.exe"
 readonly webview_setup="$install_dir/bin/MicrosoftEdgeWebview2Setup.exe"
 readonly webview_root="$prefix/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
 readonly webview_key='HKLM\Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
 readonly service_name='GameViewerService'
 readonly service_key='HKLM\System\CurrentControlSet\Services\GameViewerService'
 readonly installed_version_key='HKCU\Software\Netease\GameViewer'
-readonly package_stamp="$prefix/.uuyc-linux-controller-package"
+readonly package_stamp="$prefix/.uu-remote-for-linux-package"
 readonly eula_stamp="$data_dir/eula-accepted"
 readonly installer="$cache_dir/UURemote_Setup.exe"
 readonly installer_version_file="$cache_dir/installer-version"
@@ -86,39 +153,39 @@ readonly tray_proxy_status="$state_dir/tray-proxy-status"
 readonly autostart_log="$state_dir/autostart-bridge.log"
 readonly autostart_lock="$state_dir/autostart-bridge.lock"
 readonly autostart_desktop="$config_home/autostart/$app_id.desktop"
-readonly autostart_interval="${UUYC_AUTOSTART_BRIDGE_INTERVAL:-2}"
+readonly autostart_interval="${UU_REMOTE_AUTOSTART_BRIDGE_INTERVAL:-2}"
 readonly sleep_bridge_log="$state_dir/sleep-bridge.log"
 readonly sleep_bridge_lock="$state_dir/sleep-bridge.lock"
-readonly sleep_bridge_interval="${UUYC_SLEEP_BRIDGE_INTERVAL:-2}"
+readonly sleep_bridge_interval="${UU_REMOTE_SLEEP_BRIDGE_INTERVAL:-2}"
 readonly keyboard_bridge_log="$state_dir/keyboard-bridge.log"
 readonly keyboard_bridge_lock="$state_dir/keyboard-bridge.lock"
 readonly keyboard_bridge_status="$state_dir/keyboard-bridge-status.json"
-readonly keyboard_bridge_interval="${UUYC_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
+readonly keyboard_bridge_interval="${UU_REMOTE_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
 readonly input_bridge_log="$state_dir/input-bridge.log"
 readonly input_bridge_lock="$state_dir/input-bridge.lock"
 readonly input_bridge_status="$state_dir/input-bridge-status.json"
-readonly input_bridge_release_timeout="${UUYC_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
-readonly input_hook="$prefix/drive_c/uuyc-input-hook.dll"
-readonly input_injector="$prefix/drive_c/uuyc-input-injector.exe"
-readonly input_bridge_endpoint="$prefix/drive_c/uuyc-input-bridge.endpoint"
-readonly input_hook_windows='C:\uuyc-input-hook.dll'
+readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
+readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
+readonly input_injector="$prefix/drive_c/uu-remote-input-injector.exe"
+readonly input_bridge_endpoint="$prefix/drive_c/uu-remote-input-bridge.endpoint"
+readonly input_hook_windows='C:\uu-remote-input-hook.dll'
 current_user=$(id -un)
 readonly current_user
 readonly local_appdata="$prefix/drive_c/users/$current_user/AppData/Local/GameViewer"
 readonly client_setting_file="$local_appdata/setting.ini"
 readonly update_bridge_log="$state_dir/update-bridge.log"
 readonly update_bridge_lock="$state_dir/update-bridge.lock"
-readonly update_bridge_interval="${UUYC_UPDATE_BRIDGE_INTERVAL:-21600}"
+readonly update_bridge_interval="${UU_REMOTE_UPDATE_BRIDGE_INTERVAL:-21600}"
 readonly update_status_file="$state_dir/update-status"
 readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
 readonly update_original_archive="$data_dir/update-originals"
 readonly update_rollback_dir="$cache_dir/update-rollback"
 readonly client_log_dir="$install_dir/log/client/Log"
 readonly wol_enabled_stamp="$data_dir/wol-enabled"
-readonly wol_server_original_sha="${UUYC_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
-readonly wol_server_patched_sha="${UUYC_WOL_SERVER_PATCHED_SHA:-886c0638717d80cc567f1e9fe05b0072065a6fd67d6d114446e44953cde2822a}"
+readonly wol_server_original_sha="${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
+readonly wol_server_patched_sha="${UU_REMOTE_WOL_SERVER_PATCHED_SHA:-886c0638717d80cc567f1e9fe05b0072065a6fd67d6d114446e44953cde2822a}"
 readonly decoder_selection_file="$data_dir/decoder-selection"
-readonly operation_lock_timeout="${UUYC_OPERATION_LOCK_TIMEOUT:-30}"
+readonly operation_lock_timeout="${UU_REMOTE_OPERATION_LOCK_TIMEOUT:-30}"
 readonly hwdecode_runtime_dir="$runtime_dir/hwdecode"
 readonly hwdecode_wine_dir="$hwdecode_runtime_dir/wine"
 readonly hwdecode_dxvk_dir="$hwdecode_runtime_dir/dxvk/x64"
@@ -129,19 +196,19 @@ readonly hwdecode_dxgi="$install_dir/bin/dxgi.dll"
 readonly hwdecode_nvcuda="$prefix/drive_c/windows/system32/nvcuda.dll"
 readonly hwdecode_nvcuvid="$prefix/drive_c/windows/system32/nvcuvid.dll"
 readonly streamer_dll="$install_dir/bin/streamer.dll"
-readonly streamer_original="$install_dir/bin/streamer.uuyc-original.dll"
+readonly streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
 readonly streamer_archive="$data_dir/hwdecode-streamer-originals"
 readonly decoder_cache="$install_dir/config/streamer/decoder_codec_capability_cache.json"
 readonly decoder_cache_backup="$data_dir/decoder-cache-before-hwdecode.json"
 readonly streamer_patch_offset_1=$((0x94dc03))
 readonly streamer_patch_offset_2=$((0x94e4ee))
-readonly streamer_original_sha="${UUYC_HWDECODE_STREAMER_ORIGINAL_SHA:-2144cd9c199ee21ef55da984ef38d719e337a8202b26522458e56bff648ffb60}"
-readonly streamer_patched_sha="${UUYC_HWDECODE_STREAMER_PATCHED_SHA:-abf2e482c65397138aa69430e3413a10f80d942a28817c22f8f8ff78e3c5ca70}"
+readonly streamer_original_sha="${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-2144cd9c199ee21ef55da984ef38d719e337a8202b26522458e56bff648ffb60}"
+readonly streamer_patched_sha="${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-abf2e482c65397138aa69430e3413a10f80d942a28817c22f8f8ff78e3c5ca70}"
 
-readonly wine="${UUYC_WINE_BIN:-wine}"
-readonly wineboot="${UUYC_WINEBOOT_BIN:-wineboot}"
-readonly wineserver="${UUYC_WINESERVER_BIN:-wineserver}"
-readonly winecfg="${UUYC_WINECFG_BIN:-winecfg}"
+readonly wine="${UU_REMOTE_WINE_BIN:-wine}"
+readonly wineboot="${UU_REMOTE_WINEBOOT_BIN:-wineboot}"
+readonly wineserver="${UU_REMOTE_WINESERVER_BIN:-wineserver}"
+readonly winecfg="${UU_REMOTE_WINECFG_BIN:-winecfg}"
 readonly server_runtime_unit="${app_id}-server"
 readonly healthd_runtime_unit="${app_id}-healthd"
 readonly client_runtime_unit="${app_id}-client"
@@ -151,6 +218,43 @@ readonly input_runtime_unit="${app_id}-input"
 readonly input_injector_runtime_unit="${app_id}-input-injector"
 readonly tray_runtime_unit="${app_id}-tray"
 readonly tray_exit_runtime_unit="${app_id}-tray-exit"
+
+migrate_legacy_prefix_file() {
+    local source=$1 target=$2
+
+    [[ -e $source || -L $source ]] || return 0
+    if [[ ! -e $target && ! -L $target ]]; then
+        mv -- "$source" "$target"
+    elif cmp -s -- "$source" "$target"; then
+        rm -f -- "$source"
+    else
+        printf '警告：新旧兼容文件同时存在，已保留旧文件：%s\n' \
+            "$source" >&2
+    fi
+}
+
+migrate_legacy_prefix_files() {
+    migrate_legacy_prefix_file \
+        "$prefix/.uuyc-linux-controller-package" "$package_stamp"
+    migrate_legacy_prefix_file \
+        "$install_dir/bin/GameViewerServer.uuyc-wol-original.exe" \
+        "$wol_server_original"
+    migrate_legacy_prefix_file \
+        "$install_dir/bin/Upgrade.uuyc-original.exe" \
+        "$native_upgrade_original"
+    migrate_legacy_prefix_file \
+        "$install_dir/bin/streamer.uuyc-original.dll" \
+        "$streamer_original"
+    migrate_legacy_prefix_file \
+        "$prefix/drive_c/uuyc-input-hook.dll" "$input_hook"
+    migrate_legacy_prefix_file \
+        "$prefix/drive_c/uuyc-input-injector.exe" "$input_injector"
+    migrate_legacy_prefix_file \
+        "$prefix/drive_c/uuyc-input-bridge.endpoint" \
+        "$input_bridge_endpoint"
+}
+
+migrate_legacy_prefix_files
 
 notify_status() {
     if command -v notify-send >/dev/null 2>&1; then
@@ -166,7 +270,7 @@ die() {
 
 usage() {
     cat <<'EOF'
-用法：uuyc-linux-controller [选项] [客户端参数...]
+用法：uu-remote-for-linux [选项] [客户端参数...]
 
 选项：
   --accept-eula        接受网易 UU 远程许可协议后继续
@@ -453,7 +557,7 @@ version_greater() {
 }
 
 official_latest_version() {
-    local source_url="${UUYC_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+    local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
     local effective_url clean_url filename
 
     effective_url=$(curl --silent --show-error --fail --head --location \
@@ -569,7 +673,7 @@ update_status_label() {
     esac
 }
 
-uuyc_auto_update_enabled() {
+uu_remote_auto_update_enabled() {
     [[ -x $update_bridge ]] &&
         "$update_bridge" setting-enabled "$client_setting_file"
 }
@@ -606,8 +710,8 @@ check_base_requirements() {
     detected_version=$(wine_version) ||
         die "无法识别 Wine 版本"
     if ! version_at_least "$detected_version" "$min_wine_version"; then
-        if [[ ${UUYC_ALLOW_UNSUPPORTED_WINE:-0} != 1 ]]; then
-            die "Wine $detected_version 过旧；要求 $min_wine_version+。仅排错可设置 UUYC_ALLOW_UNSUPPORTED_WINE=1"
+        if [[ ${UU_REMOTE_ALLOW_UNSUPPORTED_WINE:-0} != 1 ]]; then
+            die "Wine $detected_version 过旧；要求 $min_wine_version+。仅排错可设置 UU_REMOTE_ALLOW_UNSUPPORTED_WINE=1"
         fi
         printf '警告：正在使用未经支持的 Wine %s（最低要求 %s）\n' \
             "$detected_version" "$min_wine_version" >&2
@@ -671,7 +775,7 @@ hwdecode_runtime_ready() {
 hwdecode_host_libraries_ready() {
     local libraries
 
-    if [[ ${UUYC_HWDECODE_ASSUME_HOST_READY:-0} == 1 ]]; then
+    if [[ ${UU_REMOTE_HWDECODE_ASSUME_HOST_READY:-0} == 1 ]]; then
         return
     fi
     libraries=$(ldconfig -p 2>/dev/null || true)
@@ -855,8 +959,8 @@ deploy_update_blocker() {
 resolve_launcher_path() {
     local candidate
 
-    if [[ -n ${UUYC_AUTOSTART_LAUNCHER:-} ]]; then
-        candidate=$UUYC_AUTOSTART_LAUNCHER
+    if [[ -n ${UU_REMOTE_AUTOSTART_LAUNCHER:-} ]]; then
+        candidate=$UU_REMOTE_AUTOSTART_LAUNCHER
     elif [[ $0 == */* ]]; then
         candidate=$(/usr/bin/readlink -f -- "$0")
     else
@@ -891,7 +995,7 @@ sync_autostart_once() {
 start_autostart_bridge() {
     local launcher_path
 
-    [[ ${UUYC_DISABLE_AUTOSTART_WATCHER:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_AUTOSTART_WATCHER:-0} != 1 ]] || return 0
     launcher_path=$(resolve_launcher_path) || {
         printf '警告：无法确定启动器绝对路径，自启动兼容桥未运行。\n' >&2
         return
@@ -906,7 +1010,7 @@ start_autostart_bridge() {
         9>&- </dev/null >/dev/null 2>&1 &
 }
 
-uuyc_prevent_sleep_state() {
+uu_remote_prevent_sleep_state() {
     [[ -x $sleep_bridge ]] || {
         printf 'unknown\n'
         return
@@ -914,10 +1018,10 @@ uuyc_prevent_sleep_state() {
     "$sleep_bridge" state "$client_log_dir" 2>/dev/null || printf 'unknown\n'
 }
 
-uuyc_prevent_sleep_label() {
+uu_remote_prevent_sleep_label() {
     local state
 
-    state=$(uuyc_prevent_sleep_state)
+    state=$(uu_remote_prevent_sleep_state)
     case $state in
         enabled)
             printf '开启'
@@ -938,7 +1042,7 @@ native_sleep_inhibition_active() {
 start_sleep_bridge() {
     local launcher_path
 
-    [[ ${UUYC_DISABLE_SLEEP_WATCHER:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_SLEEP_WATCHER:-0} != 1 ]] || return 0
     launcher_path=$(resolve_launcher_path) || {
         printf '警告：无法确定启动器绝对路径，防休眠兼容桥未运行。\n' >&2
         return
@@ -1062,7 +1166,7 @@ start_input_bridge() {
     local variable attempt
     local -a command
 
-    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
     if [[ ${XDG_SESSION_TYPE:-x11} != x11 || -z ${DISPLAY:-} ]]; then
         printf '警告：原生被控端键鼠输入桥当前仅支持 X11 会话。\n' >&2
         return 0
@@ -1163,7 +1267,7 @@ start_keyboard_bridge() {
     local variable
     local -a command
 
-    [[ ${UUYC_DISABLE_KEYBOARD_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_KEYBOARD_BRIDGE:-0} != 1 ]] || return 0
     [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
     if ! "$keyboard_bridge" check >>"$keyboard_bridge_log" 2>&1; then
         printf '警告：X11 远控键盘桥依赖检查失败，详见 %s\n' \
@@ -1221,7 +1325,7 @@ start_keyboard_bridge() {
 start_update_bridge() {
     local launcher_path
 
-    [[ ${UUYC_DISABLE_UPDATE_WATCHER:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_UPDATE_WATCHER:-0} != 1 ]] || return 0
     launcher_path=$(resolve_launcher_path) || {
         printf '警告：无法确定启动器绝对路径，自动更新兼容桥未运行。\n' >&2
         return
@@ -1313,8 +1417,8 @@ start_tray_proxy() {
     local launcher_path wine_path variable
     local -a proxy_command systemd_command
 
-    [[ ${UUYC_DISABLE_TRAY_PROXY:-0} != 1 ]] || return 0
-    [[ ${UUYC_TRAY_PROXY_CHILD:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_TRAY_PROXY:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_TRAY_PROXY_CHILD:-0} != 1 ]] || return 0
     tray_proxy_dependencies_ready || {
         printf '警告：原生托盘代理依赖不完整，详见诊断输出。\n' >&2
         return 1
@@ -1361,7 +1465,7 @@ start_tray_proxy() {
             fi
         done
         [[ -n $wine_path ]] &&
-            systemd_command+=("--setenv=UUYC_WINE_BIN=$wine_path")
+            systemd_command+=("--setenv=UU_REMOTE_WINE_BIN=$wine_path")
         systemd_command+=("${proxy_command[@]}")
         if "${systemd_command[@]}" 9>&-; then
             return
@@ -1373,7 +1477,7 @@ start_tray_proxy() {
 }
 
 systemd_user_available() {
-    [[ ${UUYC_DISABLE_SYSTEMD_RUNTIME:-0} != 1 ]] &&
+    [[ ${UU_REMOTE_DISABLE_SYSTEMD_RUNTIME:-0} != 1 ]] &&
         command -v systemctl >/dev/null 2>&1 &&
         command -v systemd-run >/dev/null 2>&1 &&
         timeout 3s systemctl --user show-environment >/dev/null 2>&1
@@ -1716,10 +1820,10 @@ print_diagnostics() {
         "UU 自启动开关" "$(windows_autostart_enabled && printf '开启' || printf '关闭')" \
         "Linux 自启动项" "$(native_autostart_enabled && printf '已创建' || printf '未创建')" \
         "自启动兼容桥" "$([[ -x $autostart_bridge ]] && printf '就绪' || printf '缺失')" \
-        "UU 防休眠开关" "$(uuyc_prevent_sleep_label)" \
+        "UU 防休眠开关" "$(uu_remote_prevent_sleep_label)" \
         "Linux 休眠抑制" "$(native_sleep_inhibition_active && printf '生效中' || printf '未生效')" \
         "防休眠兼容桥" "$([[ -x $sleep_bridge ]] && printf '就绪' || printf '缺失')" \
-        "UU 自动更新开关" "$(uuyc_auto_update_enabled && printf '开启' || printf '关闭')" \
+        "UU 自动更新开关" "$(uu_remote_auto_update_enabled && printf '开启' || printf '关闭')" \
         "安全更新状态" "$(update_status_label)" \
         "自动更新兼容桥" "$(update_runtime_label)" \
         "官方更新器保护" "$(update_blocker_ready && printf '完整' || printf '未安装/不匹配')" \
@@ -1802,7 +1906,7 @@ if $accept_eula; then
 fi
 
 if [[ ! -r $eula_stamp ]]; then
-    die "首次设置前请阅读 $eula_url，然后运行：uuyc-linux-controller --accept-eula --setup-only"
+    die "首次设置前请阅读 $eula_url，然后运行：uu-remote-for-linux --accept-eula --setup-only"
 fi
 
 export WINEPREFIX="$prefix"
@@ -1816,7 +1920,7 @@ unset WEBVIEW2_RELEASE_CHANNELS
 unset WEBVIEW2_USER_DATA_FOLDER
 
 [[ $operation_lock_timeout =~ ^[0-9]+$ ]] ||
-    die "UUYC_OPERATION_LOCK_TIMEOUT 必须是非负整数"
+    die "UU_REMOTE_OPERATION_LOCK_TIMEOUT 必须是非负整数"
 exec 9>"$state_dir/operation.lock"
 if ! flock -w "$operation_lock_timeout" 9; then
     die "另一个 UU 远程安装或启动操作仍在运行；等待 ${operation_lock_timeout} 秒后仍未获得操作锁"
@@ -1839,7 +1943,7 @@ run_logged() {
 download_installer() {
     local temp_file effective_url clean_url filename version checksum size magic
     local archive_file
-    local source_url="${UUYC_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+    local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
 
     temp_file=$(mktemp "$cache_dir/.UURemote_Setup.XXXXXX")
     notify_status "正在从网易官方下载客户端"
@@ -1947,7 +2051,7 @@ deploy_streamer_patch() {
     local current_sha original_sha patched_temp
 
     [[ -f $streamer_dll || -f $streamer_original ]] ||
-        die "UU streamer.dll 缺失，请先运行：uuyc-linux-controller --repair"
+        die "UU streamer.dll 缺失，请先运行：uu-remote-for-linux --repair"
 
     if [[ -f $streamer_original ]]; then
         original_sha=$(file_sha256 "$streamer_original")
@@ -1967,7 +2071,7 @@ deploy_streamer_patch() {
         fi
     else
         [[ -f $streamer_dll ]] ||
-            die "UU streamer.dll 缺失，请先运行：uuyc-linux-controller --repair"
+            die "UU streamer.dll 缺失，请先运行：uu-remote-for-linux --repair"
         current_sha=$(file_sha256 "$streamer_dll")
         if [[ $current_sha == "$streamer_patched_sha" ]]; then
             die "发现已修改的 streamer.dll，但原版备份缺失；拒绝继续以避免数据丢失"
@@ -1982,7 +2086,7 @@ deploy_streamer_patch() {
         $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_2") == 8b45d0 ]] ||
         die "streamer.dll 补丁位置校验失败；未修改客户端"
 
-    patched_temp="${streamer_dll}.uuyc-new"
+    patched_temp="${streamer_dll}.uu-remote-new"
     install -Dm0644 "$streamer_original" "$patched_temp" ||
         die "无法暂存 UU streamer.dll"
     printf '\262\041\220' |
@@ -2034,7 +2138,7 @@ remove_streamer_patch() {
         [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]]; then
         die "已修改的 streamer.dll 缺少原版备份；为避免破坏客户端，未关闭硬解桥"
     fi
-    rm -f -- "${streamer_dll}.uuyc-new"
+    rm -f -- "${streamer_dll}.uu-remote-new"
 
     rm -f -- "$decoder_cache"
     if [[ -f $decoder_cache_backup ]]; then
@@ -2053,7 +2157,7 @@ deploy_hwdecode_bridge() {
     hwdecode_host_libraries_ready ||
         die "未找到 NVIDIA libcuda.so.1 和 libnvcuvid.so.1；请安装匹配当前内核的 NVIDIA 专有驱动"
     app_files_present ||
-        die "UU 远程客户端尚未完整安装，请先运行：uuyc-linux-controller --setup-only"
+        die "UU 远程客户端尚未完整安装，请先运行：uu-remote-for-linux --setup-only"
 
     names=(d3d11 dxgi nvcuda nvcuvid)
     sources=(
@@ -2082,9 +2186,9 @@ deploy_hwdecode_bridge() {
     for ((i = 0; i < ${#names[@]}; i++)); do
         source=${sources[i]}
         target=${targets[i]}
-        install -Dm0644 "$source" "${target}.uuyc-new" ||
+        install -Dm0644 "$source" "${target}.uu-remote-new" ||
             die "无法暂存硬件解码 DLL：$target"
-        mv -f "${target}.uuyc-new" "$target" ||
+        mv -f "${target}.uu-remote-new" "$target" ||
             die "无法安装硬件解码 DLL：$target"
     done
 
@@ -2130,7 +2234,7 @@ remove_hwdecode_bridge() {
         elif [[ -e $target ]]; then
             printf '保留非本项目管理或已被修改的文件：%s\n' "$target" >&2
         fi
-        rm -f -- "${target}.uuyc-new"
+        rm -f -- "${target}.uu-remote-new"
     done
     rm -f -- "$hwdecode_enabled_stamp" "$hwdecode_manifest"
 }
@@ -2171,7 +2275,7 @@ apply_decoder_selection() {
                 deploy_hwdecode_bridge
                 printf '已按设备策略启用 NVIDIA NVDEC 桥。\n'
             fi
-            export UUYC_CUDA_DEVICE="$cuda_index"
+            export UU_REMOTE_CUDA_DEVICE="$cuda_index"
             ;;
         *)
             die "不支持的解码设备选择：$effective"
@@ -2378,7 +2482,7 @@ restore_update_snapshot() {
 restart_client_after_update() {
     local launcher_path
 
-    [[ ${UUYC_UPDATE_NO_RESTART:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_UPDATE_NO_RESTART:-0} != 1 ]] || return 0
     launcher_path=$(resolve_launcher_path) || return 1
     (
         cd "$data_dir"
@@ -2468,7 +2572,7 @@ run_supported_update_transaction() {
 perform_update_check() {
     local installed latest
 
-    if $automatic_update_check && ! uuyc_auto_update_enabled; then
+    if $automatic_update_check && ! uu_remote_auto_update_enabled; then
         printf 'UU 自动更新开关已关闭；跳过检查。\n'
         return
     fi
@@ -2530,7 +2634,7 @@ fi
 
 if $enable_wol; then
     app_files_present ||
-        die "UU 远程客户端尚未完整安装，请先运行：uuyc-linux-controller --setup-only"
+        die "UU 远程客户端尚未完整安装，请先运行：uu-remote-for-linux --setup-only"
     stop_prefix_for_setup
     deploy_wol_bridge
     notify_status "远程开机兼容桥已启用"
@@ -2552,7 +2656,7 @@ if $select_decoder_restart_requested; then
     [[ -x $decoder_selector ]] ||
         die "缺少解码设备选择器：$decoder_selector"
     if ! selected_decoder=$(
-        UUYC_DECODER_RESTART_AFTER_SAVE=1 \
+        UU_REMOTE_DECODER_RESTART_AFTER_SAVE=1 \
             "$decoder_selector" --select "$decoder_selection_file"
     ); then
         die "解码设备选择失败；UU 保持原运行状态"
@@ -2567,7 +2671,7 @@ if $select_decoder_restart_requested; then
     if systemd_user_available; then
         release_operation_lock
         start_systemd_decoder_restart ||
-            die "无法创建独立的 UU 重启服务；请运行 uuyc-linux-controller 重试"
+            die "无法创建独立的 UU 重启服务；请运行 uu-remote-for-linux 重试"
         exit 0
     fi
 fi
@@ -2612,12 +2716,12 @@ if hwdecode_enabled; then
     hwdecode_host_libraries_ready ||
         die "硬件解码桥已启用，但 NVIDIA CUDA/NVDEC 主机库不可用"
     hwdecode_files_deployed ||
-        die "硬件解码桥注入文件缺失或版本不匹配；请运行：uuyc-linux-controller --enable-hwdecode"
+        die "硬件解码桥注入文件缺失或版本不匹配；请运行：uu-remote-for-linux --enable-hwdecode"
     configure_hwdecode_environment
 fi
 
 app_files_present ||
-    die "客户端文件不完整，请运行：uuyc-linux-controller --repair"
+    die "客户端文件不完整，请运行：uu-remote-for-linux --repair"
 
 service_running() {
     local output line
@@ -2678,7 +2782,7 @@ start_systemd_wine_image() {
         "--setenv=WINEDEBUG=$WINEDEBUG"
     )
     for variable in \
-        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL UUYC_CUDA_DEVICE \
+        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL UU_REMOTE_CUDA_DEVICE \
         DISPLAY WAYLAND_DISPLAY XAUTHORITY \
         http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
         if [[ -v $variable ]]; then
@@ -2720,7 +2824,7 @@ ensure_wine_image_running() {
 }
 
 start_input_injector() {
-    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
     [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
     input_hook_ready || return 1
     ensure_wine_image_running \
@@ -2734,7 +2838,7 @@ start_input_injector() {
 wait_input_hook_active() {
     local attempt state
 
-    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
     [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
     for ((attempt = 0; attempt < 60; attempt++)); do
         state=$("$input_bridge" status "$state_dir" 2>/dev/null || true)

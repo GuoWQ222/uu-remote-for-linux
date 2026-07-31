@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly script_dir
-readonly nvdec_probe="$script_dir/uuyc-nvdec-probe"
+readonly nvdec_probe="$script_dir/uu-remote-nvdec-probe"
 
 sanitize_field() {
     local value=$1
@@ -47,9 +47,9 @@ nvdec_rows() {
     local index name pci codecs driver_max
     local probe_source
 
-    if [[ -n ${UUYC_NVDEC_PROBE_ROWS_FILE:-} ]]; then
-        [[ -r $UUYC_NVDEC_PROBE_ROWS_FILE ]] || return
-        probe_source=$UUYC_NVDEC_PROBE_ROWS_FILE
+    if [[ -n ${UU_REMOTE_NVDEC_PROBE_ROWS_FILE:-} ]]; then
+        [[ -r $UU_REMOTE_NVDEC_PROBE_ROWS_FILE ]] || return
+        probe_source=$UU_REMOTE_NVDEC_PROBE_ROWS_FILE
     else
         [[ -x $nvdec_probe ]] || return
         probe_source=""
@@ -188,7 +188,7 @@ select_graphically() {
 
     current=$(read_selection "$config" || true)
     [[ -n $current ]] || current=auto
-    if [[ ${UUYC_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
+    if [[ ${UU_REMOTE_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
         prompt_text='选择要交给 UU 使用的解码设备。保存后 UU 将自动重启；当前远控连接会短暂中断。'
     else
         prompt_text='选择 UU 下次启动使用的解码设备。应用选择不会中断当前远控；重启 UU 后生效。'
@@ -219,7 +219,7 @@ select_graphically() {
     fi
 
     write_selection "$config" "$chosen"
-    if [[ ${UUYC_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
+    if [[ ${UU_REMOTE_DECODER_RESTART_AFTER_SAVE:-0} == 1 ]]; then
         saved_text="已选择：$chosen"$'\n\n''网易 UU 远程将在关闭此提示后自动重启。'
     else
         saved_text="已选择：$chosen"$'\n\n''关闭并重新启动网易 UU 远程后生效。'

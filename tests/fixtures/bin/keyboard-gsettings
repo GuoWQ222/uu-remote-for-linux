@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly root="${UUYC_KEYBOARD_GSETTINGS_ROOT:?}"
-readonly trace="${UUYC_KEYBOARD_GSETTINGS_TRACE:-$root/trace.log}"
+readonly root="${UU_REMOTE_KEYBOARD_GSETTINGS_ROOT:?}"
+readonly trace="${UU_REMOTE_KEYBOARD_GSETTINGS_TRACE:-$root/trace.log}"
 
 mode=${1:-}
 schema=${2:-}

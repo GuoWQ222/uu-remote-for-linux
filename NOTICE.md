@@ -25,7 +25,7 @@ The optional NVIDIA hardware-decoding bridge includes:
   licensed under LGPL-2.1-or-later;
 - a modified `nvcuda.dll.so` that adds the UU Remote CUDA-to-D3D11 CPU-bounce
   bridge and explicit CUDA-device selection. The complete corresponding source
-  is shipped in `third_party/sources/nvcuda-uuyc-v0.6.tar.xz`.
+  is shipped in `third_party/sources/nvcuda-uu-remote-v0.6.tar.xz`.
 
 Exact revisions, checksums, build details, licenses, and the corresponding
 CUVID source archive are documented in `third_party/HWDECODE.md`.

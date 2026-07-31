@@ -236,10 +236,10 @@ ASCII_KEYSYMS = {
 class XTestBackend:
     def __init__(self) -> None:
         self.x11 = ctypes.CDLL(
-            os.environ.get("UUYC_INPUT_BRIDGE_X11_LIBRARY", "libX11.so.6")
+            os.environ.get("UU_REMOTE_INPUT_BRIDGE_X11_LIBRARY", "libX11.so.6")
         )
         self.xtst = ctypes.CDLL(
-            os.environ.get("UUYC_INPUT_BRIDGE_XTEST_LIBRARY", "libXtst.so.6")
+            os.environ.get("UU_REMOTE_INPUT_BRIDGE_XTEST_LIBRARY", "libXtst.so.6")
         )
         self._configure_signatures()
         display_name = os.environ.get("DISPLAY")
@@ -403,7 +403,7 @@ class FakeBackend:
 
 
 def make_backend():
-    fake_trace = os.environ.get("UUYC_INPUT_BRIDGE_FAKE_TRACE")
+    fake_trace = os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE")
     if fake_trace:
         return FakeBackend(Path(fake_trace))
     return XTestBackend()

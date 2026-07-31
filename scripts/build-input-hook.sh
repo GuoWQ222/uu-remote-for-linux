@@ -3,14 +3,14 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly source_file="$project_root/src/uuyc-input-hook.c"
-readonly output_file="$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
-readonly injector_source="$project_root/src/uuyc-input-injector.c"
-readonly injector_output="$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
-readonly compiler="${UUYC_MINGW_CC:-x86_64-w64-mingw32-gcc}"
-readonly include_dir="${UUYC_MINGW_INCLUDE_DIR:-}"
-readonly library_dir="${UUYC_MINGW_LIBRARY_DIR:-}"
-readonly runtime_dir="${UUYC_MINGW_RUNTIME_DIR:-}"
+readonly source_file="$project_root/src/uu-remote-input-hook.c"
+readonly output_file="$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+readonly injector_source="$project_root/src/uu-remote-input-injector.c"
+readonly injector_output="$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
+readonly compiler="${UU_REMOTE_MINGW_CC:-x86_64-w64-mingw32-gcc}"
+readonly include_dir="${UU_REMOTE_MINGW_INCLUDE_DIR:-}"
+readonly library_dir="${UU_REMOTE_MINGW_LIBRARY_DIR:-}"
+readonly runtime_dir="${UU_REMOTE_MINGW_RUNTIME_DIR:-}"
 extra_flags=()
 
 [[ -z $include_dir ]] || extra_flags+=("-isystem" "$include_dir")
@@ -26,9 +26,9 @@ command -v "$compiler" >/dev/null 2>&1 || {
 # Keep the checked-in PE artifact reproducible across local and CI builds.
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
-temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/uuyc-input-hook.XXXXXX")
-temporary="$temporary_dir/uuyc-input-hook.dll"
-injector_temporary="$temporary_dir/uuyc-input-injector.exe"
+temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/uu-remote-input-hook.XXXXXX")
+temporary="$temporary_dir/uu-remote-input-hook.dll"
+injector_temporary="$temporary_dir/uu-remote-input-injector.exe"
 trap 'rm -rf -- "$temporary_dir"' EXIT
 
 "$compiler" \

@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-update-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge"
 
 test_root=$(mktemp -d)
 watcher_pid=""

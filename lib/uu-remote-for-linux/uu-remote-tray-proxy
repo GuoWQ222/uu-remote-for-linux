@@ -22,7 +22,7 @@ import time
 from typing import Iterator
 
 
-APP_ID = "uuyc-linux-controller"
+APP_ID = "uu-remote-for-linux"
 TITLE = "网易 UU 远程"
 LEGACY_SCAN_INTERVAL_MS = 750
 CLIENT_MISSING_GRACE_TICKS = 8
@@ -365,7 +365,7 @@ class TrayProxy:
         menu.append(self.Gtk.SeparatorMenuItem())
 
         exit_item = self.Gtk.MenuItem.new_with_label("退出")
-        exit_item.connect("activate", self.exit_uuyc)
+        exit_item.connect("activate", self.exit_uu_remote)
         menu.append(exit_item)
         menu.show_all()
         self.indicator.set_menu(menu)
@@ -377,7 +377,7 @@ class TrayProxy:
     def show_main_window(self, *_unused) -> None:
         logging.info("请求显示 UU 主界面")
         environment = os.environ.copy()
-        environment["UUYC_TRAY_PROXY_CHILD"] = "1"
+        environment["UU_REMOTE_TRAY_PROXY_CHILD"] = "1"
         log_handle = self.command_log_handle()
         try:
             subprocess.Popen(
@@ -402,7 +402,7 @@ class TrayProxy:
 
         logging.info("请求选择解码设备并在保存后重启 UU")
         environment = os.environ.copy()
-        environment.pop("UUYC_TRAY_PROXY_CHILD", None)
+        environment.pop("UU_REMOTE_TRAY_PROXY_CHILD", None)
         log_handle = self.command_log_handle()
         if self.decoder_item is not None:
             self.decoder_item.set_sensitive(False)
@@ -442,7 +442,7 @@ class TrayProxy:
             self.decoder_item.set_sensitive(True)
         return False
 
-    def exit_uuyc(self, *_unused) -> None:
+    def exit_uu_remote(self, *_unused) -> None:
         logging.info("请求退出 UU")
         if self.indicator is not None:
             self.indicator.set_status(

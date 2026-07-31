@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly bridge="$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 readonly fake_gsettings="$project_root/tests/fixtures/bin/keyboard-gsettings"
 
 test_root=$(mktemp -d)
@@ -26,9 +26,9 @@ readonly lock="$test_root/keyboard.lock"
 readonly focus="$test_root/focus"
 mkdir -p "$settings_root" "$state_dir"
 
-export UUYC_KEYBOARD_BRIDGE_GSETTINGS_BIN="$fake_gsettings"
-export UUYC_KEYBOARD_BRIDGE_FAKE_FOCUS_FILE="$focus"
-export UUYC_KEYBOARD_GSETTINGS_ROOT="$settings_root"
+export UU_REMOTE_KEYBOARD_BRIDGE_GSETTINGS_BIN="$fake_gsettings"
+export UU_REMOTE_KEYBOARD_BRIDGE_FAKE_FOCUS_FILE="$focus"
+export UU_REMOTE_KEYBOARD_GSETTINGS_ROOT="$settings_root"
 export XDG_SESSION_TYPE=x11
 
 reset_settings() {
