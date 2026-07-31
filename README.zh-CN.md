@@ -73,37 +73,13 @@ uu-remote-for-linux --decoder nvidia:0
 uu-remote-for-linux --stop
 ```
 
-## Linux 被控端输入
-
-0.9.0 起，启动器会在 `GameViewerServer.exe` 的 `SendInput` 回退路径上
-加载项目自建的 Win64 钩子，将已认证的键鼠事件交给本地 X11/XTest
-守护进程。它不尝试加载网易的 Windows 内核 HID 驱动，也不需要
-`/dev/uinput` 或 root 权限。
-
-运行 `uu-remote-for-linux --diagnose`，确认：
-
-- `被控端原生输入` 为“生效中”；
-- 移动或点击时，`被控端输入事件` 的计数持续增加；
-- `Win64 输入钩子` 为“完整”。
-
-0.9.1 还会把 X11/XTest 实际采用的鼠标坐标反向同步给 Wine 的
-`GetCursorInfo` 和 `GetCursorPos`。因此 UU 的 GDI 捕获路径上报给主控端
-的光标元数据，会与 Linux 桌面上实际移动的指针保持一致。
-
-0.9.2 进一步把钩子安装到 UU 单独加载的 `streamer.dll` 捕获模块，并
-提供可由 `GetIconInfo` 正常读取位图的稳定 Win32 箭头光标。这可以避免
-Windows 主控端隐藏本地鼠标后，却收不到可用的远程光标形状。
-
-该功能当前仅支持 X11。Wayland、登录管理器/锁屏界面、游戏手柄和多点
-触控尚未支持。
-
 ## 解码器支持
 
-| 设备/后端 | 检测方式 | UU 集成状态 | 标称上限 |
-|---|---:|---:|---|
-| CPU / OpenH264 | 是 | 已支持 | 上游路径：1080p/60 fps |
-| NVIDIA NVDEC | 逐 GPU 查询驱动 | 实验性支持 | UU 菜单最高 4K/144 fps；须以实际串流测试为准 |
-| Intel/AMD VA-API | PCI 设备发现 | 尚未实现 | 不可用 |
+| 设备/后端 | UU 集成状态 | 标称上限 |
+|---|---:|---|
+| CPU / OpenH264 | 已支持 | 上游路径：1080p/60 fps |
+| NVIDIA NVDEC | 实验性支持 | UU 菜单最高 4K/144 fps；须以实际串流测试为准 |
+| Intel/AMD VA-API | 尚未实现 | 不可用 |
 
 ## 许可证与署名
 

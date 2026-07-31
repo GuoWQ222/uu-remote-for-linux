@@ -79,40 +79,13 @@ uu-remote-for-linux --decoder nvidia:0
 uu-remote-for-linux --stop
 ```
 
-## Linux controlled-host input
-
-Since 0.9.0, the launcher loads a project-built Win64 hook on
-`GameViewerServer.exe`'s `SendInput` fallback path. Authenticated mouse and
-keyboard packets are passed to a native X11/XTest daemon. This avoids the
-unavailable proprietary Windows kernel HID driver and needs neither
-`/dev/uinput` nor root privileges.
-
-Run `uu-remote-for-linux --diagnose` and verify:
-
-- `被控端原生输入` reports `生效中`;
-- `被控端输入事件` increases while the controller moves or clicks;
-- `Win64 输入钩子` reports `完整`.
-
-Version 0.9.1 also synchronizes the native X11 cursor coordinates back into
-Wine's `GetCursorInfo` and `GetCursorPos` results. This keeps the cursor
-metadata sent by UU's GDI capture path aligned with the pointer that XTest
-actually moved.
-
-Version 0.9.2 extends the hook into UU's separately loaded `streamer.dll`
-capture module and supplies a stable Win32 arrow handle whose bitmap can be
-read through `GetIconInfo`. This prevents the Windows controller from hiding
-its local pointer while receiving no usable remote cursor shape.
-
-This path currently supports X11 only. Native Wayland sessions, display
-managers/lock screens, gamepads, and multitouch remain unsupported.
-
 ## Decoder support
 
-| Device/backend | Detection | UU integration | Advertised limit |
-|---|---:|---:|---|
-| CPU / OpenH264 | Yes | Supported | Upstream path: 1080p/60 fps |
-| NVIDIA NVDEC | Per-GPU driver query | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
-| Intel/AMD VA-API | PCI discovery | Not implemented | Unavailable |
+| Device/backend | UU integration | Advertised limit |
+|---|---:|---|
+| CPU / OpenH264 | Supported | Upstream path: 1080p/60 fps |
+| NVIDIA NVDEC | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
+| Intel/AMD VA-API | Not implemented | Unavailable |
 
 ## License and attribution
 
