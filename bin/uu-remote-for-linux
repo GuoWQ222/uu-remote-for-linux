@@ -829,6 +829,13 @@ controller_xim_disabled() {
     [[ ${value^^} == N ]]
 }
 
+controller_take_focus_enabled() {
+    local value
+
+    value=$(registry_value "$controller_xim_key" UseTakeFocus) || return 1
+    [[ ${value^^} == Y ]]
+}
+
 webview_ready() {
     local version
 
@@ -1318,8 +1325,8 @@ wayland_frame_hook_status_label() {
 }
 
 controller_focus_hook_status_label() {
-    local version="" status_bits="" activate="" activate_app=""
-    local nonclient="" reused="" deferred=""
+    local version="" status_bits="" subclassed="" transitions=""
+    local storms="" resolved="" blocked="" modal="" handoffs=""
 
     if [[ ! -r $controller_focus_hook_status ]]; then
         printf '就绪（待主控窗口启动）'
@@ -1328,21 +1335,41 @@ controller_focus_hook_status_label() {
     version=$(ini_section_value "$controller_focus_hook_status" hook version)
     status_bits=$(ini_section_value \
         "$controller_focus_hook_status" hook status_bits)
-    activate=$(ini_section_value \
-        "$controller_focus_hook_status" focus suppressed_activate)
-    activate_app=$(ini_section_value \
-        "$controller_focus_hook_status" focus suppressed_activate_app)
-    nonclient=$(ini_section_value \
-        "$controller_focus_hook_status" focus stabilized_nonclient)
-    reused=$(ini_section_value \
-        "$controller_focus_hook_status" keyboard_hook reused)
-    deferred=$(ini_section_value \
-        "$controller_focus_hook_status" keyboard_hook deferred)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 8 &&
+    subclassed=$(ini_section_value \
+        "$controller_focus_hook_status" window_state subclassed)
+    transitions=$(ini_section_value \
+        "$controller_focus_hook_status" window_state transitions)
+    storms=$(ini_section_value \
+        "$controller_focus_hook_status" window_state storms_detected)
+    resolved=$(ini_section_value \
+        "$controller_focus_hook_status" window_state storms_resolved)
+    blocked=$(ini_section_value \
+        "$controller_focus_hook_status" window_state blocked_activations)
+    modal=$(ini_section_value \
+        "$controller_focus_hook_status" window_state modal_latches)
+    handoffs=$(ini_section_value \
+        "$controller_focus_hook_status" window_state post_modal_handoffs)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 9 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 127) == 127 )); then
+        if [[ ${storms:-0} =~ ^[0-9]+$ ]] && (( storms > 0 )); then
+            printf '生效中（v%s；顶层窗口 %s，争用 %s/%s，阻止抢焦 %s，接管切换 %s/%s）' \
+                "$version" "${subclassed:-0}" "${resolved:-0}" \
+                "$storms" "${blocked:-0}" "${modal:-0}" \
+                "${handoffs:-0}"
+        else
+            printf '监控中（v%s；顶层窗口 %s，真实消息 %s，接管切换 %s/%s）' \
+                "$version" "${subclassed:-0}" "${transitions:-0}" \
+                "${modal:-0}" "${handoffs:-0}"
+        fi
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 9 &&
         $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 31) == 31 )); then
-        printf '生效中（v%s；焦点 %s/%s/%s，键盘钩子 %s/%s）' \
-            "$version" "${activate:-0}" "${activate_app:-0}" \
-            "${nonclient:-0}" "${reused:-0}" "${deferred:-0}"
+        if [[ ${subclassed:-0} == 0 ]]; then
+            printf '已注入（v%s；等待主控顶层窗口）' "$version"
+        else
+            printf '部分生效（v%s；顶层窗口/API 未完整接管）' "$version"
+        fi
+    elif [[ $version == 8 ]]; then
+        printf '旧版钩子（仅 IAT，未验证真实顶层窗口）'
     else
         printf '未注入/不完整'
     fi
@@ -2326,6 +2353,7 @@ print_diagnostics() {
         "Linux 原生托盘" "$(tray_proxy_status_label)" \
         "原生托盘日志" "$tray_proxy_log" \
         "主控焦点稳定" "$(controller_focus_hook_status_label)" \
+        "Wine 主控焦点协议" "$(controller_take_focus_enabled && printf '应用级启用' || printf '未启用')" \
         "远控键盘桥" "$(keyboard_bridge_status_label)" \
         "Wine 本地输入法" "$(controller_xim_disabled && printf '已禁用（远端输入法接管）' || printf '未禁用')" \
         "键盘桥日志" "$keyboard_bridge_log" \
@@ -2935,6 +2963,9 @@ configure_compatibility() {
     run_logged "$wine" reg add "$controller_xim_key" \
         /v UseXIM /t REG_SZ /d N /f ||
         die "无法禁用 UU 主控窗口的 Wine 本地 XIM 输入法"
+    run_logged "$wine" reg add "$controller_xim_key" \
+        /v UseTakeFocus /t REG_SZ /d Y /f ||
+        die "无法启用 UU 主控窗口的 Wine WM_TAKE_FOCUS 协议"
     run_logged "$wine" reg add \
         'HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
         /v 'MS Shell Dlg' /t REG_SZ /d 'Noto Sans CJK SC' /f ||
@@ -2950,6 +2981,8 @@ configure_compatibility() {
     input_hook_ready || die "Win64 输入钩子核验失败"
     update_blocker_ready || die "自动更新保护程序核验失败"
     controller_xim_disabled || die "Wine 主控窗口 XIM 禁用设置核验失败"
+    controller_take_focus_enabled ||
+        die "Wine 主控窗口 WM_TAKE_FOCUS 设置核验失败"
     [[ -n $webview_version &&
         -f "$webview_root/$webview_version/msedgewebview2.exe" ]] ||
         die "WebView2 核验失败"
@@ -2964,6 +2997,7 @@ prefix_needs_configuration() {
     shim_ready || return 0
     update_blocker_ready || return 0
     controller_xim_disabled || return 0
+    controller_take_focus_enabled || return 0
     if wol_enabled; then
         wol_patch_ready || return 0
         wol_hook_config_ready || return 0

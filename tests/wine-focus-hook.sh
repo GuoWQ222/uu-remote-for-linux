@@ -75,12 +75,19 @@ WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
     WINEPREFIX="$prefix" WINEDEBUG=-all timeout 20s \
         wine 'C:\probe\bin\GameViewer.exe'
 )
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=8'
-grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=31'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=9'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=127'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'stabilized_nonclient=[1-9]'
 grep -A4 -F '[keyboard_hook]' "$status" | grep -Eq 'reused=[1-9]'
 grep -A4 -F '[keyboard_hook]' "$status" | grep -Eq 'released=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Fq 'mode=wndproc-arbiter'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'subclassed_total=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'storms_detected=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'storms_resolved=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'blocked_activations=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'modal_latches=[1-9]'
+grep -A12 -F '[window_state]' "$status" | grep -Eq 'post_modal_handoffs=[1-9]'
 
-printf 'Wine 主控同进程焦点归组、边框稳定和键盘钩子去抖实测通过。\n'
+printf 'Wine 主控顶层窗口接管、抢焦风暴仲裁、模态切换和键盘钩子去抖实测通过。\n'

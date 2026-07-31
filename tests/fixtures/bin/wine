@@ -37,6 +37,12 @@ case ${1:-} in
                     printf '    UseXIM    REG_SZ    N\n'
                     exit 0
                 fi
+                if [[ ${3:-} == *AppDefaults*gameviewer.exe*X11\ Driver* &&
+                    ${5:-} == UseTakeFocus &&
+                    -f "$install_dir/bin/.controller-take-focus-enabled" ]]; then
+                    printf '    UseTakeFocus    REG_SZ    Y\n'
+                    exit 0
+                fi
                 if [[ ${3:-} == *EdgeUpdate* && -f "$install_dir/bin/.webview-ready" ]]; then
                     printf '    pv    REG_SZ    149.0.0.0\n'
                     exit 0
@@ -63,6 +69,12 @@ case ${1:-} in
                     install -Dm0644 /dev/null \
                         "$install_dir/bin/.controller-xim-disabled"
                     printf 'REG_ADD_GAMEVIEWER_USEXIM=N\n' >>"$trace_file"
+                fi
+                if [[ ${3:-} == *AppDefaults*gameviewer.exe*X11\ Driver* &&
+                    ${5:-} == UseTakeFocus && ${9:-} == Y ]]; then
+                    install -Dm0644 /dev/null \
+                        "$install_dir/bin/.controller-take-focus-enabled"
+                    printf 'REG_ADD_GAMEVIEWER_USETAKEFOCUS=Y\n' >>"$trace_file"
                 fi
                 exit 0
                 ;;

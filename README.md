@@ -14,10 +14,14 @@
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
-- Stabilizes the controller window while changing quality or frame rate by
-  grouping UU's Qt menu/render helper windows and debouncing its low-level
-  keyboard hook. This prevents the active border from flashing under
-  Wine/XWayland without hiding real focus loss.
+- Stabilizes every real Qt top-level window through a process-local WndProc
+  arbiter. During device takeover, the confirmation dialog exclusively owns
+  activation and hands it to the remote-video window exactly once after it
+  closes. Repeated programmatic raises from the home/video pair are rate
+  detected and blocked, while a real user click or focus leaving UU remains
+  available. The controller also opts back into Wine's standard
+  `WM_TAKE_FOCUS` protocol instead of inheriting the wrapper's legacy global
+  override.
 - While a controller window is focused, temporarily pin the local source to a
   physical XKB keyboard and forward `Super+Space` to the remote OS. This keeps
   local IBus/Rime from consuming Chinese composition keys. Wine XIM is also
@@ -47,7 +51,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.4_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.5_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 

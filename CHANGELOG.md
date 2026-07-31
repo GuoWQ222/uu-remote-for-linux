@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.5] - 2026-07-31
+
+- Replace the ineffective controller `DispatchMessageW`-only path with direct
+  WndProc subclassing for every real GameViewer Qt top-level window.
+- Add a takeover state machine: a visible takeover dialog owns activation,
+  then hands focus to the remote-video window exactly once after closing.
+- Detect rapid home/video activation loops, latch the correct window, and
+  absorb `SetForegroundWindow`, `SetActiveWindow`, `BringWindowToTop`,
+  `SetWindowPos`, and activating `ShowWindow` calls until the loop settles.
+  Genuine external focus loss and explicit user clicks remain available.
+- Restore Wine's standard `WM_TAKE_FOCUS` protocol specifically for
+  `gameviewer.exe`, and report real subclass, transition, storm-resolution,
+  blocked-raise, and modal-handoff counters instead of treating IAT patch bits
+  alone as proof that stabilization is active.
+
 ## [1.1.4] - 2026-07-31
 
 - Add a process-local controller focus stabilizer for `bin/GameViewer.exe`.

@@ -21,6 +21,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
@@ -33,7 +34,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 8u
+#define HOOK_VERSION 9u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -41,6 +42,20 @@
 #define UUWF_STALE_TIMEOUT_MS 2000u
 #define FOCUS_UNHOOK_GRACE_MS 350u
 #define FOCUS_INTERNAL_GRACE_MS 700u
+#define FOCUS_STORM_WINDOW_MS 250u
+#define FOCUS_STORM_THRESHOLD 12
+#define FOCUS_LATCH_MS 1500u
+#define FOCUS_MODAL_REFRESH_MS 300u
+#define FOCUS_MAX_WINDOWS 64u
+#define FOCUS_MAX_MODULES 256u
+#define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
+
+enum focus_window_role {
+    FOCUS_ROLE_UNKNOWN = 0,
+    FOCUS_ROLE_HOME = 1,
+    FOCUS_ROLE_VIDEO = 2,
+    FOCUS_ROLE_DIALOG = 3
+};
 
 enum hook_process_kind {
     HOOK_PROCESS_NONE = 0,
@@ -62,6 +77,13 @@ typedef HHOOK(WINAPI *set_windows_hook_ex_w_fn)(
     int, HOOKPROC, HINSTANCE, DWORD
 );
 typedef BOOL(WINAPI *unhook_windows_hook_ex_fn)(HHOOK);
+typedef BOOL(WINAPI *set_foreground_window_fn)(HWND);
+typedef HWND(WINAPI *set_active_window_fn)(HWND);
+typedef BOOL(WINAPI *bring_window_to_top_fn)(HWND);
+typedef BOOL(WINAPI *set_window_pos_fn)(
+    HWND, HWND, int, int, int, int, UINT
+);
+typedef BOOL(WINAPI *show_window_fn)(HWND, int);
 typedef ULONG(WINAPI *get_adapters_addresses_fn)(
     ULONG,
     ULONG,
@@ -80,6 +102,11 @@ static stretch_blt_fn original_stretch_blt;
 static dispatch_message_w_fn original_dispatch_message_w;
 static set_windows_hook_ex_w_fn original_set_windows_hook_ex_w;
 static unhook_windows_hook_ex_fn original_unhook_windows_hook_ex;
+static set_foreground_window_fn original_set_foreground_window;
+static set_active_window_fn original_set_active_window;
+static bring_window_to_top_fn original_bring_window_to_top;
+static set_window_pos_fn original_set_window_pos;
+static show_window_fn original_show_window;
 static get_adapters_addresses_fn original_get_adapters_addresses;
 static get_adapters_info_fn original_get_adapters_info;
 static get_if_table2_fn original_get_if_table2;
@@ -157,6 +184,36 @@ static volatile LONG focus_keyboard_reused;
 static volatile LONG focus_keyboard_deferred;
 static volatile LONG focus_keyboard_released;
 static volatile LONG64 focus_last_internal_transition;
+static SRWLOCK focus_window_lock = SRWLOCK_INIT;
+static SRWLOCK focus_rate_lock = SRWLOCK_INIT;
+static SRWLOCK focus_module_lock = SRWLOCK_INIT;
+static volatile LONG focus_subclassed_windows;
+static volatile LONG focus_subclass_installations;
+static volatile LONG focus_activation_api_mask;
+static volatile LONG focus_transition_messages;
+static volatile LONG focus_storm_pending;
+static volatile LONG focus_storms_detected;
+static volatile LONG focus_storms_resolved;
+static volatile LONG focus_blocked_activations;
+static volatile LONG focus_modal_latches;
+static volatile LONG focus_post_modal_handoffs;
+static volatile LONG focus_user_overrides;
+static volatile LONG focus_preferred_role;
+static volatile LONG focus_latch_active;
+static volatile LONG64 focus_latch_until;
+static PVOID volatile focus_preferred_window;
+static ULONGLONG focus_rate_window_started;
+static LONG focus_rate_window_count;
+static BOOL focus_modal_was_visible;
+
+struct focus_window_entry {
+    HWND window;
+    WNDPROC original_proc;
+    enum focus_window_role role;
+};
+
+static struct focus_window_entry focus_windows[FOCUS_MAX_WINDOWS];
+static HMODULE focus_scanned_modules[FOCUS_MAX_MODULES];
 
 static void write_wol_hook_status(void);
 
@@ -1446,6 +1503,16 @@ static DWORD controller_focus_hook_status(void) {
     if (InterlockedCompareExchange(&focus_worker_running, 0, 0)) {
         status |= 16u;
     }
+    if (InterlockedCompareExchange(&focus_subclassed_windows, 0, 0) > 0) {
+        status |= 32u;
+    }
+    if (
+        (InterlockedCompareExchange(
+            &focus_activation_api_mask, 0, 0
+        ) & 31) == 31
+    ) {
+        status |= 64u;
+    }
     return status;
 }
 
@@ -1523,6 +1590,97 @@ static void write_focus_hook_status(void) {
     WritePrivateProfileStringA(
         "keyboard_hook", "released", value, focus_status_path
     );
+    WritePrivateProfileStringA(
+        "window_state", "mode", "wndproc-arbiter", focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_subclassed_windows, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "subclassed", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_subclass_installations, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "subclassed_total", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_activation_api_mask, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "activation_api_mask", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_transition_messages, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "transitions", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_storms_detected, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "storms_detected", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_storms_resolved, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "storms_resolved", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_blocked_activations, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "blocked_activations", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_modal_latches, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "modal_latches", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_post_modal_handoffs, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "post_modal_handoffs", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_user_overrides, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "user_overrides", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_preferred_role, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "window_state", "preferred_role", value, focus_status_path
+    );
 }
 
 static BOOL process_belongs_to_controller(DWORD pid) {
@@ -1588,6 +1746,753 @@ static BOOL thread_belongs_to_controller(DWORD thread_id) {
     pid = GetProcessIdOfThread(thread);
     CloseHandle(thread);
     return process_belongs_to_controller(pid);
+}
+
+static BOOL focus_transition_is_internal(const MSG *message);
+
+static BOOL wide_contains_ordinal_ci(
+    const WCHAR *text,
+    const WCHAR *needle
+) {
+    int text_length;
+    int needle_length;
+    int offset;
+
+    if (!text || !needle) {
+        return FALSE;
+    }
+    text_length = lstrlenW(text);
+    needle_length = lstrlenW(needle);
+    if (!needle_length || needle_length > text_length) {
+        return FALSE;
+    }
+    for (offset = 0; offset <= text_length - needle_length; ++offset) {
+        if (
+            CompareStringOrdinal(
+                text + offset,
+                needle_length,
+                needle,
+                needle_length,
+                TRUE
+            ) == CSTR_EQUAL
+        ) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static enum focus_window_role focus_window_role_for(HWND window) {
+    WCHAR title[256];
+    DWORD_PTR copied = 0;
+    HWND owner;
+    LONG_PTR style;
+    LONG_PTR ex_style;
+
+    title[0] = L'\0';
+    SendMessageTimeoutW(
+        window,
+        WM_GETTEXT,
+        256,
+        (LPARAM)title,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        25,
+        &copied
+    );
+    owner = GetWindow(window, GW_OWNER);
+    style = GetWindowLongPtrW(window, GWL_STYLE);
+    ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+
+    if (
+        wide_contains_ordinal_ci(
+            title, L"\u63a5\u7ba1\u8bbe\u5907"
+        ) ||
+        wide_contains_ordinal_ci(title, L"take over") ||
+        wide_contains_ordinal_ci(title, L"takeover")
+    ) {
+        return FOCUS_ROLE_DIALOG;
+    }
+    if (
+        wide_contains_ordinal_ci(title, L"\u663e\u793a\u5c4f") ||
+        wide_contains_ordinal_ci(title, L"display ") ||
+        wide_contains_ordinal_ci(title, L"remote desktop")
+    ) {
+        return FOCUS_ROLE_VIDEO;
+    }
+    if (
+        wide_contains_ordinal_ci(
+            title, L"\u7f51\u6613UU\u8fdc\u7a0b"
+        ) ||
+        wide_contains_ordinal_ci(title, L"UU Remote")
+    ) {
+        return FOCUS_ROLE_HOME;
+    }
+    if (
+        owner &&
+        window_belongs_to_controller(owner) &&
+        !(ex_style & WS_EX_TOOLWINDOW) &&
+        (
+            (ex_style & WS_EX_DLGMODALFRAME) ||
+            !IsWindowEnabled(owner) ||
+            (style & DS_MODALFRAME)
+        )
+    ) {
+        return FOCUS_ROLE_DIALOG;
+    }
+    return FOCUS_ROLE_UNKNOWN;
+}
+
+static BOOL focus_window_entry(
+    HWND window,
+    WNDPROC *original_proc,
+    enum focus_window_role *role
+) {
+    unsigned int index;
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (focus_windows[index].window != window) {
+            continue;
+        }
+        if (original_proc) {
+            *original_proc = focus_windows[index].original_proc;
+        }
+        if (role) {
+            *role = focus_windows[index].role;
+        }
+        found = TRUE;
+        break;
+    }
+    ReleaseSRWLockShared(&focus_window_lock);
+    return found;
+}
+
+static void focus_remove_window(HWND window) {
+    unsigned int index;
+
+    AcquireSRWLockExclusive(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (focus_windows[index].window == window) {
+            ZeroMemory(
+                &focus_windows[index], sizeof(focus_windows[index])
+            );
+            InterlockedDecrement(&focus_subclassed_windows);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&focus_window_lock);
+}
+
+static void focus_set_window_role(
+    HWND window,
+    enum focus_window_role role
+) {
+    unsigned int index;
+
+    AcquireSRWLockExclusive(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (focus_windows[index].window == window) {
+            focus_windows[index].role = role;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&focus_window_lock);
+}
+
+static void focus_replace_window_original(
+    HWND window,
+    WNDPROC original_proc,
+    enum focus_window_role role
+) {
+    unsigned int index;
+
+    AcquireSRWLockExclusive(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (focus_windows[index].window == window) {
+            focus_windows[index].original_proc = original_proc;
+            focus_windows[index].role = role;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&focus_window_lock);
+}
+
+static void focus_record_transition(void) {
+    ULONGLONG now = GetTickCount64();
+
+    InterlockedIncrement(&focus_transition_messages);
+    AcquireSRWLockExclusive(&focus_rate_lock);
+    if (
+        !focus_rate_window_started ||
+        now < focus_rate_window_started ||
+        now - focus_rate_window_started > FOCUS_STORM_WINDOW_MS
+    ) {
+        focus_rate_window_started = now;
+        focus_rate_window_count = 0;
+    }
+    ++focus_rate_window_count;
+    if (
+        focus_rate_window_count >= FOCUS_STORM_THRESHOLD &&
+        InterlockedCompareExchange(&focus_storm_pending, 1, 0) == 0
+    ) {
+        InterlockedIncrement(&focus_storms_detected);
+        if (focus_worker_event) {
+            SetEvent(focus_worker_event);
+        }
+    }
+    ReleaseSRWLockExclusive(&focus_rate_lock);
+}
+
+static void focus_clear_latch(void) {
+    InterlockedExchange(&focus_latch_active, 0);
+    InterlockedExchange64(&focus_latch_until, 0);
+    InterlockedExchangePointer(&focus_preferred_window, NULL);
+    InterlockedExchange(&focus_preferred_role, FOCUS_ROLE_UNKNOWN);
+}
+
+static BOOL focus_activation_is_blocked(HWND window) {
+    HWND root;
+    HWND preferred;
+    ULONGLONG until;
+    ULONGLONG now;
+
+    if (!window || !InterlockedCompareExchange(&focus_latch_active, 0, 0)) {
+        return FALSE;
+    }
+    root = GetAncestor(window, GA_ROOT);
+    if (!root || root != window || !window_belongs_to_controller(root)) {
+        return FALSE;
+    }
+    preferred = (HWND)InterlockedCompareExchangePointer(
+        &focus_preferred_window, NULL, NULL
+    );
+    if (!preferred || root == preferred) {
+        return FALSE;
+    }
+    until = (ULONGLONG)InterlockedCompareExchange64(
+        &focus_latch_until, 0, 0
+    );
+    now = GetTickCount64();
+    if (!until || now >= until) {
+        focus_clear_latch();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI hooked_set_foreground_window(HWND window) {
+    if (focus_activation_is_blocked(window)) {
+        InterlockedIncrement(&focus_blocked_activations);
+        return TRUE;
+    }
+    if (!original_set_foreground_window) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    return original_set_foreground_window(window);
+}
+
+static HWND WINAPI hooked_set_active_window(HWND window) {
+    if (focus_activation_is_blocked(window)) {
+        InterlockedIncrement(&focus_blocked_activations);
+        return (HWND)InterlockedCompareExchangePointer(
+            &focus_preferred_window, NULL, NULL
+        );
+    }
+    if (!original_set_active_window) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return NULL;
+    }
+    return original_set_active_window(window);
+}
+
+static BOOL WINAPI hooked_bring_window_to_top(HWND window) {
+    if (focus_activation_is_blocked(window)) {
+        InterlockedIncrement(&focus_blocked_activations);
+        return TRUE;
+    }
+    if (!original_bring_window_to_top) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    return original_bring_window_to_top(window);
+}
+
+static BOOL WINAPI hooked_set_window_pos(
+    HWND window,
+    HWND insert_after,
+    int x,
+    int y,
+    int width,
+    int height,
+    UINT flags
+) {
+    if (focus_activation_is_blocked(window)) {
+        flags |= SWP_NOACTIVATE | SWP_NOZORDER;
+        insert_after = NULL;
+        InterlockedIncrement(&focus_blocked_activations);
+    }
+    if (!original_set_window_pos) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    return original_set_window_pos(
+        window, insert_after, x, y, width, height, flags
+    );
+}
+
+static BOOL WINAPI hooked_show_window(HWND window, int command) {
+    if (focus_activation_is_blocked(window)) {
+        switch (command) {
+            case SW_SHOW:
+            case SW_SHOWNORMAL:
+            case SW_SHOWDEFAULT:
+            case SW_RESTORE:
+            case SW_SHOWMAXIMIZED:
+                command = SW_SHOWNOACTIVATE;
+                InterlockedIncrement(&focus_blocked_activations);
+                break;
+            default:
+                break;
+        }
+    }
+    if (!original_show_window) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    return original_show_window(window, command);
+}
+
+static LRESULT CALLBACK focus_subclass_window_proc(
+    HWND window,
+    UINT message,
+    WPARAM wparam,
+    LPARAM lparam
+) {
+    WNDPROC original_proc = NULL;
+    enum focus_window_role role = FOCUS_ROLE_UNKNOWN;
+    MSG probe;
+    LRESULT result;
+
+    if (!focus_window_entry(window, &original_proc, &role) || !original_proc) {
+        return DefWindowProcW(window, message, wparam, lparam);
+    }
+    if (message == WM_UU_FOCUS_APPLY) {
+        if (
+            window == (HWND)InterlockedCompareExchangePointer(
+                &focus_preferred_window, NULL, NULL
+            )
+        ) {
+            if (original_set_window_pos) {
+                original_set_window_pos(
+                    window,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                );
+            }
+            if (original_set_foreground_window) {
+                original_set_foreground_window(window);
+            }
+            if (original_set_active_window && wparam) {
+                original_set_active_window(window);
+            }
+        }
+        return 0;
+    }
+    ZeroMemory(&probe, sizeof(probe));
+    probe.hwnd = window;
+    probe.message = message;
+    probe.wParam = wparam;
+    probe.lParam = lparam;
+
+    if (message == WM_ACTIVATE || message == WM_ACTIVATEAPP) {
+        focus_record_transition();
+    }
+    if (
+        message == WM_ACTIVATE &&
+        LOWORD(wparam) == WA_INACTIVE &&
+        focus_transition_is_internal(&probe)
+    ) {
+        InterlockedIncrement(&focus_suppressed_activate);
+        return 0;
+    }
+    if (
+        message == WM_ACTIVATEAPP &&
+        !wparam &&
+        focus_transition_is_internal(&probe)
+    ) {
+        InterlockedIncrement(&focus_suppressed_activate_app);
+        return 0;
+    }
+    if (
+        message == WM_NCACTIVATE &&
+        !wparam &&
+        focus_transition_is_internal(&probe)
+    ) {
+        wparam = TRUE;
+        InterlockedIncrement(&focus_stabilized_nonclient);
+    }
+    if (
+        message == WM_WINDOWPOSCHANGING &&
+        focus_activation_is_blocked(window)
+    ) {
+        WINDOWPOS *position = (WINDOWPOS *)lparam;
+        if (position) {
+            position->flags |= SWP_NOACTIVATE | SWP_NOZORDER;
+            position->hwndInsertAfter = NULL;
+            InterlockedIncrement(&focus_blocked_activations);
+        }
+    }
+    if (
+        message == WM_MOUSEACTIVATE &&
+        role != FOCUS_ROLE_DIALOG &&
+        focus_activation_is_blocked(window)
+    ) {
+        focus_clear_latch();
+        InterlockedIncrement(&focus_user_overrides);
+    }
+
+    result = CallWindowProcW(
+        original_proc, window, message, wparam, lparam
+    );
+    if (message == WM_NCDESTROY) {
+        focus_remove_window(window);
+    }
+    return result;
+}
+
+static BOOL focus_ensure_window_subclassed(
+    HWND window,
+    enum focus_window_role role
+) {
+    unsigned int index;
+    WNDPROC original_proc;
+    LONG_PTR previous;
+
+    if (focus_window_entry(window, &original_proc, NULL)) {
+        focus_set_window_role(window, role);
+        SetLastError(ERROR_SUCCESS);
+        previous = GetWindowLongPtrW(window, GWLP_WNDPROC);
+        if (!previous && GetLastError() != ERROR_SUCCESS) {
+            return FALSE;
+        }
+        if ((WNDPROC)previous == focus_subclass_window_proc) {
+            return TRUE;
+        }
+        focus_replace_window_original(window, (WNDPROC)previous, role);
+        SetLastError(ERROR_SUCCESS);
+        previous = SetWindowLongPtrW(
+            window,
+            GWLP_WNDPROC,
+            (LONG_PTR)focus_subclass_window_proc
+        );
+        if (!previous && GetLastError() != ERROR_SUCCESS) {
+            focus_replace_window_original(window, original_proc, role);
+            return FALSE;
+        }
+        InterlockedIncrement(&focus_subclass_installations);
+        return TRUE;
+    }
+    SetLastError(ERROR_SUCCESS);
+    original_proc = (WNDPROC)GetWindowLongPtrW(window, GWLP_WNDPROC);
+    if (!original_proc && GetLastError() != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    AcquireSRWLockExclusive(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (!focus_windows[index].window) {
+            focus_windows[index].window = window;
+            focus_windows[index].original_proc = original_proc;
+            focus_windows[index].role = role;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&focus_window_lock);
+    if (index == FOCUS_MAX_WINDOWS) {
+        return FALSE;
+    }
+    InterlockedIncrement(&focus_subclassed_windows);
+
+    SetLastError(ERROR_SUCCESS);
+    previous = SetWindowLongPtrW(
+        window,
+        GWLP_WNDPROC,
+        (LONG_PTR)focus_subclass_window_proc
+    );
+    if (!previous && GetLastError() != ERROR_SUCCESS) {
+        focus_remove_window(window);
+        return FALSE;
+    }
+    InterlockedIncrement(&focus_subclass_installations);
+    return TRUE;
+}
+
+struct focus_window_scan {
+    HWND foreground;
+    enum focus_window_role foreground_role;
+    HWND dialog;
+    HWND video;
+    HWND home;
+    HWND nonhome;
+    LONG64 video_area;
+    LONG64 nonhome_area;
+};
+
+static BOOL CALLBACK focus_scan_window(HWND window, LPARAM parameter) {
+    struct focus_window_scan *scan = (struct focus_window_scan *)parameter;
+    enum focus_window_role role;
+    DWORD pid = 0;
+    RECT rectangle;
+    LONG64 area = 0;
+    LONG_PTR ex_style;
+
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return TRUE;
+    }
+    if (!focus_window_entry(window, NULL, &role)) {
+        role = focus_window_role_for(window);
+    }
+    focus_ensure_window_subclassed(window, role);
+    if (!IsWindowVisible(window)) {
+        return TRUE;
+    }
+    if (window == GetForegroundWindow()) {
+        scan->foreground = window;
+        scan->foreground_role = role;
+    }
+    if (GetWindowRect(window, &rectangle)) {
+        area = (LONG64)(rectangle.right - rectangle.left) *
+            (LONG64)(rectangle.bottom - rectangle.top);
+    }
+    if (role == FOCUS_ROLE_DIALOG) {
+        scan->dialog = window;
+    } else if (role == FOCUS_ROLE_VIDEO && area >= scan->video_area) {
+        scan->video = window;
+        scan->video_area = area;
+    } else if (role == FOCUS_ROLE_HOME) {
+        scan->home = window;
+    } else {
+        ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if (
+            !GetWindow(window, GW_OWNER) &&
+            !(ex_style & WS_EX_TOOLWINDOW) &&
+            area >= scan->nonhome_area
+        ) {
+            scan->nonhome = window;
+            scan->nonhome_area = area;
+        }
+    }
+    return TRUE;
+}
+
+static void focus_apply_latch(
+    HWND target,
+    enum focus_window_role role,
+    ULONGLONG duration
+) {
+    HWND previous;
+    BOOL changed;
+
+    if (!target || !IsWindow(target)) {
+        return;
+    }
+    previous = (HWND)InterlockedCompareExchangePointer(
+        &focus_preferred_window, NULL, NULL
+    );
+    changed = !InterlockedCompareExchange(&focus_latch_active, 0, 0) ||
+        previous != target;
+    InterlockedExchangePointer(&focus_preferred_window, target);
+    InterlockedExchange(&focus_preferred_role, (LONG)role);
+    InterlockedExchange64(
+        &focus_latch_until, (LONG64)(GetTickCount64() + duration)
+    );
+    InterlockedExchange(&focus_latch_active, 1);
+
+    if (changed || GetForegroundWindow() != target) {
+        PostMessageW(target, WM_UU_FOCUS_APPLY, changed ? 1u : 0u, 0);
+    }
+}
+
+static void focus_arbitrate_windows(void) {
+    struct focus_window_scan scan;
+    HWND target = NULL;
+    enum focus_window_role role = FOCUS_ROLE_UNKNOWN;
+    BOOL storm;
+    BOOL modal_visible;
+    ULONGLONG now = GetTickCount64();
+
+    ZeroMemory(&scan, sizeof(scan));
+    EnumWindows(focus_scan_window, (LPARAM)&scan);
+    modal_visible = scan.dialog != NULL;
+    if (modal_visible) {
+        if (!focus_modal_was_visible) {
+            InterlockedIncrement(&focus_modal_latches);
+        }
+        focus_apply_latch(
+            scan.dialog, FOCUS_ROLE_DIALOG, FOCUS_MODAL_REFRESH_MS
+        );
+    } else if (focus_modal_was_visible) {
+        target = scan.video ? scan.video : scan.nonhome;
+        if (target) {
+            InterlockedIncrement(&focus_post_modal_handoffs);
+            focus_apply_latch(target, FOCUS_ROLE_VIDEO, FOCUS_LATCH_MS);
+        }
+    }
+    focus_modal_was_visible = modal_visible;
+
+    storm = InterlockedExchange(&focus_storm_pending, 0) != 0;
+    if (storm) {
+        if (scan.dialog) {
+            target = scan.dialog;
+            role = FOCUS_ROLE_DIALOG;
+        } else if (scan.video) {
+            target = scan.video;
+            role = FOCUS_ROLE_VIDEO;
+        } else if (scan.nonhome) {
+            target = scan.nonhome;
+            role = FOCUS_ROLE_VIDEO;
+        } else if (scan.foreground) {
+            target = scan.foreground;
+            role = scan.foreground_role;
+        } else {
+            target = scan.home;
+            role = FOCUS_ROLE_HOME;
+        }
+        if (target) {
+            focus_apply_latch(target, role, FOCUS_LATCH_MS);
+            InterlockedIncrement(&focus_storms_resolved);
+        }
+    }
+    if (
+        !modal_visible &&
+        InterlockedCompareExchange(&focus_latch_active, 0, 0) &&
+        now >= (ULONGLONG)InterlockedCompareExchange64(
+            &focus_latch_until, 0, 0
+        )
+    ) {
+        focus_clear_latch();
+    }
+}
+
+static void focus_mark_activation_api(LONG bit) {
+    LONG previous;
+    LONG updated;
+
+    do {
+        previous = InterlockedCompareExchange(
+            &focus_activation_api_mask, 0, 0
+        );
+        updated = previous | bit;
+    } while (
+        InterlockedCompareExchange(
+            &focus_activation_api_mask, updated, previous
+        ) != previous
+    );
+}
+
+static BOOL focus_mark_module_for_scan(HMODULE module) {
+    unsigned int index;
+    unsigned int empty = FOCUS_MAX_MODULES;
+    BOOL should_scan = FALSE;
+
+    AcquireSRWLockExclusive(&focus_module_lock);
+    for (index = 0; index < FOCUS_MAX_MODULES; ++index) {
+        if (focus_scanned_modules[index] == module) {
+            break;
+        }
+        if (!focus_scanned_modules[index] && empty == FOCUS_MAX_MODULES) {
+            empty = index;
+        }
+    }
+    if (index == FOCUS_MAX_MODULES && empty < FOCUS_MAX_MODULES) {
+        focus_scanned_modules[empty] = module;
+        should_scan = TRUE;
+    }
+    ReleaseSRWLockExclusive(&focus_module_lock);
+    return should_scan;
+}
+
+static void patch_focus_activation_imports(HMODULE module) {
+    if (
+        !module ||
+        module == hook_module ||
+        !focus_mark_module_for_scan(module)
+    ) {
+        return;
+    }
+    if (patch_import(
+        module,
+        "USER32.dll",
+        "SetForegroundWindow",
+        (void *)hooked_set_foreground_window,
+        (void **)&original_set_foreground_window
+    )) {
+        focus_mark_activation_api(1);
+    }
+    if (patch_import(
+        module,
+        "USER32.dll",
+        "SetActiveWindow",
+        (void *)hooked_set_active_window,
+        (void **)&original_set_active_window
+    )) {
+        focus_mark_activation_api(2);
+    }
+    if (patch_import(
+        module,
+        "USER32.dll",
+        "BringWindowToTop",
+        (void *)hooked_bring_window_to_top,
+        (void **)&original_bring_window_to_top
+    )) {
+        focus_mark_activation_api(4);
+    }
+    if (patch_import(
+        module,
+        "USER32.dll",
+        "SetWindowPos",
+        (void *)hooked_set_window_pos,
+        (void **)&original_set_window_pos
+    )) {
+        focus_mark_activation_api(8);
+    }
+    if (patch_import(
+        module,
+        "USER32.dll",
+        "ShowWindow",
+        (void *)hooked_show_window,
+        (void **)&original_show_window
+    )) {
+        focus_mark_activation_api(16);
+    }
+}
+
+static void patch_all_focus_activation_imports(void) {
+    HANDLE snapshot;
+    MODULEENTRY32W module_entry;
+
+    snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+        GetCurrentProcessId()
+    );
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    ZeroMemory(&module_entry, sizeof(module_entry));
+    module_entry.dwSize = sizeof(module_entry);
+    if (Module32FirstW(snapshot, &module_entry)) {
+        do {
+            patch_focus_activation_imports(module_entry.hModule);
+        } while (Module32NextW(snapshot, &module_entry));
+    }
+    CloseHandle(snapshot);
 }
 
 static BOOL focus_transition_is_internal(const MSG *message) {
@@ -1775,14 +2680,14 @@ static void patch_controller_focus_imports(void) {
 
 static DWORD WINAPI focus_worker_main(LPVOID parameter) {
     ULONGLONG last_status_write = 0;
+    ULONGLONG last_activation_scan = 0;
     (void)parameter;
 
     for (;;) {
         HHOOK release_hook = NULL;
         ULONGLONG now;
 
-        WaitForSingleObject(focus_worker_event, 100);
-        patch_controller_focus_imports();
+        WaitForSingleObject(focus_worker_event, 50);
         now = GetTickCount64();
         AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
         if (
@@ -1806,12 +2711,20 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
             write_focus_hook_status();
             last_status_write = now;
         }
+        patch_controller_focus_imports();
+        if (now - last_activation_scan >= 500u) {
+            patch_all_focus_activation_imports();
+            last_activation_scan = now;
+        }
+        focus_arbitrate_windows();
     }
     return 0;
 }
 
 static BOOL initialize_controller_focus_hook(void) {
     patch_controller_focus_imports();
+    patch_all_focus_activation_imports();
+    focus_arbitrate_windows();
     if (!focus_worker_event) {
         focus_worker_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     }

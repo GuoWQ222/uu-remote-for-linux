@@ -81,8 +81,29 @@ grep -q '^INSTALL$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE"
 test -f "$state_dir/setup.log"
 grep -q '^REG_ADD_GAMEVIEWER_USEXIM=N$' "$UU_REMOTE_FAKE_TRACE"
+grep -q '^REG_ADD_GAMEVIEWER_USETAKEFOCUS=Y$' "$UU_REMOTE_FAKE_TRACE"
 "$launcher" --diagnose | grep -q \
     'Wine 本地输入法.*已禁用（远端输入法接管）'
+"$launcher" --diagnose | grep -q \
+    'Wine 主控焦点协议.*应用级启用'
+
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=947' \
+    'version=9' \
+    'status_bits=127' \
+    '[window_state]' \
+    'mode=wndproc-arbiter' \
+    'subclassed=4' \
+    'transitions=5674' \
+    'storms_detected=1' \
+    'storms_resolved=1' \
+    'blocked_activations=26' \
+    'modal_latches=1' \
+    'post_modal_handoffs=1' \
+    >"$prefix/drive_c/uu-remote-focus-hook-status.ini"
+"$launcher" --diagnose | grep -q \
+    '主控焦点稳定.*生效中（v9；顶层窗口 4，争用 1/1，阻止抢焦 26，接管切换 1/1）'
 
 printf '%s\r\n' \
     '[hook]' \

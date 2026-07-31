@@ -12,9 +12,11 @@
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
-- 切换画质或帧率时会把 UU 的 Qt 菜单、渲染辅助窗口和远控主窗口归为
-  同一焦点域，并对低级键盘钩子去抖；这能阻止 Wine/XWayland 下活动边框
-  频闪，同时保留真正切出 UU 时的正常失焦。
+- 进程内 WndProc 仲裁器直接接管 UU 的真实 Qt 顶层窗口。接管设备时，确认框
+  独占激活权，关闭后只向远控画面交接一次；主菜单与远控画面反复请求置顶时
+  会被按频率检测并阻断，而用户真实点击或切出 UU 仍可正常生效。UU 主控进程
+  还会单独恢复 Wine 标准的 `WM_TAKE_FOCUS` 协议，不再继承兼容前缀的旧全局
+  关闭项。
 - 主控端聚焦远控窗口时会临时固定本机为 XKB 物理键盘，并把
   `Super+Space` 交给远端系统；因此中文由远端输入法完成，不再被本机
   IBus/Rime 截获。Wine 的 UU 主控窗口同时禁用本地 XIM，避免同一个
@@ -40,7 +42,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.4_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.5_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 

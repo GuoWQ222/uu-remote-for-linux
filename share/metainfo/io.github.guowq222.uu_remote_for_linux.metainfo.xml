@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.5" date="2026-07-31">
+      <description>
+        <p>Stop takeover-time home/video focus races with direct Qt top-level WndProc arbitration, an atomic confirmation-to-video handoff, and an application-specific Wine WM_TAKE_FOCUS policy.</p>
+      </description>
+    </release>
     <release version="1.1.4" date="2026-07-31">
       <description>
         <p>Stop controller-border flashing during live quality and frame-rate changes by grouping UU's Qt helper windows into one focus domain and debouncing its low-level keyboard hook under Wine/XWayland.</p>
