@@ -14,12 +14,17 @@
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
-- Basic support for all features of the Windows UU Remote client.
+- Native mouse, keyboard, and remote-cursor support when Linux is controlled
+  in an X11 session.
+- Compatibility bridges for autostart, sleep inhibition, safe updates, file
+  transfer, and Wake-on-LAN.
 
 ## Requirements
 
 - Ubuntu 24.04 (tested)
 - Wine 11.1 or newer
+- An X11 session when Linux is the controlled host (native Wayland input is not
+  supported yet)
 
 ## Install from Release (recommended)
 
@@ -28,7 +33,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_0.8.1_amd64.deb
+sudo apt install ./uu-remote-for-linux_0.9.2_amd64.deb
 uuyc-linux-controller --accept-eula --setup-only
 ```
 
@@ -69,6 +74,33 @@ uuyc-linux-controller --decoder nvidia:0
 # Stop only this project's dedicated Wine prefix
 uuyc-linux-controller --stop
 ```
+
+## Linux controlled-host input
+
+Since 0.9.0, the launcher loads a project-built Win64 hook on
+`GameViewerServer.exe`'s `SendInput` fallback path. Authenticated mouse and
+keyboard packets are passed to a native X11/XTest daemon. This avoids the
+unavailable proprietary Windows kernel HID driver and needs neither
+`/dev/uinput` nor root privileges.
+
+Run `uuyc-linux-controller --diagnose` and verify:
+
+- `被控端原生输入` reports `生效中`;
+- `被控端输入事件` increases while the controller moves or clicks;
+- `Win64 输入钩子` reports `完整`.
+
+Version 0.9.1 also synchronizes the native X11 cursor coordinates back into
+Wine's `GetCursorInfo` and `GetCursorPos` results. This keeps the cursor
+metadata sent by UU's GDI capture path aligned with the pointer that XTest
+actually moved.
+
+Version 0.9.2 extends the hook into UU's separately loaded `streamer.dll`
+capture module and supplies a stable Win32 arrow handle whose bitmap can be
+read through `GetIconInfo`. This prevents the Windows controller from hiding
+its local pointer while receiving no usable remote cursor shape.
+
+This path currently supports X11 only. Native Wayland sessions, display
+managers/lock screens, gamepads, and multitouch remain unsupported.
 
 ## Decoder support
 

@@ -20,6 +20,7 @@ export UUYC_DISABLE_AUTOSTART_WATCHER=1
 export UUYC_DISABLE_SLEEP_WATCHER=1
 export UUYC_DISABLE_UPDATE_WATCHER=1
 export UUYC_DISABLE_KEYBOARD_BRIDGE=1
+export UUYC_DISABLE_INPUT_BRIDGE=1
 export UUYC_TRAY_PROXY_BIN="$fixture_bin/uuyc-tray-proxy"
 export UUYC_UPDATE_NO_RESTART=1
 export DISPLAY=:99
@@ -60,6 +61,12 @@ test -f "$install_dir/bin/Upgrade.uuyc-original.exe"
 cmp -s \
     "$project_root/lib/uuyc-linux-controller/wevtapi.dll" \
     "$install_dir/bin/wevtapi.dll"
+cmp -s \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll" \
+    "$prefix/drive_c/uuyc-input-hook.dll"
+cmp -s \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe" \
+    "$prefix/drive_c/uuyc-input-injector.exe"
 test -f "$install_dir/bin/.webview-ready"
 test -f "$cache_dir/UURemote_Setup.exe"
 grep -q '^version=4.34.0.8979$' "$cache_dir/installer-metadata"
@@ -117,6 +124,7 @@ grep -q '"mock":"original-cache"' "$decoder_cache_backup"
 "$launcher" --diagnose | grep -q '硬解桥开关.*已启用'
 "$launcher" --diagnose | grep -q 'UU 自动更新开关.*开启'
 "$launcher" --diagnose | grep -q '官方更新器保护.*完整'
+"$launcher" --diagnose | grep -q 'Win64 输入钩子.*完整'
 
 "$launcher" --check-update
 "$launcher" --diagnose | grep -q '安全更新状态.*已是最新版本'
@@ -128,14 +136,16 @@ sha256sum \
     "$install_dir/bin/Upgrade.uuyc-original.exe" \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
-    "$install_dir/bin/streamer.dll" >"$protected_before"
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/uuyc-input-hook.dll" >"$protected_before"
 UUYC_FAKE_LATEST_VERSION=4.35.0.9000 "$launcher" --check-update
 sha256sum \
     "$install_dir/bin/Upgrade.exe" \
     "$install_dir/bin/Upgrade.uuyc-original.exe" \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
-    "$install_dir/bin/streamer.dll" >"$protected_after"
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/uuyc-input-hook.dll" >"$protected_after"
 cmp -s "$protected_before" "$protected_after"
 "$launcher" --diagnose | grep -q '安全更新状态.*已暂缓 4.35.0.9000'
 

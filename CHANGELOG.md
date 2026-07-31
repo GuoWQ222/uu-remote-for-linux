@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.2] - 2026-07-31
+
+- Fixed the remaining invisible-cursor path by patching the independent
+  `streamer.dll` GDI capture module, not only `GameViewerServer.exe`.
+- Forced a stable shared arrow cursor while the native bridge is active so
+  `GetIconInfo` can always provide usable cursor bitmap and hotspot data.
+- Extended the real Wine injection test with a separate `streamer.dll` probe
+  that verifies module-local `SendInput`, cursor coordinates, visibility, and
+  cursor bitmap extraction.
+
+## [0.9.1] - 2026-07-31
+
+- Fixed a controlled-host cursor desynchronization where native XTest movement
+  succeeded but UU's GDI capture kept reporting Wine's stale cursor position.
+- Added `GetCursorInfo` and `GetCursorPos` coordinate synchronization to the
+  Win64 input hook.
+- Added hook-version enforcement and mouse-move, mouse-button, and keyboard
+  event counters to diagnostics.
+
+## [0.9.0] - 2026-07-31
+
+- Added an authenticated Win64 `SendInput` hook and native X11/XTest input
+  daemon for Linux controlled-host mouse and keyboard support.
+- Added a same-architecture injection watchdog that reloads the hook after a
+  `GameViewerServer.exe` restart without relying on Wine AppInit behavior.
+- Added automatic stuck-key/button release, per-launch token rotation, and
+  remote cursor visibility correction.
+- Added lifecycle supervision, diagnostics, package integration, and
+  update-safe redeployment for the input bridge.
+
 ## [0.8.1] - 2026-07-30
 
 - Renamed the public project and application display name to **UU Remote for

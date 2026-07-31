@@ -27,6 +27,9 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -x "$project_root/lib/uuyc-linux-controller/uuyc-wol-configure" &&
     -x "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge" &&
     -x "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge" &&
+    -x "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge" &&
+    -r "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll" &&
+    -r "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe" &&
     -r "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe" &&
     -r "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
@@ -61,6 +64,12 @@ install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge" \
     "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-update-bridge"
 install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge" \
     "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+install -Dm0755 "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge" \
+    "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-input-bridge"
+install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll" \
+    "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-input-hook.dll"
+install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe" \
+    "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-input-injector.exe"
 install -Dm0644 "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe" \
     "$stage_dir/usr/lib/uuyc-linux-controller/uuyc-update-blocker.exe"
 install -Dm0644 "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv" \

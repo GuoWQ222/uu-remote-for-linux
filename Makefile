@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all shim nvdec-probe update-blocker test deb clean
+.PHONY: all shim nvdec-probe update-blocker input-hook test deb clean
 
 all: test
 
@@ -12,6 +12,9 @@ nvdec-probe:
 
 update-blocker:
 	./scripts/build-update-blocker.sh
+
+input-hook:
+	./scripts/build-input-hook.sh
 
 test:
 	./tests/run.sh

@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""Authenticated Win32 SendInput to X11/XTest bridge for UU Remote.
+
+The Windows hook writes compact, versioned UDP datagrams to a random loopback
+port.  The endpoint file is readable only by the current user and contains a
+fresh 128-bit token for each daemon lifetime.  Valid mouse and keyboard events
+are injected into the active X11 desktop with XTest.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import hmac
+import json
+import os
+import secrets
+import signal
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+PROTOCOL_MAGIC = 0x50495555  # "UUIP" in little-endian byte order
+PROTOCOL_VERSION = 1
+MINIMUM_HOOK_VERSION = 3
+PACKET_HELLO = 1
+PACKET_MOUSE = 2
+PACKET_KEYBOARD = 3
+
+HEADER = struct.Struct("<IBBHI16s")
+HELLO = struct.Struct("<II")
+MOUSE = struct.Struct("<iiIIIQ")
+KEYBOARD = struct.Struct("<HHIIQ")
+
+MOUSE_MOVE = 0x0001
+MOUSE_LEFTDOWN = 0x0002
+MOUSE_LEFTUP = 0x0004
+MOUSE_RIGHTDOWN = 0x0008
+MOUSE_RIGHTUP = 0x0010
+MOUSE_MIDDLEDOWN = 0x0020
+MOUSE_MIDDLEUP = 0x0040
+MOUSE_XDOWN = 0x0080
+MOUSE_XUP = 0x0100
+MOUSE_WHEEL = 0x0800
+MOUSE_HWHEEL = 0x1000
+MOUSE_ABSOLUTE = 0x8000
+MOUSE_BUTTON_FLAGS = (
+    MOUSE_LEFTDOWN
+    | MOUSE_LEFTUP
+    | MOUSE_RIGHTDOWN
+    | MOUSE_RIGHTUP
+    | MOUSE_MIDDLEDOWN
+    | MOUSE_MIDDLEUP
+    | MOUSE_XDOWN
+    | MOUSE_XUP
+    | MOUSE_WHEEL
+    | MOUSE_HWHEEL
+)
+
+KEY_EXTENDED = 0x0001
+KEY_UP = 0x0002
+KEY_UNICODE = 0x0004
+KEY_SCANCODE = 0x0008
+
+STATE_VERSION = 1
+DEFAULT_RELEASE_TIMEOUT = 15.0
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    atomic_write(
+        path,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+    )
+
+
+class Logger:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def write(self, message: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+
+
+VK_KEYSYMS = {
+    0x08: "BackSpace",
+    0x09: "Tab",
+    0x0D: "Return",
+    0x13: "Pause",
+    0x14: "Caps_Lock",
+    0x1B: "Escape",
+    0x20: "space",
+    0x21: "Prior",
+    0x22: "Next",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2C: "Print",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x5B: "Super_L",
+    0x5C: "Super_R",
+    0x5D: "Menu",
+    0x60: "KP_0",
+    0x61: "KP_1",
+    0x62: "KP_2",
+    0x63: "KP_3",
+    0x64: "KP_4",
+    0x65: "KP_5",
+    0x66: "KP_6",
+    0x67: "KP_7",
+    0x68: "KP_8",
+    0x69: "KP_9",
+    0x6A: "KP_Multiply",
+    0x6B: "KP_Add",
+    0x6D: "KP_Subtract",
+    0x6E: "KP_Decimal",
+    0x6F: "KP_Divide",
+    0x90: "Num_Lock",
+    0x91: "Scroll_Lock",
+    0xA0: "Shift_L",
+    0xA1: "Shift_R",
+    0xA2: "Control_L",
+    0xA3: "Control_R",
+    0xA4: "Alt_L",
+    0xA5: "Alt_R",
+    0xAD: "XF86AudioMute",
+    0xAE: "XF86AudioLowerVolume",
+    0xAF: "XF86AudioRaiseVolume",
+    0xB0: "XF86AudioNext",
+    0xB1: "XF86AudioPrev",
+    0xB2: "XF86AudioStop",
+    0xB3: "XF86AudioPlay",
+    0xBA: "semicolon",
+    0xBB: "equal",
+    0xBC: "comma",
+    0xBD: "minus",
+    0xBE: "period",
+    0xBF: "slash",
+    0xC0: "grave",
+    0xDB: "bracketleft",
+    0xDC: "backslash",
+    0xDD: "bracketright",
+    0xDE: "apostrophe",
+}
+
+EXTENDED_SCAN_KEYCODES = {
+    0x1C: 104,  # KP Enter
+    0x1D: 105,  # Right Control
+    0x35: 106,  # KP Divide
+    0x38: 108,  # Right Alt
+    0x47: 110,  # Home
+    0x48: 111,  # Up
+    0x49: 112,  # Page Up
+    0x4B: 113,  # Left
+    0x4D: 114,  # Right
+    0x4F: 115,  # End
+    0x50: 116,  # Down
+    0x51: 117,  # Page Down
+    0x52: 118,  # Insert
+    0x53: 119,  # Delete
+    0x5B: 133,  # Left Super
+    0x5C: 134,  # Right Super
+    0x5D: 135,  # Menu
+}
+
+ASCII_KEYSYMS = {
+    " ": ("space", False),
+    "-": ("minus", False),
+    "_": ("minus", True),
+    "=": ("equal", False),
+    "+": ("equal", True),
+    "[": ("bracketleft", False),
+    "{": ("bracketleft", True),
+    "]": ("bracketright", False),
+    "}": ("bracketright", True),
+    "\\": ("backslash", False),
+    "|": ("backslash", True),
+    ";": ("semicolon", False),
+    ":": ("semicolon", True),
+    "'": ("apostrophe", False),
+    '"': ("apostrophe", True),
+    ",": ("comma", False),
+    "<": ("comma", True),
+    ".": ("period", False),
+    ">": ("period", True),
+    "/": ("slash", False),
+    "?": ("slash", True),
+    "`": ("grave", False),
+    "~": ("grave", True),
+    "!": ("1", True),
+    "@": ("2", True),
+    "#": ("3", True),
+    "$": ("4", True),
+    "%": ("5", True),
+    "^": ("6", True),
+    "&": ("7", True),
+    "*": ("8", True),
+    "(": ("9", True),
+    ")": ("0", True),
+    "\t": ("Tab", False),
+    "\r": ("Return", False),
+    "\n": ("Return", False),
+}
+
+
+class XTestBackend:
+    def __init__(self) -> None:
+        self.x11 = ctypes.CDLL(
+            os.environ.get("UUYC_INPUT_BRIDGE_X11_LIBRARY", "libX11.so.6")
+        )
+        self.xtst = ctypes.CDLL(
+            os.environ.get("UUYC_INPUT_BRIDGE_XTEST_LIBRARY", "libXtst.so.6")
+        )
+        self._configure_signatures()
+        display_name = os.environ.get("DISPLAY")
+        encoded = display_name.encode() if display_name else None
+        self.display = self.x11.XOpenDisplay(encoded)
+        if not self.display:
+            raise RuntimeError(
+                f"无法连接 X11 DISPLAY：{display_name or 'unset'}"
+            )
+        self.screen = self.x11.XDefaultScreen(self.display)
+        event_base = ctypes.c_int()
+        error_base = ctypes.c_int()
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        if not self.xtst.XTestQueryExtension(
+            self.display,
+            ctypes.byref(event_base),
+            ctypes.byref(error_base),
+            ctypes.byref(major),
+            ctypes.byref(minor),
+        ):
+            self.close()
+            raise RuntimeError("当前 X11 服务器不支持 XTEST 扩展")
+
+    def _configure_signatures(self) -> None:
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultScreen.restype = ctypes.c_int
+        self.x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XDisplayWidth.restype = ctypes.c_int
+        self.x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XDisplayHeight.restype = ctypes.c_int
+        self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.x11.XStringToKeysym.restype = ctypes.c_ulong
+        self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        self.x11.XFlush.argtypes = [ctypes.c_void_p]
+
+        self.xtst.XTestQueryExtension.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.xtst.XTestQueryExtension.restype = ctypes.c_int
+        self.xtst.XTestFakeMotionEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeMotionEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeRelativeMotionEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeButtonEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeButtonEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeKeyEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+    def close(self) -> None:
+        if getattr(self, "display", None):
+            self.x11.XCloseDisplay(self.display)
+            self.display = None
+
+    def flush(self) -> None:
+        self.x11.XFlush(self.display)
+
+    def motion(self, dx: int, dy: int, absolute: bool) -> None:
+        if absolute:
+            width = max(self.x11.XDisplayWidth(self.display, self.screen), 1)
+            height = max(self.x11.XDisplayHeight(self.display, self.screen), 1)
+            x = round(max(0, min(dx, 65535)) * (width - 1) / 65535)
+            y = round(max(0, min(dy, 65535)) * (height - 1) / 65535)
+            result = self.xtst.XTestFakeMotionEvent(
+                self.display, self.screen, x, y, 0
+            )
+        else:
+            result = self.xtst.XTestFakeRelativeMotionEvent(
+                self.display, dx, dy, 0
+            )
+        if not result:
+            raise RuntimeError("XTest 鼠标移动注入失败")
+
+    def button(self, button: int, pressed: bool) -> None:
+        if not self.xtst.XTestFakeButtonEvent(
+            self.display, button, int(pressed), 0
+        ):
+            raise RuntimeError(f"XTest 鼠标按钮 {button} 注入失败")
+
+    def keycode(self, keycode: int, pressed: bool) -> None:
+        if not 8 <= keycode <= 255:
+            raise ValueError(f"无效 X11 键码：{keycode}")
+        if not self.xtst.XTestFakeKeyEvent(
+            self.display, keycode, int(pressed), 0
+        ):
+            raise RuntimeError(f"XTest 键盘键码 {keycode} 注入失败")
+
+    def keysym_keycode(self, name: str) -> int:
+        keysym = self.x11.XStringToKeysym(name.encode("ascii"))
+        if not keysym:
+            return 0
+        return int(self.x11.XKeysymToKeycode(self.display, keysym))
+
+
+class FakeBackend:
+    def __init__(self, trace_path: Path):
+        self.trace_path = trace_path
+
+    def _write(self, event: str) -> None:
+        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(event + "\n")
+
+    def close(self) -> None:
+        self._write("close")
+
+    def flush(self) -> None:
+        self._write("flush")
+
+    def motion(self, dx: int, dy: int, absolute: bool) -> None:
+        self._write(f"motion {dx} {dy} {int(absolute)}")
+
+    def button(self, button: int, pressed: bool) -> None:
+        self._write(f"button {button} {int(pressed)}")
+
+    def keycode(self, keycode: int, pressed: bool) -> None:
+        self._write(f"keycode {keycode} {int(pressed)}")
+
+    @staticmethod
+    def keysym_keycode(name: str) -> int:
+        if len(name) == 1 and name.isalpha():
+            return ord(name.upper()) - ord("A") + 38
+        if len(name) == 1 and name.isdigit():
+            return ord(name) - ord("0") + 19
+        return {
+            "Shift_L": 50,
+            "Control_L": 37,
+            "Return": 36,
+            "space": 65,
+            "Left": 113,
+        }.get(name, 90)
+
+
+def make_backend():
+    fake_trace = os.environ.get("UUYC_INPUT_BRIDGE_FAKE_TRACE")
+    if fake_trace:
+        return FakeBackend(Path(fake_trace))
+    return XTestBackend()
+
+
+class InputController:
+    def __init__(self, backend, logger: Logger):
+        self.backend = backend
+        self.logger = logger
+        self.pressed_keys: set[int] = set()
+        self.pressed_buttons: set[int] = set()
+
+    def emit_keycode(self, keycode: int, pressed: bool) -> None:
+        if not keycode:
+            raise ValueError("无法把 Windows 键映射到当前 X11 键盘布局")
+        self.backend.keycode(keycode, pressed)
+        if pressed:
+            self.pressed_keys.add(keycode)
+        else:
+            self.pressed_keys.discard(keycode)
+
+    def keysym_keycode(self, name: str) -> int:
+        return self.backend.keysym_keycode(name)
+
+    def keycode_from_windows(
+        self,
+        virtual_key: int,
+        scan_code: int,
+        flags: int,
+    ) -> int:
+        scan_code &= 0xFF
+        if flags & KEY_SCANCODE and scan_code:
+            if flags & KEY_EXTENDED:
+                return EXTENDED_SCAN_KEYCODES.get(scan_code, 0)
+            return scan_code + 8
+        if 0x30 <= virtual_key <= 0x39:
+            return self.keysym_keycode(chr(virtual_key))
+        if 0x41 <= virtual_key <= 0x5A:
+            return self.keysym_keycode(chr(virtual_key))
+        if 0x70 <= virtual_key <= 0x7B:
+            return self.keysym_keycode(f"F{virtual_key - 0x6F}")
+        name = VK_KEYSYMS.get(virtual_key)
+        return self.keysym_keycode(name) if name else 0
+
+    def type_unicode(self, codepoint: int) -> None:
+        try:
+            character = chr(codepoint)
+        except ValueError as error:
+            raise ValueError(f"无效 Unicode 码点：{codepoint}") from error
+
+        if character.isascii():
+            if character.isalpha():
+                name = character.lower()
+                shifted = character.isupper()
+            elif character.isdigit():
+                name = character
+                shifted = False
+            else:
+                name, shifted = ASCII_KEYSYMS.get(character, ("", False))
+            keycode = self.keysym_keycode(name) if name else 0
+            if keycode:
+                shift = self.keysym_keycode("Shift_L")
+                if shifted:
+                    self.backend.keycode(shift, True)
+                self.backend.keycode(keycode, True)
+                self.backend.keycode(keycode, False)
+                if shifted:
+                    self.backend.keycode(shift, False)
+                return
+
+        # GNOME/GTK Unicode input fallback: Ctrl+Shift+U, hex codepoint, Enter.
+        control = self.keysym_keycode("Control_L")
+        shift = self.keysym_keycode("Shift_L")
+        u_key = self.keysym_keycode("u")
+        self.backend.keycode(control, True)
+        self.backend.keycode(shift, True)
+        self.backend.keycode(u_key, True)
+        self.backend.keycode(u_key, False)
+        self.backend.keycode(shift, False)
+        self.backend.keycode(control, False)
+        for digit in f"{codepoint:x}":
+            keycode = self.keysym_keycode(digit)
+            self.backend.keycode(keycode, True)
+            self.backend.keycode(keycode, False)
+        enter = self.keysym_keycode("Return")
+        self.backend.keycode(enter, True)
+        self.backend.keycode(enter, False)
+
+    def keyboard(
+        self,
+        virtual_key: int,
+        scan_code: int,
+        flags: int,
+    ) -> None:
+        pressed = not bool(flags & KEY_UP)
+        if flags & KEY_UNICODE:
+            if pressed:
+                self.type_unicode(scan_code)
+            self.backend.flush()
+            return
+        keycode = self.keycode_from_windows(virtual_key, scan_code, flags)
+        self.emit_keycode(keycode, pressed)
+        self.backend.flush()
+
+    def set_button(self, button: int, pressed: bool) -> None:
+        self.backend.button(button, pressed)
+        if pressed:
+            self.pressed_buttons.add(button)
+        else:
+            self.pressed_buttons.discard(button)
+
+    def wheel(self, button: int, count: int) -> None:
+        for _ in range(min(abs(count), 100)):
+            self.backend.button(button, True)
+            self.backend.button(button, False)
+
+    def mouse(
+        self,
+        dx: int,
+        dy: int,
+        data: int,
+        flags: int,
+    ) -> None:
+        if flags & MOUSE_MOVE:
+            self.backend.motion(dx, dy, bool(flags & MOUSE_ABSOLUTE))
+        for mask, button, pressed in (
+            (MOUSE_LEFTDOWN, 1, True),
+            (MOUSE_LEFTUP, 1, False),
+            (MOUSE_RIGHTDOWN, 3, True),
+            (MOUSE_RIGHTUP, 3, False),
+            (MOUSE_MIDDLEDOWN, 2, True),
+            (MOUSE_MIDDLEUP, 2, False),
+        ):
+            if flags & mask:
+                self.set_button(button, pressed)
+        if flags & (MOUSE_XDOWN | MOUSE_XUP):
+            pressed = bool(flags & MOUSE_XDOWN)
+            if data & 0x0001:
+                self.set_button(8, pressed)
+            if data & 0x0002:
+                self.set_button(9, pressed)
+        signed_data = ctypes.c_int32(data).value
+        if flags & MOUSE_WHEEL and signed_data:
+            self.wheel(4 if signed_data > 0 else 5, signed_data // 120)
+        if flags & MOUSE_HWHEEL and signed_data:
+            self.wheel(7 if signed_data > 0 else 6, signed_data // 120)
+        self.backend.flush()
+
+    def release_all(self, reason: str) -> None:
+        if not self.pressed_keys and not self.pressed_buttons:
+            return
+        for keycode in sorted(self.pressed_keys):
+            self.backend.keycode(keycode, False)
+        for button in sorted(self.pressed_buttons):
+            self.backend.button(button, False)
+        self.backend.flush()
+        self.logger.write(
+            f"安全释放 {len(self.pressed_keys)} 个按键和 "
+            f"{len(self.pressed_buttons)} 个鼠标按钮（{reason}）"
+        )
+        self.pressed_keys.clear()
+        self.pressed_buttons.clear()
+
+
+def endpoint_content(port: int, token: bytes) -> str:
+    return (
+        "[bridge]\n"
+        f"version={PROTOCOL_VERSION}\n"
+        f"port={port}\n"
+        f"token={token.hex()}\n"
+        "force_cursor=1\n"
+        f"pid={os.getpid()}\n"
+    )
+
+
+def status_paths(state_dir: Path) -> dict[str, Path]:
+    return {"status": state_dir / "input-bridge-status.json"}
+
+
+def write_status(
+    path: Path,
+    state: str,
+    port: int = 0,
+    hook_pid: int = 0,
+    hook_version: int = 0,
+    packets: int = 0,
+    rejected: int = 0,
+    mouse_packets: int = 0,
+    mouse_moves: int = 0,
+    mouse_buttons: int = 0,
+    keyboard_packets: int = 0,
+    last_mouse_dx: int = 0,
+    last_mouse_dy: int = 0,
+    last_mouse_flags: int = 0,
+    detail: str = "",
+) -> None:
+    atomic_write_json(
+        path,
+        {
+            "version": STATE_VERSION,
+            "pid": os.getpid(),
+            "state": state,
+            "port": port,
+            "hook_pid": hook_pid,
+            "hook_version": hook_version,
+            "packets": packets,
+            "rejected": rejected,
+            "mouse_packets": mouse_packets,
+            "mouse_moves": mouse_moves,
+            "mouse_buttons": mouse_buttons,
+            "keyboard_packets": keyboard_packets,
+            "last_mouse_dx": last_mouse_dx,
+            "last_mouse_dy": last_mouse_dy,
+            "last_mouse_flags": last_mouse_flags,
+            "detail": detail,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        },
+    )
+
+
+def parse_packet(data: bytes, token: bytes):
+    if len(data) < HEADER.size:
+        raise ValueError("数据包短于协议头")
+    magic, version, kind, size, sequence, received_token = HEADER.unpack_from(
+        data
+    )
+    if magic != PROTOCOL_MAGIC or version != PROTOCOL_VERSION:
+        raise ValueError("协议标识或版本无效")
+    if size != len(data):
+        raise ValueError("数据包长度字段无效")
+    if not hmac.compare_digest(received_token, token):
+        raise PermissionError("认证令牌无效")
+    payload = data[HEADER.size :]
+    if kind == PACKET_HELLO and len(payload) == HELLO.size:
+        return kind, sequence, HELLO.unpack(payload)
+    if kind == PACKET_MOUSE and len(payload) == MOUSE.size:
+        return kind, sequence, MOUSE.unpack(payload)
+    if kind == PACKET_KEYBOARD and len(payload) == KEYBOARD.size:
+        return kind, sequence, KEYBOARD.unpack(payload)
+    raise ValueError("数据包类型或载荷长度无效")
+
+
+def remove_owned_endpoint(endpoint: Path, token: bytes) -> None:
+    try:
+        content = endpoint.read_text(encoding="ascii")
+    except OSError:
+        return
+    if f"token={token.hex()}\n" in content:
+        endpoint.unlink(missing_ok=True)
+
+
+def watch(
+    state_dir: Path,
+    endpoint: Path,
+    log_path: Path,
+    lock_path: Path,
+    release_timeout: float,
+) -> int:
+    logger = Logger(log_path)
+    status_path = status_paths(state_dir)["status"]
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    backend = None
+    listener = None
+    controller = None
+    token = secrets.token_bytes(16)
+    running = True
+    port = 0
+    packets = 0
+    rejected = 0
+    hook_pid = 0
+    hook_version = 0
+    mouse_packets = 0
+    mouse_moves = 0
+    mouse_buttons = 0
+    keyboard_packets = 0
+    last_mouse_dx = 0
+    last_mouse_dy = 0
+    last_mouse_flags = 0
+    last_event = 0.0
+    last_status = 0.0
+
+    def publish_status(state: str, detail: str = "") -> None:
+        write_status(
+            status_path,
+            state,
+            port=port,
+            hook_pid=hook_pid,
+            hook_version=hook_version,
+            packets=packets,
+            rejected=rejected,
+            mouse_packets=mouse_packets,
+            mouse_moves=mouse_moves,
+            mouse_buttons=mouse_buttons,
+            keyboard_packets=keyboard_packets,
+            last_mouse_dx=last_mouse_dx,
+            last_mouse_dy=last_mouse_dy,
+            last_mouse_flags=last_mouse_flags,
+            detail=detail,
+        )
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGHUP, request_stop)
+
+    try:
+        backend = make_backend()
+        controller = InputController(backend, logger)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.settimeout(0.25)
+        port = int(listener.getsockname()[1])
+        atomic_write(endpoint, endpoint_content(port, token))
+        publish_status("waiting-hook")
+        logger.write(
+            f"X11 原生输入桥已启动，监听回环端口 {port}；"
+            "等待 GameViewerServer 输入钩子"
+        )
+
+        while running:
+            try:
+                data, address = listener.recvfrom(512)
+            except socket.timeout:
+                data = b""
+                address = ("", 0)
+            if data:
+                if address[0] != "127.0.0.1":
+                    rejected += 1
+                    continue
+                try:
+                    kind, _sequence, payload = parse_packet(data, token)
+                    if kind == PACKET_HELLO:
+                        hook_pid, hook_version = payload
+                        if hook_version < MINIMUM_HOOK_VERSION:
+                            logger.write(
+                                "GameViewerServer 输入钩子版本过旧"
+                                f"（PID {hook_pid}，v{hook_version}，"
+                                f"要求 v{MINIMUM_HOOK_VERSION}+）"
+                            )
+                        else:
+                            logger.write(
+                                "GameViewerServer 输入钩子已连接"
+                                f"（PID {hook_pid}，v{hook_version}）"
+                            )
+                    elif kind == PACKET_MOUSE:
+                        if hook_version < MINIMUM_HOOK_VERSION:
+                            raise ValueError("输入钩子版本过旧或尚未握手")
+                        dx, dy, mouse_data, flags, _timestamp, _extra = payload
+                        controller.mouse(dx, dy, mouse_data, flags)
+                        mouse_packets += 1
+                        if flags & MOUSE_MOVE:
+                            mouse_moves += 1
+                        if flags & MOUSE_BUTTON_FLAGS:
+                            mouse_buttons += 1
+                        last_mouse_dx = dx
+                        last_mouse_dy = dy
+                        last_mouse_flags = flags
+                        last_event = time.monotonic()
+                    elif kind == PACKET_KEYBOARD:
+                        if hook_version < MINIMUM_HOOK_VERSION:
+                            raise ValueError("输入钩子版本过旧或尚未握手")
+                        vk, scan, flags, _timestamp, _extra = payload
+                        controller.keyboard(vk, scan, flags)
+                        keyboard_packets += 1
+                        last_event = time.monotonic()
+                    packets += 1
+                except (PermissionError, ValueError):
+                    rejected += 1
+                except Exception as error:
+                    rejected += 1
+                    logger.write(f"输入事件注入失败：{error}")
+
+            now = time.monotonic()
+            if (
+                last_event
+                and now - last_event >= release_timeout
+                and (controller.pressed_keys or controller.pressed_buttons)
+            ):
+                controller.release_all("输入超时")
+                last_event = 0.0
+            if now - last_status >= 2.0:
+                compatible_hook = (
+                    hook_pid and hook_version >= MINIMUM_HOOK_VERSION
+                )
+                publish_status(
+                    "active" if compatible_hook else "waiting-hook",
+                    "" if compatible_hook else (
+                        f"等待 v{MINIMUM_HOOK_VERSION}+ 输入钩子"
+                    ),
+                )
+                last_status = now
+        return 0
+    except Exception as error:
+        logger.write(f"原生输入桥异常：{error}")
+        publish_status("error", str(error))
+        return 1
+    finally:
+        if controller is not None:
+            try:
+                controller.release_all("输入桥退出")
+            except Exception as error:
+                logger.write(f"退出时释放输入失败：{error}")
+        if listener is not None:
+            listener.close()
+        if backend is not None:
+            backend.close()
+        remove_owned_endpoint(endpoint, token)
+        if not running:
+            publish_status("stopped")
+            logger.write("X11 原生输入桥已停止")
+        lock_handle.close()
+
+
+def check_environment() -> int:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
+    if session_type and session_type != "x11":
+        print("当前不是 X11 会话", file=sys.stderr)
+        return 1
+    backend = make_backend()
+    backend.close()
+    return 0
+
+
+def print_status(state_dir: Path) -> int:
+    status_path = status_paths(state_dir)["status"]
+    if not status_path.is_file():
+        print("not-running")
+        return 1
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        print(payload.get("state", "unknown"))
+    except (OSError, ValueError, TypeError):
+        print("invalid")
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    subparsers.add_parser("check")
+
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("state_dir", type=Path)
+    watch_parser.add_argument("endpoint", type=Path)
+    watch_parser.add_argument("log", type=Path)
+    watch_parser.add_argument("lock", type=Path)
+    watch_parser.add_argument(
+        "release_timeout",
+        nargs="?",
+        type=float,
+        default=DEFAULT_RELEASE_TIMEOUT,
+    )
+
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("state_dir", type=Path)
+
+    arguments = parser.parse_args()
+    if arguments.mode == "check":
+        return check_environment()
+    if arguments.mode == "watch":
+        if arguments.release_timeout <= 0:
+            parser.error("release_timeout 必须大于 0")
+        return watch(
+            arguments.state_dir,
+            arguments.endpoint,
+            arguments.log,
+            arguments.lock,
+            arguments.release_timeout,
+        )
+    if arguments.mode == "status":
+        return print_status(arguments.state_dir)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

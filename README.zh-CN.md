@@ -12,12 +12,14 @@
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
-- 基本支持 Windows UU 远程软件的所有功能。
+- X11 会话下支持 Linux 作为被控端的原生鼠标、键盘和远端光标。
+- 支持自启动、防休眠、安全更新、文件传输与远程开机兼容桥。
 
 ## 系统要求
 
 - Ubuntu 24.04（已验证）
 - Wine 11.1 或更高版本
+- X11 会话（Linux 作为被控端时必需；Wayland 原生输入尚未支持）
 
 ## 从 Release 安装（推荐）
 
@@ -25,7 +27,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_0.8.1_amd64.deb
+sudo apt install ./uu-remote-for-linux_0.9.2_amd64.deb
 uuyc-linux-controller --accept-eula --setup-only
 ```
 
@@ -66,6 +68,30 @@ uuyc-linux-controller --decoder nvidia:0
 # 仅停止本项目的独立 Wine 前缀
 uuyc-linux-controller --stop
 ```
+
+## Linux 被控端输入
+
+0.9.0 起，启动器会在 `GameViewerServer.exe` 的 `SendInput` 回退路径上
+加载项目自建的 Win64 钩子，将已认证的键鼠事件交给本地 X11/XTest
+守护进程。它不尝试加载网易的 Windows 内核 HID 驱动，也不需要
+`/dev/uinput` 或 root 权限。
+
+运行 `uuyc-linux-controller --diagnose`，确认：
+
+- `被控端原生输入` 为“生效中”；
+- 移动或点击时，`被控端输入事件` 的计数持续增加；
+- `Win64 输入钩子` 为“完整”。
+
+0.9.1 还会把 X11/XTest 实际采用的鼠标坐标反向同步给 Wine 的
+`GetCursorInfo` 和 `GetCursorPos`。因此 UU 的 GDI 捕获路径上报给主控端
+的光标元数据，会与 Linux 桌面上实际移动的指针保持一致。
+
+0.9.2 进一步把钩子安装到 UU 单独加载的 `streamer.dll` 捕获模块，并
+提供可由 `GetIconInfo` 正常读取位图的稳定 Win32 箭头光标。这可以避免
+Windows 主控端隐藏本地鼠标后，却收不到可用的远程光标形状。
+
+该功能当前仅支持 X11。Wayland、登录管理器/锁屏界面、游戏手柄和多点
+触控尚未支持。
 
 ## 解码器支持
 

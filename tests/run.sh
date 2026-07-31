@@ -28,6 +28,9 @@ check "tray proxy Python syntax" /usr/bin/python3 -c \
 check "keyboard bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+check "input bridge Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
 check "autostart bridge syntax" bash -n \
     "$project_root/lib/uuyc-linux-controller/uuyc-autostart-bridge"
 check "sleep bridge syntax" bash -n \
@@ -52,6 +55,8 @@ check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
+check "input hook builder syntax" bash -n \
+    "$project_root/scripts/build-input-hook.sh"
 check "user installer syntax" bash -n "$project_root/scripts/install-user.sh"
 check "shim builder syntax" bash -n "$project_root/scripts/build-wevtapi.sh"
 check "deb builder syntax" bash -n "$project_root/packaging/build-deb.sh"
@@ -81,6 +86,8 @@ check "sleep bridge integration" "$project_root/tests/sleep-bridge.sh"
 check "WOL bridge integration" "$project_root/tests/wol-bridge.sh"
 check "update bridge integration" "$project_root/tests/update-bridge.sh"
 check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
+check "input bridge integration" "$project_root/tests/input-bridge.sh"
+check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
 
 check "shim exists" test -s \
     "$project_root/lib/uuyc-linux-controller/wevtapi.dll"
@@ -100,6 +107,8 @@ check "update bridge exists" test -x \
     "$project_root/lib/uuyc-linux-controller/uuyc-update-bridge"
 check "keyboard bridge exists" test -x \
     "$project_root/lib/uuyc-linux-controller/uuyc-keyboard-bridge"
+check "input bridge exists" test -x \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-bridge"
 check "update compatibility profiles exist" test -s \
     "$project_root/lib/uuyc-linux-controller/update-compatibility.tsv"
 check "NVDEC probe exists" test -x \
@@ -121,6 +130,18 @@ check "shim exports" bash -c \
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uuyc-linux-controller/uuyc-update-blocker.exe"
+check "input hook is Win64 DLL" bash -c \
+    'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
+check "input hook exports version" bash -c \
+    'objdump -p "$1" | grep -q "UUYCInputHookVersion"' _ \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-hook.dll"
+check "input injector is Win64 PE" bash -c \
+    'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
+check "input injector exports version" bash -c \
+    'objdump -p "$1" | grep -q "UUYCInputInjectorVersion"' _ \
+    "$project_root/lib/uuyc-linux-controller/uuyc-input-injector.exe"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "hardware bridge manifest" bash -c \
@@ -146,6 +167,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/install-user.sh" \
         "$project_root/scripts/build-nvdec-probe.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
+        "$project_root/scripts/build-input-hook.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
         "$project_root/packaging/debian/postinst" \
@@ -156,6 +178,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/wol-bridge.sh" \
         "$project_root/tests/update-bridge.sh" \
         "$project_root/tests/keyboard-bridge.sh" \
+        "$project_root/tests/input-bridge.sh" \
+        "$project_root/tests/wine-input-hook.sh" \
         "$project_root/tests/run.sh" \
         "$project_root/tests/fixtures/bin/curl" \
         "$project_root/tests/fixtures/bin/autostart-wine" \

@@ -41,6 +41,9 @@ readonly tray_proxy="${UUYC_TRAY_PROXY_BIN:-$runtime_dir/uuyc-tray-proxy}"
 readonly autostart_bridge="$runtime_dir/uuyc-autostart-bridge"
 readonly sleep_bridge="$runtime_dir/uuyc-sleep-bridge"
 readonly keyboard_bridge="$runtime_dir/uuyc-keyboard-bridge"
+readonly input_bridge="$runtime_dir/uuyc-input-bridge"
+readonly input_hook_source="$runtime_dir/uuyc-input-hook.dll"
+readonly input_injector_source="$runtime_dir/uuyc-input-injector.exe"
 readonly wol_bridge="$runtime_dir/uuyc-wol-bridge"
 readonly wol_configure="$runtime_dir/uuyc-wol-configure"
 readonly update_bridge="$runtime_dir/uuyc-update-bridge"
@@ -91,6 +94,14 @@ readonly keyboard_bridge_log="$state_dir/keyboard-bridge.log"
 readonly keyboard_bridge_lock="$state_dir/keyboard-bridge.lock"
 readonly keyboard_bridge_status="$state_dir/keyboard-bridge-status.json"
 readonly keyboard_bridge_interval="${UUYC_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
+readonly input_bridge_log="$state_dir/input-bridge.log"
+readonly input_bridge_lock="$state_dir/input-bridge.lock"
+readonly input_bridge_status="$state_dir/input-bridge-status.json"
+readonly input_bridge_release_timeout="${UUYC_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
+readonly input_hook="$prefix/drive_c/uuyc-input-hook.dll"
+readonly input_injector="$prefix/drive_c/uuyc-input-injector.exe"
+readonly input_bridge_endpoint="$prefix/drive_c/uuyc-input-bridge.endpoint"
+readonly input_hook_windows='C:\uuyc-input-hook.dll'
 current_user=$(id -un)
 readonly current_user
 readonly local_appdata="$prefix/drive_c/users/$current_user/AppData/Local/GameViewer"
@@ -136,6 +147,8 @@ readonly healthd_runtime_unit="${app_id}-healthd"
 readonly client_runtime_unit="${app_id}-client"
 readonly update_runtime_unit="${app_id}-update"
 readonly keyboard_runtime_unit="${app_id}-keyboard"
+readonly input_runtime_unit="${app_id}-input"
+readonly input_injector_runtime_unit="${app_id}-input-injector"
 readonly tray_runtime_unit="${app_id}-tray"
 readonly tray_exit_runtime_unit="${app_id}-tray-exit"
 
@@ -634,6 +647,18 @@ shim_ready() {
         cmp -s "$shim_source" "$native_wevtapi"
 }
 
+input_hook_files_ready() {
+    [[ -r $input_hook_source && -r $input_injector_source &&
+        -f $input_hook && -f $input_injector ]] &&
+        cmp -s "$input_hook_source" "$input_hook" &&
+        cmp -s "$input_injector_source" "$input_injector"
+}
+
+input_hook_ready() {
+    [[ -f $prefix/system.reg ]] &&
+        input_hook_files_ready
+}
+
 hwdecode_runtime_ready() {
     [[ -r "$hwdecode_dxvk_dir/d3d11.dll" &&
         -r "$hwdecode_dxvk_dir/dxgi.dll" &&
@@ -926,6 +951,184 @@ start_sleep_bridge() {
         "$sleep_bridge_lock" \
         "$sleep_bridge_interval" \
         9>&- </dev/null >/dev/null 2>&1 &
+}
+
+input_bridge_process_active() {
+    local pid="" cmdline=""
+
+    [[ -r $input_bridge_status ]] || return 1
+    pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] || return 1
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ $cmdline == *"$input_bridge"* &&
+        $cmdline == *"$input_bridge_endpoint"* ]]
+}
+
+input_bridge_status_label() {
+    local state="" hook_pid="" hook_version=""
+
+    if [[ ${XDG_SESSION_TYPE:-x11} != x11 ]]; then
+        printf '当前会话不支持被控输入（仅 X11）'
+    elif [[ ! -x $input_bridge || ! -r $input_hook_source ||
+        ! -r $input_injector_source ]]; then
+        printf '运行库缺失'
+    elif [[ -f $prefix/system.reg ]] && ! input_hook_ready; then
+        printf 'Windows 输入钩子未安装/不匹配'
+    elif [[ ! -r $input_bridge_status ]]; then
+        printf '就绪（待应用启动）'
+    else
+        state=$(sed -n 's/.*"state": "\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        hook_pid=$(sed -n 's/.*"hook_pid": \([0-9][0-9]*\).*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        hook_version=$(sed -n \
+            's/.*"hook_version": \([0-9][0-9]*\).*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        case $state in
+            active)
+                printf '生效中（GameViewerServer PID %s；钩子 v%s）' \
+                    "${hook_pid:-unknown}" "${hook_version:-unknown}"
+                ;;
+            waiting-hook)
+                printf '原生守护进程已启动，等待 Windows 钩子'
+                ;;
+            error)
+                printf '异常（详见日志）'
+                ;;
+            stopped)
+                printf '已停止'
+                ;;
+            *)
+                printf '启动中'
+                ;;
+        esac
+    fi
+}
+
+input_bridge_event_label() {
+    local mouse_moves="" mouse_buttons="" keyboard_packets=""
+
+    [[ -r $input_bridge_status ]] || {
+        printf '暂无'
+        return
+    }
+    mouse_moves=$(sed -n \
+        's/.*"mouse_moves": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    mouse_buttons=$(sed -n \
+        's/.*"mouse_buttons": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    keyboard_packets=$(sed -n \
+        's/.*"keyboard_packets": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    printf '移动 %s / 鼠标按钮 %s / 键盘 %s' \
+        "${mouse_moves:-0}" "${mouse_buttons:-0}" \
+        "${keyboard_packets:-0}"
+}
+
+stop_input_bridge_runtime() {
+    local pid="" cmdline=""
+
+    if systemd_user_available; then
+        systemctl --user stop \
+            "$input_runtime_unit.service" \
+            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$input_runtime_unit.service" \
+            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
+    fi
+    if [[ -r $input_bridge_status ]]; then
+        pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+            "$input_bridge_status" | head -n1)
+    fi
+    if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+        if [[ $cmdline == *"$input_bridge"* &&
+            $cmdline == *"$input_bridge_endpoint"* ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+            for _ in {1..50}; do
+                kill -0 "$pid" >/dev/null 2>&1 || break
+                sleep 0.02
+            done
+        fi
+    fi
+    if ! input_bridge_process_active; then
+        rm -f -- "$input_bridge_endpoint"
+    fi
+}
+
+start_input_bridge() {
+    local variable attempt
+    local -a command
+
+    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    if [[ ${XDG_SESSION_TYPE:-x11} != x11 || -z ${DISPLAY:-} ]]; then
+        printf '警告：原生被控端键鼠输入桥当前仅支持 X11 会话。\n' >&2
+        return 0
+    fi
+    if ! "$input_bridge" check >>"$input_bridge_log" 2>&1; then
+        printf '警告：X11/XTest 输入桥依赖检查失败，详见 %s\n' \
+            "$input_bridge_log" >&2
+        return 1
+    fi
+    if input_bridge_process_active && [[ -s $input_bridge_endpoint ]]; then
+        return 0
+    fi
+    rm -f -- "$input_bridge_endpoint"
+
+    if systemd_user_available; then
+        systemctl --user stop \
+            "$input_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$input_runtime_unit.service" >/dev/null 2>&1 || true
+        command=(
+            systemd-run
+            --user
+            "--unit=$input_runtime_unit"
+            --collect
+            --quiet
+            --property=Restart=on-failure
+            --property=RestartSec=1s
+            --property=TimeoutStopSec=5s
+            "--property=StandardOutput=append:$input_bridge_log"
+            "--property=StandardError=append:$input_bridge_log"
+        )
+        for variable in \
+            DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
+            XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH; do
+            if [[ -v $variable ]]; then
+                command+=("--setenv=$variable=${!variable}")
+            fi
+        done
+        command+=(
+            "$input_bridge" watch
+            "$state_dir"
+            "$input_bridge_endpoint"
+            "$input_bridge_log"
+            "$input_bridge_lock"
+            "$input_bridge_release_timeout"
+        )
+        if ! "${command[@]}" 9>&-; then
+            printf '警告：无法创建输入桥用户服务，改用兼容后台进程。\n' >&2
+        fi
+    fi
+    if ! runtime_unit_active "$input_runtime_unit"; then
+        # shellcheck disable=SC2094
+        nohup "$input_bridge" watch \
+            "$state_dir" \
+            "$input_bridge_endpoint" \
+            "$input_bridge_log" \
+            "$input_bridge_lock" \
+            "$input_bridge_release_timeout" \
+            9>&- </dev/null >>"$input_bridge_log" 2>&1 &
+    fi
+
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [[ -s $input_bridge_endpoint ]] && return 0
+        sleep 0.02
+    done
+    return 1
 }
 
 keyboard_bridge_status_label() {
@@ -1243,17 +1446,22 @@ stop_tray_proxy_runtime() {
 stop_managed_runtime_services() {
     local pid="" cmdline=""
 
+    stop_input_bridge_runtime
     if systemd_user_available; then
         systemctl --user stop \
             "$client_runtime_unit.service" \
             "$server_runtime_unit.service" \
             "$healthd_runtime_unit.service" \
-            "$keyboard_runtime_unit.service" >/dev/null 2>&1 || true
+            "$keyboard_runtime_unit.service" \
+            "$input_runtime_unit.service" \
+            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
             "$client_runtime_unit.service" \
             "$server_runtime_unit.service" \
             "$healthd_runtime_unit.service" \
-            "$keyboard_runtime_unit.service" >/dev/null 2>&1 || true
+            "$keyboard_runtime_unit.service" \
+            "$input_runtime_unit.service" \
+            "$input_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
     if [[ -r $keyboard_bridge_status ]]; then
         pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
@@ -1498,6 +1706,10 @@ print_diagnostics() {
         "原生托盘日志" "$tray_proxy_log" \
         "远控键盘桥" "$(keyboard_bridge_status_label)" \
         "键盘桥日志" "$keyboard_bridge_log" \
+        "被控端原生输入" "$(input_bridge_status_label)" \
+        "被控端输入事件" "$(input_bridge_event_label)" \
+        "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
+        "输入桥日志" "$input_bridge_log" \
         "NVIDIA 解码库" "$(hwdecode_host_libraries_ready && printf '就绪' || printf '缺失')" \
         "解码设备策略" "$decoder_policy" \
         "实际解码选择" "$decoder_effective" \
@@ -1570,6 +1782,9 @@ check_base_requirements
     die "缺少防休眠兼容桥：$sleep_bridge。请重新安装本项目"
 [[ -x $keyboard_bridge ]] ||
     die "缺少 X11 远控键盘桥：$keyboard_bridge。请重新安装本项目"
+[[ -x $input_bridge && -r $input_hook_source &&
+    -r $input_injector_source ]] ||
+    die "缺少 X11 原生输入桥或 Win64 输入钩子。请重新安装本项目"
 [[ -x $wol_bridge && -x $wol_configure ]] ||
     die "缺少远程开机兼容桥：$wol_bridge。请重新安装本项目"
 [[ -x $update_bridge && -r $update_blocker_source &&
@@ -2029,12 +2244,23 @@ install_or_update_app() {
     rm -f -- "$prefix/drive_c/users/$(id -un)/Desktop/UU远程.lnk"
 }
 
+deploy_input_hook() {
+    [[ -r $input_hook_source && -r $input_injector_source ]] ||
+        die "缺少 Win64 输入钩子或注入监视器"
+    install -m 0644 "$input_hook_source" "$input_hook" ||
+        die "无法把 Win64 输入钩子部署到独立 Wine 前缀"
+    install -m 0644 "$input_injector_source" "$input_injector" ||
+        die "无法把 Win64 输入注入监视器部署到独立 Wine 前缀"
+    input_hook_ready || die "Win64 输入钩子部署后核验失败"
+}
+
 configure_compatibility() {
     local attempt webview_version=""
 
     install -m 0644 "$shim_source" "$native_wevtapi" ||
         die "无法安装 Event Log 兼容 DLL"
     deploy_update_blocker
+    deploy_input_hook
 
     run_logged "$wine" reg query "$service_key" ||
         die "UU 远程未注册 $service_name"
@@ -2076,6 +2302,7 @@ configure_compatibility() {
     webview_version=$(registry_value "$webview_key" pv || true)
     app_files_present || die "设置过程中客户端文件丢失"
     shim_ready || die "Event Log 兼容 DLL 核验失败"
+    input_hook_ready || die "Win64 输入钩子核验失败"
     update_blocker_ready || die "自动更新保护程序核验失败"
     [[ -n $webview_version &&
         -f "$webview_root/$webview_version/msedgewebview2.exe" ]] ||
@@ -2350,8 +2577,13 @@ if $repair || $refresh_installer || prefix_needs_configuration; then
     prepare_prefix
     install_or_update_app
     configure_compatibility
-    notify_status "主控端设置完成"
-    printf '主控端设置完成。\n'
+    notify_status "UU 远程 Linux 兼容环境设置完成"
+    printf 'UU 远程 Linux 兼容环境设置完成。\n'
+fi
+
+if app_files_present && ! input_hook_ready; then
+    stop_prefix_for_setup
+    deploy_input_hook
 fi
 
 if wol_enabled; then
@@ -2425,6 +2657,7 @@ start_systemd_wine_image() {
     local wine_path variable
     local -a command
 
+    shift 2
     wine_path=$(command -v -- "$wine") || return 1
     systemctl --user stop "$unit.service" >/dev/null 2>&1 || true
     systemctl --user reset-failed "$unit.service" >/dev/null 2>&1 || true
@@ -2452,7 +2685,7 @@ start_systemd_wine_image() {
             command+=("--setenv=$variable=${!variable}")
         fi
     done
-    command+=("$wine_path" "$executable")
+    command+=("$wine_path" "$executable" "$@")
     "${command[@]}" 9>&-
 }
 
@@ -2461,18 +2694,20 @@ ensure_wine_image_running() {
     local attempt
     local launched=false
 
+    shift 2
     if ! wine_image_running "$executable"; then
         if systemd_user_available; then
             if runtime_unit_active "$unit"; then
                 launched=true
-            elif start_systemd_wine_image "$unit" "$executable"; then
+            elif start_systemd_wine_image \
+                "$unit" "$executable" "$@"; then
                 launched=true
             fi
         fi
         if ! $launched; then
             (
                 cd "$install_dir/bin"
-                nohup "$wine" "$executable" 9>&- </dev/null \
+                nohup "$wine" "$executable" "$@" 9>&- </dev/null \
                     >>"$runtime_log" 2>&1 &
             )
         fi
@@ -2484,12 +2719,46 @@ ensure_wine_image_running() {
     return 1
 }
 
+start_input_injector() {
+    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    input_hook_ready || return 1
+    ensure_wine_image_running \
+        "$input_injector_runtime_unit" \
+        "$input_injector" \
+        --watch \
+        GameViewerServer.exe \
+        "$input_hook_windows"
+}
+
+wait_input_hook_active() {
+    local attempt state
+
+    [[ ${UUYC_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
+    [[ ${XDG_SESSION_TYPE:-x11} == x11 && -n ${DISPLAY:-} ]] || return 0
+    for ((attempt = 0; attempt < 60; attempt++)); do
+        state=$("$input_bridge" status "$state_dir" 2>/dev/null || true)
+        [[ $state == active ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+start_input_bridge ||
+    printf '警告：被控端原生键鼠输入不可用，详见 %s\n' \
+        "$input_bridge_log" >&2
+start_input_injector ||
+    printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
+        "$runtime_log" >&2
 ensure_service_running ||
     die "$service_name 未进入 RUNNING 状态，详见 $setup_log"
 ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
     die "GameViewerHealthd.exe 未能启动"
 ensure_wine_image_running "$server_runtime_unit" "$server" ||
     die "GameViewerServer.exe 未能启动"
+wait_input_hook_active ||
+    printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
+        "$input_bridge_log" >&2
 
 sleep 1
 cd "$install_dir"
