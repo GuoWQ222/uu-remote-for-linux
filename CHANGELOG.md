@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.7] - 2026-08-03
+
+- Preserve an explicitly hidden home window while a remote-video window is
+  still visible. Automatic `show`, raise, activation, and `SWP_SHOWWINDOW`
+  paths are rejected until the native tray creates a one-shot explicit-show
+  request or the remote window closes.
+- Move Qt top-level enumeration, subclass maintenance, and late-module focus
+  patching onto the controller UI message thread. The worker now only queues
+  coalesced passes, preventing the cross-thread USER32 wait that could freeze
+  both its diagnostics heartbeat and the GameViewer message loop.
+- Scope activation-message suppression to the currently latched remote window,
+  remove repeated forced `SetWindowPos`/`SetActiveWindow` feedback, and rate
+  limit any remaining foreground repair. Genuine external focus changes now
+  continue to reach Qt instead of leaving its window state inconsistent.
+- Write focus diagnostics as one atomically replaced snapshot and extend the
+  Wine regression probe to cover hidden-home persistence, explicit tray
+  restore, worker liveness, bounded focus repair, and modal handoff.
+
 ## [1.1.6] - 2026-08-03
 
 - Flush CUDA-bounce uploads on the producer D3D11 context before reporting

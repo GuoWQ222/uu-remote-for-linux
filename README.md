@@ -51,7 +51,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.6_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.7_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 

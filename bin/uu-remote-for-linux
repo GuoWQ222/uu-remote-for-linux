@@ -244,6 +244,7 @@ readonly input_bridge_lock="$state_dir/input-bridge.lock"
 readonly input_bridge_status="$state_dir/input-bridge-status.json"
 readonly wayland_frame_hook_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 readonly controller_focus_hook_status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
+readonly controller_home_show_request="$prefix/drive_c/uu-remote-home-show.request"
 readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
 readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
 readonly input_hook_preload="$install_dir/bin/uu-remote-input-hook.dll"
@@ -3533,6 +3534,12 @@ start_keyboard_bridge ||
     printf '警告：Linux 快捷键可能仍会拦截远控 Win 组合键。\n' >&2
 start_tray_proxy ||
     die "Linux 原生托盘代理启动失败，详见 $tray_proxy_log"
+if $show_requested; then
+    (
+        umask 077
+        : >"$controller_home_show_request"
+    ) || die "无法授权显示 UU 主界面"
+fi
 if $uri_requested; then
     exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
         -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \

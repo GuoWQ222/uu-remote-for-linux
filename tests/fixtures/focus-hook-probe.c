@@ -67,6 +67,38 @@ static void dispatch_probe_message(
     DispatchMessageW(&probe);
 }
 
+static BOOL create_home_show_request(void) {
+    HANDLE request = CreateFileW(
+        L"C:\\uu-remote-home-show.request",
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (request == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    CloseHandle(request);
+    return TRUE;
+}
+
+static void pump_messages_for(DWORD duration_ms) {
+    ULONGLONG deadline = GetTickCount64() + duration_ms;
+
+    while (GetTickCount64() < deadline) {
+        MSG message;
+
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 10, QS_ALLINPUT);
+    }
+}
+
 int WINAPI WinMain(
     HINSTANCE instance,
     HINSTANCE previous,
@@ -95,6 +127,11 @@ int WINAPI WinMain(
     int blocked_activations;
     int modal_latches;
     int post_modal_handoffs;
+    int home_reopen_blocked;
+    int home_show_authorized;
+    int apply_posted;
+    int heartbeat_before;
+    int heartbeat_after;
     LONG outer_calls_before;
     int index;
     int expected_app_deactivate = 0;
@@ -242,7 +279,11 @@ int WINAPI WinMain(
             return 5;
         }
     }
-    /* Intra-controller transfers must not deactivate the remote viewer. */
+    /*
+     * App-wide false deactivation is invalid for an intra-process transfer
+     * and stays suppressed. Per-window activation must reach Qt outside an
+     * active storm latch so its window state cannot become permanently stale.
+     */
     dispatch_probe_message(
         main_window,
         WM_ACTIVATEAPP,
@@ -257,7 +298,7 @@ int WINAPI WinMain(
     );
     if (
         app_deactivate_messages != expected_app_deactivate ||
-        window_deactivate_messages != 0
+        window_deactivate_messages != 1
     ) {
         return 6;
     }
@@ -294,27 +335,73 @@ int WINAPI WinMain(
             (LPARAM)main_window
         );
     }
-    Sleep(350);
-    /* Programmatic attempts to re-raise the home window must be absorbed. */
-    SetForegroundWindow(main_window);
-    SetActiveWindow(main_window);
-    BringWindowToTop(main_window);
-    SetWindowPos(
-        main_window,
-        HWND_TOP,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE
+    pump_messages_for(500);
+    InterlockedExchange(&window_deactivate_messages, 0);
+    dispatch_probe_message(
+        video_window,
+        WM_ACTIVATE,
+        MAKEWPARAM(WA_INACTIVE, FALSE),
+        (LPARAM)main_window
     );
+    if (window_deactivate_messages != 0) {
+        return 21;
+    }
+    /*
+     * Closing the home window while a remote-video window remains visible
+     * is user intent. UU's application-activation callback may repeatedly
+     * try to show the home window; every automatic raise path must remain
+     * blocked without disturbing the video window.
+     */
+    ShowWindow(main_window, SW_HIDE);
+    Sleep(300);
+    for (index = 0; index < 200; ++index) {
+        SetForegroundWindow(main_window);
+        SetActiveWindow(main_window);
+        BringWindowToTop(main_window);
+        SetWindowPos(
+            main_window,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+        );
+        ShowWindow(main_window, SW_SHOW);
+    }
+    if (IsWindowVisible(main_window) || !IsWindowVisible(video_window)) {
+        return 16;
+    }
+
+    /* The native tray's explicit --show request authorizes exactly one show. */
+    if (!create_home_show_request()) {
+        return 17;
+    }
     ShowWindow(main_window, SW_SHOW);
+    if (
+        !IsWindowVisible(main_window) ||
+        GetFileAttributesW(L"C:\\uu-remote-home-show.request") !=
+            INVALID_FILE_ATTRIBUTES
+    ) {
+        return 18;
+    }
+
+    /* Once no remote window remains visible, normal home showing is restored. */
+    ShowWindow(main_window, SW_HIDE);
+    ShowWindow(video_window, SW_HIDE);
+    Sleep(300);
+    ShowWindow(main_window, SW_SHOW);
+    if (!IsWindowVisible(main_window)) {
+        return 19;
+    }
+    ShowWindow(video_window, SW_SHOWNA);
+    Sleep(300);
 
     /* The takeover dialog owns focus until it closes, then hands off once. */
     ShowWindow(modal_window, SW_SHOW);
-    Sleep(350);
+    pump_messages_for(350);
     ShowWindow(modal_window, SW_HIDE);
-    Sleep(350);
+    pump_messages_for(350);
 
     first_hook = SetWindowsHookExW(
         WH_KEYBOARD_LL, keyboard_callback, instance, 0
@@ -333,13 +420,13 @@ int WINAPI WinMain(
         external_pid &&
         external_pid != GetCurrentProcessId()
     ) {
+        expected_app_deactivate = app_deactivate_messages + 1;
         dispatch_probe_message(
             main_window,
             WM_ACTIVATEAPP,
             FALSE,
             (LPARAM)external_thread
         );
-        ++expected_app_deactivate;
         if (app_deactivate_messages != expected_app_deactivate) {
             return 12;
         }
@@ -350,13 +437,45 @@ int WINAPI WinMain(
     Sleep(50);
     InterlockedExchange(&nonclient_deactivate_messages, 0);
     dispatch_probe_message(main_window, WM_NCACTIVATE, FALSE, 0);
+    if (nonclient_deactivate_messages != 1) {
+        return 9;
+    }
+    for (index = 0; index < 12; ++index) {
+        SendMessageW(
+            main_window,
+            WM_ACTIVATE,
+            MAKEWPARAM(WA_INACTIVE, FALSE),
+            (LPARAM)video_window
+        );
+        SendMessageW(
+            video_window,
+            WM_ACTIVATE,
+            MAKEWPARAM(WA_ACTIVE, FALSE),
+            (LPARAM)main_window
+        );
+    }
+    pump_messages_for(200);
+    InterlockedExchange(&nonclient_deactivate_messages, 0);
+    dispatch_probe_message(video_window, WM_NCACTIVATE, FALSE, 0);
     if (nonclient_deactivate_messages != 0) {
         return 9;
     }
     if (!UnhookWindowsHookEx(reused_hook)) {
         return 10;
     }
+    heartbeat_before = GetPrivateProfileIntW(
+        L"worker",
+        L"heartbeats",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     Sleep(1400);
+    heartbeat_after = GetPrivateProfileIntW(
+        L"worker",
+        L"heartbeats",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     deferred = GetPrivateProfileIntW(
         L"keyboard_hook",
         L"deferred",
@@ -405,13 +524,35 @@ int WINAPI WinMain(
         0,
         L"C:\\uu-remote-focus-hook-status.ini"
     );
+    home_reopen_blocked = GetPrivateProfileIntW(
+        L"home_window",
+        L"reopen_blocked",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    home_show_authorized = GetPrivateProfileIntW(
+        L"home_window",
+        L"show_authorized",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    apply_posted = GetPrivateProfileIntW(
+        L"focus",
+        L"apply_posted",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     if (
         deferred < 2 || reused < 1 || released < 1 ||
         storms_detected < 1 || storms_resolved < 1 ||
         blocked_activations < 1 || modal_latches < 1 ||
-        post_modal_handoffs < 1
+        post_modal_handoffs < 1 || home_reopen_blocked < 200 ||
+        home_show_authorized < 1 || apply_posted > 6
     ) {
         return 11;
+    }
+    if (heartbeat_before < 1 || heartbeat_after <= heartbeat_before) {
+        return 20;
     }
     DestroyWindow(modal_window);
     DestroyWindow(video_window);

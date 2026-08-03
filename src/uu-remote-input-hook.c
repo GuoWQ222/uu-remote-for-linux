@@ -27,6 +27,8 @@
 #include <netioapi.h>
 
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #define UUIP_MAGIC 0x50495555u
@@ -34,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 10u
+#define HOOK_VERSION 11u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -46,6 +48,10 @@
 #define FOCUS_STORM_THRESHOLD 12
 #define FOCUS_LATCH_MS 1500u
 #define FOCUS_MODAL_REFRESH_MS 300u
+#define FOCUS_INTERNAL_APPLY_GRACE_MS 300u
+#define FOCUS_APPLY_COOLDOWN_MS 750u
+#define FOCUS_WINDOW_SCAN_MS 250u
+#define FOCUS_MODULE_SCAN_MS 1000u
 #define FOCUS_MAX_WINDOWS 64u
 #define FOCUS_MAX_MODULES 256u
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
@@ -117,6 +123,7 @@ static CHAR wol_status_path[MAX_PATH];
 static WCHAR frame_path[MAX_PATH];
 static CHAR frame_status_path[MAX_PATH];
 static CHAR focus_status_path[MAX_PATH];
+static CHAR focus_show_request_path[MAX_PATH];
 static WCHAR controller_root_path[MAX_PATH];
 static enum hook_process_kind process_kind;
 static INIT_ONCE winsock_once = INIT_ONCE_STATIC_INIT;
@@ -199,10 +206,22 @@ static volatile LONG focus_blocked_activations;
 static volatile LONG focus_modal_latches;
 static volatile LONG focus_post_modal_handoffs;
 static volatile LONG focus_user_overrides;
+static volatile LONG focus_internal_transitions_ignored;
+static volatile LONG focus_apply_posted;
+static volatile LONG focus_apply_rate_limited;
+static volatile LONG focus_home_hidden_by_user;
+static volatile LONG focus_home_reopen_blocked;
+static volatile LONG focus_home_show_authorized;
+static volatile LONG focus_worker_heartbeats;
+static volatile LONG focus_arbitration_pending;
+static volatile LONG focus_module_scan_pending;
 static volatile LONG focus_preferred_role;
 static volatile LONG focus_latch_active;
 static volatile LONG64 focus_latch_until;
+static volatile LONG64 focus_last_internal_apply;
+static volatile LONG64 focus_last_apply_posted;
 static PVOID volatile focus_preferred_window;
+static PVOID volatile focus_visible_remote_window;
 static ULONGLONG focus_rate_window_started;
 static LONG focus_rate_window_count;
 static BOOL focus_modal_was_visible;
@@ -1518,10 +1537,156 @@ static DWORD controller_focus_hook_status(void) {
     return status;
 }
 
+static BOOL focus_status_append(
+    CHAR *buffer,
+    size_t capacity,
+    size_t *used,
+    const CHAR *format,
+    ...
+) {
+    va_list arguments;
+    int written;
+
+    if (!buffer || !used || *used >= capacity) {
+        return FALSE;
+    }
+    va_start(arguments, format);
+    written = vsnprintf(
+        buffer + *used, capacity - *used, format, arguments
+    );
+    va_end(arguments);
+    if (
+        written < 0 ||
+        (size_t)written >= capacity - *used
+    ) {
+        return FALSE;
+    }
+    *used += (size_t)written;
+    return TRUE;
+}
+
+static BOOL write_focus_hook_status_atomic(void) {
+    CHAR buffer[2048];
+    CHAR temporary[MAX_PATH];
+    HANDLE file;
+    DWORD written = 0;
+    size_t used = 0;
+    BOOL ready;
+
+    ready = focus_status_append(
+        buffer,
+        sizeof(buffer),
+        &used,
+        "[hook]\r\n"
+        "pid=%lu\r\n"
+        "version=%lu\r\n"
+        "status_bits=%lu\r\n"
+        "[focus]\r\n"
+        "suppressed_activate=%ld\r\n"
+        "suppressed_activate_app=%ld\r\n"
+        "stabilized_nonclient=%ld\r\n"
+        "internal_transitions_ignored=%ld\r\n"
+        "apply_posted=%ld\r\n"
+        "apply_rate_limited=%ld\r\n"
+        "[keyboard_hook]\r\n"
+        "installed=%ld\r\n"
+        "reused=%ld\r\n"
+        "deferred=%ld\r\n"
+        "released=%ld\r\n"
+        "[window_state]\r\n"
+        "mode=wndproc-arbiter\r\n"
+        "subclassed=%ld\r\n"
+        "subclassed_total=%ld\r\n"
+        "external_chains=%ld\r\n"
+        "activation_api_mask=%ld\r\n"
+        "transitions=%ld\r\n"
+        "storms_detected=%ld\r\n"
+        "storms_resolved=%ld\r\n"
+        "blocked_activations=%ld\r\n"
+        "modal_latches=%ld\r\n"
+        "post_modal_handoffs=%ld\r\n"
+        "user_overrides=%ld\r\n"
+        "preferred_role=%ld\r\n"
+        "[home_window]\r\n"
+        "hidden_by_user=%ld\r\n"
+        "reopen_blocked=%ld\r\n"
+        "show_authorized=%ld\r\n"
+        "[worker]\r\n"
+        "heartbeats=%ld\r\n",
+        (unsigned long)GetCurrentProcessId(),
+        (unsigned long)HOOK_VERSION,
+        (unsigned long)controller_focus_hook_status(),
+        InterlockedCompareExchange(&focus_suppressed_activate, 0, 0),
+        InterlockedCompareExchange(&focus_suppressed_activate_app, 0, 0),
+        InterlockedCompareExchange(&focus_stabilized_nonclient, 0, 0),
+        InterlockedCompareExchange(
+            &focus_internal_transitions_ignored, 0, 0
+        ),
+        InterlockedCompareExchange(&focus_apply_posted, 0, 0),
+        InterlockedCompareExchange(&focus_apply_rate_limited, 0, 0),
+        InterlockedCompareExchange(&focus_keyboard_installed, 0, 0),
+        InterlockedCompareExchange(&focus_keyboard_reused, 0, 0),
+        InterlockedCompareExchange(&focus_keyboard_deferred, 0, 0),
+        InterlockedCompareExchange(&focus_keyboard_released, 0, 0),
+        InterlockedCompareExchange(&focus_subclassed_windows, 0, 0),
+        InterlockedCompareExchange(&focus_subclass_installations, 0, 0),
+        InterlockedCompareExchange(&focus_external_subclass_chains, 0, 0),
+        InterlockedCompareExchange(&focus_activation_api_mask, 0, 0),
+        InterlockedCompareExchange(&focus_transition_messages, 0, 0),
+        InterlockedCompareExchange(&focus_storms_detected, 0, 0),
+        InterlockedCompareExchange(&focus_storms_resolved, 0, 0),
+        InterlockedCompareExchange(&focus_blocked_activations, 0, 0),
+        InterlockedCompareExchange(&focus_modal_latches, 0, 0),
+        InterlockedCompareExchange(&focus_post_modal_handoffs, 0, 0),
+        InterlockedCompareExchange(&focus_user_overrides, 0, 0),
+        InterlockedCompareExchange(&focus_preferred_role, 0, 0),
+        InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0),
+        InterlockedCompareExchange(&focus_home_reopen_blocked, 0, 0),
+        InterlockedCompareExchange(&focus_home_show_authorized, 0, 0),
+        InterlockedCompareExchange(&focus_worker_heartbeats, 0, 0)
+    );
+    if (!ready) {
+        return FALSE;
+    }
+    lstrcpynA(temporary, focus_status_path, MAX_PATH - 5);
+    lstrcatA(temporary, ".tmp");
+    file = CreateFileA(
+        temporary,
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    ready = WriteFile(file, buffer, (DWORD)used, &written, NULL) &&
+        written == (DWORD)used;
+    CloseHandle(file);
+    if (
+        ready &&
+        MoveFileExA(
+            temporary,
+            focus_status_path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+        )
+    ) {
+        return TRUE;
+    }
+    DeleteFileA(temporary);
+    return FALSE;
+}
+
 static void write_focus_hook_status(void) {
     CHAR value[32];
 
     if (!focus_status_path[0]) {
+        return;
+    }
+    InterlockedIncrement(&focus_worker_heartbeats);
+    if (write_focus_hook_status_atomic()) {
         return;
     }
     wsprintfA(value, "%lu", (unsigned long)GetCurrentProcessId());
@@ -1559,6 +1724,32 @@ static void write_focus_hook_status(void) {
     );
     WritePrivateProfileStringA(
         "focus", "stabilized_nonclient", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &focus_internal_transitions_ignored, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "focus", "internal_transitions_ignored", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_apply_posted, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "focus", "apply_posted", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_apply_rate_limited, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "focus", "apply_rate_limited", value, focus_status_path
     );
     wsprintfA(
         value,
@@ -1693,6 +1884,38 @@ static void write_focus_hook_status(void) {
     WritePrivateProfileStringA(
         "window_state", "preferred_role", value, focus_status_path
     );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "home_window", "hidden_by_user", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_home_reopen_blocked, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "home_window", "reopen_blocked", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_home_show_authorized, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "home_window", "show_authorized", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_worker_heartbeats, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "worker", "heartbeats", value, focus_status_path
+    );
 }
 
 static BOOL process_belongs_to_controller(DWORD pid) {
@@ -1761,6 +1984,9 @@ static BOOL thread_belongs_to_controller(DWORD thread_id) {
 }
 
 static BOOL focus_transition_is_internal(const MSG *message);
+static void focus_arbitrate_windows(void);
+static void focus_queue_arbitration(void);
+static void patch_controller_focus_imports(void);
 
 static BOOL wide_contains_ordinal_ci(
     const WCHAR *text,
@@ -1894,6 +2120,13 @@ static void focus_remove_window(HWND window) {
         }
     }
     ReleaseSRWLockExclusive(&focus_window_lock);
+    if (
+        window == (HWND)InterlockedCompareExchangePointer(
+            &focus_visible_remote_window, NULL, NULL
+        )
+    ) {
+        InterlockedExchangePointer(&focus_visible_remote_window, NULL);
+    }
 }
 
 static void focus_note_window_chain(
@@ -1921,10 +2154,22 @@ static void focus_note_window_chain(
     }
 }
 
-static void focus_record_transition(void) {
+static void focus_record_transition(HWND window) {
     ULONGLONG now = GetTickCount64();
+    ULONGLONG last_internal_apply;
 
     InterlockedIncrement(&focus_transition_messages);
+    last_internal_apply = (ULONGLONG)InterlockedCompareExchange64(
+        &focus_last_internal_apply, 0, 0
+    );
+    if (
+        last_internal_apply &&
+        now >= last_internal_apply &&
+        now - last_internal_apply <= FOCUS_INTERNAL_APPLY_GRACE_MS
+    ) {
+        InterlockedIncrement(&focus_internal_transitions_ignored);
+        return;
+    }
     AcquireSRWLockExclusive(&focus_rate_lock);
     if (
         !focus_rate_window_started ||
@@ -1940,6 +2185,10 @@ static void focus_record_transition(void) {
         InterlockedCompareExchange(&focus_storm_pending, 1, 0) == 0
     ) {
         InterlockedIncrement(&focus_storms_detected);
+        InterlockedExchange(&focus_arbitration_pending, 1);
+        if (window) {
+            PostMessageW(window, WM_NULL, 0, 0);
+        }
         if (focus_worker_event) {
             SetEvent(focus_worker_event);
         }
@@ -1952,6 +2201,95 @@ static void focus_clear_latch(void) {
     InterlockedExchange64(&focus_latch_until, 0);
     InterlockedExchangePointer(&focus_preferred_window, NULL);
     InterlockedExchange(&focus_preferred_role, FOCUS_ROLE_UNKNOWN);
+}
+
+static BOOL focus_show_command_makes_visible(int command) {
+    switch (command) {
+        case SW_SHOW:
+        case SW_SHOWNORMAL:
+        case SW_SHOWDEFAULT:
+        case SW_RESTORE:
+        case SW_SHOWMAXIMIZED:
+        case SW_SHOWMINIMIZED:
+        case SW_SHOWMINNOACTIVE:
+        case SW_SHOWNOACTIVATE:
+        case SW_SHOWNA:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static BOOL focus_home_raise_is_blocked(HWND window) {
+    enum focus_window_role role = FOCUS_ROLE_UNKNOWN;
+    HWND remote;
+
+    if (
+        !window ||
+        !InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0) ||
+        !focus_window_entry(window, NULL, &role) ||
+        role != FOCUS_ROLE_HOME
+    ) {
+        return FALSE;
+    }
+    remote = (HWND)InterlockedCompareExchangePointer(
+        &focus_visible_remote_window, NULL, NULL
+    );
+    if (!remote || !IsWindow(remote) || !IsWindowVisible(remote)) {
+        InterlockedExchange(&focus_home_hidden_by_user, 0);
+        return FALSE;
+    }
+    if (
+        focus_show_request_path[0] &&
+        DeleteFileA(focus_show_request_path)
+    ) {
+        InterlockedExchange(&focus_home_hidden_by_user, 0);
+        InterlockedIncrement(&focus_home_show_authorized);
+        focus_clear_latch();
+        return FALSE;
+    }
+    InterlockedIncrement(&focus_home_reopen_blocked);
+    InterlockedIncrement(&focus_blocked_activations);
+    return TRUE;
+}
+
+static BOOL focus_deactivation_is_blocked(
+    HWND window,
+    const MSG *message
+) {
+    HWND preferred;
+    HWND root;
+    ULONGLONG until;
+    ULONGLONG now;
+
+    if (
+        !window ||
+        !message ||
+        !InterlockedCompareExchange(&focus_latch_active, 0, 0) ||
+        !focus_transition_is_internal(message)
+    ) {
+        return FALSE;
+    }
+    until = (ULONGLONG)InterlockedCompareExchange64(
+        &focus_latch_until, 0, 0
+    );
+    now = GetTickCount64();
+    if (!until || now >= until) {
+        focus_clear_latch();
+        return FALSE;
+    }
+    preferred = (HWND)InterlockedCompareExchangePointer(
+        &focus_preferred_window, NULL, NULL
+    );
+    if (!preferred || !IsWindow(preferred)) {
+        focus_clear_latch();
+        return FALSE;
+    }
+    if (message->message == WM_ACTIVATEAPP) {
+        return TRUE;
+    }
+    root = GetAncestor(window, GA_ROOT);
+    return root && root == preferred;
 }
 
 static BOOL focus_activation_is_blocked(HWND window) {
@@ -1985,6 +2323,9 @@ static BOOL focus_activation_is_blocked(HWND window) {
 }
 
 static BOOL WINAPI hooked_set_foreground_window(HWND window) {
+    if (focus_home_raise_is_blocked(window)) {
+        return TRUE;
+    }
     if (focus_activation_is_blocked(window)) {
         InterlockedIncrement(&focus_blocked_activations);
         return TRUE;
@@ -1997,6 +2338,9 @@ static BOOL WINAPI hooked_set_foreground_window(HWND window) {
 }
 
 static HWND WINAPI hooked_set_active_window(HWND window) {
+    if (focus_home_raise_is_blocked(window)) {
+        return GetActiveWindow();
+    }
     if (focus_activation_is_blocked(window)) {
         InterlockedIncrement(&focus_blocked_activations);
         return (HWND)InterlockedCompareExchangePointer(
@@ -2011,6 +2355,9 @@ static HWND WINAPI hooked_set_active_window(HWND window) {
 }
 
 static BOOL WINAPI hooked_bring_window_to_top(HWND window) {
+    if (focus_home_raise_is_blocked(window)) {
+        return TRUE;
+    }
     if (focus_activation_is_blocked(window)) {
         InterlockedIncrement(&focus_blocked_activations);
         return TRUE;
@@ -2031,6 +2378,11 @@ static BOOL WINAPI hooked_set_window_pos(
     int height,
     UINT flags
 ) {
+    if (focus_home_raise_is_blocked(window)) {
+        flags &= ~SWP_SHOWWINDOW;
+        flags |= SWP_NOACTIVATE | SWP_NOZORDER;
+        insert_after = NULL;
+    }
     if (focus_activation_is_blocked(window)) {
         flags |= SWP_NOACTIVATE | SWP_NOZORDER;
         insert_after = NULL;
@@ -2046,6 +2398,12 @@ static BOOL WINAPI hooked_set_window_pos(
 }
 
 static BOOL WINAPI hooked_show_window(HWND window, int command) {
+    if (
+        focus_show_command_makes_visible(command) &&
+        focus_home_raise_is_blocked(window)
+    ) {
+        return IsWindowVisible(window);
+    }
     if (focus_activation_is_blocked(window)) {
         switch (command) {
             case SW_SHOW:
@@ -2085,28 +2443,25 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     ) {
         return DefWindowProcW(window, message, wparam, lparam);
     }
+    if (
+        message == WM_NULL &&
+        InterlockedExchange(&focus_arbitration_pending, 0)
+    ) {
+        focus_arbitrate_windows();
+    }
     if (message == WM_UU_FOCUS_APPLY) {
         if (
             window == (HWND)InterlockedCompareExchangePointer(
                 &focus_preferred_window, NULL, NULL
-            )
+            ) &&
+            IsWindowVisible(window) &&
+            GetForegroundWindow() != window
         ) {
-            if (original_set_window_pos) {
-                original_set_window_pos(
-                    window,
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-                );
-            }
+            InterlockedExchange64(
+                &focus_last_internal_apply, (LONG64)GetTickCount64()
+            );
             if (original_set_foreground_window) {
                 original_set_foreground_window(window);
-            }
-            if (original_set_active_window && wparam) {
-                original_set_active_window(window);
             }
         }
         return 0;
@@ -2117,13 +2472,52 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     probe.wParam = wparam;
     probe.lParam = lparam;
 
+    if (
+        role == FOCUS_ROLE_HOME &&
+        (
+            message == WM_CLOSE ||
+            (message == WM_SHOWWINDOW && !wparam) ||
+            (
+                message == WM_WINDOWPOSCHANGED &&
+                lparam &&
+                (((WINDOWPOS *)lparam)->flags & SWP_HIDEWINDOW)
+            )
+        )
+    ) {
+        InterlockedExchange(&focus_home_hidden_by_user, 1);
+    }
+    if (
+        role == FOCUS_ROLE_VIDEO &&
+        message == WM_SHOWWINDOW
+    ) {
+        if (wparam) {
+            InterlockedExchangePointer(
+                &focus_visible_remote_window, window
+            );
+        } else if (
+            window == (HWND)InterlockedCompareExchangePointer(
+                &focus_visible_remote_window, NULL, NULL
+            )
+        ) {
+            InterlockedExchangePointer(&focus_visible_remote_window, NULL);
+        }
+    }
+    if (
+        role == FOCUS_ROLE_HOME &&
+        message == WM_SHOWWINDOW &&
+        wparam &&
+        !InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0) &&
+        focus_show_request_path[0]
+    ) {
+        DeleteFileA(focus_show_request_path);
+    }
     if (message == WM_ACTIVATE || message == WM_ACTIVATEAPP) {
-        focus_record_transition();
+        focus_record_transition(window);
     }
     if (
         message == WM_ACTIVATE &&
         LOWORD(wparam) == WA_INACTIVE &&
-        focus_transition_is_internal(&probe)
+        focus_deactivation_is_blocked(window, &probe)
     ) {
         InterlockedIncrement(&focus_suppressed_activate);
         return 0;
@@ -2139,17 +2533,23 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     if (
         message == WM_NCACTIVATE &&
         !wparam &&
-        focus_transition_is_internal(&probe)
+        focus_deactivation_is_blocked(window, &probe)
     ) {
         wparam = TRUE;
         InterlockedIncrement(&focus_stabilized_nonclient);
     }
-    if (
-        message == WM_WINDOWPOSCHANGING &&
-        focus_activation_is_blocked(window)
-    ) {
+    if (message == WM_WINDOWPOSCHANGING) {
         WINDOWPOS *position = (WINDOWPOS *)lparam;
-        if (position) {
+        if (
+            position &&
+            (position->flags & SWP_SHOWWINDOW) &&
+            focus_home_raise_is_blocked(window)
+        ) {
+            position->flags &= ~SWP_SHOWWINDOW;
+            position->flags |= SWP_NOACTIVATE | SWP_NOZORDER;
+            position->hwndInsertAfter = NULL;
+        }
+        if (position && focus_activation_is_blocked(window)) {
             position->flags |= SWP_NOACTIVATE | SWP_NOZORDER;
             position->hwndInsertAfter = NULL;
             InterlockedIncrement(&focus_blocked_activations);
@@ -2303,7 +2703,8 @@ static void focus_apply_latch(
     ULONGLONG duration
 ) {
     HWND previous;
-    BOOL changed;
+    ULONGLONG now;
+    ULONGLONG last_posted;
 
     if (!target || !IsWindow(target)) {
         return;
@@ -2311,8 +2712,7 @@ static void focus_apply_latch(
     previous = (HWND)InterlockedCompareExchangePointer(
         &focus_preferred_window, NULL, NULL
     );
-    changed = !InterlockedCompareExchange(&focus_latch_active, 0, 0) ||
-        previous != target;
+    (void)previous;
     InterlockedExchangePointer(&focus_preferred_window, target);
     InterlockedExchange(&focus_preferred_role, (LONG)role);
     InterlockedExchange64(
@@ -2320,8 +2720,24 @@ static void focus_apply_latch(
     );
     InterlockedExchange(&focus_latch_active, 1);
 
-    if (changed || GetForegroundWindow() != target) {
-        PostMessageW(target, WM_UU_FOCUS_APPLY, changed ? 1u : 0u, 0);
+    if (GetForegroundWindow() == target) {
+        return;
+    }
+    now = GetTickCount64();
+    last_posted = (ULONGLONG)InterlockedCompareExchange64(
+        &focus_last_apply_posted, 0, 0
+    );
+    if (
+        last_posted &&
+        now >= last_posted &&
+        now - last_posted < FOCUS_APPLY_COOLDOWN_MS
+    ) {
+        InterlockedIncrement(&focus_apply_rate_limited);
+        return;
+    }
+    if (PostMessageW(target, WM_UU_FOCUS_APPLY, 0, 0)) {
+        InterlockedExchange64(&focus_last_apply_posted, (LONG64)now);
+        InterlockedIncrement(&focus_apply_posted);
     }
 }
 
@@ -2335,6 +2751,10 @@ static void focus_arbitrate_windows(void) {
 
     ZeroMemory(&scan, sizeof(scan));
     EnumWindows(focus_scan_window, (LPARAM)&scan);
+    InterlockedExchangePointer(
+        &focus_visible_remote_window,
+        scan.video ? scan.video : scan.nonhome
+    );
     modal_visible = scan.dialog != NULL;
     if (modal_visible) {
         if (!focus_modal_was_visible) {
@@ -2383,6 +2803,57 @@ static void focus_arbitrate_windows(void) {
         )
     ) {
         focus_clear_latch();
+    }
+}
+
+struct focus_wakeup_scan {
+    HWND window;
+};
+
+static BOOL CALLBACK focus_find_wakeup_window(
+    HWND window,
+    LPARAM parameter
+) {
+    struct focus_wakeup_scan *scan = (struct focus_wakeup_scan *)parameter;
+    DWORD pid = 0;
+
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == GetCurrentProcessId()) {
+        scan->window = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void focus_queue_arbitration(void) {
+    struct focus_wakeup_scan scan;
+    HWND wake_window = NULL;
+    DWORD wake_thread = 0;
+    unsigned int index;
+
+    InterlockedExchange(&focus_arbitration_pending, 1);
+    AcquireSRWLockShared(&focus_window_lock);
+    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+        if (focus_windows[index].window) {
+            wake_window = focus_windows[index].window;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&focus_window_lock);
+
+    if (!wake_window) {
+        ZeroMemory(&scan, sizeof(scan));
+        EnumWindows(focus_find_wakeup_window, (LPARAM)&scan);
+        wake_window = scan.window;
+    }
+    if (wake_window) {
+        wake_thread = GetWindowThreadProcessId(wake_window, NULL);
+        if (wake_thread == GetCurrentThreadId()) {
+            InterlockedExchange(&focus_arbitration_pending, 0);
+            focus_arbitrate_windows();
+        } else {
+            PostMessageW(wake_window, WM_NULL, 0, 0);
+        }
     }
 }
 
@@ -2532,10 +3003,22 @@ static LRESULT WINAPI hooked_dispatch_message_w(const MSG *message) {
     if (!original_dispatch_message_w || !message) {
         return 0;
     }
+    if (InterlockedExchange(&focus_module_scan_pending, 0)) {
+        patch_controller_focus_imports();
+        patch_all_focus_activation_imports();
+    }
+    /*
+     * Enumerating and subclassing Qt windows from the hook worker can block
+     * behind synchronous UI-thread sends during an activation storm. Run the
+     * arbitration pass at this safe point in the controller message loop.
+     */
+    if (InterlockedExchange(&focus_arbitration_pending, 0)) {
+        focus_arbitrate_windows();
+    }
     if (
         message->message == WM_ACTIVATE &&
         LOWORD(message->wParam) == WA_INACTIVE &&
-        focus_transition_is_internal(message)
+        focus_deactivation_is_blocked(message->hwnd, message)
     ) {
         InterlockedIncrement(&focus_suppressed_activate);
         return 0;
@@ -2551,7 +3034,7 @@ static LRESULT WINAPI hooked_dispatch_message_w(const MSG *message) {
     if (
         message->message == WM_NCACTIVATE &&
         !message->wParam &&
-        focus_transition_is_internal(message)
+        focus_deactivation_is_blocked(message->hwnd, message)
     ) {
         adjusted = *message;
         adjusted.wParam = TRUE;
@@ -2686,13 +3169,14 @@ static void patch_controller_focus_imports(void) {
 static DWORD WINAPI focus_worker_main(LPVOID parameter) {
     ULONGLONG last_status_write = 0;
     ULONGLONG last_activation_scan = 0;
+    ULONGLONG last_window_scan = 0;
     (void)parameter;
 
     for (;;) {
         HHOOK release_hook = NULL;
         ULONGLONG now;
 
-        WaitForSingleObject(focus_worker_event, 50);
+        WaitForSingleObject(focus_worker_event, FOCUS_WINDOW_SCAN_MS);
         now = GetTickCount64();
         AcquireSRWLockExclusive(&focus_keyboard_hook_lock);
         if (
@@ -2716,20 +3200,30 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
             write_focus_hook_status();
             last_status_write = now;
         }
-        patch_controller_focus_imports();
-        if (now - last_activation_scan >= 500u) {
-            patch_all_focus_activation_imports();
+        if (now - last_activation_scan >= FOCUS_MODULE_SCAN_MS) {
+            InterlockedExchange(&focus_module_scan_pending, 1);
+            focus_queue_arbitration();
             last_activation_scan = now;
         }
-        focus_arbitrate_windows();
+        if (
+            InterlockedCompareExchange(&focus_storm_pending, 0, 0) ||
+            focus_modal_was_visible ||
+            now - last_window_scan >= FOCUS_WINDOW_SCAN_MS
+        ) {
+            focus_queue_arbitration();
+            last_window_scan = now;
+        }
     }
     return 0;
 }
 
 static BOOL initialize_controller_focus_hook(void) {
+    if (focus_show_request_path[0]) {
+        DeleteFileA(focus_show_request_path);
+    }
     patch_controller_focus_imports();
     patch_all_focus_activation_imports();
-    focus_arbitrate_windows();
+    focus_queue_arbitration();
     if (!focus_worker_event) {
         focus_worker_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     }
@@ -2881,6 +3375,11 @@ static void initialize_endpoint_path(void) {
     lstrcpynA(
         focus_status_path,
         "C:\\uu-remote-focus-hook-status.ini",
+        MAX_PATH
+    );
+    lstrcpynA(
+        focus_show_request_path,
+        "C:\\uu-remote-home-show.request",
         MAX_PATH
     );
 }

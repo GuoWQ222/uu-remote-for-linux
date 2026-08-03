@@ -75,7 +75,7 @@ WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
     WINEPREFIX="$prefix" WINEDEBUG=-all timeout 20s \
         wine 'C:\probe\bin\GameViewer.exe'
 )
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=10'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=11'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=127'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
@@ -90,5 +90,10 @@ grep -A12 -F '[window_state]' "$status" | grep -Eq 'storms_resolved=[1-9]'
 grep -A12 -F '[window_state]' "$status" | grep -Eq 'blocked_activations=[1-9]'
 grep -A12 -F '[window_state]' "$status" | grep -Eq 'modal_latches=[1-9]'
 grep -A12 -F '[window_state]' "$status" | grep -Eq 'post_modal_handoffs=[1-9]'
+grep -A8 -F '[focus]' "$status" | grep -Eq 'apply_posted=[0-9]+'
+grep -A8 -F '[focus]' "$status" | grep -Eq 'apply_rate_limited=[0-9]+'
+grep -A4 -F '[home_window]' "$status" | grep -Eq 'reopen_blocked=[1-9]'
+grep -A4 -F '[home_window]' "$status" | grep -Eq 'show_authorized=[1-9]'
+grep -A2 -F '[worker]' "$status" | grep -Eq 'heartbeats=[2-9]|heartbeats=[1-9][0-9]+'
 
-printf 'Wine 主控顶层窗口接管、抢焦风暴仲裁、模态切换和键盘钩子去抖实测通过。\n'
+printf 'Wine 主控隐藏状态、焦点反馈限速、模态切换和键盘钩子去抖实测通过。\n'
