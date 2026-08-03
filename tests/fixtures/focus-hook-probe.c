@@ -8,6 +8,7 @@ typedef DWORD(WINAPI *focus_hook_status_fn)(void);
 static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
 static volatile LONG nonclient_deactivate_messages;
+static volatile LONG nonclient_right_button_down_messages;
 static volatile LONG outer_window_proc_calls;
 static WNDPROC outer_window_proc_next;
 
@@ -39,6 +40,8 @@ static LRESULT CALLBACK probe_window_proc(
         InterlockedIncrement(&window_deactivate_messages);
     } else if (message == WM_NCACTIVATE && !wparam) {
         InterlockedIncrement(&nonclient_deactivate_messages);
+    } else if (message == WM_NCRBUTTONDOWN) {
+        InterlockedIncrement(&nonclient_right_button_down_messages);
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
@@ -157,12 +160,14 @@ int WINAPI WinMain(
     int blocked_activations;
     int modal_latches;
     int post_modal_handoffs;
+    int nonclient_right_clicks_suppressed;
     int home_reopen_blocked;
     int home_show_authorized;
     int apply_posted;
     int heartbeat_before;
     int heartbeat_after;
     LONG outer_calls_before;
+    ULONGLONG right_click_started;
     int index;
     int expected_app_deactivate = 0;
 
@@ -283,6 +288,38 @@ int WINAPI WinMain(
     SendMessageW(main_window, WM_NULL, 0, 0);
     if (outer_window_proc_calls != outer_calls_before + 1) {
         return 15;
+    }
+
+    /*
+     * A frameless Qt caption press must never enter Wine's blocking default
+     * handler: the X11 release can be lost and leave the UI thread waiting
+     * forever. A non-caption right click remains available to the original
+     * Qt procedure.
+     */
+    InterlockedExchange(&nonclient_right_button_down_messages, 0);
+    outer_calls_before = outer_window_proc_calls;
+    right_click_started = GetTickCount64();
+    dispatch_probe_message(
+        main_window,
+        WM_NCRBUTTONDOWN,
+        HTCAPTION,
+        MAKELPARAM(40, 20)
+    );
+    if (
+        GetTickCount64() - right_click_started > 250u ||
+        nonclient_right_button_down_messages != 0 ||
+        outer_window_proc_calls != outer_calls_before + 1
+    ) {
+        return 24;
+    }
+    dispatch_probe_message(
+        main_window,
+        WM_NCRBUTTONDOWN,
+        HTCLIENT,
+        MAKELPARAM(40, 40)
+    );
+    if (nonclient_right_button_down_messages != 1) {
+        return 25;
     }
 
     InterlockedExchange(&app_deactivate_messages, 0);
@@ -575,6 +612,12 @@ int WINAPI WinMain(
         0,
         L"C:\\uu-remote-focus-hook-status.ini"
     );
+    nonclient_right_clicks_suppressed = GetPrivateProfileIntW(
+        L"window_state",
+        L"nonclient_right_clicks_suppressed",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     home_reopen_blocked = GetPrivateProfileIntW(
         L"home_window",
         L"reopen_blocked",
@@ -598,7 +641,8 @@ int WINAPI WinMain(
         storms_detected < 1 || storms_resolved < 1 ||
         blocked_activations < 1 || modal_latches < 1 ||
         post_modal_handoffs < 1 || home_reopen_blocked < 200 ||
-        home_show_authorized < 1 || apply_posted > 6
+        home_show_authorized < 1 ||
+        nonclient_right_clicks_suppressed < 1 || apply_posted > 6
     ) {
         return 11;
     }

@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 12u
+#define HOOK_VERSION 13u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -199,6 +199,7 @@ static SRWLOCK focus_module_lock = SRWLOCK_INIT;
 static volatile LONG focus_subclassed_windows;
 static volatile LONG focus_subclass_installations;
 static volatile LONG focus_external_subclass_chains;
+static volatile LONG focus_nonclient_right_clicks_suppressed;
 static volatile LONG focus_activation_api_mask;
 static volatile LONG focus_transition_messages;
 static volatile LONG focus_storm_pending;
@@ -1600,6 +1601,7 @@ static BOOL write_focus_hook_status_atomic(void) {
         "subclassed=%ld\r\n"
         "subclassed_total=%ld\r\n"
         "external_chains=%ld\r\n"
+        "nonclient_right_clicks_suppressed=%ld\r\n"
         "activation_api_mask=%ld\r\n"
         "transitions=%ld\r\n"
         "storms_detected=%ld\r\n"
@@ -1633,6 +1635,9 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&focus_subclassed_windows, 0, 0),
         InterlockedCompareExchange(&focus_subclass_installations, 0, 0),
         InterlockedCompareExchange(&focus_external_subclass_chains, 0, 0),
+        InterlockedCompareExchange(
+            &focus_nonclient_right_clicks_suppressed, 0, 0
+        ),
         InterlockedCompareExchange(&focus_activation_api_mask, 0, 0),
         InterlockedCompareExchange(&focus_transition_messages, 0, 0),
         InterlockedCompareExchange(&focus_storms_detected, 0, 0),
@@ -2471,6 +2476,22 @@ static BOOL WINAPI hooked_show_window(HWND window, int command) {
     return original_show_window(window, command);
 }
 
+static BOOL focus_nonclient_right_click_is_unsafe(
+    enum focus_window_role role,
+    UINT message,
+    WPARAM wparam
+) {
+    if (
+        role != FOCUS_ROLE_HOME &&
+        role != FOCUS_ROLE_VIDEO
+    ) {
+        return FALSE;
+    }
+    return
+        message == WM_NCRBUTTONDOWN &&
+        (wparam == HTCAPTION || wparam == HTSYSMENU);
+}
+
 static LRESULT CALLBACK focus_subclass_window_proc(
     HWND window,
     UINT message,
@@ -2521,6 +2542,20 @@ static LRESULT CALLBACK focus_subclass_window_proc(
                 original_set_foreground_window(window);
             }
         }
+        return 0;
+    }
+    /*
+     * Wine's default WM_NCRBUTTONDOWN handler captures the mouse and runs a
+     * nested GetMessage loop until it receives WM_RBUTTONUP. UU's frameless
+     * Qt title bars can receive the non-client press through Wine/X11 while
+     * the matching release is consumed outside the Win32 queue. The nested
+     * loop then owns the Qt UI thread forever and the unmapped/repainted
+     * window becomes white. These two application-owned title bars do not
+     * need Wine's native system menu, so keep the message out of DefWindowProc
+     * instead of trying to repair an already-lost release event afterwards.
+     */
+    if (focus_nonclient_right_click_is_unsafe(role, message, wparam)) {
+        InterlockedIncrement(&focus_nonclient_right_clicks_suppressed);
         return 0;
     }
     ZeroMemory(&probe, sizeof(probe));

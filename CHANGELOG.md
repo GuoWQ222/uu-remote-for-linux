@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.10] - 2026-08-03
+
+- Prevent Wine's blocking non-client right-click loop from freezing UU's Qt
+  UI when X11 loses the matching button-release message. Caption and system-
+  menu right clicks on the home and remote-video windows are now absorbed by
+  the process-local WndProc arbiter, while client-area and dialog right clicks
+  keep their normal behavior.
+
 ## [1.1.9] - 2026-08-03
 
 - Make the native tray's “Show main window” action an active one-shot command.
