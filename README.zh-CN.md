@@ -7,25 +7,13 @@
 
 ## 功能特性
 
-- 图形化 GUI 界面。
+- 图形化 GUI 界面，支持 Ubuntu 24.04、X11/Wayland。
 - 可随网易UU Windows版本同步更新。
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
-- 进程内 WndProc 仲裁器直接接管 UU 的真实 Qt 顶层窗口。接管设备时，确认框
-  独占激活权，关闭后只向远控画面交接一次；主菜单与远控画面反复请求置顶时
-  会被按频率检测并阻断，而用户真实点击或切出 UU 仍可正常生效。UU 主控进程
-  还会单独恢复 Wine 标准的 `WM_TAKE_FOCUS` 协议，不再继承兼容前缀的旧全局
-  关闭项。
-- 主控端聚焦远控窗口时会临时固定本机为 XKB 物理键盘，并把
-  `Super+Space` 交给远端系统；因此中文由远端输入法完成，不再被本机
-  IBus/Rime 截获。Wine 的 UU 主控窗口同时禁用本地 XIM，避免同一个
-  快捷键又在 Wine 内启用雾凇。离开远控窗口后会恢复原输入源和快捷键。
 - Linux 作为被控端时支持原生鼠标、键盘和远端光标：X11 使用 XTest，
   Wayland 使用 RemoteDesktop Portal。
-- Wayland 画面通过 XDG ScreenCast/PipeWire 写入共享帧，由进程内 Win64
-  钩子直接提供给 UU 的 GDI 采集，使其读取真实 GNOME 桌面，而不是无法
-  读取的无根 XWayland 根窗口。
 - 支持自启动、防休眠、安全更新、Linux 系统代理、文件传输与远程开机兼容桥。
 
 ## 系统要求

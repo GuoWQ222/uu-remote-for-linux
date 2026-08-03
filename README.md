@@ -9,30 +9,13 @@
 
 ## Features
 
-- Graphical user interface (GUI).
+- Graphical user interface (GUI), with support for Ubuntu 24.04 on X11 and Wayland.
 - Supports updates in sync with the Windows version of NetEase UU Remote.
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
-- Stabilizes every real Qt top-level window through a process-local WndProc
-  arbiter. During device takeover, the confirmation dialog exclusively owns
-  activation and hands it to the remote-video window exactly once after it
-  closes. Repeated programmatic raises from the home/video pair are rate
-  detected and blocked, while a real user click or focus leaving UU remains
-  available. The controller also opts back into Wine's standard
-  `WM_TAKE_FOCUS` protocol instead of inheriting the wrapper's legacy global
-  override.
-- While a controller window is focused, temporarily pin the local source to a
-  physical XKB keyboard and forward `Super+Space` to the remote OS. This keeps
-  local IBus/Rime from consuming Chinese composition keys. Wine XIM is also
-  disabled for the UU controller executable so the same shortcut cannot enable
-  a local IME inside Wine. The original source and shortcuts are restored after
-  focus leaves the viewer.
 - Native mouse, keyboard, and remote-cursor support when Linux is controlled:
   XTest on X11, or the RemoteDesktop portal on Wayland.
-- Wayland screen capture through an XDG ScreenCast/PipeWire shared-frame
-  bridge, so the process-local Win64 hook feeds the real GNOME desktop to UU's
-  GDI capture instead of the unreadable rootless XWayland surface.
 - Compatibility bridges for autostart, sleep inhibition, safe updates, the
   Linux system proxy, file transfer, and Wake-on-LAN.
 
