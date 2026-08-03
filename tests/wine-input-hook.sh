@@ -71,6 +71,8 @@ cleanup() {
     fi
     WINEPREFIX="$test_root/prefix" WINEDEBUG=-all wineserver -k \
         >/dev/null 2>&1 || true
+    WINEPREFIX="$test_root/prefix" WINEDEBUG=-all timeout 10s \
+        wineserver -w >/dev/null 2>&1 || true
     if [[ ${UU_REMOTE_KEEP_WINE_HOOK_TEST:-0} == 1 ]]; then
         printf '保留 Wine 输入钩子测试目录：%s\n' "$test_root" >&2
     else
@@ -223,7 +225,7 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=14'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=15'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 

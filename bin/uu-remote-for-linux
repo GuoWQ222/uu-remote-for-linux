@@ -1458,7 +1458,7 @@ wayland_frame_hook_status_label() {
 controller_focus_hook_status_label() {
     local version="" status_bits="" subclassed="" transitions=""
     local storms="" resolved="" blocked="" modal="" handoffs=""
-    local guard_breaks="" health_timeouts="" recoveries=""
+    local guard_breaks="" health_timeouts="" recoveries="" health_suppressed=""
 
     if [[ ! -r $controller_focus_hook_status ]]; then
         printf '就绪（待主控窗口启动）'
@@ -1487,7 +1487,15 @@ controller_focus_hook_status_label() {
         "$controller_focus_hook_status" ui_health timeouts)
     recoveries=$(ini_section_value \
         "$controller_focus_hook_status" ui_health recovery_requests)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 14 &&
+    health_suppressed=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health no_livelock_suppressions)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 15 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
+        printf '生效中（v%s；事件循环纠正 %s，UI 超时/恢复/安全抑制 %s/%s/%s，顶层窗口 %s）' \
+            "$version" "${guard_breaks:-0}" "${health_timeouts:-0}" \
+            "${recoveries:-0}" "${health_suppressed:-0}" \
+            "${subclassed:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 14 &&
         $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
         printf '生效中（v%s；事件循环纠正 %s，UI 超时/恢复 %s/%s，顶层窗口 %s）' \
             "$version" "${guard_breaks:-0}" "${health_timeouts:-0}" \

@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 14u
+#define HOOK_VERSION 15u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -247,9 +247,16 @@ static volatile LONG ui_health_pings_sent;
 static volatile LONG ui_health_pings_acked;
 static volatile LONG ui_health_timeouts;
 static volatile LONG ui_health_recovery_requests;
+static volatile LONG ui_health_window_invalidations;
+static volatile LONG ui_health_progress_cancellations;
+static volatile LONG ui_health_no_livelock_suppressions;
 static volatile LONG64 ui_health_ping_sent_at;
 static volatile LONG64 ui_health_last_worker_tick;
 static volatile LONG ui_health_recovery_requested;
+static volatile LONG ui_health_ping_generation;
+static volatile LONG ui_health_ping_guard_breaks;
+static volatile LONG ui_health_ping_messages_dequeued;
+static PVOID volatile ui_health_ping_window;
 static volatile LONG focus_arbitration_pending;
 static volatile LONG focus_module_scan_pending;
 static volatile LONG focus_preferred_role;
@@ -259,6 +266,7 @@ static volatile LONG64 focus_last_internal_apply;
 static volatile LONG64 focus_last_apply_posted;
 static PVOID volatile focus_preferred_window;
 static PVOID volatile focus_visible_remote_window;
+static volatile LONG focus_window_generation;
 static ULONGLONG focus_rate_window_started;
 static LONG focus_rate_window_count;
 static BOOL focus_modal_was_visible;
@@ -1955,6 +1963,10 @@ static BOOL write_focus_hook_status_atomic(void) {
         "pings_acked=%ld\r\n"
         "timeouts=%ld\r\n"
         "recovery_requests=%ld\r\n"
+        "target_generation=%ld\r\n"
+        "window_invalidations=%ld\r\n"
+        "progress_cancellations=%ld\r\n"
+        "no_livelock_suppressions=%ld\r\n"
         "[worker]\r\n"
         "heartbeats=%ld\r\n",
         (unsigned long)GetCurrentProcessId(),
@@ -2002,6 +2014,16 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&ui_health_pings_acked, 0, 0),
         InterlockedCompareExchange(&ui_health_timeouts, 0, 0),
         InterlockedCompareExchange(&ui_health_recovery_requests, 0, 0),
+        InterlockedCompareExchange(&ui_health_ping_generation, 0, 0),
+        InterlockedCompareExchange(
+            &ui_health_window_invalidations, 0, 0
+        ),
+        InterlockedCompareExchange(
+            &ui_health_progress_cancellations, 0, 0
+        ),
+        InterlockedCompareExchange(
+            &ui_health_no_livelock_suppressions, 0, 0
+        ),
         InterlockedCompareExchange(&focus_worker_heartbeats, 0, 0)
     );
     if (!ready) {
@@ -2465,8 +2487,20 @@ static BOOL focus_window_entry(
     return found;
 }
 
+static void ui_health_clear_pending(LONG sent) {
+    if (sent < 0) {
+        sent = InterlockedCompareExchange(&ui_health_pings_sent, 0, 0);
+    }
+    InterlockedExchange(&ui_health_pings_acked, sent);
+    InterlockedExchange64(&ui_health_ping_sent_at, 0);
+    InterlockedExchangePointer(&ui_health_ping_window, NULL);
+    InterlockedExchange(&ui_health_ping_generation, 0);
+}
+
 static void focus_remove_window(HWND window) {
     unsigned int index;
+    BOOL removed = FALSE;
+    LONG sent;
 
     AcquireSRWLockExclusive(&focus_window_lock);
     for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
@@ -2475,10 +2509,22 @@ static void focus_remove_window(HWND window) {
                 &focus_windows[index], sizeof(focus_windows[index])
             );
             InterlockedDecrement(&focus_subclassed_windows);
+            InterlockedIncrement(&focus_window_generation);
+            removed = TRUE;
             break;
         }
     }
     ReleaseSRWLockExclusive(&focus_window_lock);
+    if (
+        removed &&
+        window == (HWND)InterlockedCompareExchangePointer(
+            &ui_health_ping_window, NULL, NULL
+        )
+    ) {
+        sent = InterlockedCompareExchange(&ui_health_pings_sent, 0, 0);
+        InterlockedIncrement(&ui_health_window_invalidations);
+        ui_health_clear_pending(sent);
+    }
     if (
         window == (HWND)InterlockedCompareExchangePointer(
             &focus_visible_remote_window, NULL, NULL
@@ -2488,7 +2534,7 @@ static void focus_remove_window(HWND window) {
     }
 }
 
-static HWND focus_ui_health_window(void) {
+static HWND focus_ui_health_window(LONG *generation) {
     HWND fallback = NULL;
     HWND home = NULL;
     unsigned int index;
@@ -2506,12 +2552,44 @@ static HWND focus_ui_health_window(void) {
             break;
         }
     }
+    if (generation) {
+        *generation = InterlockedCompareExchange(
+            &focus_window_generation, 0, 0
+        );
+    }
     ReleaseSRWLockShared(&focus_window_lock);
     return home ? home : fallback;
 }
 
-static void request_controller_restart(void) {
-    CHAR payload[128];
+static BOOL ui_health_target_is_current(
+    HWND window,
+    LONG generation
+) {
+    HWND current;
+    LONG current_generation = 0;
+
+    if (!window || !IsWindow(window)) {
+        return FALSE;
+    }
+    current = focus_ui_health_window(&current_generation);
+    return current == window && current_generation == generation;
+}
+
+static BOOL ui_health_has_livelock_evidence(
+    LONG guard_breaks_before,
+    LONG guard_breaks_now,
+    LONG messages_before,
+    LONG messages_now
+) {
+    return guard_breaks_now != guard_breaks_before &&
+        messages_now == messages_before;
+}
+
+static void request_controller_restart(
+    LONG generation,
+    LONG guard_breaks
+) {
+    CHAR payload[192];
     HANDLE file;
     DWORD written = 0;
     int length;
@@ -2526,9 +2604,16 @@ static void request_controller_restart(void) {
     }
     length = wsprintfA(
         payload,
-        "pid=%lu\r\nreason=ui-message-timeout\r\nhook_version=%lu\r\n",
+        "pid=%lu\r\n"
+        "reason=event-loop-livelock\r\n"
+        "hook_version=%lu\r\n"
+        "guard_evidence=1\r\n"
+        "window_generation=%ld\r\n"
+        "guard_breaks=%ld\r\n",
         (unsigned long)GetCurrentProcessId(),
-        (unsigned long)HOOK_VERSION
+        (unsigned long)HOOK_VERSION,
+        generation,
+        guard_breaks
     );
     file = CreateFileA(
         controller_restart_request_path,
@@ -2562,6 +2647,11 @@ static void focus_ui_health_tick(ULONGLONG now) {
     LONG sent;
     LONG acked;
     LONG next;
+    LONG generation;
+    LONG guard_breaks_before;
+    LONG guard_breaks_now;
+    LONG messages_before;
+    LONG messages_now;
     HWND window;
 
     previous_tick = (ULONGLONG)InterlockedExchange64(
@@ -2575,11 +2665,32 @@ static void focus_ui_health_tick(ULONGLONG now) {
         now - previous_tick > UI_HEALTH_RESUME_GAP_MS
     ) {
         /* A suspended laptop is not a hung Qt event loop. */
-        InterlockedExchange(&ui_health_pings_acked, sent);
-        InterlockedExchange64(&ui_health_ping_sent_at, 0);
+        ui_health_clear_pending(sent);
         acked = sent;
     }
     if (sent != acked) {
+        window = (HWND)InterlockedCompareExchangePointer(
+            &ui_health_ping_window, NULL, NULL
+        );
+        generation = InterlockedCompareExchange(
+            &ui_health_ping_generation, 0, 0
+        );
+        if (!ui_health_target_is_current(window, generation)) {
+            InterlockedIncrement(&ui_health_window_invalidations);
+            ui_health_clear_pending(sent);
+            return;
+        }
+        messages_before = InterlockedCompareExchange(
+            &ui_health_ping_messages_dequeued, 0, 0
+        );
+        messages_now = InterlockedCompareExchange(
+            &event_loop_messages_dequeued, 0, 0
+        );
+        if (messages_now != messages_before) {
+            InterlockedIncrement(&ui_health_progress_cancellations);
+            ui_health_clear_pending(sent);
+            return;
+        }
         sent_at = (ULONGLONG)InterlockedCompareExchange64(
             &ui_health_ping_sent_at, 0, 0
         );
@@ -2589,7 +2700,25 @@ static void focus_ui_health_tick(ULONGLONG now) {
             now - sent_at >= UI_HEALTH_TIMEOUT_MS
         ) {
             InterlockedIncrement(&ui_health_timeouts);
-            request_controller_restart();
+            guard_breaks_before = InterlockedCompareExchange(
+                &ui_health_ping_guard_breaks, 0, 0
+            );
+            guard_breaks_now = InterlockedCompareExchange(
+                &event_loop_guard_breaks, 0, 0
+            );
+            if (ui_health_has_livelock_evidence(
+                    guard_breaks_before,
+                    guard_breaks_now,
+                    messages_before,
+                    messages_now
+                )) {
+                request_controller_restart(generation, guard_breaks_now);
+            } else {
+                InterlockedIncrement(
+                    &ui_health_no_livelock_suppressions
+                );
+                ui_health_clear_pending(sent);
+            }
         }
         return;
     }
@@ -2598,7 +2727,8 @@ static void focus_ui_health_tick(ULONGLONG now) {
     ) {
         return;
     }
-    window = focus_ui_health_window();
+    generation = 0;
+    window = focus_ui_health_window(&generation);
     if (!window || !IsWindow(window)) {
         return;
     }
@@ -2606,9 +2736,26 @@ static void focus_ui_health_tick(ULONGLONG now) {
     if (next <= 0) {
         next = 1;
     }
-    if (PostMessageW(window, WM_UU_UI_HEALTH, (WPARAM)next, 0)) {
-        InterlockedExchange64(&ui_health_ping_sent_at, (LONG64)now);
-        InterlockedExchange(&ui_health_pings_sent, next);
+    InterlockedExchangePointer(&ui_health_ping_window, window);
+    InterlockedExchange(&ui_health_ping_generation, generation);
+    InterlockedExchange(
+        &ui_health_ping_guard_breaks,
+        InterlockedCompareExchange(&event_loop_guard_breaks, 0, 0)
+    );
+    InterlockedExchange(
+        &ui_health_ping_messages_dequeued,
+        InterlockedCompareExchange(&event_loop_messages_dequeued, 0, 0)
+    );
+    InterlockedExchange64(&ui_health_ping_sent_at, (LONG64)now);
+    InterlockedExchange(&ui_health_pings_sent, next);
+    if (!PostMessageW(
+            window,
+            WM_UU_UI_HEALTH,
+            (WPARAM)next,
+            (LPARAM)generation
+        )) {
+        InterlockedIncrement(&ui_health_window_invalidations);
+        ui_health_clear_pending(next);
     }
 }
 
@@ -2619,10 +2766,14 @@ static void focus_note_window_chain(
 ) {
     unsigned int index;
     BOOL changed = FALSE;
+    BOOL role_changed = FALSE;
 
     AcquireSRWLockExclusive(&focus_window_lock);
     for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
         if (focus_windows[index].window == window) {
+            if (focus_windows[index].role != role) {
+                role_changed = TRUE;
+            }
             focus_windows[index].role = role;
             if (focus_windows[index].external_proc != external_proc) {
                 focus_windows[index].external_proc = external_proc;
@@ -2630,6 +2781,9 @@ static void focus_note_window_chain(
             }
             break;
         }
+    }
+    if (role_changed) {
+        InterlockedIncrement(&focus_window_generation);
     }
     ReleaseSRWLockExclusive(&focus_window_lock);
     if (changed) {
@@ -2998,7 +3152,21 @@ static LRESULT CALLBACK focus_subclass_window_proc(
         return 0;
     }
     if (message == WM_UU_UI_HEALTH) {
-        InterlockedExchange(&ui_health_pings_acked, (LONG)wparam);
+        if (
+            window == (HWND)InterlockedCompareExchangePointer(
+                &ui_health_ping_window, NULL, NULL
+            ) &&
+            (LONG)wparam == InterlockedCompareExchange(
+                &ui_health_pings_sent, 0, 0
+            ) &&
+            (LONG)lparam == InterlockedCompareExchange(
+                &ui_health_ping_generation, 0, 0
+            )
+        ) {
+            InterlockedExchange(&ui_health_pings_acked, (LONG)wparam);
+            InterlockedExchange64(&ui_health_ping_sent_at, 0);
+            InterlockedExchangePointer(&ui_health_ping_window, NULL);
+        }
         return 0;
     }
     if (
@@ -3187,6 +3355,7 @@ static BOOL focus_ensure_window_subclassed(
             focus_windows[index].original_proc = original_proc;
             focus_windows[index].external_proc = NULL;
             focus_windows[index].role = role;
+            InterlockedIncrement(&focus_window_generation);
             break;
         }
     }
@@ -4157,6 +4326,16 @@ __declspec(dllexport) DWORD WINAPI UURemoteEventLoopGuardSelfTest(void) {
         return 0u;
     }
     return state.last_peek_empty ? 0u : 1u;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteUIHealthEvidenceSelfTest(void) {
+    if (ui_health_has_livelock_evidence(3, 3, 10, 10)) {
+        return 0u;
+    }
+    if (ui_health_has_livelock_evidence(3, 4, 10, 11)) {
+        return 0u;
+    }
+    return ui_health_has_livelock_evidence(3, 4, 10, 10) ? 1u : 0u;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(

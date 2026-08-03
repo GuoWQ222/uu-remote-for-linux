@@ -46,6 +46,10 @@ instance.ever_saw_client = False
 instance.client_missing_ticks = 0
 instance.remove_legacy_icons = lambda: 0
 instance.write_status = lambda *_args: None
+instance.consume_client_quit_event = lambda: False
+instance.controlled_session_state = lambda: "idle"
+instance.controller_recovery_requested = lambda: False
+instance.controller_restart_idle_confirmations = 0
 instance.Gtk = DummyGtk()
 original_prefix_processes = namespace["prefix_processes"]
 namespace["prefix_processes"].__globals__["prefix_processes"] = (
@@ -134,6 +138,9 @@ with tempfile.TemporaryDirectory() as prefix:
     monitor.client_missing_ticks = 0
     monitor.remove_legacy_icons = lambda: 0
     monitor.request_full_exit = lambda detail: exits.append(detail)
+    monitor.controlled_session_state = lambda: "idle"
+    monitor.controller_recovery_requested = lambda: False
+    monitor.controller_restart_idle_confirmations = 0
     with client_log.open("a") as log_handle:
         log_handle.write(marker + "\n")
     original_prefix_processes = namespace["prefix_processes"]
@@ -157,18 +164,44 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     recovery.launcher = "/mock/uu-remote-for-linux"
     recovery.log_file = Path(state) / "tray.log"
     recovery.client_missing_ticks = 3
+    recovery.decoder_process = None
+    recovery.ever_saw_client = True
+    recovery.remove_legacy_icons = lambda: 0
+    recovery.consume_client_quit_event = lambda: False
+    recovery.server_log_path = None
+    recovery.server_log_offset = 0
+    recovery.server_log_tail = ""
+    recovery.server_session_states = {}
+    recovery.last_controlled_session_state = "unknown"
+    recovery.controller_restart_idle_confirmations = 0
+    recovery.controller_recovery_suppressed = 0
     recovery.write_status = lambda *_args: None
+    server_log_dir = recovery.server_connection_log_dir
+    server_log_dir.mkdir(parents=True)
+    (server_log_dir / "connection_log_20260803000000000_1.txt").write_text(
+        "server ready\n"
+    )
     marker = recovery.controller_restart_marker
-    marker.parent.mkdir(parents=True)
-    marker.write_text("reason=ui-message-timeout\n")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    valid_request = (
+        "reason=event-loop-livelock\n"
+        "hook_version=15\n"
+        "guard_evidence=1\n"
+        "window_generation=7\n"
+    )
+    marker.write_text(valid_request)
     assert recovery.controller_recovery_requested()
+    assert recovery.controlled_session_state() == "idle"
 
     recovery_globals = recovery.recover_controller.__globals__
     original_controller_processes = recovery_globals["controller_processes"]
     recovery_globals["controller_processes"] = lambda *_args: set()
     try:
         with mock.patch.object(namespace["subprocess"], "Popen") as popen:
-            assert recovery.recover_controller()
+            assert recovery.periodic_check()
+            assert recovery.controller_restart_idle_confirmations == 1
+            popen.assert_not_called()
+            assert recovery.periodic_check()
             popen.assert_called_once()
     finally:
         recovery_globals["controller_processes"] = original_controller_processes
@@ -183,6 +216,51 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     os.utime(marker, (stale, stale))
     assert not recovery.controller_recovery_requested()
     assert not marker.exists()
+
+    marker.write_text(
+        "reason=ui-message-timeout\n"
+        "hook_version=14\n"
+    )
+    assert not recovery.controller_recovery_requested()
+    assert not marker.exists()
+
+with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as state:
+    active = proxy_class.__new__(proxy_class)
+    active.prefix = namespace["canonical_path"](prefix)
+    active.launcher = "/mock/uu-remote-for-linux"
+    active.log_file = Path(state) / "tray.log"
+    active.client_missing_ticks = 0
+    active.server_log_path = None
+    active.server_log_offset = 0
+    active.server_log_tail = ""
+    active.server_session_states = {}
+    active.last_controlled_session_state = "unknown"
+    active.controller_restart_idle_confirmations = 0
+    active.controller_recovery_suppressed = 0
+    active.write_status = lambda *_args: None
+    server_log_dir = active.server_connection_log_dir
+    server_log_dir.mkdir(parents=True)
+    server_log = server_log_dir / "connection_log_20260803000000000_1.txt"
+    server_log.write_text(
+        "[2026-08-03 22:24:02.261][I][controlled][rtc] "
+        "Session: 123 Old state: have-remote-offer New state: stable\n"
+    )
+    marker = active.controller_restart_marker
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(valid_request)
+    assert active.controlled_session_state() == "active"
+    with mock.patch.object(namespace["subprocess"], "Popen") as popen:
+        assert not active.recover_controller()
+        popen.assert_not_called()
+    assert not marker.exists()
+    assert active.controller_recovery_suppressed == 1
+
+    with server_log.open("a") as log_handle:
+        log_handle.write(
+            "[2026-08-03 22:24:17.627][I][controlled][rtc] "
+            "Session: 123 Old state: stable New state: closed\n"
+        )
+    assert active.controlled_session_state() == "idle"
 
 display = os.environ.get("DISPLAY")
 if display:

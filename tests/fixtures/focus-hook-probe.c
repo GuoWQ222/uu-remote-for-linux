@@ -5,6 +5,7 @@
 typedef DWORD(WINAPI *initialize_hook_fn)(LPVOID);
 typedef DWORD(WINAPI *focus_hook_status_fn)(void);
 typedef DWORD(WINAPI *event_loop_guard_self_test_fn)(void);
+typedef DWORD(WINAPI *ui_health_evidence_self_test_fn)(void);
 
 static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
@@ -150,6 +151,7 @@ int WINAPI WinMain(
     initialize_hook_fn initialize_hook;
     focus_hook_status_fn focus_hook_status;
     event_loop_guard_self_test_fn event_loop_guard_self_test;
+    ui_health_evidence_self_test_fn ui_health_evidence_self_test;
     HHOOK first_hook;
     HHOOK reused_hook;
     DWORD external_pid = 0;
@@ -170,6 +172,7 @@ int WINAPI WinMain(
     int heartbeat_after;
     int health_pings_sent;
     int health_pings_acked;
+    int no_livelock_suppressions;
     LONG outer_calls_before;
     ULONGLONG right_click_started;
     int index;
@@ -265,11 +268,21 @@ int WINAPI WinMain(
         &procedure,
         sizeof(event_loop_guard_self_test)
     );
+    procedure = GetProcAddress(
+        hook_module, "UURemoteUIHealthEvidenceSelfTest"
+    );
+    CopyMemory(
+        &ui_health_evidence_self_test,
+        &procedure,
+        sizeof(ui_health_evidence_self_test)
+    );
     if (
         !initialize_hook ||
         !focus_hook_status ||
         !event_loop_guard_self_test ||
         !event_loop_guard_self_test() ||
+        !ui_health_evidence_self_test ||
+        !ui_health_evidence_self_test() ||
         !initialize_hook(NULL) ||
         (focus_hook_status() & 1023u) != 1023u
     ) {
@@ -680,19 +693,32 @@ int WINAPI WinMain(
     }
 
     /*
-     * The worker must detect a UI thread that stops dispatching posted
-     * messages and leave a controller-only recovery request for the native
-     * tray. This sleep deliberately blocks the probe's sole UI thread.
+     * A legitimate UI pause without an observed event-loop livelock must
+     * never produce a restart request. Incoming controlled sessions can
+     * temporarily stop dispatching the selected top-level window in exactly
+     * this way.
      */
     DeleteFileW(L"C:\\uu-remote-controller-restart.request");
-    Sleep(11000);
+    /*
+     * Leave more than one complete worker interval beyond the 10-second
+     * threshold so a loaded Wine host cannot race the assertion below.
+     */
+    Sleep(13000);
     if (
-        GetFileAttributesW(L"C:\\uu-remote-controller-restart.request") ==
+        GetFileAttributesW(L"C:\\uu-remote-controller-restart.request") !=
         INVALID_FILE_ATTRIBUTES
     ) {
         return 27;
     }
-    DeleteFileW(L"C:\\uu-remote-controller-restart.request");
+    no_livelock_suppressions = GetPrivateProfileIntW(
+        L"ui_health",
+        L"no_livelock_suppressions",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    if (no_livelock_suppressions < 1) {
+        return 28;
+    }
     DestroyWindow(modal_window);
     DestroyWindow(video_window);
     DestroyWindow(helper_window);

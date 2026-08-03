@@ -15,6 +15,7 @@ import fcntl
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -34,6 +35,12 @@ CONTROLLER_RESTART_MARKER = "uu-remote-controller-restart.request"
 CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS = 60
 CONTROLLER_RESTART_GRACE_SECONDS = 20
 CONTROLLER_TERMINATE_GRACE_SECONDS = 2
+CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 15
+CONTROLLER_RESTART_IDLE_CONFIRMATIONS = 2
+RTC_SESSION_STATE_PATTERN = re.compile(
+    r"Session:\s*([0-9]+).*?\bNew state:\s*([A-Za-z-]+)",
+    re.IGNORECASE,
+)
 
 
 class XClassHint(ctypes.Structure):
@@ -387,8 +394,15 @@ class TrayProxy:
         self.client_log_path: Path | None = None
         self.client_log_offset = 0
         self.client_log_tail = ""
+        self.server_log_path: Path | None = None
+        self.server_log_offset = 0
+        self.server_log_tail = ""
+        self.server_session_states: dict[str, str] = {}
+        self.last_controlled_session_state = "unknown"
         self.exit_in_progress = False
         self.controller_recovery_grace_until = 0.0
+        self.controller_restart_idle_confirmations = 0
+        self.controller_recovery_suppressed = 0
 
     @property
     def client_log_dir(self) -> Path:
@@ -451,8 +465,99 @@ class TrayProxy:
         return CLIENT_QUIT_MARKER in text
 
     @property
+    def server_connection_log_dir(self) -> Path:
+        return (
+            Path(self.prefix)
+            / "drive_c"
+            / "Program Files"
+            / "Netease"
+            / "GameViewer"
+            / "log"
+            / "server"
+            / "log"
+        )
+
+    def latest_server_connection_log(self) -> Path | None:
+        try:
+            candidates = list(
+                self.server_connection_log_dir.glob("connection_log_*.txt")
+            )
+            return max(
+                candidates,
+                key=lambda path: path.stat().st_mtime_ns,
+                default=None,
+            )
+        except OSError:
+            return None
+
+    def controlled_session_state(self) -> str:
+        """Return active, idle, or unknown without exposing RTC log data."""
+
+        latest = self.latest_server_connection_log()
+        if latest is None:
+            self.last_controlled_session_state = "unknown"
+            return "unknown"
+        if latest != getattr(self, "server_log_path", None):
+            self.server_log_path = latest
+            self.server_log_offset = 0
+            self.server_log_tail = ""
+            self.server_session_states = {}
+        try:
+            size = latest.stat().st_size
+            if size < self.server_log_offset:
+                self.server_log_offset = 0
+                self.server_log_tail = ""
+                self.server_session_states = {}
+            with latest.open("r", errors="replace") as log_handle:
+                log_handle.seek(self.server_log_offset)
+                appended = log_handle.read()
+                self.server_log_offset = log_handle.tell()
+        except OSError:
+            self.last_controlled_session_state = "unknown"
+            return "unknown"
+
+        text = self.server_log_tail + appended
+        if "\n" in text:
+            complete, self.server_log_tail = text.rsplit("\n", 1)
+        else:
+            complete = ""
+            self.server_log_tail = text
+        for match in RTC_SESSION_STATE_PATTERN.finditer(complete):
+            session_id, state = match.groups()
+            normalized = state.casefold()
+            if normalized == "stable":
+                self.server_session_states[session_id] = normalized
+            elif normalized == "closed":
+                self.server_session_states.pop(session_id, None)
+
+        state = (
+            "active"
+            if any(
+                value == "stable"
+                for value in self.server_session_states.values()
+            )
+            else "idle"
+        )
+        self.last_controlled_session_state = state
+        return state
+
+    @property
     def controller_restart_marker(self) -> Path:
         return Path(self.prefix) / "drive_c" / CONTROLLER_RESTART_MARKER
+
+    def suppress_controller_recovery(self, detail: str) -> None:
+        self.controller_restart_idle_confirmations = 0
+        self.controller_recovery_suppressed = (
+            getattr(self, "controller_recovery_suppressed", 0) + 1
+        )
+        try:
+            self.controller_restart_marker.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logging.exception("无法清理已抑制的 UU 主控恢复请求")
+        logging.warning("抑制 UU 主控自动恢复：%s", detail)
+        self.write_status("active", detail)
 
     def controller_recovery_requested(self) -> bool:
         marker = self.controller_restart_marker
@@ -467,13 +572,32 @@ class TrayProxy:
             age < -5
             or age > CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS
         ):
-            logging.warning("丢弃过期的 UU 主控恢复请求：age=%.1fs", age)
-            try:
-                marker.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                logging.exception("无法删除过期的 UU 主控恢复请求")
+            self.suppress_controller_recovery(
+                f"丢弃过期恢复请求（age={age:.1f}s）"
+            )
+            return False
+        try:
+            payload = marker.read_text(errors="replace")
+        except OSError:
+            logging.exception("无法读取 UU 主控恢复请求内容")
+            return False
+        fields: dict[str, str] = {}
+        for line in payload.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                fields[key.strip()] = value.strip()
+        try:
+            hook_version = int(fields.get("hook_version", "0"))
+        except ValueError:
+            hook_version = 0
+        if (
+            fields.get("reason") != "event-loop-livelock"
+            or fields.get("guard_evidence") != "1"
+            or hook_version < CONTROLLER_RESTART_REQUIRED_HOOK_VERSION
+        ):
+            self.suppress_controller_recovery(
+                "恢复请求缺少事件循环活锁证据，已安全忽略"
+            )
             return False
         return True
 
@@ -481,6 +605,12 @@ class TrayProxy:
         """Restart only the hung Qt controller, preserving UU background services."""
 
         marker = self.controller_restart_marker
+        controlled_state = self.controlled_session_state()
+        if controlled_state != "idle":
+            self.suppress_controller_recovery(
+                "被控 RTC 会话活动中或状态未知，禁止重启主控"
+            )
+            return False
         controller_pids = controller_processes(self.prefix)
         logging.warning(
             "UU 主界面心跳超时，准备仅重启主控进程：pids=%s",
@@ -538,6 +668,7 @@ class TrayProxy:
         self.controller_recovery_grace_until = (
             time.monotonic() + CONTROLLER_RESTART_GRACE_SECONDS
         )
+        self.controller_restart_idle_confirmations = 0
         self.client_missing_ticks = 0
         logging.info("UU 主控进程自动恢复已启动")
         return True
@@ -554,6 +685,10 @@ class TrayProxy:
                     f"title={TITLE}",
                     f"pid={os.getpid()}",
                     f"legacy_icons_removed={self.removed_icons}",
+                    "controlled_session="
+                    f"{getattr(self, 'last_controlled_session_state', 'unknown')}",
+                    "recovery_suppressed="
+                    f"{getattr(self, 'controller_recovery_suppressed', 0)}",
                     f"detail={detail.replace(chr(10), ' ')}",
                     f"updated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
                     "",
@@ -808,9 +943,33 @@ class TrayProxy:
             and self.decoder_process.poll() is None
         )
         client_quit = self.consume_client_quit_event()
+        controlled_state = self.controlled_session_state()
         if self.controller_recovery_requested():
-            if self.recover_controller():
-                return True
+            if controlled_state != "idle":
+                self.suppress_controller_recovery(
+                    "被控 RTC 会话活动中或状态未知，禁止重启主控"
+                )
+            else:
+                self.controller_restart_idle_confirmations = (
+                    getattr(
+                        self,
+                        "controller_restart_idle_confirmations",
+                        0,
+                    )
+                    + 1
+                )
+                if (
+                    self.controller_restart_idle_confirmations
+                    < CONTROLLER_RESTART_IDLE_CONFIRMATIONS
+                ):
+                    self.write_status(
+                        "active", "正在复核主控活锁，尚未执行重启"
+                    )
+                    return True
+                if self.recover_controller():
+                    return True
+        else:
+            self.controller_restart_idle_confirmations = 0
         recovery_grace = time.monotonic() < getattr(
             self, "controller_recovery_grace_until", 0.0
         )
@@ -860,6 +1019,7 @@ class TrayProxy:
         self.x11 = X11(os.environ.get("DISPLAY"))
         self.remove_legacy_icons()
         self.prime_client_quit_monitor()
+        self.controlled_session_state()
         self.write_status("active", "原生托盘已注册")
         self.GLib.timeout_add(LEGACY_SCAN_INTERVAL_MS, self.periodic_check)
 

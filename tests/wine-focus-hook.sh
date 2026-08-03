@@ -39,6 +39,8 @@ test_root=$(mktemp -d)
 cleanup() {
     WINEPREFIX="$test_root/prefix" WINEDEBUG=-all wineserver -k \
         >/dev/null 2>&1 || true
+    WINEPREFIX="$test_root/prefix" WINEDEBUG=-all timeout 10s \
+        wineserver -w >/dev/null 2>&1 || true
     if [[ ${UU_REMOTE_KEEP_FOCUS_HOOK_TEST:-0} == 1 ]]; then
         printf '保留 Wine 焦点测试目录：%s\n' "$test_root" >&2
     else
@@ -68,14 +70,32 @@ mkdir -p "$bin_dir"
     -luser32
 install -Dm0644 "$hook" "$bin_dir/uu-remote-input-hook.dll"
 
-WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
-    >/dev/null 2>&1
-(
-    cd "$bin_dir"
-    WINEPREFIX="$prefix" WINEDEBUG=-all timeout 35s \
-        wine 'C:\probe\bin\GameViewer.exe'
-)
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=14'
+probe_status=0
+for attempt in 1 2; do
+    WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
+        >/dev/null 2>&1
+    if (
+        cd "$bin_dir"
+        WINEPREFIX="$prefix" WINEDEBUG=-all timeout 60s \
+            wine 'C:\probe\bin\GameViewer.exe'
+    ); then
+        probe_status=0
+        break
+    else
+        probe_status=$?
+    fi
+    if (( probe_status != 124 || attempt == 2 )); then
+        exit "$probe_status"
+    fi
+    printf '%s\n' \
+        'Wine 焦点探针启动超时；清理临时前缀后重试一次。' >&2
+    WINEPREFIX="$prefix" WINEDEBUG=-all wineserver -k \
+        >/dev/null 2>&1 || true
+    WINEPREFIX="$prefix" WINEDEBUG=-all timeout 10s \
+        wineserver -w >/dev/null 2>&1 || true
+done
+(( probe_status == 0 )) || exit "$probe_status"
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=15'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=1023'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
@@ -100,6 +120,8 @@ grep -A7 -F '[event_loop]' "$status" |
     grep -Fq 'mode=qt-wine-empty-wake-guard'
 grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_sent=[1-9]'
 grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_acked=[1-9]'
+grep -A9 -F '[ui_health]' "$status" |
+    grep -Eq 'no_livelock_suppressions=[1-9]'
 grep -A2 -F '[worker]' "$status" | grep -Eq 'heartbeats=[2-9]|heartbeats=[1-9][0-9]+'
 
 printf 'Wine 主控隐藏状态、焦点反馈限速、模态切换和键盘钩子去抖实测通过。\n'

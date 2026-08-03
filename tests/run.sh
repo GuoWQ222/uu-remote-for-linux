@@ -177,6 +177,10 @@ check "input hook exports event-loop self-test" bash -c \
     'objdump -p "$1" | grep -q "UURemoteEventLoopGuardSelfTest"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
+check "input hook exports UI-health evidence self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteUIHealthEvidenceSelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports WOL status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteWolHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"

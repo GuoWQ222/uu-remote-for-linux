@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.12] - 2026-08-03
+
+- Prevent the controller watchdog from terminating a healthy incoming remote
+  session. Heartbeats are now bound to the exact top-level window generation;
+  destroying, replacing, or making message progress on that window cancels
+  the pending timeout instead of turning a stale acknowledgement into a
+  restart request.
+- Require direct Qt/Wine event-loop livelock evidence in addition to a stable
+  unresponsive window before the injected hook can request recovery. A plain
+  10-second UI pause is recorded as safely suppressed and never kills UU.
+- Make the native tray track controlled RTC sessions from the local server's
+  `stable`/`closed` transitions without logging connection contents. Recovery
+  requests are rejected while a session is active or its state is unknown,
+  require the v15 evidence payload, and require two idle observations before
+  the controller can be restarted.
+- Add regression coverage for legitimate blocked UI work, invalid recovery
+  payloads, active controlled sessions, RTC close transitions, and the
+  two-pass idle confirmation path.
+
 ## [1.1.11] - 2026-08-03
 
 - Break the Wine 11/Qt 5 empty-queue livelock at its actual event-dispatcher
