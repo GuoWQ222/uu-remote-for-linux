@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+## [1.1.6] - 2026-08-03
+
+- Flush CUDA-bounce uploads on the producer D3D11 context before reporting
+  resource unmap completion. This prevents a second DXVK D3D11 device from
+  observing stale or zero-filled shared NV12/P010 frames.
+- Make the CUDA relay honor the launcher's `UU_REMOTE_CUDA_DEVICE` variable;
+  retain `UUYC_CUDA_DEVICE` as a backwards-compatible fallback.
+- Add a real NVIDIA/Wine shared-NV12 regression probe covering cross-device
+  visibility and both CUDA-device-selection variable names.
+- Keep framework-installed outer window procedures above the controller focus
+  hook. Reinstalling the hook above a Qt wrapper that already chained to it
+  could create a `hook -> Qt -> hook` recursion cycle and pin the UI thread at
+  100% CPU.
+- Add a Wine regression probe for late Qt WndProc chaining, expose the observed
+  external-chain count in hook diagnostics, and provide
+  `UU_REMOTE_DISABLE_FOCUS_STABILIZER=1` as an emergency startup fallback.
+
 ## [1.1.5] - 2026-07-31
 
 - Replace the ineffective controller `DispatchMessageW`-only path with direct

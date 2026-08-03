@@ -102,8 +102,8 @@ install -Dm0644 "$project_root/LICENSE" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/copyright"
 install -Dm0644 "$project_root/third_party/HWDECODE.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/HWDECODE.md"
-install -Dm0644 "$project_root/third_party/sources/nvcuda-uu-remote-v0.6.tar.xz" \
-    "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvcuda-uu-remote-v0.6.tar.xz"
+install -Dm0644 "$project_root/third_party/sources/nvcuda-uu-remote-v0.7.tar.xz" \
+    "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvcuda-uu-remote-v0.7.tar.xz"
 install -Dm0644 "$project_root/third_party/sources/nvenc-nvcuvid-v0.5.tar.xz" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvenc-nvcuvid-v0.5.tar.xz"
 

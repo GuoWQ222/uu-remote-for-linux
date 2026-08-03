@@ -24,8 +24,9 @@ The optional NVIDIA hardware-decoding bridge includes:
 - Wine CUDA and CUVID relay code from `SveSop/nvcuda` and `SveSop/nvenc`,
   licensed under LGPL-2.1-or-later;
 - a modified `nvcuda.dll.so` that adds the UU Remote CUDA-to-D3D11 CPU-bounce
-  bridge and explicit CUDA-device selection. The complete corresponding source
-  is shipped in `third_party/sources/nvcuda-uu-remote-v0.6.tar.xz`.
+  bridge, cross-device upload submission, and explicit CUDA-device selection.
+  The complete corresponding source is shipped in
+  `third_party/sources/nvcuda-uu-remote-v0.7.tar.xz`.
 
 Exact revisions, checksums, build details, licenses, and the corresponding
 CUVID source archive are documented in `third_party/HWDECODE.md`.

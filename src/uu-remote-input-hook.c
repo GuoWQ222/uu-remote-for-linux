@@ -34,7 +34,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 9u
+#define HOOK_VERSION 10u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -189,6 +189,7 @@ static SRWLOCK focus_rate_lock = SRWLOCK_INIT;
 static SRWLOCK focus_module_lock = SRWLOCK_INIT;
 static volatile LONG focus_subclassed_windows;
 static volatile LONG focus_subclass_installations;
+static volatile LONG focus_external_subclass_chains;
 static volatile LONG focus_activation_api_mask;
 static volatile LONG focus_transition_messages;
 static volatile LONG focus_storm_pending;
@@ -209,6 +210,7 @@ static BOOL focus_modal_was_visible;
 struct focus_window_entry {
     HWND window;
     WNDPROC original_proc;
+    WNDPROC external_proc;
     enum focus_window_role role;
 };
 
@@ -1612,6 +1614,16 @@ static void write_focus_hook_status(void) {
     wsprintfA(
         value,
         "%ld",
+        InterlockedCompareExchange(
+            &focus_external_subclass_chains, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "window_state", "external_chains", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
         InterlockedCompareExchange(&focus_activation_api_mask, 0, 0)
     );
     WritePrivateProfileStringA(
@@ -1884,38 +1896,29 @@ static void focus_remove_window(HWND window) {
     ReleaseSRWLockExclusive(&focus_window_lock);
 }
 
-static void focus_set_window_role(
+static void focus_note_window_chain(
     HWND window,
+    WNDPROC external_proc,
     enum focus_window_role role
 ) {
     unsigned int index;
+    BOOL changed = FALSE;
 
     AcquireSRWLockExclusive(&focus_window_lock);
     for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
         if (focus_windows[index].window == window) {
             focus_windows[index].role = role;
+            if (focus_windows[index].external_proc != external_proc) {
+                focus_windows[index].external_proc = external_proc;
+                changed = external_proc != NULL;
+            }
             break;
         }
     }
     ReleaseSRWLockExclusive(&focus_window_lock);
-}
-
-static void focus_replace_window_original(
-    HWND window,
-    WNDPROC original_proc,
-    enum focus_window_role role
-) {
-    unsigned int index;
-
-    AcquireSRWLockExclusive(&focus_window_lock);
-    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
-        if (focus_windows[index].window == window) {
-            focus_windows[index].original_proc = original_proc;
-            focus_windows[index].role = role;
-            break;
-        }
+    if (changed) {
+        InterlockedIncrement(&focus_external_subclass_chains);
     }
-    ReleaseSRWLockExclusive(&focus_window_lock);
 }
 
 static void focus_record_transition(void) {
@@ -2075,7 +2078,11 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     MSG probe;
     LRESULT result;
 
-    if (!focus_window_entry(window, &original_proc, &role) || !original_proc) {
+    if (
+        !focus_window_entry(window, &original_proc, &role) ||
+        !original_proc ||
+        original_proc == focus_subclass_window_proc
+    ) {
         return DefWindowProcW(window, message, wparam, lparam);
     }
     if (message == WM_UU_FOCUS_APPLY) {
@@ -2174,28 +2181,25 @@ static BOOL focus_ensure_window_subclassed(
     WNDPROC original_proc;
     LONG_PTR previous;
 
-    if (focus_window_entry(window, &original_proc, NULL)) {
-        focus_set_window_role(window, role);
+    if (focus_window_entry(window, NULL, NULL)) {
         SetLastError(ERROR_SUCCESS);
         previous = GetWindowLongPtrW(window, GWLP_WNDPROC);
         if (!previous && GetLastError() != ERROR_SUCCESS) {
             return FALSE;
         }
         if ((WNDPROC)previous == focus_subclass_window_proc) {
+            focus_note_window_chain(window, NULL, role);
             return TRUE;
         }
-        focus_replace_window_original(window, (WNDPROC)previous, role);
-        SetLastError(ERROR_SUCCESS);
-        previous = SetWindowLongPtrW(
-            window,
-            GWLP_WNDPROC,
-            (LONG_PTR)focus_subclass_window_proc
-        );
-        if (!previous && GetLastError() != ERROR_SUCCESS) {
-            focus_replace_window_original(window, original_proc, role);
-            return FALSE;
-        }
-        InterlockedIncrement(&focus_subclass_installations);
+
+        /*
+         * A framework may legitimately install an outer WndProc after us.
+         * It normally keeps our procedure as its next link. Moving our hook
+         * above it would create hook -> outer -> hook recursion and spin the
+         * UI thread forever. Preserve the framework-owned outer link;
+         * messages that it chains continue to reach this hook exactly once.
+         */
+        focus_note_window_chain(window, (WNDPROC)previous, role);
         return TRUE;
     }
     SetLastError(ERROR_SUCCESS);
@@ -2209,6 +2213,7 @@ static BOOL focus_ensure_window_subclassed(
         if (!focus_windows[index].window) {
             focus_windows[index].window = window;
             focus_windows[index].original_proc = original_proc;
+            focus_windows[index].external_proc = NULL;
             focus_windows[index].role = role;
             break;
         }

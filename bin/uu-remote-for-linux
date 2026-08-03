@@ -3457,6 +3457,7 @@ start_input_injector() {
 start_focus_injector() {
     local wine_path
 
+    [[ ${UU_REMOTE_DISABLE_FOCUS_STABILIZER:-0} != 1 ]] || return 0
     [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
     [[ -n ${DISPLAY:-} ]] || return 0
     input_hook_ready || return 1

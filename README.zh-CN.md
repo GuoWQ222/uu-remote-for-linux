@@ -42,7 +42,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.5_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.6_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
@@ -84,6 +84,9 @@ uu-remote-for-linux --decoder nvidia:0
 
 # 仅停止本项目的独立 Wine 前缀
 uu-remote-for-linux --stop
+
+# 主控焦点处理不兼容时的应急回退
+UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
 
 ## 解码器支持

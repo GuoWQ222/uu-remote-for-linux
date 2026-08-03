@@ -51,7 +51,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.5_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.6_amd64.deb
 uu-remote-for-linux --accept-eula --setup-only
 ```
 
@@ -93,6 +93,9 @@ uu-remote-for-linux --decoder nvidia:0
 
 # Stop only this project's dedicated Wine prefix
 uu-remote-for-linux --stop
+
+# Emergency fallback if controller focus handling is incompatible
+UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
 
 ## Decoder support

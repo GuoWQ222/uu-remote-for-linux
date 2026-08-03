@@ -7,12 +7,20 @@ The optional bridge is an NVIDIA-only, correctness-first compatibility path:
 2. The modified CUDA relay copies each decoded plane from CUDA device memory
    to a CPU buffer.
 3. `ID3D11DeviceContext::UpdateSubresource` uploads the planes to the DXVK
-   D3D11 textures expected by UU Remote.
+   D3D11 textures expected by UU Remote, then `Flush` submits the upload before
+   the texture is consumed from UU Remote's second D3D11 device.
 
 This removes the missing CUDA/D3D11 interop blocker. It is hardware decoding
-with CPU copyback, not a zero-copy implementation. The UU-specific v0.6 relay
+with CPU copyback, not a zero-copy implementation. The UU-specific v0.7 relay
 also accepts `UU_REMOTE_CUDA_DEVICE=<ordinal>` and binds the D3D11 CUDA-context
-entry points to that enumerated CUDA device. Invalid ordinals fail explicitly.
+entry points to that enumerated CUDA device. Invalid ordinals fail explicitly;
+the former `UUYC_CUDA_DEVICE` name remains accepted as a fallback.
+
+The explicit D3D11 submission is required for shared textures under DXVK.
+Without it, `UpdateSubresource` can remain queued on the producer context while
+the renderer's consumer device observes stale or zero-filled NV12/P010 data.
+`tests/wine-nvdec-d3d11.sh` reproduces this boundary with two D3D11 devices and
+verifies every byte of a CUDA-uploaded shared NV12 frame on a real NVIDIA GPU.
 
 UU Remote 4.34.0.8979 currently auto-selects implementation 32 (DXVA11)
 under Wine, while implementation 33 is NVDEC. Because DXVK does not implement
@@ -51,7 +59,7 @@ The complete modified nvcuda source and the corresponding nvcuvid source are
 included under `third_party/sources/`. Their archive SHA-256 values are:
 
 ```text
-db94af7278ff49d4a0551b9ef49d170e5cb6b881aae8c9081d68386e7b5a4ca0  nvcuda-uu-remote-v0.6.tar.xz
+b76e0c397df52b66f3470e8123b9e0ee87afe081fc4b5c79613f29b3c969a348  nvcuda-uu-remote-v0.7.tar.xz
 e2b5e99ef3a849a8ed779ce8c786505578d82169b25b08e2a3905702550751be  nvenc-nvcuvid-v0.5.tar.xz
 ```
 
@@ -64,18 +72,19 @@ The source uses Meson and Wine's `winegcc`. With Wine development headers,
 Meson, and Ninja available:
 
 ```bash
-tar -xf third_party/sources/nvcuda-uu-remote-v0.6.tar.xz
+tar -xf third_party/sources/nvcuda-uu-remote-v0.7.tar.xz
 meson setup \
-  --cross-file nvcuda-uu-remote-v0.6/build-wine64.txt \
+  --cross-file nvcuda-uu-remote-v0.7/build-wine64.txt \
   --buildtype release \
-  -Dfakedll=false \
+  -Dfakedll=true \
   build-nvcuda \
-  nvcuda-uu-remote-v0.6
+  nvcuda-uu-remote-v0.7
 ninja -C build-nvcuda
 ```
 
 The resulting Unix relay is
-`build-nvcuda/dlls/nvcuda/nvcuda.dll.so`.
+`build-nvcuda/dlls/nvcuda/nvcuda.dll.so`; the Wine fake DLL is
+`build-nvcuda/dlls/nvcuda_fdll/nvcuda.dll`.
 
 ## Licenses
 

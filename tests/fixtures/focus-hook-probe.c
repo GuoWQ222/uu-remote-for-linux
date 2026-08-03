@@ -8,6 +8,20 @@ typedef DWORD(WINAPI *focus_hook_status_fn)(void);
 static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
 static volatile LONG nonclient_deactivate_messages;
+static volatile LONG outer_window_proc_calls;
+static WNDPROC outer_window_proc_next;
+
+static LRESULT CALLBACK outer_window_proc(
+    HWND window,
+    UINT message,
+    WPARAM wparam,
+    LPARAM lparam
+) {
+    InterlockedIncrement(&outer_window_proc_calls);
+    return CallWindowProcW(
+        outer_window_proc_next, window, message, wparam, lparam
+    );
+}
 
 static LRESULT CALLBACK probe_window_proc(
     HWND window,
@@ -81,6 +95,7 @@ int WINAPI WinMain(
     int blocked_activations;
     int modal_latches;
     int post_modal_handoffs;
+    LONG outer_calls_before;
     int index;
     int expected_app_deactivate = 0;
 
@@ -173,6 +188,34 @@ int WINAPI WinMain(
         (focus_hook_status() & 127u) != 127u
     ) {
         return 4;
+    }
+
+    /*
+     * Qt may install another WndProc after the hook.  That outer procedure
+     * already chains to our hook, so the hook must never move itself above
+     * the new procedure: doing so creates hook -> outer -> hook recursion.
+     */
+    SetLastError(ERROR_SUCCESS);
+    outer_window_proc_next = (WNDPROC)SetWindowLongPtrW(
+        main_window, GWLP_WNDPROC, (LONG_PTR)outer_window_proc
+    );
+    if (
+        (!outer_window_proc_next && GetLastError() != ERROR_SUCCESS) ||
+        outer_window_proc_next == outer_window_proc
+    ) {
+        return 13;
+    }
+    Sleep(200);
+    if (
+        (WNDPROC)GetWindowLongPtrW(main_window, GWLP_WNDPROC) !=
+            outer_window_proc
+    ) {
+        return 14;
+    }
+    outer_calls_before = outer_window_proc_calls;
+    SendMessageW(main_window, WM_NULL, 0, 0);
+    if (outer_window_proc_calls != outer_calls_before + 1) {
+        return 15;
     }
 
     InterlockedExchange(&app_deactivate_messages, 0);

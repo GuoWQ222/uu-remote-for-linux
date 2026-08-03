@@ -21,6 +21,7 @@ export UU_REMOTE_DISABLE_SLEEP_WATCHER=1
 export UU_REMOTE_DISABLE_UPDATE_WATCHER=1
 export UU_REMOTE_DISABLE_KEYBOARD_BRIDGE=1
 export UU_REMOTE_DISABLE_INPUT_BRIDGE=1
+export UU_REMOTE_DISABLE_FOCUS_STABILIZER=1
 export UU_REMOTE_TRAY_PROXY_BIN="$fixture_bin/uu-remote-tray-proxy"
 export UU_REMOTE_UPDATE_NO_RESTART=1
 export UU_REMOTE_SYSTEM_PROXY_SOURCE=none
@@ -90,7 +91,7 @@ grep -q '^REG_ADD_GAMEVIEWER_USETAKEFOCUS=Y$' "$UU_REMOTE_FAKE_TRACE"
 printf '%s\r\n' \
     '[hook]' \
     'pid=947' \
-    'version=9' \
+    'version=10' \
     'status_bits=127' \
     '[window_state]' \
     'mode=wndproc-arbiter' \
@@ -103,7 +104,7 @@ printf '%s\r\n' \
     'post_modal_handoffs=1' \
     >"$prefix/drive_c/uu-remote-focus-hook-status.ini"
 "$launcher" --diagnose | grep -q \
-    '主控焦点稳定.*生效中（v9；顶层窗口 4，争用 1/1，阻止抢焦 26，接管切换 1/1）'
+    '主控焦点稳定.*生效中（v10；顶层窗口 4，争用 1/1，阻止抢焦 26，接管切换 1/1）'
 
 printf '%s\r\n' \
     '[hook]' \
@@ -255,6 +256,11 @@ grep -q '^HWDECODE_ENV$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CUDA_DEVICE=0$' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-healthd' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-server' "$UU_REMOTE_FAKE_TRACE"
+if grep -q -- '--watch-module GameViewer.exe Qt5Core.dll' \
+    "$UU_REMOTE_FAKE_TRACE"; then
+    printf '已禁用的主控焦点稳定器仍被启动。\n' >&2
+    exit 1
+fi
 if grep -q '^FD9_LEAK ' "$UU_REMOTE_FAKE_TRACE"; then
     printf '操作锁文件描述符被泄漏给子进程：\n' >&2
     grep '^FD9_LEAK ' "$UU_REMOTE_FAKE_TRACE" >&2
