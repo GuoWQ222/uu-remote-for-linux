@@ -4,6 +4,7 @@
 
 typedef DWORD(WINAPI *initialize_hook_fn)(LPVOID);
 typedef DWORD(WINAPI *focus_hook_status_fn)(void);
+typedef DWORD(WINAPI *event_loop_guard_self_test_fn)(void);
 
 static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
@@ -148,6 +149,7 @@ int WINAPI WinMain(
     FARPROC procedure;
     initialize_hook_fn initialize_hook;
     focus_hook_status_fn focus_hook_status;
+    event_loop_guard_self_test_fn event_loop_guard_self_test;
     HHOOK first_hook;
     HHOOK reused_hook;
     DWORD external_pid = 0;
@@ -166,6 +168,8 @@ int WINAPI WinMain(
     int apply_posted;
     int heartbeat_before;
     int heartbeat_after;
+    int health_pings_sent;
+    int health_pings_acked;
     LONG outer_calls_before;
     ULONGLONG right_click_started;
     int index;
@@ -253,11 +257,21 @@ int WINAPI WinMain(
         hook_module, "UURemoteFocusHookStatus"
     );
     CopyMemory(&focus_hook_status, &procedure, sizeof(focus_hook_status));
+    procedure = GetProcAddress(
+        hook_module, "UURemoteEventLoopGuardSelfTest"
+    );
+    CopyMemory(
+        &event_loop_guard_self_test,
+        &procedure,
+        sizeof(event_loop_guard_self_test)
+    );
     if (
         !initialize_hook ||
         !focus_hook_status ||
+        !event_loop_guard_self_test ||
+        !event_loop_guard_self_test() ||
         !initialize_hook(NULL) ||
-        (focus_hook_status() & 127u) != 127u
+        (focus_hook_status() & 1023u) != 1023u
     ) {
         return 4;
     }
@@ -564,6 +578,18 @@ int WINAPI WinMain(
         0,
         L"C:\\uu-remote-focus-hook-status.ini"
     );
+    health_pings_sent = GetPrivateProfileIntW(
+        L"ui_health",
+        L"pings_sent",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    health_pings_acked = GetPrivateProfileIntW(
+        L"ui_health",
+        L"pings_acked",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     deferred = GetPrivateProfileIntW(
         L"keyboard_hook",
         L"deferred",
@@ -649,6 +675,24 @@ int WINAPI WinMain(
     if (heartbeat_before < 1 || heartbeat_after <= heartbeat_before) {
         return 20;
     }
+    if (health_pings_sent < 1 || health_pings_acked < 1) {
+        return 26;
+    }
+
+    /*
+     * The worker must detect a UI thread that stops dispatching posted
+     * messages and leave a controller-only recovery request for the native
+     * tray. This sleep deliberately blocks the probe's sole UI thread.
+     */
+    DeleteFileW(L"C:\\uu-remote-controller-restart.request");
+    Sleep(11000);
+    if (
+        GetFileAttributesW(L"C:\\uu-remote-controller-restart.request") ==
+        INVALID_FILE_ATTRIBUTES
+    ) {
+        return 27;
+    }
+    DeleteFileW(L"C:\\uu-remote-controller-restart.request");
     DestroyWindow(modal_window);
     DestroyWindow(video_window);
     DestroyWindow(helper_window);

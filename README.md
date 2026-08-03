@@ -34,7 +34,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.10_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.11_amd64.deb
 ```
 
 Then launch **UU Remote for Linux** from the Ubuntu application menu, or run

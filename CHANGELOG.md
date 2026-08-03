@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.11] - 2026-08-03
+
+- Break the Wine 11/Qt 5 empty-queue livelock at its actual event-dispatcher
+  boundary. The process-local hook now verifies repeated `PeekMessageW` empty
+  results followed by stale `MsgWaitForMultipleObjectsEx` message wakes, then
+  returns one correct timeout with a 1 ms yield so Qt can enter its normal
+  blocking wait instead of pinning the UI thread and leaving a white window.
+- Coalesce duplicate `WM_QT_SENDPOSTEDEVENTS` wakeups for Qt's hidden event
+  dispatcher window while preserving every queued Qt event. This bounds the
+  cross-thread wakeup burst that makes the Wine timing race more likely after
+  a control session closes or fails.
+- Add an independent posted-message heartbeat from the injected worker to the
+  real Qt top-level window. After a verified 10-second UI stall, the native
+  tray restarts only the Qt controller process; the controlled-host server, health
+  service, Wine prefix, settings, and tray remain alive. Resume gaps are
+  explicitly ignored so laptop suspend cannot trigger a false recovery. The
+  controller lookup also recognizes UU's runtime `source=start.exe` identity
+  inside the matching Wine prefix, without widening the kill target to other
+  UU processes.
+- Extend Wine regression coverage to verify all three event-loop IAT hooks,
+  the guard state machine, UI heartbeat acknowledgement, timeout signaling,
+  and the tray's controller-only recovery path.
+
 ## [1.1.10] - 2026-08-03
 
 - Prevent Wine's blocking non-client right-click loop from freezing UU's Qt

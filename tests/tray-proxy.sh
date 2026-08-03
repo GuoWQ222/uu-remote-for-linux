@@ -15,6 +15,8 @@ from pathlib import Path
 import runpy
 import subprocess
 import tempfile
+import time
+from unittest import mock
 
 proxy = os.environ["PROXY_PATH"]
 source = Path(proxy).read_text()
@@ -68,6 +70,25 @@ with tempfile.TemporaryDirectory() as prefix:
         )
         assert not namespace["process_matches_prefix"](
             child.pid, namespace["canonical_path"](prefix + "-other")
+        )
+    finally:
+        child.terminate()
+        child.wait()
+
+with tempfile.TemporaryDirectory() as prefix:
+    environment = os.environ.copy()
+    environment["WINEPREFIX"] = prefix
+    controller_id = "4B6671A6-B8EA-4597-A9B7-3EFA8575855F"
+    (Path(prefix) / controller_id).write_text("sleep 5\n")
+    child = subprocess.Popen(
+        ["source=start.exe", controller_id],
+        executable="/bin/bash",
+        cwd=prefix,
+        env=environment,
+    )
+    try:
+        assert child.pid in namespace["controller_processes"](
+            namespace["canonical_path"](prefix)
         )
     finally:
         child.terminate()
@@ -129,6 +150,39 @@ with tempfile.TemporaryDirectory() as prefix:
 
     setting.write_text("[settingCenter]\nCloseOption=0\n")
     assert not namespace["exit_on_close_enabled"](prefix)
+
+with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as state:
+    recovery = proxy_class.__new__(proxy_class)
+    recovery.prefix = namespace["canonical_path"](prefix)
+    recovery.launcher = "/mock/uu-remote-for-linux"
+    recovery.log_file = Path(state) / "tray.log"
+    recovery.client_missing_ticks = 3
+    recovery.write_status = lambda *_args: None
+    marker = recovery.controller_restart_marker
+    marker.parent.mkdir(parents=True)
+    marker.write_text("reason=ui-message-timeout\n")
+    assert recovery.controller_recovery_requested()
+
+    recovery_globals = recovery.recover_controller.__globals__
+    original_controller_processes = recovery_globals["controller_processes"]
+    recovery_globals["controller_processes"] = lambda *_args: set()
+    try:
+        with mock.patch.object(namespace["subprocess"], "Popen") as popen:
+            assert recovery.recover_controller()
+            popen.assert_called_once()
+    finally:
+        recovery_globals["controller_processes"] = original_controller_processes
+    assert not marker.exists()
+    assert recovery.client_missing_ticks == 0
+    assert recovery.controller_recovery_grace_until > time.monotonic()
+
+    marker.write_text("reason=stale\n")
+    stale = time.time() - (
+        namespace["CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS"] + 5
+    )
+    os.utime(marker, (stale, stale))
+    assert not recovery.controller_recovery_requested()
+    assert not marker.exists()
 
 display = os.environ.get("DISPLAY")
 if display:

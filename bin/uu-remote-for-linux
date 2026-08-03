@@ -246,6 +246,7 @@ readonly input_bridge_status="$state_dir/input-bridge-status.json"
 readonly wayland_frame_hook_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 readonly controller_focus_hook_status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
 readonly controller_home_show_request="$prefix/drive_c/uu-remote-home-show.request"
+readonly controller_restart_request="$prefix/drive_c/uu-remote-controller-restart.request"
 readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
 readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
 readonly input_hook_preload="$install_dir/bin/uu-remote-input-hook.dll"
@@ -1457,6 +1458,7 @@ wayland_frame_hook_status_label() {
 controller_focus_hook_status_label() {
     local version="" status_bits="" subclassed="" transitions=""
     local storms="" resolved="" blocked="" modal="" handoffs=""
+    local guard_breaks="" health_timeouts="" recoveries=""
 
     if [[ ! -r $controller_focus_hook_status ]]; then
         printf '就绪（待主控窗口启动）'
@@ -1479,7 +1481,18 @@ controller_focus_hook_status_label() {
         "$controller_focus_hook_status" window_state modal_latches)
     handoffs=$(ini_section_value \
         "$controller_focus_hook_status" window_state post_modal_handoffs)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 9 &&
+    guard_breaks=$(ini_section_value \
+        "$controller_focus_hook_status" event_loop guard_breaks)
+    health_timeouts=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health timeouts)
+    recoveries=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health recovery_requests)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 14 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
+        printf '生效中（v%s；事件循环纠正 %s，UI 超时/恢复 %s/%s，顶层窗口 %s）' \
+            "$version" "${guard_breaks:-0}" "${health_timeouts:-0}" \
+            "${recoveries:-0}" "${subclassed:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 9 &&
         $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 127) == 127 )); then
         if [[ ${storms:-0} =~ ^[0-9]+$ ]] && (( storms > 0 )); then
             printf '生效中（v%s；顶层窗口 %s，争用 %s/%s，阻止抢焦 %s，接管切换 %s/%s）' \
@@ -2175,7 +2188,11 @@ controller_focus_hook_live() {
     # Active tray restore needs a live worker and at least one subclassed Qt
     # window. Some real UU builds do not import every activation API, so the
     # unrelated full activation mask must not disable the fast path.
-    (((status_bits & 48) == 48)) || return 1
+    if ((version >= 14)); then
+        (((status_bits & 947) == 947)) || return 1
+    else
+        (((status_bits & 48) == 48)) || return 1
+    fi
     modified=$(stat -c %Y "$controller_focus_hook_status" 2>/dev/null) || return 1
     printf -v now '%(%s)T' -1
     [[ $modified =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] || return 1
@@ -3660,7 +3677,8 @@ start_focus_injector() {
         if runtime_unit_active "$focus_injector_runtime_unit"; then
             return 0
         fi
-        rm -f -- "$controller_focus_hook_status"
+        rm -f -- "$controller_focus_hook_status" \
+            "$controller_restart_request"
         start_systemd_wine_image \
             "$focus_injector_runtime_unit" \
             "$input_injector" \
@@ -3671,7 +3689,8 @@ start_focus_injector() {
         return
     fi
     wine_path=$(command -v -- "$wine") || return 1
-    rm -f -- "$controller_focus_hook_status"
+    rm -f -- "$controller_focus_hook_status" \
+        "$controller_restart_request"
     (
         cd "$install_dir/bin"
         nohup env \

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from typing import Iterator
+import uuid
 
 
 APP_ID = "uu-remote-for-linux"
@@ -29,6 +30,10 @@ CLIENT_MISSING_GRACE_TICKS = 8
 CLIENT_QUIT_MARKER = (
     "GameViewerApplication::quitApplication] Quit application"
 )
+CONTROLLER_RESTART_MARKER = "uu-remote-controller-restart.request"
+CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS = 60
+CONTROLLER_RESTART_GRACE_SECONDS = 20
+CONTROLLER_TERMINATE_GRACE_SECONDS = 2
 
 
 class XClassHint(ctypes.Structure):
@@ -269,6 +274,18 @@ def process_name(pid: int) -> str:
         return ""
 
 
+def process_arguments(pid: int) -> list[str]:
+    try:
+        payload = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+    return [
+        value.decode(errors="replace")
+        for value in payload.split(b"\0")
+        if value
+    ]
+
+
 def process_matches_prefix(pid: int, prefix: str) -> bool:
     environment = process_environment(pid)
     if not environment:
@@ -287,6 +304,36 @@ def prefix_processes(prefix: str, executable: str) -> set[int]:
         if process_name(pid).casefold() != executable:
             continue
         if process_matches_prefix(pid, prefix):
+            result.add(pid)
+    return result
+
+
+def controller_processes(prefix: str) -> set[int]:
+    """Return the real Qt controller PIDs for one Wine prefix.
+
+    UU rewrites its controller command line to ``source=start.exe <uuid>``
+    after the outer GameViewer launcher exits. Linux then exposes the first
+    token as the process name, so matching only ``GameViewer.exe`` misses the
+    long-lived UI process. Prefix ownership plus this exact token keeps the
+    recovery target narrow and excludes GameViewerServer/Healthd/Service.
+    """
+
+    result = prefix_processes(prefix, "GameViewer.exe")
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+        pid = int(proc_entry.name)
+        if pid in result or not process_matches_prefix(pid, prefix):
+            continue
+        arguments = process_arguments(pid)
+        if (
+            len(arguments) == 2
+            and arguments[0].casefold() == "source=start.exe"
+        ):
+            try:
+                uuid.UUID(arguments[1])
+            except ValueError:
+                continue
             result.add(pid)
     return result
 
@@ -341,6 +388,7 @@ class TrayProxy:
         self.client_log_offset = 0
         self.client_log_tail = ""
         self.exit_in_progress = False
+        self.controller_recovery_grace_until = 0.0
 
     @property
     def client_log_dir(self) -> Path:
@@ -401,6 +449,98 @@ class TrayProxy:
         keep = max(len(CLIENT_QUIT_MARKER) - 1, 0)
         self.client_log_tail = text[-keep:] if keep else ""
         return CLIENT_QUIT_MARKER in text
+
+    @property
+    def controller_restart_marker(self) -> Path:
+        return Path(self.prefix) / "drive_c" / CONTROLLER_RESTART_MARKER
+
+    def controller_recovery_requested(self) -> bool:
+        marker = self.controller_restart_marker
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        except OSError:
+            logging.exception("无法读取 UU 主控恢复请求")
+            return False
+        if (
+            age < -5
+            or age > CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS
+        ):
+            logging.warning("丢弃过期的 UU 主控恢复请求：age=%.1fs", age)
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.exception("无法删除过期的 UU 主控恢复请求")
+            return False
+        return True
+
+    def recover_controller(self) -> bool:
+        """Restart only the hung Qt controller, preserving UU background services."""
+
+        marker = self.controller_restart_marker
+        controller_pids = controller_processes(self.prefix)
+        logging.warning(
+            "UU 主界面心跳超时，准备仅重启主控进程：pids=%s",
+            sorted(controller_pids),
+        )
+        self.write_status(
+            "recovering", "UU 主界面无响应，正在自动恢复"
+        )
+        for pid in controller_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                continue
+        deadline = time.monotonic() + CONTROLLER_TERMINATE_GRACE_SECONDS
+        remaining = set(controller_pids)
+        while remaining and time.monotonic() < deadline:
+            remaining = {
+                pid for pid in remaining if Path(f"/proc/{pid}").exists()
+            }
+            if remaining:
+                time.sleep(0.05)
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+        environment = os.environ.copy()
+        environment["UU_REMOTE_TRAY_PROXY_CHILD"] = "1"
+        log_handle = self.command_log_handle()
+        try:
+            subprocess.Popen(
+                [self.launcher],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception:
+            logging.exception("UU 主控进程自动恢复启动失败")
+            self.write_status(
+                "error", "UU 主界面自动恢复失败，请从托盘重新打开"
+            )
+            return False
+        finally:
+            log_handle.close()
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logging.exception("无法清理已消费的 UU 主控恢复请求")
+        self.controller_recovery_grace_until = (
+            time.monotonic() + CONTROLLER_RESTART_GRACE_SECONDS
+        )
+        self.client_missing_ticks = 0
+        logging.info("UU 主控进程自动恢复已启动")
+        return True
 
     def write_status(self, status: str, detail: str = "") -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -662,15 +802,22 @@ class TrayProxy:
 
     def periodic_check(self) -> bool:
         removed = self.remove_legacy_icons()
-        client_running = bool(prefix_processes(self.prefix, "GameViewer.exe"))
+        client_running = bool(controller_processes(self.prefix))
         decoder_workflow_running = (
             self.decoder_process is not None
             and self.decoder_process.poll() is None
         )
         client_quit = self.consume_client_quit_event()
+        if self.controller_recovery_requested():
+            if self.recover_controller():
+                return True
+        recovery_grace = time.monotonic() < getattr(
+            self, "controller_recovery_grace_until", 0.0
+        )
         if (
             client_quit
             and not decoder_workflow_running
+            and not recovery_grace
             and exit_on_close_enabled(self.prefix)
         ):
             logging.info(
@@ -683,7 +830,7 @@ class TrayProxy:
         if client_running:
             self.ever_saw_client = True
             self.client_missing_ticks = 0
-        elif decoder_workflow_running:
+        elif decoder_workflow_running or recovery_grace:
             self.client_missing_ticks = 0
         elif self.ever_saw_client:
             self.client_missing_ticks += 1
