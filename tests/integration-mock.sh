@@ -50,7 +50,33 @@ if "$launcher" --decoder unknown >"$test_root/unknown.out" 2>"$test_root/unknown
 fi
 grep -q '不可选择或未知设备' "$test_root/unknown.err"
 
-"$launcher" --accept-eula --setup-only
+headless_root="$test_root/headless"
+if env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_DATA_HOME="$headless_root/data" \
+    XDG_STATE_HOME="$headless_root/state" \
+    XDG_CACHE_HOME="$headless_root/cache" \
+    "$launcher" --setup-only \
+    >"$test_root/headless.out" 2>"$test_root/headless.err"; then
+    printf '无图形环境下首次设置被意外自动接受。\n' >&2
+    exit 1
+fi
+grep -q '首次设置前请阅读' "$test_root/headless.err"
+test ! -e "$headless_root/data/uu-remote-for-linux/eula-accepted"
+
+UU_REMOTE_FAKE_ZENITY_CANCEL=1 "$launcher"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/eula-accepted"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/wineprefix/system.reg"
+if grep -q '^INSTALL$\|^CLIENT$' "$UU_REMOTE_FAKE_TRACE"; then
+    printf '拒绝 EULA 后仍执行了安装或启动。\n' >&2
+    exit 1
+fi
+
+"$launcher"
+grep -q '^EULA_FETCH$' "$UU_REMOTE_FAKE_TRACE"
+grep -q 'ZENITY .*--text-info' "$UU_REMOTE_FAKE_TRACE"
+grep -q 'ZENITY .*--checkbox=' "$UU_REMOTE_FAKE_TRACE"
+grep -q 'ZENITY .*--ok-label=接受并继续' "$UU_REMOTE_FAKE_TRACE"
+grep -q '^CLIENT$' "$UU_REMOTE_FAKE_TRACE"
 
 prefix="$XDG_DATA_HOME/uu-remote-for-linux/wineprefix"
 install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"

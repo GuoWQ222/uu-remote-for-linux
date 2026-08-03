@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.8] - 2026-08-03
+
+- Add a first-launch graphical license flow. A normal desktop or command-line
+  launch now downloads and displays NetEase's official UU Remote agreement in
+  a read-only Zenity window with explicit accept and reject actions.
+- Continue directly through isolated Wine, UU client, and WebView2 setup before
+  opening the application when the user accepts. Rejecting or closing the
+  dialog records nothing and performs no installation or launch.
+- Keep non-graphical and unattended sessions non-interactive: they still
+  require the explicit `--accept-eula --setup-only` command, and autostart can
+  never accept a license on the user's behalf.
+- Add regression coverage for graphical acceptance, refusal, full first-run
+  setup and launch, official-page parsing, and the headless fallback.
+
 ## [1.1.7] - 2026-08-03
 
 - Preserve an explicitly hidden home window while a remote-video window is

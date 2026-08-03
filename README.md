@@ -51,19 +51,27 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.7_amd64.deb
-uu-remote-for-linux --accept-eula --setup-only
+sudo apt install ./uu-remote-for-linux_1.1.8_amd64.deb
 ```
+
+Then launch **UU Remote for Linux** from the Ubuntu application menu, or run
+`uu-remote-for-linux`. On first launch, a window displays NetEase's official
+UU Remote license agreement. Accepting it automatically installs the isolated
+Windows client and WebView2 runtime, then opens UU Remote; rejecting it leaves
+the client uninstalled and exits.
+
+For a terminal-only session, read the [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html)
+and explicitly run `uu-remote-for-linux --accept-eula --setup-only`.
 
 ### Install from source (optional)
 
 ```bash
-sudo apt install python3-gi gir1.2-gstreamer-1.0 \
+sudo apt install python3-gi zenity gir1.2-gstreamer-1.0 \
   gstreamer1.0-pipewire gstreamer1.0-plugins-base
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
-~/.local/bin/uu-remote-for-linux --accept-eula --setup-only
+~/.local/bin/uu-remote-for-linux
 ```
 
 ## Usage (command line)

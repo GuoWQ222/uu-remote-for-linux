@@ -3,6 +3,7 @@ set -euo pipefail
 
 output_file=""
 head_only=false
+request_url=""
 latest_version=${UU_REMOTE_FAKE_LATEST_VERSION:-4.34.0.8979}
 effective_url="https://a56.gdl.netease.com/UURemote_Setup_${latest_version}_0723104500_gwqd.exe?test=1"
 
@@ -19,12 +20,29 @@ while (($# > 0)); do
             shift
             output_file=${1:?}
             ;;
+        http://*|https://*)
+            request_url=$1
+            ;;
     esac
     shift
 done
 
 if ! $head_only; then
     [[ -n $output_file ]]
+    if [[ $request_url == *'/contact/20240402/40294_1146065.html' ]]; then
+        printf 'EULA_FETCH\n' >>"${UU_REMOTE_FAKE_TRACE:?}"
+        printf '%s\n' \
+            '<!doctype html><html><body>' \
+            '<div class="news-article">' \
+            '<h1>网易UU远程软件许可及服务协议</h1>' \
+            '<p>本版更新时间：【2024】年【3】月【29】日</p>' \
+            '<p>请用户认真阅读本协议全部条款。用户点击接受并继续，表示已经阅读、理解并同意本协议。</p>' \
+            '<p>1、软件许可。用户应依法使用网易UU远程软件及服务。</p>' \
+            '<p>2、用户责任。用户应妥善保管账号并遵守适用法律及本协议约定。</p>' \
+            '<p>3、其他。完整内容以网易UU远程官方网站公布的协议为准。</p>' \
+            '</div></body></html>' >"$output_file"
+        exit 0
+    fi
     printf 'MZ' >"$output_file"
     truncate -s 11534336 "$output_file"
 fi

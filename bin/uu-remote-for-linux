@@ -7,6 +7,7 @@ readonly app_name="UU 远程（Linux 版本）"
 readonly min_wine_version="11.1"
 readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
 readonly eula_url="https://uuyc.163.com/contact/20240402/40294_1146065.html"
+readonly zenity_bin="${UU_REMOTE_ZENITY_BIN:-zenity}"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
@@ -355,6 +356,134 @@ die() {
     notify_status "$1"
     printf '错误：%s\n' "$1" >&2
     exit 1
+}
+
+eula_gui_prompt_allowed() {
+    [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || return 1
+    command -v "$zenity_bin" >/dev/null 2>&1 || return 1
+    $autostart_launch && return 1
+    if $update_check_requested || $stop_requested || $diagnose_requested ||
+        $enable_hwdecode || $disable_hwdecode ||
+        $enable_wol || $disable_wol ||
+        $select_decoder_requested || $select_decoder_restart_requested ||
+        $restart_selected_decoder || $list_decoders_requested ||
+        [[ -n $decoder_direct_choice ]]; then
+        return 1
+    fi
+    return 0
+}
+
+prompt_eula_acceptance() {
+    local html_file text_file status=0
+
+    html_file=$(mktemp "$cache_dir/.eula-source.XXXXXX") || return 2
+    text_file=$(mktemp "$cache_dir/.eula-text.XXXXXX") || {
+        rm -f -- "$html_file"
+        return 2
+    }
+    if ! curl --fail --location --silent --show-error --retry 2 \
+        --connect-timeout 10 --max-time 30 \
+        --output "$html_file" "$eula_url"; then
+        rm -f -- "$html_file" "$text_file"
+        "$zenity_bin" --error \
+            --title='无法加载网易 UU 远程许可协议' \
+            --width=560 \
+            --text="请检查网络连接后重新启动。也可先在浏览器阅读：\n$eula_url" \
+            >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! /usr/bin/python3 - "$html_file" "$text_file" "$eula_url" <<'PY'
+import html
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+
+class AgreementParser(HTMLParser):
+    block_tags = {
+        "article", "div", "h1", "h2", "h3", "h4", "li", "p",
+        "section", "table", "td", "th", "tr", "ul", "ol",
+    }
+    void_tags = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = set(attributes.get("class", "").split())
+        if not self.depth and "news-article" in classes:
+            self.depth = 1
+            return
+        if not self.depth:
+            return
+        if tag == "br":
+            self.parts.append("\n")
+        elif tag in self.block_tags:
+            self.parts.append("\n")
+        if tag not in self.void_tags:
+            self.depth += 1
+
+    def handle_endtag(self, tag):
+        if not self.depth:
+            return
+        if tag in self.block_tags:
+            self.parts.append("\n")
+        if tag not in self.void_tags:
+            self.depth -= 1
+
+    def handle_data(self, data):
+        if self.depth:
+            self.parts.append(data)
+
+
+source_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+source_url = sys.argv[3]
+parser = AgreementParser()
+parser.feed(source_path.read_text(encoding="utf-8", errors="replace"))
+text = html.unescape("".join(parser.parts)).replace("\xa0", " ")
+text = re.sub(r"[ \t\r\f\v]+", " ", text)
+text = re.sub(r" *\n *", "\n", text)
+text = re.sub(r"\n{3,}", "\n\n", text).strip()
+if "网易UU远程软件许可及服务协议" not in text or len(text) < 100:
+    raise SystemExit("official agreement body was not found")
+output_path.write_text(
+    "本协议正文来自网易 UU 远程官方网站。\n"
+    f"官方原文：{source_url}\n\n{text}\n",
+    encoding="utf-8",
+)
+PY
+    then
+        rm -f -- "$html_file" "$text_file"
+        "$zenity_bin" --error \
+            --title='无法解析网易 UU 远程许可协议' \
+            --width=560 \
+            --text="官方协议页面格式发生变化，未记录任何接受状态。\n请稍后重试或访问：\n$eula_url" \
+            >/dev/null 2>&1 || true
+        return 2
+    fi
+
+    "$zenity_bin" --text-info \
+        --title='网易 UU 远程软件许可及服务协议' \
+        --filename="$text_file" \
+        --width=900 \
+        --height=700 \
+        --checkbox='我已阅读并同意上述《网易UU远程软件许可及服务协议》' \
+        --ok-label='接受并继续' \
+        --cancel-label='拒绝并退出' >/dev/null 2>&1 || status=$?
+    rm -f -- "$html_file" "$text_file"
+    case $status in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 usage() {
@@ -2458,12 +2587,33 @@ check_base_requirements
 
 mkdir -p "$data_dir" "$state_dir" "$cache_dir"
 
+if [[ ! -r $eula_stamp ]] && ! $accept_eula && eula_gui_prompt_allowed; then
+    eula_prompt_status=0
+    prompt_eula_acceptance || eula_prompt_status=$?
+    case $eula_prompt_status in
+        0)
+            accept_eula=true
+            ;;
+        1)
+            notify_status "您已拒绝许可协议；未安装或启动 UU 远程"
+            printf '未接受网易 UU 远程许可协议；未进行初始化或启动。\n'
+            exit 0
+            ;;
+        *)
+            die "无法显示完整许可协议；未记录接受状态，请检查网络后重试"
+            ;;
+    esac
+fi
+
 if $accept_eula; then
+    eula_acceptance_temp=$(mktemp "${eula_stamp}.tmp.XXXXXX") ||
+        die "无法创建许可接受状态文件"
     {
         printf 'accepted_at=%(%FT%T%z)T\n' -1
         printf 'eula_url=%s\n' "$eula_url"
-    } >"${eula_stamp}.tmp"
-    mv -f "${eula_stamp}.tmp" "$eula_stamp"
+    } >"$eula_acceptance_temp"
+    chmod 0600 "$eula_acceptance_temp"
+    mv -f "$eula_acceptance_temp" "$eula_stamp"
 fi
 
 if [[ ! -r $eula_stamp ]]; then

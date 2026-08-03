@@ -42,19 +42,26 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.7_amd64.deb
-uu-remote-for-linux --accept-eula --setup-only
+sudo apt install ./uu-remote-for-linux_1.1.8_amd64.deb
 ```
+
+安装完成后，从 Ubuntu 应用菜单点击“UU 远程（Linux 版本）”，或运行
+`uu-remote-for-linux`。首次启动会显示网易官方《UU 远程软件许可及服务协议》；
+选择“接受并继续”后，程序会自动安装独立的 Windows 客户端和 WebView2，随后
+直接打开 UU 远程。选择“拒绝并退出”不会写入接受状态，也不会安装或启动客户端。
+
+纯终端环境下，请先阅读[官方协议](https://uuyc.163.com/contact/20240402/40294_1146065.html)，
+再显式运行 `uu-remote-for-linux --accept-eula --setup-only`。
 
 ### 从源码安装（可选）
 
 ```bash
-sudo apt install python3-gi gir1.2-gstreamer-1.0 \
+sudo apt install python3-gi zenity gir1.2-gstreamer-1.0 \
   gstreamer1.0-pipewire gstreamer1.0-plugins-base
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
-~/.local/bin/uu-remote-for-linux --accept-eula --setup-only
+~/.local/bin/uu-remote-for-linux
 ```
 
 ## 使用方法（命令行）

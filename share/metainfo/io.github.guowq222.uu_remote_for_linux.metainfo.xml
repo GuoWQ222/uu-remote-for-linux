@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.8" date="2026-08-03">
+      <description>
+        <p>Add a first-launch license window that shows NetEase's official UU Remote agreement and, after explicit acceptance, automatically initializes the isolated client before opening the application.</p>
+      </description>
+    </release>
     <release version="1.1.7" date="2026-08-03">
       <description>
         <p>Keep a user-closed home window hidden during an active remote session, and eliminate controller hangs by moving window arbitration onto the Qt UI thread with bounded focus repair.</p>
