@@ -30,7 +30,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.8_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.9_amd64.deb
 ```
 
 安装完成后，从 Ubuntu 应用菜单点击“UU 远程（Linux 版本）”，或运行

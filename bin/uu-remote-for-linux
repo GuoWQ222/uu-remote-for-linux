@@ -2162,6 +2162,40 @@ ini_section_value() {
     ' "$file" 2>/dev/null
 }
 
+controller_focus_hook_live() {
+    local version status_bits modified now
+
+    [[ -r $controller_focus_hook_status ]] || return 1
+    version=$(ini_section_value \
+        "$controller_focus_hook_status" hook version)
+    status_bits=$(ini_section_value \
+        "$controller_focus_hook_status" hook status_bits)
+    [[ $version =~ ^[0-9]+$ && $version -ge 12 ]] || return 1
+    [[ $status_bits =~ ^[0-9]+$ ]] || return 1
+    # Active tray restore needs a live worker and at least one subclassed Qt
+    # window. Some real UU builds do not import every activation API, so the
+    # unrelated full activation mask must not disable the fast path.
+    (((status_bits & 48) == 48)) || return 1
+    modified=$(stat -c %Y "$controller_focus_hook_status" 2>/dev/null) || return 1
+    printf -v now '%(%s)T' -1
+    [[ $modified =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] || return 1
+    ((modified <= now && now - modified <= 3))
+}
+
+request_controller_home_show() {
+    local attempt
+
+    (
+        umask 077
+        : >"$controller_home_show_request"
+    ) || return 1
+    for ((attempt = 0; attempt < 40; attempt++)); do
+        [[ -e $controller_home_show_request ]] || return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 wol_hook_runtime_label() {
     local version addresses addresses_patched info info_patched
     local if_table2 if_table2_patched
@@ -2629,6 +2663,13 @@ unset WEBVIEW2_BROWSER_EXECUTABLE_FOLDER
 unset WEBVIEW2_CHANNEL_SEARCH_KIND
 unset WEBVIEW2_RELEASE_CHANNELS
 unset WEBVIEW2_USER_DATA_FOLDER
+
+if $show_requested && controller_focus_hook_live; then
+    if request_controller_home_show; then
+        exit 0
+    fi
+    rm -f -- "$controller_home_show_request"
+fi
 
 [[ $operation_lock_timeout =~ ^[0-9]+$ ]] ||
     die "UU_REMOTE_OPERATION_LOCK_TIMEOUT 必须是非负整数"
@@ -3685,10 +3726,9 @@ start_keyboard_bridge ||
 start_tray_proxy ||
     die "Linux 原生托盘代理启动失败，详见 $tray_proxy_log"
 if $show_requested; then
-    (
-        umask 077
-        : >"$controller_home_show_request"
-    ) || die "无法授权显示 UU 主界面"
+    if request_controller_home_show; then
+        exit 0
+    fi
 fi
 if $uri_requested; then
     exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \

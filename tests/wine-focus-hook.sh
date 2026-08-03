@@ -75,7 +75,7 @@ WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
     WINEPREFIX="$prefix" WINEDEBUG=-all timeout 20s \
         wine 'C:\probe\bin\GameViewer.exe'
 )
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=11'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=12'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=127'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'

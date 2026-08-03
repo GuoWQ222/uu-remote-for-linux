@@ -280,6 +280,37 @@ fi
 grep -q '^TRAY_PROXY ' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^HWDECODE_ENV$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CUDA_DEVICE=0$' "$UU_REMOTE_FAKE_TRACE"
+
+# A live v12 focus hook consumes the tray's one-shot show request directly.
+# The launcher must not run the complete Wine startup path or launch a second
+# GameViewer instance in this case.
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=949' \
+    'version=12' \
+    'status_bits=63' \
+    '[worker]' \
+    'heartbeats=10' \
+    >"$prefix/drive_c/uu-remote-focus-hook-status.ini"
+show_request="$prefix/drive_c/uu-remote-home-show.request"
+(
+    for _attempt in {1..100}; do
+        if [[ -e $show_request ]]; then
+            rm -f -- "$show_request"
+            exit 0
+        fi
+        sleep 0.02
+    done
+    exit 1
+) &
+show_consumer_pid=$!
+client_count_before_show=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+"$launcher" --show
+wait "$show_consumer_pid"
+test ! -e "$show_request"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$client_count_before_show"
+
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-healthd' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-server' "$UU_REMOTE_FAKE_TRACE"
 if grep -q -- '--watch-module GameViewer.exe Qt5Core.dll' \

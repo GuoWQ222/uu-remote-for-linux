@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.9] - 2026-08-03
+
+- Make the native tray's “Show main window” action an active one-shot command.
+  A live v12 controller hook now restores and activates the real hidden Qt home
+  window on its UI thread instead of waiting for UU to issue another unreliable
+  `ShowWindow` call; stale requests expire safely, and live instances bypass the
+  full Wine startup path.
+
 ## [1.1.8] - 2026-08-03
 
 - Add a first-launch graphical license flow. A normal desktop or command-line

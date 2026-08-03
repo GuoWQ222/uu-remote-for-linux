@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 11u
+#define HOOK_VERSION 12u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -52,9 +52,11 @@
 #define FOCUS_APPLY_COOLDOWN_MS 750u
 #define FOCUS_WINDOW_SCAN_MS 250u
 #define FOCUS_MODULE_SCAN_MS 1000u
+#define FOCUS_SHOW_REQUEST_TTL_MS 30000u
 #define FOCUS_MAX_WINDOWS 64u
 #define FOCUS_MAX_MODULES 256u
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
+#define WM_UU_HOME_SHOW (WM_APP + 0x4b2u)
 
 enum focus_window_role {
     FOCUS_ROLE_UNKNOWN = 0,
@@ -2203,6 +2205,56 @@ static void focus_clear_latch(void) {
     InterlockedExchange(&focus_preferred_role, FOCUS_ROLE_UNKNOWN);
 }
 
+static BOOL focus_home_show_request_pending(void) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    FILETIME current_time;
+    ULARGE_INTEGER modified;
+    ULARGE_INTEGER current;
+    ULONGLONG maximum_age;
+
+    if (
+        !focus_show_request_path[0] ||
+        !GetFileAttributesExA(
+            focus_show_request_path,
+            GetFileExInfoStandard,
+            &attributes
+        )
+    ) {
+        return FALSE;
+    }
+    if (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        DeleteFileA(focus_show_request_path);
+        return FALSE;
+    }
+    GetSystemTimeAsFileTime(&current_time);
+    modified.LowPart = attributes.ftLastWriteTime.dwLowDateTime;
+    modified.HighPart = attributes.ftLastWriteTime.dwHighDateTime;
+    current.LowPart = current_time.dwLowDateTime;
+    current.HighPart = current_time.dwHighDateTime;
+    maximum_age = (ULONGLONG)FOCUS_SHOW_REQUEST_TTL_MS * 10000u;
+    if (
+        current.QuadPart >= modified.QuadPart &&
+        current.QuadPart - modified.QuadPart > maximum_age
+    ) {
+        DeleteFileA(focus_show_request_path);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL focus_consume_home_show_request(void) {
+    if (
+        !focus_home_show_request_pending() ||
+        !DeleteFileA(focus_show_request_path)
+    ) {
+        return FALSE;
+    }
+    InterlockedExchange(&focus_home_hidden_by_user, 0);
+    InterlockedIncrement(&focus_home_show_authorized);
+    focus_clear_latch();
+    return TRUE;
+}
+
 static BOOL focus_show_command_makes_visible(int command) {
     switch (command) {
         case SW_SHOW:
@@ -2239,13 +2291,7 @@ static BOOL focus_home_raise_is_blocked(HWND window) {
         InterlockedExchange(&focus_home_hidden_by_user, 0);
         return FALSE;
     }
-    if (
-        focus_show_request_path[0] &&
-        DeleteFileA(focus_show_request_path)
-    ) {
-        InterlockedExchange(&focus_home_hidden_by_user, 0);
-        InterlockedIncrement(&focus_home_show_authorized);
-        focus_clear_latch();
+    if (focus_consume_home_show_request()) {
         return FALSE;
     }
     InterlockedIncrement(&focus_home_reopen_blocked);
@@ -2442,6 +2488,17 @@ static LRESULT CALLBACK focus_subclass_window_proc(
         original_proc == focus_subclass_window_proc
     ) {
         return DefWindowProcW(window, message, wparam, lparam);
+    }
+    if (message == WM_UU_HOME_SHOW) {
+        if (
+            role == FOCUS_ROLE_HOME &&
+            focus_consume_home_show_request()
+        ) {
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+            write_focus_hook_status();
+        }
+        return 0;
     }
     if (
         message == WM_NULL &&
@@ -2665,6 +2722,9 @@ static BOOL CALLBACK focus_scan_window(HWND window, LPARAM parameter) {
         role = focus_window_role_for(window);
     }
     focus_ensure_window_subclassed(window, role);
+    if (role == FOCUS_ROLE_HOME) {
+        scan->home = window;
+    }
     if (!IsWindowVisible(window)) {
         return TRUE;
     }
@@ -2681,9 +2741,7 @@ static BOOL CALLBACK focus_scan_window(HWND window, LPARAM parameter) {
     } else if (role == FOCUS_ROLE_VIDEO && area >= scan->video_area) {
         scan->video = window;
         scan->video_area = area;
-    } else if (role == FOCUS_ROLE_HOME) {
-        scan->home = window;
-    } else {
+    } else if (role != FOCUS_ROLE_HOME) {
         ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
         if (
             !GetWindow(window, GW_OWNER) &&
@@ -2755,6 +2813,12 @@ static void focus_arbitrate_windows(void) {
         &focus_visible_remote_window,
         scan.video ? scan.video : scan.nonhome
     );
+    if (
+        scan.home &&
+        focus_home_show_request_pending()
+    ) {
+        PostMessageW(scan.home, WM_UU_HOME_SHOW, 0, 0);
+    }
     modal_visible = scan.dialog != NULL;
     if (modal_visible) {
         if (!focus_modal_was_visible) {
@@ -3218,9 +3282,7 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
 }
 
 static BOOL initialize_controller_focus_hook(void) {
-    if (focus_show_request_path[0]) {
-        DeleteFileA(focus_show_request_path);
-    }
+    focus_home_show_request_pending();
     patch_controller_focus_imports();
     patch_all_focus_activation_imports();
     focus_queue_arbitration();

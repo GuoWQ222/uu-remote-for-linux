@@ -85,6 +85,36 @@ static BOOL create_home_show_request(void) {
     return TRUE;
 }
 
+static BOOL age_home_show_request(DWORD age_ms) {
+    HANDLE request;
+    FILETIME current_time;
+    FILETIME modified_time;
+    ULARGE_INTEGER modified;
+    BOOL result;
+
+    request = CreateFileW(
+        L"C:\\uu-remote-home-show.request",
+        FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (request == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    GetSystemTimeAsFileTime(&current_time);
+    modified.LowPart = current_time.dwLowDateTime;
+    modified.HighPart = current_time.dwHighDateTime;
+    modified.QuadPart -= (ULONGLONG)age_ms * 10000u;
+    modified_time.dwLowDateTime = modified.LowPart;
+    modified_time.dwHighDateTime = modified.HighPart;
+    result = SetFileTime(request, NULL, NULL, &modified_time);
+    CloseHandle(request);
+    return result;
+}
+
 static void pump_messages_for(DWORD duration_ms) {
     ULONGLONG deadline = GetTickCount64() + duration_ms;
 
@@ -373,17 +403,38 @@ int WINAPI WinMain(
         return 16;
     }
 
-    /* The native tray's explicit --show request authorizes exactly one show. */
-    if (!create_home_show_request()) {
+    /* An abandoned request must expire without reopening the home window. */
+    if (
+        !create_home_show_request() ||
+        !age_home_show_request(60000u)
+    ) {
         return 17;
     }
-    ShowWindow(main_window, SW_SHOW);
+    pump_messages_for(700);
+    if (
+        IsWindowVisible(main_window) ||
+        GetFileAttributesW(L"C:\\uu-remote-home-show.request") !=
+            INVALID_FILE_ATTRIBUTES
+    ) {
+        return 18;
+    }
+
+    /*
+     * The native tray's explicit --show request is an active one-shot command.
+     * UU does not reliably issue another ShowWindow call when a second launcher
+     * instance starts, so the hook itself must restore the hidden home window
+     * on the controller UI thread.
+     */
+    if (!create_home_show_request()) {
+        return 22;
+    }
+    pump_messages_for(700);
     if (
         !IsWindowVisible(main_window) ||
         GetFileAttributesW(L"C:\\uu-remote-home-show.request") !=
             INVALID_FILE_ATTRIBUTES
     ) {
-        return 18;
+        return 23;
     }
 
     /* Once no remote window remains visible, normal home showing is restored. */
