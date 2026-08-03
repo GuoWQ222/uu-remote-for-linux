@@ -25,7 +25,9 @@ jobs:
             desktop-file-utils \
             file \
             gir1.2-appindicator3-0.1 \
+            gir1.2-gstreamer-1.0 \
             gir1.2-gtk-3.0 \
+            gstreamer1.0-plugins-base \
             libx11-6 \
             libxml2-utils \
             python3-gi \

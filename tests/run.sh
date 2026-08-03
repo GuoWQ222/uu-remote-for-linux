@@ -164,9 +164,11 @@ check "input hook is Win64 DLL" bash -c \
 check "input hook exports version" bash -c \
     'objdump -p "$1" | grep -q "UURemoteInputHookVersion"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports Wayland frame status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteFrameHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports controller focus status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteFocusHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
