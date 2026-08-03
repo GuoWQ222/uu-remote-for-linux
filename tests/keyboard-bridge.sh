@@ -56,6 +56,16 @@ wait_for_value() {
     return 1
 }
 
+wait_for_absence() {
+    local path=$1 attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [[ -e $path ]] || return 0
+        sleep 0.02
+    done
+    printf '等待文件删除超时：%s\n' "$path" >&2
+    return 1
+}
+
 assert_originals() {
     [[ $(<"$settings_root/switch") == \
         "['<Super>space', 'XF86Keyboard']" ]]
@@ -105,7 +115,7 @@ wait_for_value "$settings_root/switch_backward" \
     "['<Shift><Super>space', '<Shift>XF86Keyboard']"
 wait_for_value "$settings_root/ibus_triggers" "['<Super>space']"
 wait_for_value "$settings_root/overlay" "'Super_L'"
-[[ ! -e $state_dir/keyboard-bridge-restore.json ]]
+wait_for_absence "$state_dir/keyboard-bridge-restore.json"
 
 printf '%s\n' remote >"$focus"
 wait_for_value "$settings_root/switch" "['XF86Keyboard']"
