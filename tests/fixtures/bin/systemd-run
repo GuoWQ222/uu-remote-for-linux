@@ -3,6 +3,10 @@ set -euo pipefail
 
 printf 'SYSTEMD_RUN %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 
+if [[ ${UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC:-0} == 1 ]]; then
+    exit 0
+fi
+
 workdir=
 declare -a environment=()
 while (($# > 0)); do

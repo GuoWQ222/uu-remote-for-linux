@@ -1778,8 +1778,14 @@ start_update_bridge() {
     }
     if systemd_user_available; then
         if runtime_unit_active "$update_runtime_unit"; then
-            active_version=$(sed -n 's/^package_version=//p' \
-                "$update_bridge_status" 2>/dev/null | head -n1)
+            # A bridge started by an older package may not have written the
+            # versioned status file yet.  Missing migration state must be
+            # treated as an unknown version, not as a fatal launcher error
+            # under `set -e -o pipefail`.
+            if [[ -r $update_bridge_status ]]; then
+                active_version=$(sed -n 's/^package_version=//p' \
+                    "$update_bridge_status" | head -n1 || true)
+            fi
             if [[ $active_version == "$package_version" ]]; then
                 return
             fi

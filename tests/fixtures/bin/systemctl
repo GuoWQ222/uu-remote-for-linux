@@ -12,6 +12,12 @@ case "$*" in
         exit 0
         ;;
     *" is-active "*)
+        requested_unit=${!#}
+        case " ${UU_REMOTE_FAKE_ACTIVE_UNITS:-} " in
+            *" $requested_unit "*)
+                exit 0
+                ;;
+        esac
         exit 1
         ;;
     *)

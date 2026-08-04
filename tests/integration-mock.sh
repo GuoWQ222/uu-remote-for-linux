@@ -83,6 +83,25 @@ install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 cache_dir="$XDG_CACHE_HOME/uu-remote-for-linux"
 state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
 
+# Package upgrades can inherit a live update bridge created before versioned
+# status files existed.  The launcher must replace that bridge and continue to
+# the client instead of exiting because the missing file makes sed fail under
+# `set -e -o pipefail`.
+rm -f -- "$state_dir/update-bridge-status"
+client_count_before_bridge_migration=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_DISABLE_UPDATE_WATCHER=0 \
+UU_REMOTE_FAKE_ACTIVE_UNITS=uu-remote-for-linux-update.service \
+UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC=1 \
+    "$launcher"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$((client_count_before_bridge_migration + 1))"
+grep -q \
+    'SYSTEMCTL --user stop uu-remote-for-linux-update.service' \
+    "$UU_REMOTE_FAKE_TRACE"
+grep -q \
+    'SYSTEMD_RUN .*--unit=uu-remote-for-linux-update .*update-bridge-status' \
+    "$UU_REMOTE_FAKE_TRACE"
+
 test -f "$XDG_DATA_HOME/uu-remote-for-linux/eula-accepted"
 test -f "$prefix/system.reg"
 test -f "$install_dir/GameViewer.exe"

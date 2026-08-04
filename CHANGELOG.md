@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.16] - 2026-08-04
+
+- Treat a live update bridge without versioned migration state as an unknown
+  older instance, stop it, and replace it with the packaged bridge instead of
+  letting a missing status file abort the launcher under `set -e -o pipefail`.
+- Add an upgrade regression that proves the stale bridge is replaced and the
+  Qt controller still starts when no update-bridge status file exists.
+
 ## [1.1.15] - 2026-08-04
 
 - Replace the silent `Upgrade.exe` blocker with a Win64 handoff stub that
