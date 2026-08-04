@@ -281,9 +281,9 @@ grep -q '^TRAY_PROXY ' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^HWDECODE_ENV$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CUDA_DEVICE=0$' "$UU_REMOTE_FAKE_TRACE"
 
-# A live v12 focus hook consumes the tray's one-shot show request directly.
-# The launcher must not run the complete Wine startup path or launch a second
-# GameViewer instance in this case.
+# A live focus hook turns --show into a one-shot authorization and then starts
+# a second GameViewer instance. UU's single-instance IPC must perform the real
+# Qt show so WebView2 resumes together with the native window.
 printf '%s\r\n' \
     '[hook]' \
     'pid=949' \
@@ -309,7 +309,7 @@ client_count_before_show=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 wait "$show_consumer_pid"
 test ! -e "$show_request"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
-    "$client_count_before_show"
+    "$((client_count_before_show + 1))"
 
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-healthd' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-server' "$UU_REMOTE_FAKE_TRACE"

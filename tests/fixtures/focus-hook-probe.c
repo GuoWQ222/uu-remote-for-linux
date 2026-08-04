@@ -499,21 +499,30 @@ int WINAPI WinMain(
     }
 
     /*
-     * The native tray's explicit --show request is an active one-shot command.
-     * UU does not reliably issue another ShowWindow call when a second launcher
-     * instance starts, so the hook itself must restore the hidden home window
-     * on the controller UI thread.
+     * The native tray's explicit --show request is only an authorization.
+     * It must never map the native HWND on its own because that bypasses Qt's
+     * QWidget visibility state and leaves WebView2 suspended behind a white
+     * shell. The second GameViewer instance drives the real application show.
      */
     if (!create_home_show_request()) {
         return 22;
     }
     pump_messages_for(700);
     if (
+        IsWindowVisible(main_window) ||
+        GetFileAttributesW(L"C:\\uu-remote-home-show.request") ==
+            INVALID_FILE_ATTRIBUTES
+    ) {
+        return 23;
+    }
+    ShowWindow(main_window, SW_SHOW);
+    pump_messages_for(300);
+    if (
         !IsWindowVisible(main_window) ||
         GetFileAttributesW(L"C:\\uu-remote-home-show.request") !=
             INVALID_FILE_ATTRIBUTES
     ) {
-        return 23;
+        return 31;
     }
 
     /* Once no remote window remains visible, normal home showing is restored. */

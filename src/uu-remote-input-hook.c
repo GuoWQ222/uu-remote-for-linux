@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 16u
+#define HOOK_VERSION 17u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -64,7 +64,6 @@
 #define FOCUS_MAX_WINDOWS 64u
 #define FOCUS_MAX_MODULES 256u
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
-#define WM_UU_HOME_SHOW (WM_APP + 0x4b2u)
 #define WM_UU_UI_HEALTH (WM_APP + 0x4b3u)
 #define WM_UU_FOCUS_ARBITRATE (WM_APP + 0x4b4u)
 #define WM_QT_SENDPOSTEDEVENTS (WM_USER + 1u)
@@ -3367,17 +3366,6 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     ) {
         return DefWindowProcW(window, message, wparam, lparam);
     }
-    if (message == WM_UU_HOME_SHOW) {
-        if (
-            role == FOCUS_ROLE_HOME &&
-            focus_consume_home_show_request()
-        ) {
-            ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
-            write_focus_hook_status();
-        }
-        return 0;
-    }
     if (message == WM_UU_UI_HEALTH) {
         if (
             window == (HWND)InterlockedCompareExchangePointer(
@@ -3735,12 +3723,6 @@ static void focus_arbitrate_windows(void) {
         &focus_visible_remote_window,
         scan.video ? scan.video : scan.nonhome
     );
-    if (
-        scan.home &&
-        focus_home_show_request_pending()
-    ) {
-        PostMessageW(scan.home, WM_UU_HOME_SHOW, 0, 0);
-    }
     modal_visible = scan.dialog != NULL;
     if (modal_visible) {
         if (!focus_modal_was_visible) {
@@ -4297,9 +4279,8 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
             InterlockedExchange(&focus_module_scan_pending, 1);
             last_activation_scan = now;
         }
-        if (focus_home_show_request_pending()) {
-            focus_request_arbitration(NULL);
-        }
+        /* Expire abandoned tray authorizations without touching any window. */
+        (void)focus_home_show_request_pending();
         current_signature = (LONG64)focus_window_state_signature_value();
         previous_signature = InterlockedExchange64(
             &focus_last_window_signature, current_signature

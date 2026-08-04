@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.14] - 2026-08-04
+
+- Restore the main window through UU's own single-instance activation path so
+  Qt updates its `QWidget` visibility state and resumes the embedded WebView2
+  surface together with the native Wine/X11 window.
+- Turn the native tray request into a short-lived one-shot authorization only.
+  The injected hook can permit UU's real show operation but can no longer map
+  the top-level HWND directly and expose an unpainted white shell.
+- Add Wine and launcher regression coverage proving that an authorization file
+  alone never shows the home window, while the subsequent application-driven
+  show is accepted exactly once and launches one activation instance.
+
 ## [1.1.13] - 2026-08-04
 
 - Replace the controller worker's unconditional 250 ms `WM_NULL` wakeup with

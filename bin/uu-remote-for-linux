@@ -2219,18 +2219,11 @@ controller_focus_hook_live() {
     ((modified <= now && now - modified <= 3))
 }
 
-request_controller_home_show() {
-    local attempt
-
+authorize_controller_home_show() {
     (
         umask 077
         : >"$controller_home_show_request"
-    ) || return 1
-    for ((attempt = 0; attempt < 40; attempt++)); do
-        [[ -e $controller_home_show_request ]] || return 0
-        sleep 0.05
-    done
-    return 1
+    )
 }
 
 wol_hook_runtime_label() {
@@ -2705,10 +2698,13 @@ unset WEBVIEW2_RELEASE_CHANNELS
 unset WEBVIEW2_USER_DATA_FOLDER
 
 if $show_requested && controller_focus_hook_live; then
-    if request_controller_home_show; then
-        exit 0
-    fi
-    rm -f -- "$controller_home_show_request"
+    authorize_controller_home_show ||
+        die "无法授权 UU 自身恢复主界面"
+    cd "$install_dir"
+    exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" "$client"
 fi
 
 [[ $operation_lock_timeout =~ ^[0-9]+$ ]] ||
@@ -3768,9 +3764,8 @@ start_keyboard_bridge ||
 start_tray_proxy ||
     die "Linux 原生托盘代理启动失败，详见 $tray_proxy_log"
 if $show_requested; then
-    if request_controller_home_show; then
-        exit 0
-    fi
+    authorize_controller_home_show ||
+        die "无法授权 UU 自身恢复主界面"
 fi
 if $uri_requested; then
     exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
