@@ -95,7 +95,7 @@ for attempt in 1 2; do
         wineserver -w >/dev/null 2>&1 || true
 done
 (( probe_status == 0 )) || exit "$probe_status"
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=15'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=16'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=1023'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
@@ -117,7 +117,7 @@ grep -A8 -F '[focus]' "$status" | grep -Eq 'apply_rate_limited=[0-9]+'
 grep -A4 -F '[home_window]' "$status" | grep -Eq 'reopen_blocked=[1-9]'
 grep -A4 -F '[home_window]' "$status" | grep -Eq 'show_authorized=[1-9]'
 grep -A7 -F '[event_loop]' "$status" |
-    grep -Fq 'mode=qt-wine-empty-wake-guard'
+    grep -Fq 'mode=qt-wine-sticky-message-guard'
 grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_sent=[1-9]'
 grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_acked=[1-9]'
 grep -A9 -F '[ui_health]' "$status" |

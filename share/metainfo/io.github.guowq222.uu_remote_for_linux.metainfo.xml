@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.13" date="2026-08-04">
+      <description>
+        <p>Prevent a Wine message-queue race from pinning the Qt UI on one stale WM_NULL by removing periodic null wakeups, filtering a proven sticky fingerprint, and accepting only genuine UI heartbeat acknowledgements.</p>
+      </description>
+    </release>
     <release version="1.1.12" date="2026-08-03">
       <description>
         <p>Keep active incoming remote sessions alive by binding UI heartbeats to window generations, requiring direct livelock evidence, and forbidding controller recovery while the controlled RTC session is active or unknown.</p>

@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.13] - 2026-08-04
+
+- Replace the controller worker's unconditional 250 ms `WM_NULL` wakeup with
+  a coalesced private arbitration message emitted only when the top-level
+  window signature or an explicit tray request actually changes.
+- Detect a complete `WM_NULL` fingerprint that Wine returns repeatedly despite
+  `PM_REMOVE`, quarantine the sticky message, continue dequeuing every other
+  message class, and add a bounded wait backoff so Qt can paint and dispatch
+  input instead of spinning one CPU core forever.
+- Count only a real `WM_UU_UI_HEALTH` dispatch as a UI acknowledgement. Message
+  throughput can no longer cancel a pending heartbeat; verified sticky-message
+  or empty-queue evidence is carried separately into controller recovery.
+- Add Win64 state-machine coverage for sticky-message detection, require v16
+  recovery evidence in the native tray, and verify that a deliberately paused
+  UI never fabricates heartbeat acknowledgements or triggers a restart.
+
 ## [1.1.12] - 2026-08-03
 
 - Prevent the controller watchdog from terminating a healthy incoming remote

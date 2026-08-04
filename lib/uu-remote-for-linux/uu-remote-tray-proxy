@@ -35,7 +35,7 @@ CONTROLLER_RESTART_MARKER = "uu-remote-controller-restart.request"
 CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS = 60
 CONTROLLER_RESTART_GRACE_SECONDS = 20
 CONTROLLER_TERMINATE_GRACE_SECONDS = 2
-CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 15
+CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 16
 CONTROLLER_RESTART_IDLE_CONFIRMATIONS = 2
 RTC_SESSION_STATE_PATTERN = re.compile(
     r"Session:\s*([0-9]+).*?\bNew state:\s*([A-Za-z-]+)",
@@ -590,9 +590,13 @@ class TrayProxy:
             hook_version = int(fields.get("hook_version", "0"))
         except ValueError:
             hook_version = 0
+        direct_evidence = (
+            fields.get("guard_evidence") == "1"
+            or fields.get("sticky_null_evidence") == "1"
+        )
         if (
             fields.get("reason") != "event-loop-livelock"
-            or fields.get("guard_evidence") != "1"
+            or not direct_evidence
             or hook_version < CONTROLLER_RESTART_REQUIRED_HOOK_VERSION
         ):
             self.suppress_controller_recovery(

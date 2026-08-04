@@ -185,8 +185,9 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     marker.parent.mkdir(parents=True, exist_ok=True)
     valid_request = (
         "reason=event-loop-livelock\n"
-        "hook_version=15\n"
-        "guard_evidence=1\n"
+        "hook_version=16\n"
+        "guard_evidence=0\n"
+        "sticky_null_evidence=1\n"
         "window_generation=7\n"
     )
     marker.write_text(valid_request)

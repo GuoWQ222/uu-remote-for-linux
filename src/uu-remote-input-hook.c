@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 15u
+#define HOOK_VERSION 16u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -47,7 +47,6 @@
 #define FOCUS_STORM_WINDOW_MS 250u
 #define FOCUS_STORM_THRESHOLD 12
 #define FOCUS_LATCH_MS 1500u
-#define FOCUS_MODAL_REFRESH_MS 300u
 #define FOCUS_INTERNAL_APPLY_GRACE_MS 300u
 #define FOCUS_APPLY_COOLDOWN_MS 750u
 #define FOCUS_WINDOW_SCAN_MS 250u
@@ -56,6 +55,9 @@
 #define EVENT_LOOP_FALSE_WAKE_THRESHOLD 32u
 #define EVENT_LOOP_FALSE_WAKE_WINDOW_MS 100u
 #define EVENT_LOOP_BREAK_BACKOFF_MS 1u
+#define EVENT_LOOP_STICKY_NULL_THRESHOLD 32u
+#define EVENT_LOOP_STICKY_NULL_WINDOW_MS 100u
+#define EVENT_LOOP_STICKY_NULL_BACKOFF_MS 4u
 #define UI_HEALTH_PING_INTERVAL_MS 1000u
 #define UI_HEALTH_TIMEOUT_MS 10000u
 #define UI_HEALTH_RESUME_GAP_MS 3000u
@@ -64,6 +66,7 @@
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
 #define WM_UU_HOME_SHOW (WM_APP + 0x4b2u)
 #define WM_UU_UI_HEALTH (WM_APP + 0x4b3u)
+#define WM_UU_FOCUS_ARBITRATE (WM_APP + 0x4b4u)
 #define WM_QT_SENDPOSTEDEVENTS (WM_USER + 1u)
 
 enum focus_window_role {
@@ -239,25 +242,31 @@ static volatile LONG focus_home_show_authorized;
 static volatile LONG focus_worker_heartbeats;
 static volatile LONG event_loop_empty_queue_wakes;
 static volatile LONG event_loop_guard_breaks;
-static volatile LONG event_loop_messages_dequeued;
+static volatile LONG64 event_loop_messages_dequeued;
 static volatile LONG event_loop_posted_forwarded;
 static volatile LONG event_loop_posted_coalesced;
+static volatile LONG event_loop_sticky_nulls_detected;
+static volatile LONG event_loop_sticky_nulls_filtered;
+static volatile LONG event_loop_sticky_null_wake_breaks;
 static volatile LONG64 event_loop_last_guard_break;
+static volatile LONG64 event_loop_last_sticky_null;
 static volatile LONG ui_health_pings_sent;
 static volatile LONG ui_health_pings_acked;
 static volatile LONG ui_health_timeouts;
 static volatile LONG ui_health_recovery_requests;
 static volatile LONG ui_health_window_invalidations;
-static volatile LONG ui_health_progress_cancellations;
 static volatile LONG ui_health_no_livelock_suppressions;
 static volatile LONG64 ui_health_ping_sent_at;
 static volatile LONG64 ui_health_last_worker_tick;
 static volatile LONG ui_health_recovery_requested;
 static volatile LONG ui_health_ping_generation;
 static volatile LONG ui_health_ping_guard_breaks;
-static volatile LONG ui_health_ping_messages_dequeued;
+static volatile LONG ui_health_ping_sticky_nulls;
 static PVOID volatile ui_health_ping_window;
 static volatile LONG focus_arbitration_pending;
+static volatile LONG focus_arbitration_posts;
+static volatile LONG focus_arbitration_coalesced;
+static volatile LONG focus_window_state_changes;
 static volatile LONG focus_module_scan_pending;
 static volatile LONG focus_preferred_role;
 static volatile LONG focus_latch_active;
@@ -270,12 +279,27 @@ static volatile LONG focus_window_generation;
 static ULONGLONG focus_rate_window_started;
 static LONG focus_rate_window_count;
 static BOOL focus_modal_was_visible;
+static volatile LONG64 focus_last_window_signature;
 static DWORD event_loop_tls_index = TLS_OUT_OF_INDEXES;
+
+struct event_loop_message_fingerprint {
+    HWND window;
+    UINT message;
+    WPARAM wparam;
+    LPARAM lparam;
+    DWORD time;
+    POINT point;
+};
 
 struct event_loop_thread_state {
     BOOL last_peek_empty;
     DWORD consecutive_false_wakes;
     ULONGLONG false_wake_burst_started;
+    struct event_loop_message_fingerprint last_removed_message;
+    DWORD repeated_removed_messages;
+    ULONGLONG repeated_message_burst_started;
+    BOOL sticky_null_active;
+    struct event_loop_message_fingerprint sticky_null_message;
 };
 
 struct qt_posted_wakeup_entry {
@@ -1641,6 +1665,145 @@ static BOOL event_loop_false_wake_should_break(
     return TRUE;
 }
 
+static void event_loop_message_fingerprint(
+    struct event_loop_message_fingerprint *fingerprint,
+    const MSG *message
+) {
+    ZeroMemory(fingerprint, sizeof(*fingerprint));
+    if (!message) {
+        return;
+    }
+    fingerprint->window = message->hwnd;
+    fingerprint->message = message->message;
+    fingerprint->wparam = message->wParam;
+    fingerprint->lparam = message->lParam;
+    fingerprint->time = message->time;
+    fingerprint->point = message->pt;
+}
+
+static BOOL event_loop_message_fingerprint_equal(
+    const struct event_loop_message_fingerprint *left,
+    const struct event_loop_message_fingerprint *right
+) {
+    return
+        left->window == right->window &&
+        left->message == right->message &&
+        left->wparam == right->wparam &&
+        left->lparam == right->lparam &&
+        left->time == right->time &&
+        left->point.x == right->point.x &&
+        left->point.y == right->point.y;
+}
+
+static BOOL event_loop_message_belongs_to_process(const MSG *message) {
+    DWORD pid = 0;
+
+    if (!message || !message->hwnd) {
+        return FALSE;
+    }
+    GetWindowThreadProcessId(message->hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void event_loop_reset_repeated_message_probe(
+    struct event_loop_thread_state *state
+) {
+    if (!state) {
+        return;
+    }
+    ZeroMemory(
+        &state->last_removed_message,
+        sizeof(state->last_removed_message)
+    );
+    state->repeated_removed_messages = 0;
+    state->repeated_message_burst_started = 0;
+}
+
+static BOOL event_loop_sticky_null_fingerprint_should_filter(
+    struct event_loop_thread_state *state,
+    const struct event_loop_message_fingerprint *current,
+    BOOL belongs_to_process,
+    ULONGLONG now
+) {
+    if (!state || !current) {
+        return FALSE;
+    }
+    if (state->sticky_null_active) {
+        if (event_loop_message_fingerprint_equal(
+                &state->sticky_null_message, current
+            )) {
+            return TRUE;
+        }
+        state->sticky_null_active = FALSE;
+        ZeroMemory(
+            &state->sticky_null_message,
+            sizeof(state->sticky_null_message)
+        );
+        event_loop_reset_repeated_message_probe(state);
+    }
+    if (
+        current->message != WM_NULL ||
+        !belongs_to_process
+    ) {
+        event_loop_reset_repeated_message_probe(state);
+        return FALSE;
+    }
+    if (
+        !state->repeated_message_burst_started ||
+        now < state->repeated_message_burst_started ||
+        now - state->repeated_message_burst_started >
+            EVENT_LOOP_STICKY_NULL_WINDOW_MS ||
+        !event_loop_message_fingerprint_equal(
+            &state->last_removed_message, current
+        )
+    ) {
+        state->last_removed_message = *current;
+        state->repeated_removed_messages = 1;
+        state->repeated_message_burst_started = now;
+        return FALSE;
+    }
+    ++state->repeated_removed_messages;
+    if (
+        state->repeated_removed_messages <
+        EVENT_LOOP_STICKY_NULL_THRESHOLD
+    ) {
+        return FALSE;
+    }
+    state->sticky_null_active = TRUE;
+    state->sticky_null_message = *current;
+    event_loop_reset_repeated_message_probe(state);
+    return TRUE;
+}
+
+static BOOL event_loop_sticky_null_should_filter(
+    struct event_loop_thread_state *state,
+    const MSG *message,
+    ULONGLONG now
+) {
+    struct event_loop_message_fingerprint current;
+    BOOL was_active;
+    BOOL should_filter;
+
+    if (!state || !message) {
+        return FALSE;
+    }
+    event_loop_message_fingerprint(&current, message);
+    was_active = state->sticky_null_active;
+    should_filter = event_loop_sticky_null_fingerprint_should_filter(
+        state,
+        &current,
+        event_loop_message_belongs_to_process(message),
+        now
+    );
+    if (should_filter && !was_active && state->sticky_null_active) {
+        InterlockedIncrement(&event_loop_sticky_nulls_detected);
+        InterlockedExchange64(
+            &event_loop_last_sticky_null, (LONG64)now
+        );
+    }
+    return should_filter;
+}
+
 static BOOL qt_posted_event_window(HWND window) {
     WCHAR class_name[96];
 
@@ -1731,11 +1894,37 @@ static BOOL WINAPI hooked_peek_message_w(
     if (!result) {
         if (state) {
             state->last_peek_empty = TRUE;
+            state->sticky_null_active = FALSE;
+            ZeroMemory(
+                &state->sticky_null_message,
+                sizeof(state->sticky_null_message)
+            );
+            event_loop_reset_repeated_message_probe(state);
         }
         return FALSE;
     }
+    if (
+        state &&
+        message &&
+        event_loop_sticky_null_should_filter(
+            state, message, GetTickCount64()
+        )
+    ) {
+        InterlockedIncrement(&event_loop_sticky_nulls_filtered);
+        result = original_peek_message_w(
+            message,
+            NULL,
+            WM_NULL + 1u,
+            0xffffffffu,
+            remove_message
+        );
+        if (!result) {
+            state->last_peek_empty = TRUE;
+            return FALSE;
+        }
+    }
     event_loop_reset_false_wakes(state);
-    InterlockedIncrement(&event_loop_messages_dequeued);
+    InterlockedIncrement64(&event_loop_messages_dequeued);
     if (
         message &&
         message->message == WM_QT_SENDPOSTEDEVENTS &&
@@ -1771,6 +1960,16 @@ static DWORD WINAPI hooked_msg_wait_for_multiple_objects_ex(
     ) {
         event_loop_reset_false_wakes(state);
         return result;
+    }
+    if (
+        state &&
+        state->sticky_null_active &&
+        result == WAIT_OBJECT_0 + handle_count
+    ) {
+        InterlockedIncrement(&event_loop_sticky_null_wake_breaks);
+        event_loop_reset_false_wakes(state);
+        Sleep(EVENT_LOOP_STICKY_NULL_BACKOFF_MS);
+        return WAIT_TIMEOUT;
     }
     if (
         state &&
@@ -1946,18 +2145,25 @@ static BOOL write_focus_hook_status_atomic(void) {
         "post_modal_handoffs=%ld\r\n"
         "user_overrides=%ld\r\n"
         "preferred_role=%ld\r\n"
+        "arbitration_posts=%ld\r\n"
+        "arbitration_coalesced=%ld\r\n"
+        "state_changes=%ld\r\n"
         "[home_window]\r\n"
         "hidden_by_user=%ld\r\n"
         "reopen_blocked=%ld\r\n"
         "show_authorized=%ld\r\n"
         "[event_loop]\r\n"
-        "mode=qt-wine-empty-wake-guard\r\n"
+        "mode=qt-wine-sticky-message-guard\r\n"
         "empty_queue_wakes=%ld\r\n"
         "guard_breaks=%ld\r\n"
-        "messages_dequeued=%ld\r\n"
+        "messages_dequeued=%lld\r\n"
         "posted_forwarded=%ld\r\n"
         "posted_coalesced=%ld\r\n"
+        "sticky_nulls_detected=%ld\r\n"
+        "sticky_nulls_filtered=%ld\r\n"
+        "sticky_null_wake_breaks=%ld\r\n"
         "last_guard_break_tick=%lld\r\n"
+        "last_sticky_null_tick=%lld\r\n"
         "[ui_health]\r\n"
         "pings_sent=%ld\r\n"
         "pings_acked=%ld\r\n"
@@ -1965,7 +2171,6 @@ static BOOL write_focus_hook_status_atomic(void) {
         "recovery_requests=%ld\r\n"
         "target_generation=%ld\r\n"
         "window_invalidations=%ld\r\n"
-        "progress_cancellations=%ld\r\n"
         "no_livelock_suppressions=%ld\r\n"
         "[worker]\r\n"
         "heartbeats=%ld\r\n",
@@ -1999,16 +2204,29 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&focus_post_modal_handoffs, 0, 0),
         InterlockedCompareExchange(&focus_user_overrides, 0, 0),
         InterlockedCompareExchange(&focus_preferred_role, 0, 0),
+        InterlockedCompareExchange(&focus_arbitration_posts, 0, 0),
+        InterlockedCompareExchange(&focus_arbitration_coalesced, 0, 0),
+        InterlockedCompareExchange(&focus_window_state_changes, 0, 0),
         InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0),
         InterlockedCompareExchange(&focus_home_reopen_blocked, 0, 0),
         InterlockedCompareExchange(&focus_home_show_authorized, 0, 0),
         InterlockedCompareExchange(&event_loop_empty_queue_wakes, 0, 0),
         InterlockedCompareExchange(&event_loop_guard_breaks, 0, 0),
-        InterlockedCompareExchange(&event_loop_messages_dequeued, 0, 0),
+        (long long)InterlockedCompareExchange64(
+            &event_loop_messages_dequeued, 0, 0
+        ),
         InterlockedCompareExchange(&event_loop_posted_forwarded, 0, 0),
         InterlockedCompareExchange(&event_loop_posted_coalesced, 0, 0),
+        InterlockedCompareExchange(&event_loop_sticky_nulls_detected, 0, 0),
+        InterlockedCompareExchange(&event_loop_sticky_nulls_filtered, 0, 0),
+        InterlockedCompareExchange(
+            &event_loop_sticky_null_wake_breaks, 0, 0
+        ),
         (long long)InterlockedCompareExchange64(
             &event_loop_last_guard_break, 0, 0
+        ),
+        (long long)InterlockedCompareExchange64(
+            &event_loop_last_sticky_null, 0, 0
         ),
         InterlockedCompareExchange(&ui_health_pings_sent, 0, 0),
         InterlockedCompareExchange(&ui_health_pings_acked, 0, 0),
@@ -2017,9 +2235,6 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&ui_health_ping_generation, 0, 0),
         InterlockedCompareExchange(
             &ui_health_window_invalidations, 0, 0
-        ),
-        InterlockedCompareExchange(
-            &ui_health_progress_cancellations, 0, 0
         ),
         InterlockedCompareExchange(
             &ui_health_no_livelock_suppressions, 0, 0
@@ -2366,7 +2581,7 @@ static BOOL thread_belongs_to_controller(DWORD thread_id) {
 
 static BOOL focus_transition_is_internal(const MSG *message);
 static void focus_arbitrate_windows(void);
-static void focus_queue_arbitration(void);
+static BOOL focus_request_arbitration(HWND preferred_window);
 static void patch_controller_focus_imports(void);
 
 static BOOL wide_contains_ordinal_ci(
@@ -2487,11 +2702,7 @@ static BOOL focus_window_entry(
     return found;
 }
 
-static void ui_health_clear_pending(LONG sent) {
-    if (sent < 0) {
-        sent = InterlockedCompareExchange(&ui_health_pings_sent, 0, 0);
-    }
-    InterlockedExchange(&ui_health_pings_acked, sent);
+static void ui_health_cancel_pending(void) {
     InterlockedExchange64(&ui_health_ping_sent_at, 0);
     InterlockedExchangePointer(&ui_health_ping_window, NULL);
     InterlockedExchange(&ui_health_ping_generation, 0);
@@ -2500,7 +2711,6 @@ static void ui_health_clear_pending(LONG sent) {
 static void focus_remove_window(HWND window) {
     unsigned int index;
     BOOL removed = FALSE;
-    LONG sent;
 
     AcquireSRWLockExclusive(&focus_window_lock);
     for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
@@ -2521,9 +2731,8 @@ static void focus_remove_window(HWND window) {
             &ui_health_ping_window, NULL, NULL
         )
     ) {
-        sent = InterlockedCompareExchange(&ui_health_pings_sent, 0, 0);
         InterlockedIncrement(&ui_health_window_invalidations);
-        ui_health_clear_pending(sent);
+        ui_health_cancel_pending();
     }
     if (
         window == (HWND)InterlockedCompareExchangePointer(
@@ -2578,18 +2787,21 @@ static BOOL ui_health_target_is_current(
 static BOOL ui_health_has_livelock_evidence(
     LONG guard_breaks_before,
     LONG guard_breaks_now,
-    LONG messages_before,
-    LONG messages_now
+    LONG sticky_nulls_before,
+    LONG sticky_nulls_now
 ) {
-    return guard_breaks_now != guard_breaks_before &&
-        messages_now == messages_before;
+    return guard_breaks_now != guard_breaks_before ||
+        sticky_nulls_now != sticky_nulls_before;
 }
 
 static void request_controller_restart(
     LONG generation,
-    LONG guard_breaks
+    LONG guard_breaks_before,
+    LONG guard_breaks_now,
+    LONG sticky_nulls_before,
+    LONG sticky_nulls_now
 ) {
-    CHAR payload[192];
+    CHAR payload[256];
     HANDLE file;
     DWORD written = 0;
     int length;
@@ -2607,13 +2819,18 @@ static void request_controller_restart(
         "pid=%lu\r\n"
         "reason=event-loop-livelock\r\n"
         "hook_version=%lu\r\n"
-        "guard_evidence=1\r\n"
+        "guard_evidence=%u\r\n"
+        "sticky_null_evidence=%u\r\n"
         "window_generation=%ld\r\n"
-        "guard_breaks=%ld\r\n",
+        "guard_breaks=%ld\r\n"
+        "sticky_nulls=%ld\r\n",
         (unsigned long)GetCurrentProcessId(),
         (unsigned long)HOOK_VERSION,
+        guard_breaks_now != guard_breaks_before ? 1u : 0u,
+        sticky_nulls_now != sticky_nulls_before ? 1u : 0u,
         generation,
-        guard_breaks
+        guard_breaks_now,
+        sticky_nulls_now
     );
     file = CreateFileA(
         controller_restart_request_path,
@@ -2645,30 +2862,31 @@ static void focus_ui_health_tick(ULONGLONG now) {
     ULONGLONG previous_tick;
     ULONGLONG sent_at;
     LONG sent;
-    LONG acked;
     LONG next;
     LONG generation;
     LONG guard_breaks_before;
     LONG guard_breaks_now;
-    LONG messages_before;
-    LONG messages_now;
+    LONG sticky_nulls_before;
+    LONG sticky_nulls_now;
     HWND window;
 
     previous_tick = (ULONGLONG)InterlockedExchange64(
         &ui_health_last_worker_tick, (LONG64)now
     );
     sent = InterlockedCompareExchange(&ui_health_pings_sent, 0, 0);
-    acked = InterlockedCompareExchange(&ui_health_pings_acked, 0, 0);
+    sent_at = (ULONGLONG)InterlockedCompareExchange64(
+        &ui_health_ping_sent_at, 0, 0
+    );
     if (
         previous_tick &&
         now >= previous_tick &&
         now - previous_tick > UI_HEALTH_RESUME_GAP_MS
     ) {
         /* A suspended laptop is not a hung Qt event loop. */
-        ui_health_clear_pending(sent);
-        acked = sent;
+        ui_health_cancel_pending();
+        sent_at = 0;
     }
-    if (sent != acked) {
+    if (sent_at) {
         window = (HWND)InterlockedCompareExchangePointer(
             &ui_health_ping_window, NULL, NULL
         );
@@ -2677,25 +2895,10 @@ static void focus_ui_health_tick(ULONGLONG now) {
         );
         if (!ui_health_target_is_current(window, generation)) {
             InterlockedIncrement(&ui_health_window_invalidations);
-            ui_health_clear_pending(sent);
+            ui_health_cancel_pending();
             return;
         }
-        messages_before = InterlockedCompareExchange(
-            &ui_health_ping_messages_dequeued, 0, 0
-        );
-        messages_now = InterlockedCompareExchange(
-            &event_loop_messages_dequeued, 0, 0
-        );
-        if (messages_now != messages_before) {
-            InterlockedIncrement(&ui_health_progress_cancellations);
-            ui_health_clear_pending(sent);
-            return;
-        }
-        sent_at = (ULONGLONG)InterlockedCompareExchange64(
-            &ui_health_ping_sent_at, 0, 0
-        );
         if (
-            sent_at &&
             now >= sent_at &&
             now - sent_at >= UI_HEALTH_TIMEOUT_MS
         ) {
@@ -2706,18 +2909,30 @@ static void focus_ui_health_tick(ULONGLONG now) {
             guard_breaks_now = InterlockedCompareExchange(
                 &event_loop_guard_breaks, 0, 0
             );
+            sticky_nulls_before = InterlockedCompareExchange(
+                &ui_health_ping_sticky_nulls, 0, 0
+            );
+            sticky_nulls_now = InterlockedCompareExchange(
+                &event_loop_sticky_nulls_detected, 0, 0
+            );
             if (ui_health_has_livelock_evidence(
                     guard_breaks_before,
                     guard_breaks_now,
-                    messages_before,
-                    messages_now
+                    sticky_nulls_before,
+                    sticky_nulls_now
                 )) {
-                request_controller_restart(generation, guard_breaks_now);
+                request_controller_restart(
+                    generation,
+                    guard_breaks_before,
+                    guard_breaks_now,
+                    sticky_nulls_before,
+                    sticky_nulls_now
+                );
             } else {
                 InterlockedIncrement(
                     &ui_health_no_livelock_suppressions
                 );
-                ui_health_clear_pending(sent);
+                ui_health_cancel_pending();
             }
         }
         return;
@@ -2743,8 +2958,8 @@ static void focus_ui_health_tick(ULONGLONG now) {
         InterlockedCompareExchange(&event_loop_guard_breaks, 0, 0)
     );
     InterlockedExchange(
-        &ui_health_ping_messages_dequeued,
-        InterlockedCompareExchange(&event_loop_messages_dequeued, 0, 0)
+        &ui_health_ping_sticky_nulls,
+        InterlockedCompareExchange(&event_loop_sticky_nulls_detected, 0, 0)
     );
     InterlockedExchange64(&ui_health_ping_sent_at, (LONG64)now);
     InterlockedExchange(&ui_health_pings_sent, next);
@@ -2753,9 +2968,9 @@ static void focus_ui_health_tick(ULONGLONG now) {
             WM_UU_UI_HEALTH,
             (WPARAM)next,
             (LPARAM)generation
-        )) {
+    )) {
         InterlockedIncrement(&ui_health_window_invalidations);
-        ui_health_clear_pending(next);
+        ui_health_cancel_pending();
     }
 }
 
@@ -2822,10 +3037,7 @@ static void focus_record_transition(HWND window) {
         InterlockedCompareExchange(&focus_storm_pending, 1, 0) == 0
     ) {
         InterlockedIncrement(&focus_storms_detected);
-        InterlockedExchange(&focus_arbitration_pending, 1);
-        if (window) {
-            PostMessageW(window, WM_NULL, 0, 0);
-        }
+        focus_request_arbitration(window);
         if (focus_worker_event) {
             SetEvent(focus_worker_event);
         }
@@ -2942,6 +3154,7 @@ static BOOL focus_deactivation_is_blocked(
     HWND root;
     ULONGLONG until;
     ULONGLONG now;
+    LONG preferred_role;
 
     if (
         !window ||
@@ -2955,7 +3168,13 @@ static BOOL focus_deactivation_is_blocked(
         &focus_latch_until, 0, 0
     );
     now = GetTickCount64();
-    if (!until || now >= until) {
+    preferred_role = InterlockedCompareExchange(
+        &focus_preferred_role, 0, 0
+    );
+    if (
+        (!until || now >= until) &&
+        !(preferred_role == FOCUS_ROLE_DIALOG && focus_modal_was_visible)
+    ) {
         focus_clear_latch();
         return FALSE;
     }
@@ -2978,6 +3197,7 @@ static BOOL focus_activation_is_blocked(HWND window) {
     HWND preferred;
     ULONGLONG until;
     ULONGLONG now;
+    LONG preferred_role;
 
     if (!window || !InterlockedCompareExchange(&focus_latch_active, 0, 0)) {
         return FALSE;
@@ -2996,7 +3216,13 @@ static BOOL focus_activation_is_blocked(HWND window) {
         &focus_latch_until, 0, 0
     );
     now = GetTickCount64();
-    if (!until || now >= until) {
+    preferred_role = InterlockedCompareExchange(
+        &focus_preferred_role, 0, 0
+    );
+    if (
+        (!until || now >= until) &&
+        !(preferred_role == FOCUS_ROLE_DIALOG && focus_modal_was_visible)
+    ) {
         focus_clear_latch();
         return FALSE;
     }
@@ -3132,6 +3358,7 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     enum focus_window_role role = FOCUS_ROLE_UNKNOWN;
     MSG probe;
     LRESULT result;
+    BOOL state_changed;
 
     if (
         !focus_window_entry(window, &original_proc, &role) ||
@@ -3169,11 +3396,11 @@ static LRESULT CALLBACK focus_subclass_window_proc(
         }
         return 0;
     }
-    if (
-        message == WM_NULL &&
-        InterlockedExchange(&focus_arbitration_pending, 0)
-    ) {
-        focus_arbitrate_windows();
+    if (message == WM_UU_FOCUS_ARBITRATE) {
+        if (InterlockedExchange(&focus_arbitration_pending, 0)) {
+            focus_arbitrate_windows();
+        }
+        return 0;
     }
     if (message == WM_UU_FOCUS_APPLY) {
         if (
@@ -3304,11 +3531,22 @@ static LRESULT CALLBACK focus_subclass_window_proc(
         InterlockedIncrement(&focus_user_overrides);
     }
 
+    state_changed =
+        message == WM_SHOWWINDOW ||
+        message == WM_WINDOWPOSCHANGED ||
+        message == WM_STYLECHANGED ||
+        message == WM_SETTEXT ||
+        message == WM_NCDESTROY;
     result = CallWindowProcW(
         original_proc, window, message, wparam, lparam
     );
     if (message == WM_NCDESTROY) {
         focus_remove_window(window);
+    }
+    if (state_changed) {
+        focus_request_arbitration(
+            message == WM_NCDESTROY ? NULL : window
+        );
     }
     return result;
 }
@@ -3509,7 +3747,7 @@ static void focus_arbitrate_windows(void) {
             InterlockedIncrement(&focus_modal_latches);
         }
         focus_apply_latch(
-            scan.dialog, FOCUS_ROLE_DIALOG, FOCUS_MODAL_REFRESH_MS
+            scan.dialog, FOCUS_ROLE_DIALOG, 0
         );
     } else if (focus_modal_was_visible) {
         target = scan.video ? scan.video : scan.nonhome;
@@ -3558,6 +3796,11 @@ struct focus_wakeup_scan {
     HWND window;
 };
 
+struct focus_window_state_signature {
+    uint64_t hash;
+    uint32_t count;
+};
+
 static BOOL CALLBACK focus_find_wakeup_window(
     HWND window,
     LPARAM parameter
@@ -3573,15 +3816,80 @@ static BOOL CALLBACK focus_find_wakeup_window(
     return TRUE;
 }
 
-static void focus_queue_arbitration(void) {
+static uint64_t focus_signature_mix(uint64_t value) {
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static BOOL CALLBACK focus_collect_window_state(
+    HWND window,
+    LPARAM parameter
+) {
+    struct focus_window_state_signature *signature =
+        (struct focus_window_state_signature *)parameter;
+    DWORD pid = 0;
+    uint64_t value;
+
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return TRUE;
+    }
+    value = (uint64_t)(uintptr_t)window;
+    value ^= (uint64_t)(uintptr_t)GetWindow(window, GW_OWNER) << 1;
+    value ^= (uint64_t)(ULONG_PTR)GetWindowLongPtrW(window, GWL_STYLE) << 7;
+    value ^=
+        (uint64_t)(ULONG_PTR)GetWindowLongPtrW(window, GWL_EXSTYLE) << 13;
+    if (IsWindowVisible(window)) {
+        value ^= UINT64_C(0x9e3779b97f4a7c15);
+    }
+    if (IsIconic(window)) {
+        value ^= UINT64_C(0xd6e8feb86659fd93);
+    }
+    signature->hash ^= focus_signature_mix(value);
+    ++signature->count;
+    return TRUE;
+}
+
+static uint64_t focus_window_state_signature_value(void) {
+    struct focus_window_state_signature signature;
+    HWND foreground;
+    DWORD foreground_pid = 0;
+
+    signature.hash = UINT64_C(0x6eed0e9da4d94a4f);
+    signature.count = 0;
+    EnumWindows(focus_collect_window_state, (LPARAM)&signature);
+    foreground = GetForegroundWindow();
+    if (foreground) {
+        GetWindowThreadProcessId(foreground, &foreground_pid);
+        if (foreground_pid == GetCurrentProcessId()) {
+            signature.hash ^= focus_signature_mix(
+                (uint64_t)(uintptr_t)foreground ^
+                UINT64_C(0xa0761d6478bd642f)
+            );
+        }
+    }
+    return focus_signature_mix(
+        signature.hash ^ ((uint64_t)signature.count << 32)
+    );
+}
+
+static BOOL focus_request_arbitration(HWND preferred_window) {
     struct focus_wakeup_scan scan;
     HWND wake_window = NULL;
-    DWORD wake_thread = 0;
+    DWORD wake_pid = 0;
     unsigned int index;
 
-    InterlockedExchange(&focus_arbitration_pending, 1);
+    if (preferred_window && IsWindow(preferred_window)) {
+        GetWindowThreadProcessId(preferred_window, &wake_pid);
+        if (wake_pid == GetCurrentProcessId()) {
+            wake_window = preferred_window;
+        }
+    }
     AcquireSRWLockShared(&focus_window_lock);
-    for (index = 0; index < FOCUS_MAX_WINDOWS; ++index) {
+    for (index = 0; !wake_window && index < FOCUS_MAX_WINDOWS; ++index) {
         if (focus_windows[index].window) {
             wake_window = focus_windows[index].window;
             break;
@@ -3594,15 +3902,19 @@ static void focus_queue_arbitration(void) {
         EnumWindows(focus_find_wakeup_window, (LPARAM)&scan);
         wake_window = scan.window;
     }
-    if (wake_window) {
-        wake_thread = GetWindowThreadProcessId(wake_window, NULL);
-        if (wake_thread == GetCurrentThreadId()) {
-            InterlockedExchange(&focus_arbitration_pending, 0);
-            focus_arbitrate_windows();
-        } else {
-            PostMessageW(wake_window, WM_NULL, 0, 0);
-        }
+    if (!wake_window) {
+        return FALSE;
     }
+    if (InterlockedCompareExchange(&focus_arbitration_pending, 1, 0)) {
+        InterlockedIncrement(&focus_arbitration_coalesced);
+        return TRUE;
+    }
+    if (PostMessageW(wake_window, WM_UU_FOCUS_ARBITRATE, 0, 0)) {
+        InterlockedIncrement(&focus_arbitration_posts);
+        return TRUE;
+    }
+    InterlockedCompareExchange(&focus_arbitration_pending, 0, 1);
+    return FALSE;
 }
 
 static void focus_mark_activation_api(LONG bit) {
@@ -3944,13 +4256,14 @@ static void patch_controller_focus_imports(void) {
 static DWORD WINAPI focus_worker_main(LPVOID parameter) {
     ULONGLONG last_status_write = 0;
     ULONGLONG last_activation_scan = 0;
-    ULONGLONG last_window_scan = 0;
     ULONGLONG last_health_ping = 0;
     (void)parameter;
 
     for (;;) {
         HHOOK release_hook = NULL;
         ULONGLONG now;
+        LONG64 previous_signature;
+        LONG64 current_signature;
 
         WaitForSingleObject(focus_worker_event, FOCUS_WINDOW_SCAN_MS);
         now = GetTickCount64();
@@ -3982,16 +4295,18 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
         }
         if (now - last_activation_scan >= FOCUS_MODULE_SCAN_MS) {
             InterlockedExchange(&focus_module_scan_pending, 1);
-            focus_queue_arbitration();
             last_activation_scan = now;
         }
-        if (
-            InterlockedCompareExchange(&focus_storm_pending, 0, 0) ||
-            focus_modal_was_visible ||
-            now - last_window_scan >= FOCUS_WINDOW_SCAN_MS
-        ) {
-            focus_queue_arbitration();
-            last_window_scan = now;
+        if (focus_home_show_request_pending()) {
+            focus_request_arbitration(NULL);
+        }
+        current_signature = (LONG64)focus_window_state_signature_value();
+        previous_signature = InterlockedExchange64(
+            &focus_last_window_signature, current_signature
+        );
+        if (previous_signature && previous_signature != current_signature) {
+            InterlockedIncrement(&focus_window_state_changes);
+            focus_request_arbitration(NULL);
         }
     }
     return 0;
@@ -4010,7 +4325,11 @@ static BOOL initialize_controller_focus_hook(void) {
     focus_home_show_request_pending();
     patch_controller_focus_imports();
     patch_all_focus_activation_imports();
-    focus_queue_arbitration();
+    focus_arbitrate_windows();
+    InterlockedExchange64(
+        &focus_last_window_signature,
+        (LONG64)focus_window_state_signature_value()
+    );
     if (!focus_worker_event) {
         focus_worker_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     }
@@ -4328,14 +4647,82 @@ __declspec(dllexport) DWORD WINAPI UURemoteEventLoopGuardSelfTest(void) {
     return state.last_peek_empty ? 0u : 1u;
 }
 
+__declspec(dllexport) DWORD WINAPI UURemoteStickyNullGuardSelfTest(void) {
+    struct event_loop_thread_state state;
+    struct event_loop_message_fingerprint fingerprint;
+    unsigned int index;
+
+    ZeroMemory(&state, sizeof(state));
+    ZeroMemory(&fingerprint, sizeof(fingerprint));
+    fingerprint.window = (HWND)(uintptr_t)1u;
+    fingerprint.message = WM_NULL;
+    fingerprint.time = 1234u;
+    fingerprint.point.x = 1313;
+    fingerprint.point.y = 395;
+    for (
+        index = 0;
+        index + 1u < EVENT_LOOP_STICKY_NULL_THRESHOLD;
+        ++index
+    ) {
+        if (event_loop_sticky_null_fingerprint_should_filter(
+                &state, &fingerprint, TRUE, 10u + index
+            )) {
+            return 0u;
+        }
+    }
+    if (!event_loop_sticky_null_fingerprint_should_filter(
+            &state,
+            &fingerprint,
+            TRUE,
+            10u + EVENT_LOOP_STICKY_NULL_THRESHOLD
+        )) {
+        return 0u;
+    }
+    if (!state.sticky_null_active) {
+        return 0u;
+    }
+    if (!event_loop_sticky_null_fingerprint_should_filter(
+            &state,
+            &fingerprint,
+            TRUE,
+            11u + EVENT_LOOP_STICKY_NULL_THRESHOLD
+        )) {
+        return 0u;
+    }
+    ++fingerprint.time;
+    if (event_loop_sticky_null_fingerprint_should_filter(
+            &state,
+            &fingerprint,
+            TRUE,
+            12u + EVENT_LOOP_STICKY_NULL_THRESHOLD
+        )) {
+        return 0u;
+    }
+    if (state.sticky_null_active) {
+        return 0u;
+    }
+    ZeroMemory(&state, sizeof(state));
+    for (index = 0; index < EVENT_LOOP_STICKY_NULL_THRESHOLD; ++index) {
+        if (event_loop_sticky_null_fingerprint_should_filter(
+                &state, &fingerprint, FALSE, 100u + index
+            )) {
+            return 0u;
+        }
+    }
+    return 1u;
+}
+
 __declspec(dllexport) DWORD WINAPI UURemoteUIHealthEvidenceSelfTest(void) {
     if (ui_health_has_livelock_evidence(3, 3, 10, 10)) {
         return 0u;
     }
-    if (ui_health_has_livelock_evidence(3, 4, 10, 11)) {
+    if (!ui_health_has_livelock_evidence(3, 4, 10, 10)) {
         return 0u;
     }
-    return ui_health_has_livelock_evidence(3, 4, 10, 10) ? 1u : 0u;
+    if (!ui_health_has_livelock_evidence(3, 3, 10, 11)) {
+        return 0u;
+    }
+    return ui_health_has_livelock_evidence(3, 4, 10, 11) ? 1u : 0u;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(

@@ -5,6 +5,7 @@
 typedef DWORD(WINAPI *initialize_hook_fn)(LPVOID);
 typedef DWORD(WINAPI *focus_hook_status_fn)(void);
 typedef DWORD(WINAPI *event_loop_guard_self_test_fn)(void);
+typedef DWORD(WINAPI *sticky_null_guard_self_test_fn)(void);
 typedef DWORD(WINAPI *ui_health_evidence_self_test_fn)(void);
 
 static volatile LONG app_deactivate_messages;
@@ -151,6 +152,7 @@ int WINAPI WinMain(
     initialize_hook_fn initialize_hook;
     focus_hook_status_fn focus_hook_status;
     event_loop_guard_self_test_fn event_loop_guard_self_test;
+    sticky_null_guard_self_test_fn sticky_null_guard_self_test;
     ui_health_evidence_self_test_fn ui_health_evidence_self_test;
     HHOOK first_hook;
     HHOOK reused_hook;
@@ -172,6 +174,9 @@ int WINAPI WinMain(
     int heartbeat_after;
     int health_pings_sent;
     int health_pings_acked;
+    int health_pings_acked_after_pause;
+    int health_timeouts;
+    int arbitration_posts;
     int no_livelock_suppressions;
     LONG outer_calls_before;
     ULONGLONG right_click_started;
@@ -269,6 +274,14 @@ int WINAPI WinMain(
         sizeof(event_loop_guard_self_test)
     );
     procedure = GetProcAddress(
+        hook_module, "UURemoteStickyNullGuardSelfTest"
+    );
+    CopyMemory(
+        &sticky_null_guard_self_test,
+        &procedure,
+        sizeof(sticky_null_guard_self_test)
+    );
+    procedure = GetProcAddress(
         hook_module, "UURemoteUIHealthEvidenceSelfTest"
     );
     CopyMemory(
@@ -281,6 +294,8 @@ int WINAPI WinMain(
         !focus_hook_status ||
         !event_loop_guard_self_test ||
         !event_loop_guard_self_test() ||
+        !sticky_null_guard_self_test ||
+        !sticky_null_guard_self_test() ||
         !ui_health_evidence_self_test ||
         !ui_health_evidence_self_test() ||
         !initialize_hook(NULL) ||
@@ -704,6 +719,24 @@ int WINAPI WinMain(
      * threshold so a loaded Wine host cannot race the assertion below.
      */
     Sleep(13000);
+    health_pings_acked_after_pause = GetPrivateProfileIntW(
+        L"ui_health",
+        L"pings_acked",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    health_timeouts = GetPrivateProfileIntW(
+        L"ui_health",
+        L"timeouts",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    arbitration_posts = GetPrivateProfileIntW(
+        L"window_state",
+        L"arbitration_posts",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     if (
         GetFileAttributesW(L"C:\\uu-remote-controller-restart.request") !=
         INVALID_FILE_ATTRIBUTES
@@ -718,6 +751,15 @@ int WINAPI WinMain(
     );
     if (no_livelock_suppressions < 1) {
         return 28;
+    }
+    if (
+        health_pings_acked_after_pause != health_pings_acked ||
+        health_timeouts < 1
+    ) {
+        return 29;
+    }
+    if (arbitration_posts < 1 || arbitration_posts > 40) {
+        return 30;
     }
     DestroyWindow(modal_window);
     DestroyWindow(video_window);
