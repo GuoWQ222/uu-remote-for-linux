@@ -112,18 +112,6 @@ UU's synchronized remote cursor remains responsible for pointer rendering.
 Display-manager and lock-screen capture are still outside the logged-in user's
 Portal session, so X11 remains the safer choice for pre-login unattended use.
 
-## Chinese input from the controller
-
-The viewer transports physical keyboard events; it cannot turn a committed
-Linux IBus/Fcitx candidate into remote keystrokes. Keep the viewer focused and
-press `Super+Space` (Win+Space) to select the **remote device's** Chinese IME,
-then type the pinyin normally. Since 1.1.3, the launcher applies Wine's
-per-application `UseXIM=N` option to `gameviewer.exe`, preventing the controller
-from opening a local IBus context. The keyboard bridge also pins the local source
-to XKB while focused and treats Wine helper windows as part of the viewer. The
-original Linux source is restored about 0.75 seconds after focus really leaves
-the viewer.
-
 ## License and attribution
 
 Original project code is available under the Zero-Clause BSD license
