@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.15] - 2026-08-04
+
+- Replace the silent `Upgrade.exe` blocker with a Win64 handoff stub that
+  creates one prefix-local update request before UU begins shutting down.
+- Make the native update watcher atomically validate and consume that request,
+  wait briefly for UU's normal exit, terminate only the matching prefix's Qt
+  controller if shutdown stalls, and run the existing hash-gated update path.
+- Keep the native tray alive during the intentional update handoff, reject
+  unsupported upstream versions without touching compatibility files, and
+  always restart the last fully verified client after a check or safe rollback.
+- Close the launcher's operation-lock descriptor before spawning the restored
+  client so the replacement process cannot deadlock while acquiring its own
+  startup lock.
+
 ## [1.1.14] - 2026-08-04
 
 - Restore the main window through UU's own single-instance activation path so

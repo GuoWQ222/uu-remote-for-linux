@@ -79,6 +79,42 @@ with tempfile.TemporaryDirectory() as prefix:
         child.terminate()
         child.wait()
 
+with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as other:
+    environment = os.environ.copy()
+    environment["WINEPREFIX"] = prefix
+    controller_id = "A537971D-B665-47E5-8B5B-DFF52C5CDE44"
+    (Path(prefix) / controller_id).write_text("sleep 5\n")
+    controller = subprocess.Popen(
+        ["source=start.exe", controller_id],
+        executable="/bin/bash",
+        cwd=prefix,
+        env=environment,
+    )
+    other_environment = os.environ.copy()
+    other_environment["WINEPREFIX"] = other
+    unrelated = subprocess.Popen(["sleep", "5"], env=other_environment)
+    try:
+        assert namespace["quiesce_controller"](prefix, 0)
+        controller.wait(timeout=2)
+        assert unrelated.poll() is None
+    finally:
+        if controller.poll() is None:
+            controller.terminate()
+            controller.wait()
+        unrelated.terminate()
+        unrelated.wait()
+
+with tempfile.TemporaryDirectory() as prefix:
+    drive_c = Path(prefix) / "drive_c"
+    drive_c.mkdir()
+    request = drive_c / namespace["UPSTREAM_UPDATE_REQUEST_MARKER"]
+    request.touch()
+    assert namespace["upstream_update_handoff_active"](prefix)
+    request.unlink()
+    processing = drive_c / namespace["UPSTREAM_UPDATE_PROCESSING_MARKER"]
+    processing.touch()
+    assert namespace["upstream_update_handoff_active"](prefix)
+
 with tempfile.TemporaryDirectory() as prefix:
     environment = os.environ.copy()
     environment["WINEPREFIX"] = prefix
@@ -143,11 +179,22 @@ with tempfile.TemporaryDirectory() as prefix:
     monitor.controller_restart_idle_confirmations = 0
     with client_log.open("a") as log_handle:
         log_handle.write(marker + "\n")
+    update_request = (
+        prefix_path
+        / "drive_c"
+        / namespace["UPSTREAM_UPDATE_REQUEST_MARKER"]
+    )
+    update_request.touch()
     original_prefix_processes = namespace["prefix_processes"]
     namespace["prefix_processes"].__globals__["prefix_processes"] = (
         lambda *_args: {1234}
     )
     try:
+        assert monitor.periodic_check()
+        assert not exits
+        update_request.unlink()
+        with client_log.open("a") as log_handle:
+            log_handle.write(marker + "\n")
         assert not monitor.periodic_check()
         assert exits
     finally:

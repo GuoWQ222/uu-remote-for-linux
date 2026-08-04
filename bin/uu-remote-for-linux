@@ -247,6 +247,7 @@ readonly wayland_frame_hook_status="$prefix/drive_c/uu-remote-wayland-frame-stat
 readonly controller_focus_hook_status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
 readonly controller_home_show_request="$prefix/drive_c/uu-remote-home-show.request"
 readonly controller_restart_request="$prefix/drive_c/uu-remote-controller-restart.request"
+readonly upstream_update_request="$prefix/drive_c/uu-remote-upstream-update.request"
 readonly input_bridge_release_timeout="${UU_REMOTE_INPUT_BRIDGE_RELEASE_TIMEOUT:-15}"
 readonly input_hook="$prefix/drive_c/uu-remote-input-hook.dll"
 readonly input_hook_preload="$install_dir/bin/uu-remote-input-hook.dll"
@@ -264,6 +265,7 @@ readonly local_appdata="$prefix/drive_c/users/$current_user/AppData/Local/GameVi
 readonly client_setting_file="$local_appdata/setting.ini"
 readonly update_bridge_log="$state_dir/update-bridge.log"
 readonly update_bridge_lock="$state_dir/update-bridge.lock"
+readonly update_bridge_status="$state_dir/update-bridge-status"
 readonly update_bridge_interval="${UU_REMOTE_UPDATE_BRIDGE_INTERVAL:-21600}"
 readonly update_status_file="$state_dir/update-status"
 readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
@@ -521,6 +523,7 @@ repair=false
 refresh_installer=false
 update_check_requested=false
 automatic_update_check=false
+upstream_update_handoff=false
 stop_requested=false
 diagnose_requested=false
 enable_hwdecode=false
@@ -559,6 +562,10 @@ while (($# > 0)); do
         --auto-update-check)
             update_check_requested=true
             automatic_update_check=true
+            ;;
+        --upstream-update-handoff)
+            update_check_requested=true
+            upstream_update_handoff=true
             ;;
         --stop)
             stop_requested=true
@@ -1762,7 +1769,7 @@ start_keyboard_bridge() {
 }
 
 start_update_bridge() {
-    local launcher_path
+    local launcher_path active_version=""
 
     [[ ${UU_REMOTE_DISABLE_UPDATE_WATCHER:-0} != 1 ]] || return 0
     launcher_path=$(resolve_launcher_path) || {
@@ -1771,7 +1778,12 @@ start_update_bridge() {
     }
     if systemd_user_available; then
         if runtime_unit_active "$update_runtime_unit"; then
-            return
+            active_version=$(sed -n 's/^package_version=//p' \
+                "$update_bridge_status" 2>/dev/null | head -n1)
+            if [[ $active_version == "$package_version" ]]; then
+                return
+            fi
+            stop_update_bridge_runtime
         fi
         systemctl --user reset-failed \
             "$update_runtime_unit.service" >/dev/null 2>&1 || true
@@ -1790,6 +1802,9 @@ start_update_bridge() {
             "$update_bridge_log" \
             "$update_bridge_lock" \
             "$update_bridge_interval" \
+            "$upstream_update_request" \
+            "$update_bridge_status" \
+            "$package_version" \
             9>&-; then
             return
         fi
@@ -1801,6 +1816,9 @@ start_update_bridge() {
         "$update_bridge_log" \
         "$update_bridge_lock" \
         "$update_bridge_interval" \
+        "$upstream_update_request" \
+        "$update_bridge_status" \
+        "$package_version" \
         9>&- </dev/null >/dev/null 2>&1 &
 }
 
@@ -3300,8 +3318,23 @@ restart_client_after_update() {
     (
         cd "$data_dir"
         nohup "$launcher_path" --autostart \
-            </dev/null >>"$update_bridge_log" 2>&1 &
+            9>&- </dev/null >>"$update_bridge_log" 2>&1 &
     )
+}
+
+update_restart_ready() {
+    app_files_present &&
+        shim_ready &&
+        input_hook_ready &&
+        update_blocker_ready || return 1
+    if hwdecode_enabled; then
+        hwdecode_files_deployed || return 1
+    fi
+    if wol_enabled; then
+        wol_patch_ready &&
+            wol_hook_config_ready &&
+            powershell_bridge_ready || return 1
+    fi
 }
 
 run_supported_update_transaction() {
@@ -3426,8 +3459,55 @@ perform_update_check() {
     run_supported_update_transaction "$latest"
 }
 
+perform_upstream_update_handoff() {
+    local check_status=0 restart_status=0
+    local exit_grace=${UU_REMOTE_UPSTREAM_UPDATE_EXIT_GRACE:-8}
+
+    notify_status "已接管 UU 内置更新，正在安全检查并恢复主程序"
+    printf '已接管 UU 内置更新请求；正在等待旧主程序退出。\n'
+    if ! "$tray_proxy" \
+        --quiesce-controller \
+        --prefix "$prefix" \
+        --grace-seconds "$exit_grace"; then
+        printf '警告：旧主控未能完整退出；继续执行只读版本检查。\n' >&2
+    fi
+
+    # The handoff owns the single restart decision.  Supported update and
+    # rollback paths must not launch a competing client from the subshell.
+    if (
+        export UU_REMOTE_UPDATE_NO_RESTART=1
+        perform_update_check
+    ); then
+        check_status=0
+    else
+        check_status=$?
+    fi
+
+    if update_restart_ready; then
+        restart_client_after_update || restart_status=$?
+        if ((restart_status == 0)); then
+            notify_status "UU 安全更新检查完成，正在恢复兼容版本"
+            printf '安全更新检查完成；已请求重新启动当前兼容版本。\n'
+        else
+            notify_status "UU 更新检查完成，但主程序恢复启动失败"
+            printf '错误：无法重新启动当前兼容版本。\n' >&2
+        fi
+    else
+        restart_status=1
+        notify_status "UU 更新或回滚未通过完整性校验，已阻止启动"
+        printf '错误：客户端兼容文件未通过完整性校验，已阻止不安全启动。\n' >&2
+    fi
+
+    ((restart_status == 0)) || return "$restart_status"
+    return "$check_status"
+}
+
 if $update_check_requested; then
-    perform_update_check
+    if $upstream_update_handoff; then
+        perform_upstream_update_handoff
+    else
+        perform_update_check
+    fi
     exit
 fi
 

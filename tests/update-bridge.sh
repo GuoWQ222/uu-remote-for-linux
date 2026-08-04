@@ -21,6 +21,9 @@ readonly launcher="$test_root/launcher"
 readonly trace="$test_root/checks.log"
 readonly log_file="$test_root/state/update-bridge.log"
 readonly lock_file="$test_root/state/update-bridge.lock"
+readonly request_file="$test_root/prefix/drive_c/uu-remote-upstream-update.request"
+readonly processing_file="$test_root/prefix/drive_c/uu-remote-upstream-update.processing"
+readonly status_file="$test_root/state/update-bridge-status"
 
 write_setting() {
     local value=$1
@@ -78,5 +81,31 @@ wait "$watcher_pid" >/dev/null 2>&1 || true
 watcher_pid=""
 test "$(wc -l <"$trace")" -eq 1
 grep -q 'UU 自动更新开关：disabled' "$log_file"
+
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n" "$*" >>%q\n' "$trace"
+} >"$launcher"
+chmod 0755 "$launcher"
+mkdir -p -- "${request_file%/*}"
+"$bridge" watch \
+    "$setting" "$launcher" "$log_file" "$lock_file" 30 "$request_file" \
+    "$status_file" 1.1.15 &
+watcher_pid=$!
+sleep 0.2
+: >"$request_file"
+for _attempt in {1..50}; do
+    grep -Fxq -- '--upstream-update-handoff' "$trace" && break
+    sleep 0.1
+done
+grep -Fxq -- '--upstream-update-handoff' "$trace"
+test ! -e "$request_file"
+test ! -e "$processing_file"
+grep -q '已接管 UU 内置更新请求' "$log_file"
+grep -Fxq 'status=active' "$status_file"
+grep -Fxq 'package_version=1.1.15' "$status_file"
+kill "$watcher_pid"
+wait "$watcher_pid" >/dev/null 2>&1 || true
+watcher_pid=""
 
 printf '自动更新兼容桥检查通过。\n'

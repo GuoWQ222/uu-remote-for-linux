@@ -155,6 +155,10 @@ check "shim preloads input hook" bash -c \
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
+# shellcheck disable=SC2016
+check "update blocker creates native handoff request" bash -c \
+    'objdump -p "$1" | grep -q "CreateFileA" && strings -a "$1" | grep -q "uu-remote-upstream-update.request"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "input hook is Win64 DLL" bash -c \

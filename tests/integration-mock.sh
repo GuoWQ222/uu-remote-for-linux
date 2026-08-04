@@ -225,6 +225,20 @@ sha256sum \
 cmp -s "$protected_before" "$protected_after"
 "$launcher" --diagnose | grep -q '安全更新状态.*已暂缓 4.35.0.9000'
 
+handoff_clients_before=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_UPDATE_NO_RESTART=0 \
+UU_REMOTE_UPSTREAM_UPDATE_EXIT_GRACE=0 \
+UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+    "$launcher" --upstream-update-handoff
+for _attempt in {1..50}; do
+    handoff_clients_after=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+    ((handoff_clients_after > handoff_clients_before)) && break
+    sleep 0.1
+done
+((handoff_clients_after > handoff_clients_before))
+grep -q 'TRAY_PROXY --quiesce-controller .*--grace-seconds 0' \
+    "$UU_REMOTE_FAKE_TRACE"
+
 installer_sha=$(sed -n 's/^sha256=//p' "$cache_dir/installer-metadata")
 server_sha=$(sha256sum "$install_dir/bin/GameViewerServer.exe")
 server_sha=${server_sha%% *}

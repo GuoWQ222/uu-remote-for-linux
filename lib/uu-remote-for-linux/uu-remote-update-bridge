@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 用法：
   uu-remote-update-bridge setting-enabled SETTING_INI
-  uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL]
+  uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL [REQUEST [STATUS [PACKAGE_VERSION]]]]
 EOF
 }
 
@@ -47,10 +47,77 @@ log_message() {
     printf '[%(%FT%T%z)T] %s\n' -1 "$*" >>"$log_file"
 }
 
+write_bridge_status() {
+    local status_file=$1 package_version=$2 state=$3 temp
+
+    [[ -n $status_file ]] || return 0
+    mkdir -p -- "${status_file%/*}"
+    temp="${status_file}.tmp.$$"
+    {
+        printf 'version=1\n'
+        printf 'status=%s\n' "$state"
+        printf 'package_version=%s\n' "$package_version"
+        printf 'pid=%s\n' "$$"
+        printf 'updated_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f -- "$temp" "$status_file"
+}
+
+consume_upstream_update_request() {
+    local request_file=$1 launcher=$2 log_file=$3
+    local processing_file owner modified now age result=0
+
+    [[ -e $request_file || -L $request_file ]] || return 1
+    processing_file=${request_file%.request}.processing
+    if [[ -L $request_file || ! -f $request_file ]]; then
+        log_message "$log_file" \
+            "拒绝非普通文件的 UU 更新接管请求"
+        rm -f -- "$request_file"
+        return 0
+    fi
+    owner=$(stat -c '%u' -- "$request_file" 2>/dev/null || printf invalid)
+    modified=$(stat -c '%Y' -- "$request_file" 2>/dev/null || printf 0)
+    now=$(date +%s)
+    if [[ $owner != "$(id -u)" || ! $modified =~ ^[0-9]+$ ]]; then
+        log_message "$log_file" \
+            "拒绝所有者或时间戳无效的 UU 更新接管请求"
+        rm -f -- "$request_file"
+        return 0
+    fi
+    age=$((now - modified))
+    if ((age < -5 || age > 300)); then
+        log_message "$log_file" \
+            "丢弃过期的 UU 更新接管请求（age=${age}s）"
+        rm -f -- "$request_file"
+        return 0
+    fi
+    if ! mv -f -- "$request_file" "$processing_file"; then
+        log_message "$log_file" "无法原子接管 UU 更新请求"
+        return 0
+    fi
+
+    log_message "$log_file" \
+        "已接管 UU 内置更新请求，等待主控退出并执行兼容性检查"
+    "$launcher" --upstream-update-handoff >>"$log_file" 2>&1 || result=$?
+    rm -f -- "$processing_file"
+    if ((result == 0)); then
+        log_message "$log_file" "UU 内置更新接管完成，主程序恢复已请求"
+    else
+        log_message "$log_file" \
+            "UU 内置更新接管返回 ${result}；已保留诊断状态并尝试恢复兼容客户端"
+    fi
+    return 0
+}
+
 watch_auto_update() {
     local setting_file=$1 launcher=$2 log_file=$3 lock_file=$4
     local interval=${5:-21600}
+    local request_file=${6:-}
+    local status_file=${7:-}
+    local package_version=${8:-unknown}
     local state=disabled previous_state=""
+    local manual_consumed=false
 
     [[ $interval =~ ^[1-9][0-9]*$ ]] || {
         printf '无效的更新检查间隔：%s\n' "$interval" >&2
@@ -60,6 +127,14 @@ watch_auto_update() {
         printf '启动器必须是可执行的绝对路径：%s\n' "$launcher" >&2
         return 2
     }
+    if [[ -n $request_file && $request_file != /* ]]; then
+        printf '更新接管请求必须是绝对路径：%s\n' "$request_file" >&2
+        return 2
+    fi
+    if [[ -n $status_file && $status_file != /* ]]; then
+        printf '更新桥状态必须是绝对路径：%s\n' "$status_file" >&2
+        return 2
+    fi
 
     mkdir -p -- "${lock_file%/*}" "${log_file%/*}"
     exec 8>"$lock_file"
@@ -69,8 +144,15 @@ watch_auto_update() {
     # down automatic checks; still honor explicit INT/TERM shutdown.
     trap 'exit 0' INT TERM
 
+    write_bridge_status "$status_file" "$package_version" active
     log_message "$log_file" "自动更新兼容桥开始监视 UU 设置"
     while [[ -x $launcher ]]; do
+        manual_consumed=false
+        if [[ -n $request_file ]] &&
+            consume_upstream_update_request \
+                "$request_file" "$launcher" "$log_file"; then
+            manual_consumed=true
+        fi
         if auto_update_enabled "$setting_file"; then
             state=enabled
         else
@@ -80,7 +162,7 @@ watch_auto_update() {
             log_message "$log_file" "UU 自动更新开关：$state"
             previous_state=$state
         fi
-        if [[ $state == enabled ]]; then
+        if [[ $state == enabled ]] && ! $manual_consumed; then
             if ! "$launcher" --auto-update-check \
                 >>"$log_file" 2>&1; then
                 log_message "$log_file" \
@@ -93,6 +175,10 @@ watch_auto_update() {
         for ((remaining = interval; remaining > 0; remaining--)); do
             [[ -x $launcher ]] || break 2
             sleep 1
+            if [[ -n $request_file &&
+                ( -e $request_file || -L $request_file ) ]]; then
+                break
+            fi
             if auto_update_enabled "$setting_file"; then
                 [[ $state == enabled ]] || break
             else
@@ -100,6 +186,7 @@ watch_auto_update() {
             fi
         done
     done
+    write_bridge_status "$status_file" "$package_version" stopped
     log_message "$log_file" "启动器已移除，自动更新兼容桥退出"
 }
 
@@ -113,11 +200,13 @@ case $mode in
         auto_update_enabled "$2"
         ;;
     watch)
-        (($# == 5 || $# == 6)) || {
+        (($# >= 5 && $# <= 9)) || {
             usage >&2
             exit 2
         }
-        watch_auto_update "$2" "$3" "$4" "$5" "${6:-21600}"
+        watch_auto_update \
+            "$2" "$3" "$4" "$5" "${6:-21600}" "${7:-}" \
+            "${8:-}" "${9:-unknown}"
         ;;
     -h|--help)
         usage

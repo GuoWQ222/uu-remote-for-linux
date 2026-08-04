@@ -37,6 +37,9 @@ CONTROLLER_RESTART_GRACE_SECONDS = 20
 CONTROLLER_TERMINATE_GRACE_SECONDS = 2
 CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 16
 CONTROLLER_RESTART_IDLE_CONFIRMATIONS = 2
+UPSTREAM_UPDATE_REQUEST_MARKER = "uu-remote-upstream-update.request"
+UPSTREAM_UPDATE_PROCESSING_MARKER = "uu-remote-upstream-update.processing"
+UPSTREAM_UPDATE_HANDOFF_MAX_AGE_SECONDS = 300
 RTC_SESSION_STATE_PATTERN = re.compile(
     r"Session:\s*([0-9]+).*?\bNew state:\s*([A-Za-z-]+)",
     re.IGNORECASE,
@@ -343,6 +346,63 @@ def controller_processes(prefix: str) -> set[int]:
                 continue
             result.add(pid)
     return result
+
+
+def quiesce_controller(prefix: str, natural_grace_seconds: float) -> bool:
+    """Let UU exit naturally, then terminate only its matching Qt controller."""
+
+    prefix = canonical_path(prefix)
+    deadline = time.monotonic() + max(natural_grace_seconds, 0.0)
+    remaining = controller_processes(prefix)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.05)
+        remaining = controller_processes(prefix)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+    deadline = time.monotonic() + CONTROLLER_TERMINATE_GRACE_SECONDS
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.05)
+        remaining = controller_processes(prefix)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    deadline = time.monotonic() + 1.0
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.05)
+        remaining = controller_processes(prefix)
+    return not remaining
+
+
+def upstream_update_handoff_active(prefix: str) -> bool:
+    """Recognize only a recent regular request owned by the current user."""
+
+    drive_c = Path(prefix) / "drive_c"
+    now = time.time()
+    for name in (
+        UPSTREAM_UPDATE_REQUEST_MARKER,
+        UPSTREAM_UPDATE_PROCESSING_MARKER,
+    ):
+        marker = drive_c / name
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        age = now - metadata.st_mtime
+        if (
+            marker.is_file()
+            and not marker.is_symlink()
+            and metadata.st_uid == os.getuid()
+            and -5 <= age <= UPSTREAM_UPDATE_HANDOFF_MAX_AGE_SECONDS
+        ):
+            return True
+    return False
 
 
 def exit_on_close_enabled(prefix: str) -> bool:
@@ -947,6 +1007,7 @@ class TrayProxy:
             and self.decoder_process.poll() is None
         )
         client_quit = self.consume_client_quit_event()
+        update_handoff = upstream_update_handoff_active(self.prefix)
         controlled_state = self.controlled_session_state()
         if self.controller_recovery_requested():
             if controlled_state != "idle":
@@ -981,6 +1042,7 @@ class TrayProxy:
             client_quit
             and not decoder_workflow_running
             and not recovery_grace
+            and not update_handoff
             and exit_on_close_enabled(self.prefix)
         ):
             logging.info(
@@ -993,7 +1055,7 @@ class TrayProxy:
         if client_running:
             self.ever_saw_client = True
             self.client_missing_ticks = 0
-        elif decoder_workflow_running or recovery_grace:
+        elif decoder_workflow_running or recovery_grace or update_handoff:
             self.client_missing_ticks = 0
         elif self.ever_saw_client:
             self.client_missing_ticks += 1
@@ -1082,6 +1144,8 @@ def dependency_check() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--quiesce-controller", action="store_true")
+    parser.add_argument("--grace-seconds", type=float, default=8.0)
     parser.add_argument("--prefix")
     parser.add_argument("--launcher")
     parser.add_argument("--state-dir")
@@ -1089,7 +1153,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--icon", default=APP_ID)
     parser.add_argument("--icon-theme-path", default="")
     args = parser.parse_args()
-    if not args.check:
+    if args.check and args.quiesce_controller:
+        parser.error("--check 和 --quiesce-controller 不能组合")
+    if args.quiesce_controller:
+        if not args.prefix:
+            parser.error("--quiesce-controller 需要 --prefix")
+        if args.grace_seconds < 0:
+            parser.error("--grace-seconds 不能为负数")
+    elif not args.check:
         missing = [
             name
             for name in ("prefix", "launcher", "state_dir", "log_file")
@@ -1107,6 +1178,8 @@ def main() -> int:
     args = parse_args()
     if args.check:
         return dependency_check()
+    if args.quiesce_controller:
+        return 0 if quiesce_controller(args.prefix, args.grace_seconds) else 1
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "tray-proxy.lock"
