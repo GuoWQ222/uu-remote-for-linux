@@ -10,12 +10,6 @@ readonly desktop_target="$user_prefix/share/applications/uu-remote-for-linux.des
 readonly metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
 readonly icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
 readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-remote-for-linux.svg"
-readonly previous_launcher_target="$user_prefix/bin/uuyc-linux-controller"
-readonly previous_runtime_target="$user_prefix/lib/uuyc-linux-controller"
-readonly previous_desktop_target="$user_prefix/share/applications/uuyc-linux-controller.desktop"
-readonly previous_metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uuyc_linux_controller.metainfo.xml"
-readonly previous_icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uuyc-linux-controller.png"
-readonly previous_scalable_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uuyc-linux-controller.svg"
 
 [[ -r "$project_root/lib/uu-remote-for-linux/wevtapi.dll" ]] || {
     printf '缺少预构建的 wevtapi.dll；请先运行 make shim。\n' >&2
@@ -95,16 +89,6 @@ install -Dm0644 \
     "$project_root/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" \
     "$icon_target"
 rm -f -- "$legacy_icon_target"
-rm -f -- \
-    "$previous_launcher_target" \
-    "$previous_desktop_target" \
-    "$previous_metainfo_target" \
-    "$previous_icon_target" \
-    "$previous_scalable_icon_target"
-if [[ -d $previous_runtime_target &&
-    $previous_runtime_target == "$user_prefix/lib/"* ]]; then
-    find "$previous_runtime_target" -depth -delete
-fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$user_prefix/share/applications" >/dev/null 2>&1 || true

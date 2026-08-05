@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
-readonly source_archive="$project_root/third_party/sources/nvcuda-uu-remote-v0.7.tar.xz"
+readonly source_archive="$project_root/third_party/sources/nvcuda-uu-remote-v0.8.tar.xz"
 readonly fixture="$project_root/tests/fixtures/nvdec-d3d11-probe.c"
 readonly hwdecode="$project_root/lib/uu-remote-for-linux/hwdecode"
 
@@ -25,7 +25,7 @@ mkdir -p "$test_root/app"
 
 x86_64-w64-mingw32-gcc \
     -std=c11 -O2 -Wall -Wextra -Werror \
-    -I"$test_root/nvcuda-uu-remote-v0.7/include" \
+    -I"$test_root/nvcuda-uu-remote-v0.8/include" \
     "$fixture" \
     -o "$test_root/app/nvdec-d3d11-probe.exe" \
     -ld3d11 -ldxgi -luuid
@@ -44,6 +44,4 @@ export DXVK_LOG_LEVEL=none
 
 wine "$test_root/app/nvdec-d3d11-probe.exe"
 UU_REMOTE_CUDA_DEVICE=999 \
-    wine "$test_root/app/nvdec-d3d11-probe.exe" --expect-invalid-device
-UUYC_CUDA_DEVICE=999 \
     wine "$test_root/app/nvdec-d3d11-probe.exe" --expect-invalid-device

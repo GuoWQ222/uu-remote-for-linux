@@ -5,7 +5,6 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 launcher="$project_root/bin/uu-remote-for-linux"
 readonly launcher
-export UU_REMOTE_DISABLE_LEGACY_MIGRATION=1
 
 failures=0
 
@@ -102,8 +101,6 @@ check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
 check "Wayland portal input bridge integration" \
     "$project_root/tests/wayland-input-bridge.sh"
-check "legacy project-name migration" \
-    "$project_root/tests/legacy-name-migration.sh"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
 check "Wine controller focus stabilizer" \
     "$project_root/tests/wine-focus-hook.sh"

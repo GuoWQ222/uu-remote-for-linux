@@ -63,7 +63,7 @@ body:
     id: diagnose
     attributes:
       label: Redacted diagnostic output
-      description: Paste `uuyc-linux-controller --diagnose` output after removing sensitive data.
+      description: Paste `uu-remote-for-linux --diagnose` output after removing sensitive data.
       render: text
     validations:
       required: true

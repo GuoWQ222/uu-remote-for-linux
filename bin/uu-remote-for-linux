@@ -2,7 +2,6 @@
 set -euo pipefail
 
 readonly app_id="uu-remote-for-linux"
-readonly legacy_app_id="uuyc-linux-controller"
 readonly app_name="UU 远程（Linux 版本）"
 readonly min_wine_version="11.1"
 readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
@@ -100,102 +99,6 @@ readonly data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 readonly cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
-
-migrate_legacy_path() {
-    local source=$1 target=$2
-
-    [[ -e $source || -L $source ]] || return 0
-    if [[ -e $target || -L $target ]]; then
-        printf '警告：新旧项目路径同时存在，已保留旧路径：%s\n' \
-            "$source" >&2
-        return 0
-    fi
-    mkdir -p -- "$(dirname -- "$target")"
-    mv -- "$source" "$target"
-    printf '已迁移旧版项目数据：%s -> %s\n' \
-        "$source" "$target" >&2
-}
-
-cleanup_legacy_background_processes() {
-    local proc pid cmdline proc_uid current_uid
-
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user stop \
-            "$legacy_app_id-client.service" \
-            "$legacy_app_id-server.service" \
-            "$legacy_app_id-healthd.service" \
-            "$legacy_app_id-update.service" \
-            "$legacy_app_id-autostart.service" \
-            "$legacy_app_id-sleep.service" \
-            "$legacy_app_id-keyboard.service" \
-            "$legacy_app_id-input.service" \
-            "$legacy_app_id-input-injector.service" \
-            "$legacy_app_id-tray.service" \
-            "$legacy_app_id-tray-exit.service" >/dev/null 2>&1 || true
-    fi
-
-    current_uid=$(id -u)
-    for proc in /proc/[0-9]*; do
-        [[ -r $proc/status && -r $proc/cmdline ]] || continue
-        pid=${proc##*/}
-        [[ $pid != "$$" && $pid != "$PPID" ]] || continue
-        proc_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-            "$proc/status" 2>/dev/null | head -n1)
-        [[ $proc_uid == "$current_uid" ]] || continue
-        cmdline=$(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)
-        [[ $cmdline == *"$legacy_app_id"* ]] || continue
-        case "$cmdline" in
-            *uuyc-autostart-bridge*|\
-            *uuyc-sleep-bridge*|\
-            *uuyc-update-bridge*|\
-            *uuyc-keyboard-bridge*|\
-            *uuyc-input-bridge*|\
-            *uuyc-tray-proxy*|\
-            *"systemd-inhibit "*"--who=$legacy_app_id"*)
-                kill "$pid" >/dev/null 2>&1 || true
-                ;;
-        esac
-    done
-}
-
-migrate_legacy_user_state() {
-    local legacy_prefix migration_wineserver
-
-    [[ ${UU_REMOTE_DISABLE_LEGACY_MIGRATION:-0} != 1 ]] || return 0
-    cleanup_legacy_background_processes
-    legacy_prefix="$data_home/$legacy_app_id/wineprefix"
-    if [[ ! -e $data_home/$legacy_app_id &&
-        ! -e $state_home/$legacy_app_id &&
-        ! -e $cache_home/$legacy_app_id &&
-        ! -e $config_home/autostart/$legacy_app_id.desktop ]]; then
-        return 0
-    fi
-
-    migration_wineserver=${UU_REMOTE_WINESERVER_BIN:-wineserver}
-    if [[ -f $legacy_prefix/system.reg ]] &&
-        command -v "$migration_wineserver" >/dev/null 2>&1; then
-        WINEPREFIX="$legacy_prefix" WINEDEBUG=-all \
-            "$migration_wineserver" -k >/dev/null 2>&1 || true
-    fi
-
-    migrate_legacy_path \
-        "$data_home/$legacy_app_id" "$data_home/$app_id"
-    migrate_legacy_path \
-        "$state_home/$legacy_app_id" "$state_home/$app_id"
-    migrate_legacy_path \
-        "$cache_home/$legacy_app_id" "$cache_home/$app_id"
-    migrate_legacy_path \
-        "$config_home/autostart/$legacy_app_id.desktop" \
-        "$config_home/autostart/$app_id.desktop"
-    if [[ -f $config_home/autostart/$app_id.desktop ]]; then
-        sed -i \
-            -e "s/$legacy_app_id/$app_id/g" \
-            -e 's/X-UUYC-Autostart-Bridge/X-UU-Remote-Autostart-Bridge/g' \
-            "$config_home/autostart/$app_id.desktop"
-    fi
-}
-
-migrate_legacy_user_state
 
 readonly data_dir="$data_home/$app_id"
 readonly state_dir="$state_home/$app_id"
@@ -311,43 +214,6 @@ readonly input_injector_runtime_unit="${app_id}-input-injector"
 readonly focus_injector_runtime_unit="${app_id}-focus-injector"
 readonly tray_runtime_unit="${app_id}-tray"
 readonly tray_exit_runtime_unit="${app_id}-tray-exit"
-
-migrate_legacy_prefix_file() {
-    local source=$1 target=$2
-
-    [[ -e $source || -L $source ]] || return 0
-    if [[ ! -e $target && ! -L $target ]]; then
-        mv -- "$source" "$target"
-    elif cmp -s -- "$source" "$target"; then
-        rm -f -- "$source"
-    else
-        printf '警告：新旧兼容文件同时存在，已保留旧文件：%s\n' \
-            "$source" >&2
-    fi
-}
-
-migrate_legacy_prefix_files() {
-    migrate_legacy_prefix_file \
-        "$prefix/.uuyc-linux-controller-package" "$package_stamp"
-    migrate_legacy_prefix_file \
-        "$install_dir/bin/GameViewerServer.uuyc-wol-original.exe" \
-        "$wol_server_original"
-    migrate_legacy_prefix_file \
-        "$install_dir/bin/Upgrade.uuyc-original.exe" \
-        "$native_upgrade_original"
-    migrate_legacy_prefix_file \
-        "$install_dir/bin/streamer.uuyc-original.dll" \
-        "$streamer_original"
-    migrate_legacy_prefix_file \
-        "$prefix/drive_c/uuyc-input-hook.dll" "$input_hook"
-    migrate_legacy_prefix_file \
-        "$prefix/drive_c/uuyc-input-injector.exe" "$input_injector"
-    migrate_legacy_prefix_file \
-        "$prefix/drive_c/uuyc-input-bridge.endpoint" \
-        "$input_bridge_endpoint"
-}
-
-migrate_legacy_prefix_files
 
 notify_status() {
     if command -v notify-send >/dev/null 2>&1; then
@@ -793,10 +659,6 @@ official_latest_version() {
     clean_url=${effective_url%%\?*}
     filename=${clean_url##*/}
     if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-        return
-    fi
-    if [[ $filename =~ uuyc_([0-9]+([.][0-9]+){2,3})[.]exe ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return
     fi
@@ -2777,8 +2639,6 @@ download_installer() {
     filename=${clean_url##*/}
     version="unknown"
     if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
-        version=${BASH_REMATCH[1]}
-    elif [[ $filename =~ uuyc_([0-9]+([.][0-9]+){2,3})[.]exe ]]; then
         version=${BASH_REMATCH[1]}
     fi
     checksum=$(sha256sum "$temp_file")

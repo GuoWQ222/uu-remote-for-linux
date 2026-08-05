@@ -4,4 +4,4 @@
 *.so binary
 *.xz binary
 *.png binary
-lib/uuyc-linux-controller/hwdecode/licenses/*.txt -whitespace
+lib/uu-remote-for-linux/hwdecode/licenses/*.txt -whitespace

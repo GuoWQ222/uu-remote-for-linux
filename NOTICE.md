@@ -1,10 +1,5 @@
 # Third-party notices
 
-The launcher design and the Event Log compatibility shim are adapted from
-`ParticleG/uuyc-wine` at commit
-`66d400c37dfe58ee9c733ce25a9789feb56e22a0`, which is licensed under the
-Zero-Clause BSD license.
-
 NetEase UU Remote is proprietary software. This repository does not include or
 redistribute the NetEase installer, application binaries, or account data. The
 desktop/tray identification icon is the icon resource from the official
@@ -26,7 +21,7 @@ The optional NVIDIA hardware-decoding bridge includes:
 - a modified `nvcuda.dll.so` that adds the UU Remote CUDA-to-D3D11 CPU-bounce
   bridge, cross-device upload submission, and explicit CUDA-device selection.
   The complete corresponding source is shipped in
-  `third_party/sources/nvcuda-uu-remote-v0.7.tar.xz`.
+  `third_party/sources/nvcuda-uu-remote-v0.8.tar.xz`.
 
 Exact revisions, checksums, build details, licenses, and the corresponding
 CUVID source archive are documented in `third_party/HWDECODE.md`.

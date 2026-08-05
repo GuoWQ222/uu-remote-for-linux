@@ -34,7 +34,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.16_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.18_amd64.deb
 ```
 
 Then launch **UU Remote for Linux** from the Ubuntu application menu, or run
@@ -115,10 +115,9 @@ Portal session, so X11 remains the safer choice for pre-login unattended use.
 ## License and attribution
 
 Original project code is available under the Zero-Clause BSD license
-([LICENSE](LICENSE)). Some compatibility ideas and the Event Log shim are
-adapted from `ParticleG/uuyc-wine`; bundled optional decoding components retain
-their respective zlib and LGPL licenses. Exact revisions, corresponding source,
-and checksums are documented in [NOTICE.md](NOTICE.md) and
+([LICENSE](LICENSE)). Bundled optional decoding components retain their
+respective zlib and LGPL licenses. Exact revisions, corresponding source, and
+checksums are documented in [NOTICE.md](NOTICE.md) and
 [third_party/HWDECODE.md](third_party/HWDECODE.md).
 
 The repository does not include the proprietary NetEase installer or client

@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.18] - 2026-08-05
+
+- Remove the former upstream repository name and attribution text from the
+  English and Chinese documentation and packaged third-party notice.
+
+## [1.1.17] - 2026-08-05
+
+- Remove the former repository identity from the launcher, user installer,
+  Debian relationships, issue template, tests, and runtime migration paths so
+  this repository is packaged only as `uu-remote-for-linux`.
+- Rename every project-owned identifier in the modified NVIDIA CUDA relay,
+  remove the obsolete CUDA environment-variable alias, and ship a rebuilt
+  v0.8 source archive and binary with only `UU_REMOTE_*` names.
+
 ## [1.1.16] - 2026-08-04
 
 - Treat a live update bridge without versioned migration state as an unknown
@@ -149,10 +163,9 @@ All notable changes to this project are documented here.
 - Flush CUDA-bounce uploads on the producer D3D11 context before reporting
   resource unmap completion. This prevents a second DXVK D3D11 device from
   observing stale or zero-filled shared NV12/P010 frames.
-- Make the CUDA relay honor the launcher's `UU_REMOTE_CUDA_DEVICE` variable;
-  retain `UUYC_CUDA_DEVICE` as a backwards-compatible fallback.
+- Make the CUDA relay honor the launcher's `UU_REMOTE_CUDA_DEVICE` variable.
 - Add a real NVIDIA/Wine shared-NV12 regression probe covering cross-device
-  visibility and both CUDA-device-selection variable names.
+  visibility and CUDA-device selection.
 - Keep framework-installed outer window procedures above the controller focus
   hook. Reinstalling the hook above a Qt wrapper that already chained to it
   could create a `hook -> Qt -> hook` recursion cycle and pin the UI thread at

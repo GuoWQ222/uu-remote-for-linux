@@ -30,7 +30,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.16_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.18_amd64.deb
 ```
 
 安装完成后，从 Ubuntu 应用菜单点击“UU 远程（Linux 版本）”，或运行
@@ -108,8 +108,7 @@ Portal 授权是 Wayland 的安全边界，应用不能绕过。画面桥请求�
 ## 许可证与署名
 
 本项目的原创代码采用零条款 BSD 许可证
-（[LICENSE](LICENSE)）。部分兼容思路和 Event Log 兼容层改编自
-`ParticleG/uuyc-wine`；随附的可选解码组件继续使用各自的 zlib 和 LGPL
+（[LICENSE](LICENSE)）。随附的可选解码组件继续使用各自的 zlib 和 LGPL
 许可证。准确的修订版本、对应源代码和校验和记录在
 [NOTICE.md](NOTICE.md) 与
 [third_party/HWDECODE.md](third_party/HWDECODE.md) 中。
