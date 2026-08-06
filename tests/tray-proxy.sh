@@ -222,6 +222,9 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     recovery.last_controlled_session_state = "unknown"
     recovery.controller_restart_idle_confirmations = 0
     recovery.controller_recovery_suppressed = 0
+    recovery.controller_recovery_deferred = 0
+    recovery.controller_recovery_reason = ""
+    recovery.controller_recovery_defer_detail = ""
     recovery.write_status = lambda *_args: None
     server_log_dir = recovery.server_connection_log_dir
     server_log_dir.mkdir(parents=True)
@@ -257,6 +260,64 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     assert recovery.client_missing_ticks == 0
     assert recovery.controller_recovery_grace_until > time.monotonic()
 
+    focus_status = recovery.controller_focus_status
+    focus_status.write_text(
+        "[hook]\n"
+        "pid=4242\n"
+        "version=18\n"
+        "[ui_health]\n"
+        "pings_sent=41\n"
+        "pings_acked=39\n"
+        "target_generation=9\n"
+        "consecutive_timeouts=2\n"
+        "hard_stalls_detected=1\n"
+    )
+    marker.write_text(
+        "pid=4242\n"
+        "reason=ui-hard-stall\n"
+        "hook_version=18\n"
+        "guard_evidence=0\n"
+        "sticky_null_evidence=0\n"
+        "ui_timeout_evidence=1\n"
+        "consecutive_timeouts=2\n"
+        "pings_sent=41\n"
+        "pings_acked=39\n"
+        "window_generation=9\n"
+    )
+    assert recovery.controller_recovery_requested()
+    assert recovery.controller_recovery_reason == "ui-hard-stall"
+    with mock.patch.object(namespace["subprocess"], "Popen") as popen:
+        recovery.show_main_window()
+        popen.assert_not_called()
+    assert recovery.controller_restart_idle_confirmations == 1
+    marker.unlink()
+
+    marker.write_text(
+        "pid=4243\n"
+        "reason=ui-hard-stall\n"
+        "hook_version=18\n"
+        "ui_timeout_evidence=1\n"
+        "consecutive_timeouts=2\n"
+        "pings_sent=41\n"
+        "pings_acked=39\n"
+        "window_generation=9\n"
+    )
+    assert not recovery.controller_recovery_requested()
+    assert not marker.exists()
+
+    marker.write_text(
+        "pid=4242\n"
+        "reason=ui-hard-stall\n"
+        "hook_version=18\n"
+        "ui_timeout_evidence=1\n"
+        "consecutive_timeouts=1\n"
+        "pings_sent=41\n"
+        "pings_acked=39\n"
+        "window_generation=9\n"
+    )
+    assert not recovery.controller_recovery_requested()
+    assert not marker.exists()
+
     marker.write_text("reason=stale\n")
     stale = time.time() - (
         namespace["CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS"] + 5
@@ -285,6 +346,9 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     active.last_controlled_session_state = "unknown"
     active.controller_restart_idle_confirmations = 0
     active.controller_recovery_suppressed = 0
+    active.controller_recovery_deferred = 0
+    active.controller_recovery_reason = ""
+    active.controller_recovery_defer_detail = ""
     active.write_status = lambda *_args: None
     server_log_dir = active.server_connection_log_dir
     server_log_dir.mkdir(parents=True)
@@ -300,8 +364,9 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
     with mock.patch.object(namespace["subprocess"], "Popen") as popen:
         assert not active.recover_controller()
         popen.assert_not_called()
-    assert not marker.exists()
-    assert active.controller_recovery_suppressed == 1
+    assert marker.exists()
+    assert active.controller_recovery_deferred == 1
+    assert active.controller_recovery_suppressed == 0
 
     with server_log.open("a") as log_handle:
         log_handle.write(

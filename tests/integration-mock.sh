@@ -344,6 +344,32 @@ test ! -e "$show_request"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
     "$((client_count_before_show + 1))"
 
+# A fresh worker status is not sufficient proof that the Qt UI thread is
+# alive. Two real heartbeat timeouts must prevent another single-instance
+# activation from being sent into the hard-stalled controller.
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=949' \
+    'version=18' \
+    'status_bits=1023' \
+    '[window_state]' \
+    'subclassed=1' \
+    '[ui_health]' \
+    'pings_sent=12' \
+    'pings_acked=10' \
+    'consecutive_timeouts=2' \
+    'hard_stalls_detected=1' \
+    'last_ack_age_ms=25000' \
+    '[worker]' \
+    'heartbeats=20' \
+    >"$prefix/drive_c/uu-remote-focus-hook-status.ini"
+client_count_before_show=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+show_output=$("$launcher" --show)
+grep -Fq '主界面心跳停止' <<<"$show_output"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$client_count_before_show"
+rm -f -- "$prefix/drive_c/uu-remote-focus-hook-status.ini"
+
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-healthd' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-server' "$UU_REMOTE_FAKE_TRACE"
 if grep -q -- '--watch-module GameViewer.exe Qt5Core.dll' \

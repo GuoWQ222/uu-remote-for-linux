@@ -176,6 +176,8 @@ int WINAPI WinMain(
     int health_pings_acked;
     int health_pings_acked_after_pause;
     int health_timeouts;
+    int consecutive_timeouts;
+    int hard_stalls_detected;
     int arbitration_posts;
     int no_livelock_suppressions;
     LONG outer_calls_before;
@@ -717,10 +719,12 @@ int WINAPI WinMain(
     }
 
     /*
-     * A legitimate UI pause without an observed event-loop livelock must
-     * never produce a restart request. Incoming controlled sessions can
+     * One isolated UI timeout without an observed event-loop livelock must
+     * not produce a restart request. Incoming controlled sessions can
      * temporarily stop dispatching the selected top-level window in exactly
-     * this way.
+     * this way. A second consecutive timeout on the same HWND generation is
+     * independent hard-stall evidence; the native tray still verifies that
+     * the controlled RTC session is idle before restarting the controller.
      */
     DeleteFileW(L"C:\\uu-remote-controller-restart.request");
     /*
@@ -769,6 +773,26 @@ int WINAPI WinMain(
     }
     if (arbitration_posts < 1 || arbitration_posts > 40) {
         return 30;
+    }
+    Sleep(12000);
+    consecutive_timeouts = GetPrivateProfileIntW(
+        L"ui_health",
+        L"consecutive_timeouts",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    hard_stalls_detected = GetPrivateProfileIntW(
+        L"ui_health",
+        L"hard_stalls_detected",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
+    if (
+        consecutive_timeouts < 2 || hard_stalls_detected < 1 ||
+        GetFileAttributesW(L"C:\\uu-remote-controller-restart.request") ==
+            INVALID_FILE_ATTRIBUTES
+    ) {
+        return 31;
     }
     DestroyWindow(modal_window);
     DestroyWindow(video_window);

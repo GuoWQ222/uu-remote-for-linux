@@ -32,10 +32,13 @@ CLIENT_QUIT_MARKER = (
     "GameViewerApplication::quitApplication] Quit application"
 )
 CONTROLLER_RESTART_MARKER = "uu-remote-controller-restart.request"
+CONTROLLER_FOCUS_STATUS = "uu-remote-focus-hook-status.ini"
 CONTROLLER_RESTART_REQUEST_MAX_AGE_SECONDS = 60
 CONTROLLER_RESTART_GRACE_SECONDS = 20
 CONTROLLER_TERMINATE_GRACE_SECONDS = 2
 CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 16
+CONTROLLER_HARD_STALL_REQUIRED_HOOK_VERSION = 18
+CONTROLLER_HARD_STALL_REQUIRED_TIMEOUTS = 2
 CONTROLLER_RESTART_IDLE_CONFIRMATIONS = 2
 UPSTREAM_UPDATE_REQUEST_MARKER = "uu-remote-upstream-update.request"
 UPSTREAM_UPDATE_PROCESSING_MARKER = "uu-remote-upstream-update.processing"
@@ -463,6 +466,9 @@ class TrayProxy:
         self.controller_recovery_grace_until = 0.0
         self.controller_restart_idle_confirmations = 0
         self.controller_recovery_suppressed = 0
+        self.controller_recovery_deferred = 0
+        self.controller_recovery_reason = ""
+        self.controller_recovery_defer_detail = ""
 
     @property
     def client_log_dir(self) -> Path:
@@ -605,8 +611,46 @@ class TrayProxy:
     def controller_restart_marker(self) -> Path:
         return Path(self.prefix) / "drive_c" / CONTROLLER_RESTART_MARKER
 
+    @property
+    def controller_focus_status(self) -> Path:
+        return Path(self.prefix) / "drive_c" / CONTROLLER_FOCUS_STATUS
+
+    def read_controller_focus_status(self) -> dict[str, str] | None:
+        path = self.controller_focus_status
+        try:
+            age = time.time() - path.stat().st_mtime
+            text = path.read_text(errors="replace")
+        except OSError:
+            return None
+        if age < -5 or age > 5:
+            return None
+        fields: dict[str, str] = {}
+        section = ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            key, separator, value = line.partition("=")
+            if separator and section:
+                fields[f"{section}.{key.strip()}"] = value.strip()
+        return fields
+
+    def defer_controller_recovery(self, detail: str) -> None:
+        self.controller_restart_idle_confirmations = 0
+        if getattr(self, "controller_recovery_defer_detail", "") == detail:
+            return
+        self.controller_recovery_defer_detail = detail
+        self.controller_recovery_deferred = (
+            getattr(self, "controller_recovery_deferred", 0) + 1
+        )
+        logging.info("延后 UU 主控自动恢复：%s", detail)
+        self.write_status("active", detail)
+
     def suppress_controller_recovery(self, detail: str) -> None:
         self.controller_restart_idle_confirmations = 0
+        self.controller_recovery_reason = ""
+        self.controller_recovery_defer_detail = ""
         self.controller_recovery_suppressed = (
             getattr(self, "controller_recovery_suppressed", 0) + 1
         )
@@ -650,19 +694,86 @@ class TrayProxy:
             hook_version = int(fields.get("hook_version", "0"))
         except ValueError:
             hook_version = 0
+        reason = fields.get("reason", "")
         direct_evidence = (
             fields.get("guard_evidence") == "1"
             or fields.get("sticky_null_evidence") == "1"
         )
-        if (
-            fields.get("reason") != "event-loop-livelock"
-            or not direct_evidence
-            or hook_version < CONTROLLER_RESTART_REQUIRED_HOOK_VERSION
-        ):
+        if reason == "event-loop-livelock":
+            valid = (
+                direct_evidence
+                and hook_version >= CONTROLLER_RESTART_REQUIRED_HOOK_VERSION
+            )
+        elif reason == "ui-hard-stall":
+            try:
+                marker_pid = int(fields.get("pid", "0"))
+                consecutive_timeouts = int(
+                    fields.get("consecutive_timeouts", "0")
+                )
+                pings_sent = int(fields.get("pings_sent", "0"))
+                pings_acked = int(fields.get("pings_acked", "0"))
+                marker_generation = int(
+                    fields.get("window_generation", "0")
+                )
+            except ValueError:
+                marker_pid = 0
+                consecutive_timeouts = 0
+                pings_sent = 0
+                pings_acked = 0
+                marker_generation = 0
+            valid = (
+                hook_version >= CONTROLLER_HARD_STALL_REQUIRED_HOOK_VERSION
+                and fields.get("ui_timeout_evidence") == "1"
+                and consecutive_timeouts
+                >= CONTROLLER_HARD_STALL_REQUIRED_TIMEOUTS
+                and pings_sent > pings_acked
+                and marker_pid > 0
+                and marker_generation > 0
+            )
+            status = self.read_controller_focus_status()
+            if valid and status is None:
+                logging.info("等待 UU UI 硬卡死状态文件完成原子更新")
+                return False
+            if valid and status is not None:
+                try:
+                    status_pid = int(status.get("hook.pid", "0"))
+                    status_version = int(status.get("hook.version", "0"))
+                    status_generation = int(
+                        status.get("ui_health.target_generation", "0")
+                    )
+                    status_consecutive = int(
+                        status.get("ui_health.consecutive_timeouts", "0")
+                    )
+                    status_hard_stalls = int(
+                        status.get("ui_health.hard_stalls_detected", "0")
+                    )
+                    status_sent = int(
+                        status.get("ui_health.pings_sent", "0")
+                    )
+                    status_acked = int(
+                        status.get("ui_health.pings_acked", "0")
+                    )
+                except ValueError:
+                    valid = False
+                else:
+                    valid = (
+                        status_pid == marker_pid
+                        and status_version == hook_version
+                        and status_generation == marker_generation
+                        and status_consecutive
+                        >= CONTROLLER_HARD_STALL_REQUIRED_TIMEOUTS
+                        and status_hard_stalls >= 1
+                        and status_sent == pings_sent
+                        and status_acked == pings_acked
+                    )
+        else:
+            valid = False
+        if not valid:
             self.suppress_controller_recovery(
-                "恢复请求缺少事件循环活锁证据，已安全忽略"
+                "恢复请求缺少可验证的 UI 卡死证据，已安全忽略"
             )
             return False
+        self.controller_recovery_reason = reason
         return True
 
     def recover_controller(self) -> bool:
@@ -671,13 +782,14 @@ class TrayProxy:
         marker = self.controller_restart_marker
         controlled_state = self.controlled_session_state()
         if controlled_state != "idle":
-            self.suppress_controller_recovery(
-                "被控 RTC 会话活动中或状态未知，禁止重启主控"
+            self.defer_controller_recovery(
+                "被控 RTC 会话活动中或状态未知，等待会话结束后恢复"
             )
             return False
         controller_pids = controller_processes(self.prefix)
         logging.warning(
-            "UU 主界面心跳超时，准备仅重启主控进程：pids=%s",
+            "UU 主界面心跳超时（%s），准备仅重启主控进程：pids=%s",
+            getattr(self, "controller_recovery_reason", "unknown"),
             sorted(controller_pids),
         )
         self.write_status(
@@ -733,6 +845,8 @@ class TrayProxy:
             time.monotonic() + CONTROLLER_RESTART_GRACE_SECONDS
         )
         self.controller_restart_idle_confirmations = 0
+        self.controller_recovery_reason = ""
+        self.controller_recovery_defer_detail = ""
         self.client_missing_ticks = 0
         logging.info("UU 主控进程自动恢复已启动")
         return True
@@ -753,6 +867,8 @@ class TrayProxy:
                     f"{getattr(self, 'last_controlled_session_state', 'unknown')}",
                     "recovery_suppressed="
                     f"{getattr(self, 'controller_recovery_suppressed', 0)}",
+                    "recovery_deferred="
+                    f"{getattr(self, 'controller_recovery_deferred', 0)}",
                     f"detail={detail.replace(chr(10), ' ')}",
                     f"updated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
                     "",
@@ -811,6 +927,23 @@ class TrayProxy:
 
     def show_main_window(self, *_unused) -> None:
         logging.info("请求显示 UU 主界面")
+        if self.controller_recovery_requested():
+            controlled_state = self.controlled_session_state()
+            if controlled_state == "idle":
+                self.controller_restart_idle_confirmations = max(
+                    getattr(
+                        self, "controller_restart_idle_confirmations", 0
+                    ),
+                    CONTROLLER_RESTART_IDLE_CONFIRMATIONS - 1,
+                )
+                self.write_status(
+                    "active", "已确认 UI 卡死，正在复核并恢复主界面"
+                )
+            else:
+                self.defer_controller_recovery(
+                    "被控 RTC 会话活动中，显示请求将在会话结束后恢复"
+                )
+            return
         environment = os.environ.copy()
         environment["UU_REMOTE_TRAY_PROXY_CHILD"] = "1"
         log_handle = self.command_log_handle()
@@ -1011,8 +1144,8 @@ class TrayProxy:
         controlled_state = self.controlled_session_state()
         if self.controller_recovery_requested():
             if controlled_state != "idle":
-                self.suppress_controller_recovery(
-                    "被控 RTC 会话活动中或状态未知，禁止重启主控"
+                self.defer_controller_recovery(
+                    "被控 RTC 会话活动中或状态未知，等待会话结束后恢复"
                 )
             else:
                 self.controller_restart_idle_confirmations = (

@@ -36,7 +36,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 17u
+#define HOOK_VERSION 18u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -61,6 +61,8 @@
 #define UI_HEALTH_PING_INTERVAL_MS 1000u
 #define UI_HEALTH_TIMEOUT_MS 10000u
 #define UI_HEALTH_RESUME_GAP_MS 3000u
+#define UI_HEALTH_HARD_STALL_TIMEOUTS 2
+#define UI_HEALTH_RECOVERY_RETRY_MS 5000u
 #define FOCUS_MAX_WINDOWS 64u
 #define FOCUS_MAX_MODULES 256u
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
@@ -255,13 +257,19 @@ static volatile LONG ui_health_timeouts;
 static volatile LONG ui_health_recovery_requests;
 static volatile LONG ui_health_window_invalidations;
 static volatile LONG ui_health_no_livelock_suppressions;
+static volatile LONG ui_health_consecutive_timeouts;
+static volatile LONG ui_health_hard_stalls_detected;
 static volatile LONG64 ui_health_ping_sent_at;
 static volatile LONG64 ui_health_last_worker_tick;
+static volatile LONG64 ui_health_last_ack_tick;
+static volatile LONG64 ui_health_recovery_requested_at;
 static volatile LONG ui_health_recovery_requested;
 static volatile LONG ui_health_ping_generation;
 static volatile LONG ui_health_ping_guard_breaks;
 static volatile LONG ui_health_ping_sticky_nulls;
 static PVOID volatile ui_health_ping_window;
+static volatile LONG ui_health_stall_generation;
+static PVOID volatile ui_health_stall_window;
 static volatile LONG focus_arbitration_pending;
 static volatile LONG focus_arbitration_posts;
 static volatile LONG focus_arbitration_coalesced;
@@ -2108,6 +2116,15 @@ static BOOL write_focus_hook_status_atomic(void) {
     DWORD written = 0;
     size_t used = 0;
     BOOL ready;
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG last_ack = (ULONGLONG)InterlockedCompareExchange64(
+        &ui_health_last_ack_tick, 0, 0
+    );
+    LONG64 last_ack_age = -1;
+
+    if (last_ack && now >= last_ack) {
+        last_ack_age = (LONG64)(now - last_ack);
+    }
 
     ready = focus_status_append(
         buffer,
@@ -2171,6 +2188,10 @@ static BOOL write_focus_hook_status_atomic(void) {
         "target_generation=%ld\r\n"
         "window_invalidations=%ld\r\n"
         "no_livelock_suppressions=%ld\r\n"
+        "consecutive_timeouts=%ld\r\n"
+        "hard_stalls_detected=%ld\r\n"
+        "last_ack_tick=%lld\r\n"
+        "last_ack_age_ms=%lld\r\n"
         "[worker]\r\n"
         "heartbeats=%ld\r\n",
         (unsigned long)GetCurrentProcessId(),
@@ -2231,13 +2252,21 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&ui_health_pings_acked, 0, 0),
         InterlockedCompareExchange(&ui_health_timeouts, 0, 0),
         InterlockedCompareExchange(&ui_health_recovery_requests, 0, 0),
-        InterlockedCompareExchange(&ui_health_ping_generation, 0, 0),
+        InterlockedCompareExchange(&ui_health_stall_generation, 0, 0),
         InterlockedCompareExchange(
             &ui_health_window_invalidations, 0, 0
         ),
         InterlockedCompareExchange(
             &ui_health_no_livelock_suppressions, 0, 0
         ),
+        InterlockedCompareExchange(
+            &ui_health_consecutive_timeouts, 0, 0
+        ),
+        InterlockedCompareExchange(
+            &ui_health_hard_stalls_detected, 0, 0
+        ),
+        (long long)last_ack,
+        (long long)last_ack_age,
         InterlockedCompareExchange(&focus_worker_heartbeats, 0, 0)
     );
     if (!ready) {
@@ -2707,6 +2736,41 @@ static void ui_health_cancel_pending(void) {
     InterlockedExchange(&ui_health_ping_generation, 0);
 }
 
+static void ui_health_reset_stall_tracking(void) {
+    InterlockedExchange(&ui_health_consecutive_timeouts, 0);
+    InterlockedExchangePointer(&ui_health_stall_window, NULL);
+    InterlockedExchange(&ui_health_stall_generation, 0);
+}
+
+static void ui_health_cancel_recovery_request(void) {
+    InterlockedExchange(&ui_health_recovery_requested, 0);
+    InterlockedExchange64(&ui_health_recovery_requested_at, 0);
+    if (controller_restart_request_path[0]) {
+        DeleteFileA(controller_restart_request_path);
+    }
+}
+
+static LONG ui_health_note_timeout(HWND window, LONG generation) {
+    HWND previous_window = (HWND)InterlockedCompareExchangePointer(
+        &ui_health_stall_window, NULL, NULL
+    );
+    LONG previous_generation = InterlockedCompareExchange(
+        &ui_health_stall_generation, 0, 0
+    );
+
+    if (previous_window != window || previous_generation != generation) {
+        InterlockedExchangePointer(&ui_health_stall_window, window);
+        InterlockedExchange(&ui_health_stall_generation, generation);
+        InterlockedExchange(&ui_health_consecutive_timeouts, 1);
+        return 1;
+    }
+    return InterlockedIncrement(&ui_health_consecutive_timeouts);
+}
+
+static BOOL ui_health_has_hard_stall_evidence(LONG consecutive_timeouts) {
+    return consecutive_timeouts >= UI_HEALTH_HARD_STALL_TIMEOUTS;
+}
+
 static void focus_remove_window(HWND window) {
     unsigned int index;
     BOOL removed = FALSE;
@@ -2732,6 +2796,32 @@ static void focus_remove_window(HWND window) {
     ) {
         InterlockedIncrement(&ui_health_window_invalidations);
         ui_health_cancel_pending();
+    }
+    if (
+        removed &&
+        window == (HWND)InterlockedCompareExchangePointer(
+            &ui_health_stall_window, NULL, NULL
+        )
+    ) {
+        /* Never restart a replacement UI for a window that already died. */
+        ui_health_cancel_recovery_request();
+        ui_health_reset_stall_tracking();
+    }
+    if (
+        removed &&
+        window == (HWND)InterlockedCompareExchangePointer(
+            &focus_preferred_window, NULL, NULL
+        )
+    ) {
+        InterlockedExchange(&focus_latch_active, 0);
+        InterlockedExchange64(&focus_latch_until, 0);
+        InterlockedExchangePointer(&focus_preferred_window, NULL);
+        InterlockedExchange(&focus_preferred_role, FOCUS_ROLE_UNKNOWN);
+        InterlockedExchange64(&focus_last_apply_posted, 0);
+    }
+    if (removed) {
+        /* A posted arbitration message dies with its target HWND. */
+        InterlockedExchange(&focus_arbitration_pending, 0);
     }
     if (
         window == (HWND)InterlockedCompareExchangePointer(
@@ -2794,13 +2884,15 @@ static BOOL ui_health_has_livelock_evidence(
 }
 
 static void request_controller_restart(
+    const CHAR *reason,
     LONG generation,
     LONG guard_breaks_before,
     LONG guard_breaks_now,
     LONG sticky_nulls_before,
-    LONG sticky_nulls_now
+    LONG sticky_nulls_now,
+    LONG consecutive_timeouts
 ) {
-    CHAR payload[256];
+    CHAR payload[512];
     HANDLE file;
     DWORD written = 0;
     int length;
@@ -2816,17 +2908,26 @@ static void request_controller_restart(
     length = wsprintfA(
         payload,
         "pid=%lu\r\n"
-        "reason=event-loop-livelock\r\n"
+        "reason=%s\r\n"
         "hook_version=%lu\r\n"
         "guard_evidence=%u\r\n"
         "sticky_null_evidence=%u\r\n"
+        "ui_timeout_evidence=%u\r\n"
+        "consecutive_timeouts=%ld\r\n"
+        "pings_sent=%ld\r\n"
+        "pings_acked=%ld\r\n"
         "window_generation=%ld\r\n"
         "guard_breaks=%ld\r\n"
         "sticky_nulls=%ld\r\n",
         (unsigned long)GetCurrentProcessId(),
+        reason ? reason : "unknown",
         (unsigned long)HOOK_VERSION,
         guard_breaks_now != guard_breaks_before ? 1u : 0u,
         sticky_nulls_now != sticky_nulls_before ? 1u : 0u,
+        ui_health_has_hard_stall_evidence(consecutive_timeouts) ? 1u : 0u,
+        consecutive_timeouts,
+        InterlockedCompareExchange(&ui_health_pings_sent, 0, 0),
+        InterlockedCompareExchange(&ui_health_pings_acked, 0, 0),
         generation,
         guard_breaks_now,
         sticky_nulls_now
@@ -2842,6 +2943,7 @@ static void request_controller_restart(
     );
     if (file == INVALID_HANDLE_VALUE) {
         InterlockedExchange(&ui_health_recovery_requested, 0);
+        InterlockedExchange64(&ui_health_recovery_requested_at, 0);
         return;
     }
     if (
@@ -2851,8 +2953,13 @@ static void request_controller_restart(
     ) {
         FlushFileBuffers(file);
         InterlockedIncrement(&ui_health_recovery_requests);
+        InterlockedExchange64(
+            &ui_health_recovery_requested_at,
+            (LONG64)GetTickCount64()
+        );
     } else {
         InterlockedExchange(&ui_health_recovery_requested, 0);
+        InterlockedExchange64(&ui_health_recovery_requested_at, 0);
     }
     CloseHandle(file);
 }
@@ -2867,6 +2974,9 @@ static void focus_ui_health_tick(ULONGLONG now) {
     LONG guard_breaks_now;
     LONG sticky_nulls_before;
     LONG sticky_nulls_now;
+    LONG consecutive_timeouts;
+    LONG recovery_requested;
+    ULONGLONG recovery_requested_at;
     HWND window;
 
     previous_tick = (ULONGLONG)InterlockedExchange64(
@@ -2883,7 +2993,29 @@ static void focus_ui_health_tick(ULONGLONG now) {
     ) {
         /* A suspended laptop is not a hung Qt event loop. */
         ui_health_cancel_pending();
+        ui_health_cancel_recovery_request();
+        ui_health_reset_stall_tracking();
         sent_at = 0;
+    }
+    recovery_requested = InterlockedCompareExchange(
+        &ui_health_recovery_requested, 0, 0
+    );
+    if (recovery_requested) {
+        recovery_requested_at = (ULONGLONG)InterlockedCompareExchange64(
+            &ui_health_recovery_requested_at, 0, 0
+        );
+        if (
+            recovery_requested_at &&
+            now >= recovery_requested_at &&
+            now - recovery_requested_at >= UI_HEALTH_RECOVERY_RETRY_MS &&
+            GetFileAttributesA(controller_restart_request_path) ==
+                INVALID_FILE_ATTRIBUTES
+        ) {
+            InterlockedExchange(&ui_health_recovery_requested, 0);
+            InterlockedExchange64(&ui_health_recovery_requested_at, 0);
+        } else {
+            return;
+        }
     }
     if (sent_at) {
         window = (HWND)InterlockedCompareExchangePointer(
@@ -2895,6 +3027,7 @@ static void focus_ui_health_tick(ULONGLONG now) {
         if (!ui_health_target_is_current(window, generation)) {
             InterlockedIncrement(&ui_health_window_invalidations);
             ui_health_cancel_pending();
+            ui_health_reset_stall_tracking();
             return;
         }
         if (
@@ -2902,6 +3035,9 @@ static void focus_ui_health_tick(ULONGLONG now) {
             now - sent_at >= UI_HEALTH_TIMEOUT_MS
         ) {
             InterlockedIncrement(&ui_health_timeouts);
+            consecutive_timeouts = ui_health_note_timeout(
+                window, generation
+            );
             guard_breaks_before = InterlockedCompareExchange(
                 &ui_health_ping_guard_breaks, 0, 0
             );
@@ -2921,11 +3057,26 @@ static void focus_ui_health_tick(ULONGLONG now) {
                     sticky_nulls_now
                 )) {
                 request_controller_restart(
+                    "event-loop-livelock",
                     generation,
                     guard_breaks_before,
                     guard_breaks_now,
                     sticky_nulls_before,
-                    sticky_nulls_now
+                    sticky_nulls_now,
+                    consecutive_timeouts
+                );
+            } else if (ui_health_has_hard_stall_evidence(
+                    consecutive_timeouts
+                )) {
+                InterlockedIncrement(&ui_health_hard_stalls_detected);
+                request_controller_restart(
+                    "ui-hard-stall",
+                    generation,
+                    guard_breaks_before,
+                    guard_breaks_now,
+                    sticky_nulls_before,
+                    sticky_nulls_now,
+                    consecutive_timeouts
                 );
             } else {
                 InterlockedIncrement(
@@ -2936,15 +3087,23 @@ static void focus_ui_health_tick(ULONGLONG now) {
         }
         return;
     }
-    if (
-        InterlockedCompareExchange(&ui_health_recovery_requested, 0, 0)
-    ) {
-        return;
-    }
     generation = 0;
     window = focus_ui_health_window(&generation);
     if (!window || !IsWindow(window)) {
+        ui_health_reset_stall_tracking();
         return;
+    }
+    if (
+        window != (HWND)InterlockedCompareExchangePointer(
+            &ui_health_stall_window, NULL, NULL
+        ) ||
+        generation != InterlockedCompareExchange(
+            &ui_health_stall_generation, 0, 0
+        )
+    ) {
+        ui_health_reset_stall_tracking();
+        InterlockedExchangePointer(&ui_health_stall_window, window);
+        InterlockedExchange(&ui_health_stall_generation, generation);
     }
     next = sent + 1;
     if (next <= 0) {
@@ -2970,6 +3129,7 @@ static void focus_ui_health_tick(ULONGLONG now) {
     )) {
         InterlockedIncrement(&ui_health_window_invalidations);
         ui_health_cancel_pending();
+        ui_health_reset_stall_tracking();
     }
 }
 
@@ -3379,8 +3539,13 @@ static LRESULT CALLBACK focus_subclass_window_proc(
             )
         ) {
             InterlockedExchange(&ui_health_pings_acked, (LONG)wparam);
+            InterlockedExchange64(
+                &ui_health_last_ack_tick, (LONG64)GetTickCount64()
+            );
             InterlockedExchange64(&ui_health_ping_sent_at, 0);
             InterlockedExchangePointer(&ui_health_ping_window, NULL);
+            ui_health_reset_stall_tracking();
+            ui_health_cancel_recovery_request();
         }
         return 0;
     }
@@ -4703,7 +4868,17 @@ __declspec(dllexport) DWORD WINAPI UURemoteUIHealthEvidenceSelfTest(void) {
     if (!ui_health_has_livelock_evidence(3, 3, 10, 11)) {
         return 0u;
     }
-    return ui_health_has_livelock_evidence(3, 4, 10, 11) ? 1u : 0u;
+    if (!ui_health_has_livelock_evidence(3, 4, 10, 11)) {
+        return 0u;
+    }
+    if (ui_health_has_hard_stall_evidence(
+            UI_HEALTH_HARD_STALL_TIMEOUTS - 1
+        )) {
+        return 0u;
+    }
+    return ui_health_has_hard_stall_evidence(
+        UI_HEALTH_HARD_STALL_TIMEOUTS
+    ) ? 1u : 0u;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(

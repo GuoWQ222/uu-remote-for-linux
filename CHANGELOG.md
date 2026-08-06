@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.19] - 2026-08-06
+
+- Detect an application-level Qt/Wine UI hard stall from two consecutive,
+  generation-bound heartbeat timeouts even when no sticky `WM_NULL` or event
+  loop guard evidence is present.
+- Validate the matching hook status before recovering, defer recovery while a
+  controlled RTC session is active, and restart only the controller after two
+  idle confirmations so the background host stays online.
+- Refuse tray and command-line show requests while the controller is proven
+  hung, and cancel stale recovery state when the target window disappears, a
+  delayed heartbeat is finally dispatched, or the machine resumes from sleep.
+- Clear coalesced window-arbitration state when its target is destroyed so a
+  later home-window activation cannot inherit a permanently pending request.
+
 ## [1.1.18] - 2026-08-05
 
 - Remove the former upstream repository name and attribution text from the

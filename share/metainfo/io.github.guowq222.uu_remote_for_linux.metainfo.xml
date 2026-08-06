@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.19" date="2026-08-06">
+      <description>
+        <p>Detect genuine Qt/Wine UI hard stalls independently of WM_NULL, reject show requests to the frozen controller, and recover only that controller after validating the exact window generation while keeping active controlled sessions online.</p>
+      </description>
+    </release>
     <release version="1.1.18" date="2026-08-05">
       <description>
         <p>Remove the former upstream repository name and attribution text from the project documentation and packaged notices.</p>

@@ -95,7 +95,7 @@ for attempt in 1 2; do
         wineserver -w >/dev/null 2>&1 || true
 done
 (( probe_status == 0 )) || exit "$probe_status"
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=17'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=18'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=1023'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
@@ -122,6 +122,10 @@ grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_sent=[1-9]'
 grep -A5 -F '[ui_health]' "$status" | grep -Eq 'pings_acked=[1-9]'
 grep -A9 -F '[ui_health]' "$status" |
     grep -Eq 'no_livelock_suppressions=[1-9]'
+grep -A13 -F '[ui_health]' "$status" |
+    grep -Eq 'consecutive_timeouts=[2-9]|consecutive_timeouts=[1-9][0-9]+'
+grep -A13 -F '[ui_health]' "$status" |
+    grep -Eq 'hard_stalls_detected=[1-9]'
 grep -A2 -F '[worker]' "$status" | grep -Eq 'heartbeats=[2-9]|heartbeats=[1-9][0-9]+'
 
 printf 'Wine 主控隐藏状态、焦点反馈限速、模态切换和键盘钩子去抖实测通过。\n'

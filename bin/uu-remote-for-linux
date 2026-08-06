@@ -1328,7 +1328,8 @@ controller_focus_hook_status_label() {
     local version="" status_bits="" subclassed="" transitions=""
     local storms="" resolved="" blocked="" modal="" handoffs=""
     local guard_breaks="" health_timeouts="" recoveries="" health_suppressed=""
-    local sticky_detected="" sticky_filtered=""
+    local sticky_detected="" sticky_filtered="" hard_stalls=""
+    local consecutive_timeouts=""
 
     if [[ ! -r $controller_focus_hook_status ]]; then
         printf '就绪（待主控窗口启动）'
@@ -1363,7 +1364,18 @@ controller_focus_hook_status_label() {
         "$controller_focus_hook_status" ui_health recovery_requests)
     health_suppressed=$(ini_section_value \
         "$controller_focus_hook_status" ui_health no_livelock_suppressions)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 16 &&
+    hard_stalls=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health hard_stalls_detected)
+    consecutive_timeouts=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health consecutive_timeouts)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 18 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
+        printf '生效中（v%s；空队列/粘滞消息纠正 %s/%s，UI 超时/连续/硬卡死/恢复 %s/%s/%s/%s，顶层窗口 %s）' \
+            "$version" "${guard_breaks:-0}" "${sticky_detected:-0}" \
+            "${health_timeouts:-0}" "${consecutive_timeouts:-0}" \
+            "${hard_stalls:-0}" "${recoveries:-0}" \
+            "${subclassed:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 16 &&
         $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
         printf '生效中（v%s；空队列/粘滞消息纠正 %s/%s，粘滞过滤 %s，UI 超时/恢复/安全抑制 %s/%s/%s，顶层窗口 %s）' \
             "$version" "${guard_breaks:-0}" "${sticky_detected:-0}" \
@@ -2105,6 +2117,61 @@ controller_focus_hook_live() {
     ((modified <= now && now - modified <= 3))
 }
 
+controller_focus_ui_state() {
+    local version pings_sent pings_acked consecutive hard_stalls ack_age
+
+    controller_focus_hook_live || {
+        printf 'unavailable'
+        return
+    }
+    version=$(ini_section_value \
+        "$controller_focus_hook_status" hook version)
+    pings_sent=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health pings_sent)
+    pings_acked=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health pings_acked)
+    consecutive=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health consecutive_timeouts)
+    hard_stalls=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health hard_stalls_detected)
+    ack_age=$(ini_section_value \
+        "$controller_focus_hook_status" ui_health last_ack_age_ms)
+    if [[ $version =~ ^[0-9]+$ && $version -lt 18 ]]; then
+        printf 'legacy'
+        return
+    fi
+    if [[ $version =~ ^[0-9]+$ && $version -ge 18 &&
+        $pings_sent =~ ^[0-9]+$ && $pings_acked =~ ^[0-9]+$ &&
+        $consecutive =~ ^[0-9]+$ && $hard_stalls =~ ^[0-9]+$ ]] &&
+        ((consecutive >= 2 && hard_stalls >= 1 &&
+            pings_sent > pings_acked)); then
+        printf 'hard-stalled'
+        return
+    fi
+    if [[ $version =~ ^[0-9]+$ && $version -ge 18 &&
+        $pings_acked =~ ^[0-9]+$ && $pings_acked -ge 1 &&
+        $consecutive =~ ^[0-9]+$ && $consecutive -eq 0 &&
+        $ack_age =~ ^[0-9]+$ && $ack_age -le 5000 ]]; then
+        printf 'healthy'
+        return
+    fi
+    printf 'unknown'
+}
+
+wait_controller_focus_ui_state() {
+    local attempt state
+
+    for ((attempt = 0; attempt < 30; ++attempt)); do
+        state=$(controller_focus_ui_state)
+        [[ $state == unknown ]] || {
+            printf '%s' "$state"
+            return
+        }
+        sleep 0.1
+    done
+    printf 'unknown'
+}
+
 authorize_controller_home_show() {
     (
         umask 077
@@ -2583,14 +2650,28 @@ unset WEBVIEW2_CHANNEL_SEARCH_KIND
 unset WEBVIEW2_RELEASE_CHANNELS
 unset WEBVIEW2_USER_DATA_FOLDER
 
-if $show_requested && controller_focus_hook_live; then
-    authorize_controller_home_show ||
-        die "无法授权 UU 自身恢复主界面"
-    cd "$install_dir"
-    exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
-        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
-        -u ALL_PROXY -u NO_PROXY \
-        "$wine" "$client"
+if controller_focus_hook_live; then
+    controller_ui_state=$(wait_controller_focus_ui_state)
+    if [[ $controller_ui_state == hard-stalled ]]; then
+        notify_status "检测到 UU 主界面卡死，正在安全恢复主控进程"
+        printf '检测到 UU 主界面心跳停止；原生托盘将在确认无被控会话后自动恢复。\n'
+        exit 0
+    fi
+    if $show_requested; then
+        if [[ $controller_ui_state != healthy &&
+            $controller_ui_state != legacy ]]; then
+            notify_status "UU 主界面暂未响应，正在等待安全恢复"
+            printf 'UU 主界面未通过真实 UI 心跳检查；已避免向可能卡死的单实例进程继续投递激活请求。\n'
+            exit 0
+        fi
+        authorize_controller_home_show ||
+            die "无法授权 UU 自身恢复主界面"
+        cd "$install_dir"
+        exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+            -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+            -u ALL_PROXY -u NO_PROXY \
+            "$wine" "$client"
+    fi
 fi
 
 [[ $operation_lock_timeout =~ ^[0-9]+$ ]] ||
