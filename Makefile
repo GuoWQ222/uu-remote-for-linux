@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all shim nvdec-probe update-blocker input-hook powershell-bridge test deb clean
+.PHONY: all shim nvdec-probe dxgi-probe update-blocker input-hook powershell-bridge test deb clean
 
 all: test
 
@@ -9,6 +9,9 @@ shim:
 
 nvdec-probe:
 	./scripts/build-nvdec-probe.sh
+
+dxgi-probe:
+	./scripts/build-dxgi-probe.sh
 
 update-blocker:
 	./scripts/build-update-blocker.sh

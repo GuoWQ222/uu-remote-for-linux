@@ -25,6 +25,31 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.24" date="2026-08-11">
+      <description>
+        <p>Automatically derive fail-closed NVDEC profiles after official UU updates, validate the bridge with the real DXGI adapter and UU's own codec detector, and restore or roll back before launch if hardware decoding is not confirmed.</p>
+      </description>
+    </release>
+    <release version="1.1.23" date="2026-08-11">
+      <description>
+        <p>Restore UU 4.36 NVIDIA NVDEC negotiation and 20M quality selection with a fail-closed, per-version streamer patch profile validated by hashes and instruction fingerprints.</p>
+      </description>
+    </release>
+    <release version="1.1.22" date="2026-08-11">
+      <description>
+        <p>Prevent UU 4.36+ from installing Windows-only IDD, gvInput, and ViGEm drivers into Wine so the server completes IPC startup and tray activation can restore the real Qt main window.</p>
+      </description>
+    </release>
+    <release version="1.1.21" date="2026-08-11">
+      <description>
+        <p>Automatically install the latest official UU client on launch and during periodic checks, falling back only version-bound NVDEC/WOL patches while retaining generic Linux integration and transactional rollback.</p>
+      </description>
+    </release>
+    <release version="1.1.20" date="2026-08-07">
+      <description>
+        <p>Prevent the native tray exit helper from stopping its own transient systemd unit, so a requested exit reaches wineserver and cannot leave the Qt controller visible but non-interactive.</p>
+      </description>
+    </release>
     <release version="1.1.19" date="2026-08-06">
       <description>
         <p>Detect genuine Qt/Wine UI hard stalls independently of WM_NULL, reject show requests to the frozen controller, and recover only that controller after validating the exact window generation while keeping active controlled sessions online.</p>

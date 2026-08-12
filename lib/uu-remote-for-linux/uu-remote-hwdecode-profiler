@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Derive a fail-closed NVDEC patch profile from an official streamer.dll."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import struct
+import sys
+from pathlib import Path
+
+
+PATCH_1_SIGNATURE = bytes.fromhex(
+    "49 8b d8 89 55 d0 4c 8b f1 48 89 8d 00 01 00 00 "
+    "89 54 24 60 c7 44 24 58 01 00 00 00 45 33 ff 4c "
+    "89 39 4c 89 79 08 4c 89 79 10 c7 44 24 58 01 00 "
+    "00 00 48 8d 8d 48 02 00 00 e8 32 18 00 00 90 4c "
+    "39 bd 58 02 00 00 75 47"
+)
+PATCH_2_SIGNATURE = bytes.fromhex(
+    "89 85 e8 01 00 00 48 8b 45 90 8b 00 89 85 f0 01 "
+    "00 00 8b 45 a0 89 85 f4 01 00 00 8b 45 a4 89 85 "
+    "f8 01 00 00 c7 85 fc 01 00 00 ff ff ff ff 8b 45 "
+    "d0 89 85 00 02 00 00 0f b6 45 a8 88 85 04 02 00 "
+    "00 0f b6 44 24 54 88 85 05 02 00 00 49 8b 56 08 "
+    "49 3b 56 10 74 2c"
+)
+PATCH_1_RELATIVE_OFFSET = 3
+PATCH_2_RELATIVE_OFFSET = 0x2E
+PATCH_DISTANCE = 0x8EB
+PATCH_1_BEFORE = bytes.fromhex("89 55 d0")
+PATCH_1_AFTER = bytes.fromhex("b2 21 90")
+PATCH_2_BEFORE = bytes.fromhex("8b 45 d0")
+PATCH_2_AFTER = bytes.fromhex("6a 21 58")
+REQUIRED_MARKERS = (
+    b"StreamerCodecDetector.exe",
+    b"decoder probe produced only software fallback",
+)
+
+
+class ProfileError(RuntimeError):
+    pass
+
+
+def find_all(data: bytes, needle: bytes, start: int, end: int) -> list[int]:
+    matches: list[int] = []
+    cursor = start
+    while True:
+        position = data.find(needle, cursor, end)
+        if position < 0:
+            return matches
+        matches.append(position)
+        cursor = position + 1
+
+
+def executable_text_range(data: bytes) -> tuple[int, int]:
+    if len(data) < 0x100 or data[:2] != b"MZ":
+        raise ProfileError("streamer.dll 不是有效的 PE 文件")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ProfileError("streamer.dll 缺少有效的 PE 签名")
+    machine, section_count = struct.unpack_from("<HH", data, pe_offset + 4)
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    if machine != 0x8664:
+        raise ProfileError("仅支持官方 Win64 streamer.dll")
+    section_table = pe_offset + 24 + optional_size
+    for index in range(section_count):
+        header = section_table + index * 40
+        if header + 40 > len(data):
+            raise ProfileError("PE 节表越界")
+        name = data[header : header + 8].rstrip(b"\0")
+        raw_size, raw_offset = struct.unpack_from("<II", data, header + 16)
+        characteristics = struct.unpack_from("<I", data, header + 36)[0]
+        if name == b".text" and characteristics & 0x20000000:
+            end = raw_offset + raw_size
+            if raw_offset < 0x200 or end > len(data) or raw_offset >= end:
+                raise ProfileError("PE .text 节范围无效")
+            return raw_offset, end
+    raise ProfileError("没有找到可执行的 PE .text 节")
+
+
+def derive_profile(data: bytes, version: str) -> tuple[str, bytes]:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2,3}", version):
+        raise ProfileError("UU 版本号格式无效")
+    for marker in REQUIRED_MARKERS:
+        if data.count(marker) != 1:
+            raise ProfileError(f"缺少或重复的语义标记：{marker.decode()}")
+
+    text_start, text_end = executable_text_range(data)
+    first_matches = find_all(data, PATCH_1_SIGNATURE, text_start, text_end)
+    second_matches = find_all(data, PATCH_2_SIGNATURE, text_start, text_end)
+    if len(first_matches) != 1 or len(second_matches) != 1:
+        raise ProfileError(
+            "NVDEC 指令指纹不是唯一匹配："
+            f"选择点={len(first_matches)}，能力点={len(second_matches)}"
+        )
+    first = first_matches[0] + PATCH_1_RELATIVE_OFFSET
+    second = second_matches[0] + PATCH_2_RELATIVE_OFFSET
+    if second - first != PATCH_DISTANCE:
+        raise ProfileError(
+            f"NVDEC 两处指令不属于已知函数布局：间距={second - first:#x}"
+        )
+    if data[first : first + 3] != PATCH_1_BEFORE:
+        raise ProfileError("NVDEC 选择点原始字节不匹配")
+    if data[second : second + 3] != PATCH_2_BEFORE:
+        raise ProfileError("NVDEC 能力点原始字节不匹配")
+
+    patched = bytearray(data)
+    patched[first : first + 3] = PATCH_1_AFTER
+    patched[second : second + 3] = PATCH_2_AFTER
+    patched_bytes = bytes(patched)
+    original_sha = hashlib.sha256(data).hexdigest()
+    patched_sha = hashlib.sha256(patched_bytes).hexdigest()
+    row = "\t".join(
+        (
+            version,
+            original_sha,
+            patched_sha,
+            hex(first),
+            PATCH_1_BEFORE.hex(),
+            PATCH_1_AFTER.hex(),
+            hex(second),
+            PATCH_2_BEFORE.hex(),
+            PATCH_2_AFTER.hex(),
+        )
+    )
+    return row, patched_bytes
+
+
+def synthetic_pe() -> bytes:
+    data = bytearray(0x1800)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HH", data, 0x84, 0x8664, 1)
+    struct.pack_into("<H", data, 0x94, 0xF0)
+    section = 0x80 + 24 + 0xF0
+    data[section : section + 8] = b".text\0\0\0"
+    struct.pack_into("<II", data, section + 16, 0x1200, 0x200)
+    struct.pack_into("<I", data, section + 36, 0x60000020)
+    first_signature = 0x300
+    first = first_signature + PATCH_1_RELATIVE_OFFSET
+    second = first + PATCH_DISTANCE
+    second_signature = second - PATCH_2_RELATIVE_OFFSET
+    data[first_signature : first_signature + len(PATCH_1_SIGNATURE)] = PATCH_1_SIGNATURE
+    data[second_signature : second_signature + len(PATCH_2_SIGNATURE)] = PATCH_2_SIGNATURE
+    data[0x1500:0x1500 + len(REQUIRED_MARKERS[0])] = REQUIRED_MARKERS[0]
+    data[0x1580:0x1580 + len(REQUIRED_MARKERS[1])] = REQUIRED_MARKERS[1]
+    return bytes(data)
+
+
+def self_test() -> None:
+    fixture = synthetic_pe()
+    row, patched = derive_profile(fixture, "9.9.9.9")
+    columns = row.split("\t")
+    if len(columns) != 9 or columns[3] != "0x303" or columns[6] != "0xbee":
+        raise ProfileError("自检生成的偏移或字段数错误")
+    if patched[0x303:0x306] != PATCH_1_AFTER:
+        raise ProfileError("自检选择补丁未写入")
+    if patched[0xBEE:0xBF1] != PATCH_2_AFTER:
+        raise ProfileError("自检能力补丁未写入")
+    duplicate = bytearray(fixture)
+    duplicate[0x1000:0x1000 + len(PATCH_1_SIGNATURE)] = PATCH_1_SIGNATURE
+    try:
+        derive_profile(bytes(duplicate), "9.9.9.9")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检未拒绝重复指纹")
+    print("NVDEC 自动档案生成器自检通过")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--derive", type=Path)
+    parser.add_argument("--version")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.self_test:
+            self_test()
+            return 0
+        if args.derive is None or not args.version:
+            parser.error("--derive 和 --version 必须同时提供")
+        row, _ = derive_profile(args.derive.read_bytes(), args.version)
+        print(row)
+        return 0
+    except (OSError, ProfileError) as error:
+        print(f"错误：{error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

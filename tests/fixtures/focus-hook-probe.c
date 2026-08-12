@@ -12,6 +12,7 @@ static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
 static volatile LONG nonclient_deactivate_messages;
 static volatile LONG nonclient_right_button_down_messages;
+static volatile LONG home_size_messages;
 static volatile LONG outer_window_proc_calls;
 static WNDPROC outer_window_proc_next;
 
@@ -45,6 +46,8 @@ static LRESULT CALLBACK probe_window_proc(
         InterlockedIncrement(&nonclient_deactivate_messages);
     } else if (message == WM_NCRBUTTONDOWN) {
         InterlockedIncrement(&nonclient_right_button_down_messages);
+    } else if (message == WM_SIZE) {
+        InterlockedIncrement(&home_size_messages);
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
@@ -169,6 +172,7 @@ int WINAPI WinMain(
     int nonclient_right_clicks_suppressed;
     int home_reopen_blocked;
     int home_show_authorized;
+    int home_repaint_pulses;
     int apply_posted;
     int heartbeat_before;
     int heartbeat_after;
@@ -254,6 +258,8 @@ int WINAPI WinMain(
     if (!main_window || !helper_window || !video_window || !modal_window) {
         return 2;
     }
+    ShowWindow(main_window, SW_SHOWNA);
+    InterlockedExchange(&home_size_messages, 0);
     qt_core = LoadLibraryW(L"Qt5Core.dll");
     hook_module = LoadLibraryW(L"uu-remote-input-hook.dll");
     if (!qt_core || !hook_module) {
@@ -304,6 +310,10 @@ int WINAPI WinMain(
         (focus_hook_status() & 1023u) != 1023u
     ) {
         return 4;
+    }
+    pump_messages_for(900);
+    if (InterlockedCompareExchange(&home_size_messages, 0, 0) < 2) {
+        return 32;
     }
 
     /*
@@ -517,12 +527,14 @@ int WINAPI WinMain(
     ) {
         return 23;
     }
+    InterlockedExchange(&home_size_messages, 0);
     ShowWindow(main_window, SW_SHOW);
-    pump_messages_for(300);
+    pump_messages_for(900);
     if (
         !IsWindowVisible(main_window) ||
         GetFileAttributesW(L"C:\\uu-remote-home-show.request") !=
-            INVALID_FILE_ATTRIBUTES
+            INVALID_FILE_ATTRIBUTES ||
+        InterlockedCompareExchange(&home_size_messages, 0, 0) < 2
     ) {
         return 31;
     }
@@ -695,6 +707,12 @@ int WINAPI WinMain(
         0,
         L"C:\\uu-remote-focus-hook-status.ini"
     );
+    home_repaint_pulses = GetPrivateProfileIntW(
+        L"home_window",
+        L"repaint_pulses",
+        0,
+        L"C:\\uu-remote-focus-hook-status.ini"
+    );
     apply_posted = GetPrivateProfileIntW(
         L"focus",
         L"apply_posted",
@@ -706,7 +724,7 @@ int WINAPI WinMain(
         storms_detected < 1 || storms_resolved < 1 ||
         blocked_activations < 1 || modal_latches < 1 ||
         post_modal_handoffs < 1 || home_reopen_blocked < 200 ||
-        home_show_authorized < 1 ||
+        home_show_authorized < 1 || home_repaint_pulses < 2 ||
         nonclient_right_clicks_suppressed < 1 || apply_posted > 6
     ) {
         return 11;

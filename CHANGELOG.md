@@ -4,6 +4,75 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.24] - 2026-08-11
+
+- Derive a fail-closed NVDEC `streamer.dll` patch profile automatically after
+  an official UU client update when both semantic instruction fingerprints
+  remain unique and retain their verified relationship.
+- Enumerate the real DXGI adapter inside the Wine/DXVK environment and validate
+  each generated profile synchronously with UU's own
+  `StreamerCodecDetector.exe` before the updated client may start.
+- Restore the official decoder files, discard the generated profile, and roll
+  back the update transaction if H.264 and H.265 NVDEC are not both confirmed,
+  while preserving CPU fallback for an unrecognized future binary layout.
+
+## [1.1.23] - 2026-08-11
+
+- Restore NVIDIA NVDEC capability negotiation for official UU 4.36.0.9155,
+  allowing the controller to request the remote host's 20M and higher quality
+  tiers instead of being capped at the OpenH264 software-decoder profile.
+- Move the `streamer.dll` compatibility patch into an independent per-version
+  profile with original and patched SHA-256 values, instruction offsets, and
+  before/after byte fingerprints, so unsupported future clients fail closed.
+- Resolve decoder profiles by the installed version during deployment and by
+  verified file hashes during cleanup or transactional rollback.
+
+## [1.1.22] - 2026-08-11
+
+- Run only `GameViewerServer.exe` with Wine's Windows 7 application profile,
+  preventing UU 4.36+ from repeatedly installing Windows IDD, gvInput, and
+  ViGEm kernel drivers into Wine's emulated device database.
+- Restore reliable server IPC initialization, automatic login, and creation of
+  the real Qt home window so tray activation no longer targets a transparent
+  placeholder after the Windows-driver startup path fails.
+- Verify the server-only compatibility profile during setup, repair, and
+  diagnostics while leaving the Qt/WebView2 controller on Wine's normal
+  Windows version.
+- After an authorized tray restore, let the native Linux tray locate only the
+  mapped, prefix-owned `gameviewer.exe` home window and issue a one-pixel X11
+  size pulse. This forces a real `ConfigureNotify` instead of relying on Wine
+  to forward a Win32 repaint that can be discarded during remapping.
+- Apply the same one-shot pulse when the hook first adopts an already-visible
+  home window, covering the equivalent stale surface on initial UU 4.36
+  startup without introducing a periodic resize loop.
+- Delay the tray pulse for 2.5 seconds so UU's deferred Qt/WebView2 remap has
+  finished, retry briefly until `WM_STATE` confirms the home window is really
+  mapped, and keep the one-pixel geometry for 80 ms before restoring it. Both
+  X11 changes are synchronized separately so neither UU nor the window manager
+  can overwrite or coalesce the intermediate configure event.
+
+## [1.1.21] - 2026-08-11
+
+- Check the official UU release on every application launch and periodically
+  while running, independently of UU's in-app automatic-update switch.
+- Install the latest official client even before a version-specific binary
+  profile exists; keep the generic Wine, UI, tray, and input bridges active
+  while safely suspending NVDEC and WOL patches that require exact hashes.
+- Preserve the selected NVIDIA device for automatic reactivation by a future
+  matching profile, and report the temporary CPU fallback in diagnostics.
+- Snapshot and restore version-bound bridge state together with the Wine
+  prefix, so a failed latest-version transaction still performs a complete
+  rollback.
+
+## [1.1.20] - 2026-08-07
+
+- Mark the native tray's transient exit helper explicitly and prevent the
+  helper from stopping its own systemd unit before it reaches `wineserver -k`.
+- Complete tray-requested shutdown as one transaction instead of leaving the
+  Qt controller alive in a non-interactive, half-finished exit state.
+- Add tray and launcher regressions proving the exit helper survives long
+  enough to stop Wine and never includes its own unit in the stop request.
+
 ## [1.1.19] - 2026-08-06
 
 - Detect an application-level Qt/Wine UI hard stall from two consecutive,

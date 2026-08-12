@@ -10,7 +10,8 @@
 ## Features
 
 - Graphical user interface (GUI), with support for Ubuntu 24.04 on X11 and Wayland.
-- Supports updates in sync with the Windows version of NetEase UU Remote.
+- Checks for an official UU update on every launch and periodically while
+  running, then installs the latest version transactionally.
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
 - Native Linux tray menu with decoder selection and automatic restart.
@@ -34,7 +35,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.19_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.24_amd64.deb
 ```
 
 Then launch **UU Remote for Linux** from the Ubuntu application menu, or run
@@ -70,7 +71,7 @@ uu-remote-for-linux --repair
 # Inspect the installation without changing it
 uu-remote-for-linux --diagnose
 
-# Run a safe, compatibility-gated update check
+# Check now and install the latest official UU version
 uu-remote-for-linux --check-update
 
 # Select a decoder interactively, or list detected devices
@@ -96,6 +97,17 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 | CPU / OpenH264 | Supported | Upstream path: 1080p/60 fps |
 | NVIDIA NVDEC | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
 | Intel/AMD VA-API | Not implemented | Unavailable |
+
+The launcher always keeps the official UU client current. If an updated build
+does not yet have a bundled profile, it locates two unique, relationally
+verified NVDEC instruction fingerprints in the official `streamer.dll`, derives
+the new offsets and original/patched SHA-256 values, and redeploys the hardware
+decoder bridge. Before the new client may start, it enumerates the real adapter
+inside Wine/DXVK and asks UU's own `StreamerCodecDetector.exe` to confirm H.264
+and H.265 NVDEC. Any failure restores the official DLL, discards the generated
+profile, and rolls back the update. If a future binary changes the known code
+structure, no offsets are guessed: CPU decoding is used safely and the selected
+NVIDIA device is retained.
 
 ## Desktop backends
 

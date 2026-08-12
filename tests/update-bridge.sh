@@ -60,14 +60,15 @@ watcher_pid=""
 
 test "$(wc -l <"$trace")" -eq 1
 grep -Fxq -- '--auto-update-check' "$trace"
-grep -q 'UU 自动更新开关：enabled' "$log_file"
+grep -q 'UU 内置自动更新开关：enabled' "$log_file"
 
 write_setting 0
 {
     printf '#!/usr/bin/env bash\n'
-    printf 'printf "unexpected\\n" >>%q\n' "$trace"
+    printf 'printf "%%s\\n" "$*" >>%q\n' "$trace"
 } >"$launcher"
 chmod 0755 "$launcher"
+disabled_count_before=$(wc -l <"$trace")
 nohup "$bridge" watch \
     "$setting" "$launcher" "$log_file" "$lock_file" 1 &
 watcher_pid=$!
@@ -79,8 +80,9 @@ sleep 1
 kill "$watcher_pid"
 wait "$watcher_pid" >/dev/null 2>&1 || true
 watcher_pid=""
-test "$(wc -l <"$trace")" -eq 1
-grep -q 'UU 自动更新开关：disabled' "$log_file"
+test "$(wc -l <"$trace")" -gt "$disabled_count_before"
+grep -Fxq -- '--auto-update-check' "$trace"
+grep -q 'UU 内置自动更新开关：disabled' "$log_file"
 
 {
     printf '#!/usr/bin/env bash\n'

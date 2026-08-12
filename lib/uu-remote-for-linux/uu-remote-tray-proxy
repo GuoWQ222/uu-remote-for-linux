@@ -27,6 +27,10 @@ import uuid
 APP_ID = "uu-remote-for-linux"
 TITLE = "网易 UU 远程"
 LEGACY_SCAN_INTERVAL_MS = 750
+HOME_REPAINT_DELAY_MS = 2500
+HOME_REPAINT_RETRY_MS = 100
+HOME_REPAINT_RESTORE_DELAY_MS = 80
+HOME_REPAINT_MAX_ATTEMPTS = 30
 CLIENT_MISSING_GRACE_TICKS = 8
 CLIENT_QUIT_MARKER = (
     "GameViewerApplication::quitApplication] Quit application"
@@ -74,6 +78,9 @@ class X11:
         )
         self.xembed_atom = self.lib.XInternAtom(
             self.display, b"_XEMBED_INFO", False
+        )
+        self.wm_state_atom = self.lib.XInternAtom(
+            self.display, b"WM_STATE", False
         )
 
     def _configure_prototypes(self) -> None:
@@ -133,6 +140,13 @@ class X11:
         lib.XGetWindowProperty.restype = ctypes.c_int
         lib.XDestroyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         lib.XDestroyWindow.restype = ctypes.c_int
+        lib.XResizeWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        lib.XResizeWindow.restype = ctypes.c_int
         lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.XFree.argtypes = [ctypes.c_void_p]
 
@@ -258,6 +272,74 @@ class X11:
     def destroy(self, window: int) -> None:
         self.lib.XDestroyWindow(self.display, window)
         self.lib.XSync(self.display, False)
+
+    def resize(self, window: int, width: int, height: int) -> None:
+        self.lib.XResizeWindow(self.display, window, width, height)
+        self.lib.XSync(self.display, False)
+
+
+def mapped_home_window(
+    x11: X11, prefix: str
+) -> tuple[int, int, int] | None:
+    """Return this prefix's mapped Qt home window and its X11 size."""
+
+    controller_pids = controller_processes(prefix)
+    if not controller_pids:
+        return None
+    candidates: list[tuple[int, int, int]] = []
+    for window in x11.windows():
+        window_class = x11.window_class(window)
+        if not window_class or not any(
+            value.casefold() == "gameviewer.exe" for value in window_class
+        ):
+            continue
+        if (
+            x11.property_first_cardinal(window, x11.pid_atom)
+            not in controller_pids
+        ):
+            continue
+        if x11.property_first_cardinal(window, x11.wm_state_atom) != 1:
+            continue
+        geometry = x11.geometry(window)
+        if not geometry:
+            continue
+        width, height = geometry
+        if width < 640 or height < 480:
+            continue
+        candidates.append((window, width, height))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[1] * candidate[2])
+
+
+def repaint_home_window(prefix: str, delay_ms: int) -> bool:
+    """Send two separately synchronized X11 configures after a UI restore."""
+
+    time.sleep(delay_ms / 1000)
+    x11 = X11(os.environ.get("DISPLAY"))
+    try:
+        target = None
+        for _attempt in range(HOME_REPAINT_MAX_ATTEMPTS):
+            target = mapped_home_window(x11, canonical_path(prefix))
+            if target is not None:
+                break
+            time.sleep(HOME_REPAINT_RETRY_MS / 1000)
+        if target is None:
+            logging.warning("显示主界面后未找到已映射的 UU 顶层窗口")
+            return False
+        window, width, height = target
+        x11.resize(window, width + 1, height + 1)
+        time.sleep(HOME_REPAINT_RESTORE_DELAY_MS / 1000)
+        x11.resize(window, width, height)
+        logging.info(
+            "已刷新 UU 主界面 X11 表面：window=0x%x size=%dx%d",
+            window,
+            width,
+            height,
+        )
+        return True
+    finally:
+        x11.close()
 
 
 def canonical_path(value: str) -> str:
@@ -1020,6 +1102,8 @@ class TrayProxy:
                 self.AppIndicator3.IndicatorStatus.PASSIVE
             )
         command = [self.launcher, "--stop"]
+        helper_environment = os.environ.copy()
+        helper_environment["UU_REMOTE_TRAY_EXIT_HELPER"] = "1"
         log_handle = self.command_log_handle()
         try:
             if (
@@ -1053,6 +1137,7 @@ class TrayProxy:
                         "systemd-run",
                         "--user",
                         f"--unit={APP_ID}-tray-exit",
+                        "--setenv=UU_REMOTE_TRAY_EXIT_HELPER=1",
                         "--collect",
                         "--quiet",
                         *command,
@@ -1078,6 +1163,7 @@ class TrayProxy:
                     stdin=subprocess.DEVNULL,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
+                    env=helper_environment,
                     start_new_session=True,
                     close_fds=True,
                 )
@@ -1278,7 +1364,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--quiesce-controller", action="store_true")
+    parser.add_argument("--repaint-home-window", action="store_true")
     parser.add_argument("--grace-seconds", type=float, default=8.0)
+    parser.add_argument(
+        "--repaint-delay-ms", type=int, default=HOME_REPAINT_DELAY_MS
+    )
     parser.add_argument("--prefix")
     parser.add_argument("--launcher")
     parser.add_argument("--state-dir")
@@ -1286,13 +1376,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--icon", default=APP_ID)
     parser.add_argument("--icon-theme-path", default="")
     args = parser.parse_args()
-    if args.check and args.quiesce_controller:
-        parser.error("--check 和 --quiesce-controller 不能组合")
+    operation_count = sum(
+        bool(operation)
+        for operation in (
+            args.check,
+            args.quiesce_controller,
+            args.repaint_home_window,
+        )
+    )
+    if operation_count > 1:
+        parser.error(
+            "--check、--quiesce-controller 和 --repaint-home-window 不能组合"
+        )
     if args.quiesce_controller:
         if not args.prefix:
             parser.error("--quiesce-controller 需要 --prefix")
         if args.grace_seconds < 0:
             parser.error("--grace-seconds 不能为负数")
+    elif args.repaint_home_window:
+        if not args.prefix:
+            parser.error("--repaint-home-window 需要 --prefix")
+        if not 0 <= args.repaint_delay_ms <= 10000:
+            parser.error("--repaint-delay-ms 必须介于 0 和 10000 之间")
     elif not args.check:
         missing = [
             name
@@ -1313,6 +1418,14 @@ def main() -> int:
         return dependency_check()
     if args.quiesce_controller:
         return 0 if quiesce_controller(args.prefix, args.grace_seconds) else 1
+    if args.repaint_home_window:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
+        return 0 if repaint_home_window(
+            args.prefix, args.repaint_delay_ms
+        ) else 1
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "tray-proxy.lock"

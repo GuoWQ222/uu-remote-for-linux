@@ -43,6 +43,12 @@ case ${1:-} in
                     printf '    UseTakeFocus    REG_SZ    Y\n'
                     exit 0
                 fi
+                if [[ ${3:-} == *AppDefaults*GameViewerServer.exe* &&
+                    ${5:-} == Version &&
+                    -f "$install_dir/bin/.server-windows-driver-compat" ]]; then
+                    printf '    Version    REG_SZ    win7\n'
+                    exit 0
+                fi
                 if [[ ${3:-} == *EdgeUpdate* && -f "$install_dir/bin/.webview-ready" ]]; then
                     printf '    pv    REG_SZ    149.0.0.0\n'
                     exit 0
@@ -75,6 +81,12 @@ case ${1:-} in
                     install -Dm0644 /dev/null \
                         "$install_dir/bin/.controller-take-focus-enabled"
                     printf 'REG_ADD_GAMEVIEWER_USETAKEFOCUS=Y\n' >>"$trace_file"
+                fi
+                if [[ ${3:-} == *AppDefaults*GameViewerServer.exe* &&
+                    ${5:-} == Version && ${9:-} == win7 ]]; then
+                    install -Dm0644 /dev/null \
+                        "$install_dir/bin/.server-windows-driver-compat"
+                    printf 'REG_ADD_GAMEVIEWERSERVER_VERSION=win7\n' >>"$trace_file"
                 fi
                 exit 0
                 ;;

@@ -8,7 +8,7 @@
 ## 功能特性
 
 - 图形化 GUI 界面，支持 Ubuntu 24.04、X11/Wayland。
-- 可随网易UU Windows版本同步更新。
+- 每次启动及运行期间定期检查网易官方更新，并以事务方式安装最新版本。
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
@@ -30,7 +30,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.19_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.24_amd64.deb
 ```
 
 安装完成后，从 Ubuntu 应用菜单点击“UU 远程（Linux 版本）”，或运行
@@ -65,7 +65,7 @@ uu-remote-for-linux --repair
 # 在不做任何更改的情况下检查安装状态
 uu-remote-for-linux --diagnose
 
-# 执行一次受兼容性限制的安全更新检查
+# 立即检查并安装网易官方最新版本
 uu-remote-for-linux --check-update
 
 # 交互式选择解码器，或列出检测到的设备
@@ -91,6 +91,14 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 | CPU / OpenH264 | 已支持 | 上游路径：1080p/60 fps |
 | NVIDIA NVDEC | 实验性支持 | UU 菜单最高 4K/144 fps；须以实际串流测试为准 |
 | Intel/AMD VA-API | 尚未实现 | 不可用 |
+
+启动器始终优先保持 UU 官方客户端为最新版。更新后若还没有内置的版本档案，
+程序会在官方 `streamer.dll` 中查找两处唯一且相互关系经过验证的 NVDEC 指令
+指纹，自动计算新文件的原始/补丁 SHA-256 和偏移，并重新部署硬件解码桥。
+启动新客户端前，还会在 Wine/DXVK 中枚举真实显卡，并调用 UU 自带的
+`StreamerCodecDetector.exe` 验证 H.264 与 H.265 NVDEC；任一步失败都会恢复
+官方 DLL、删除自动档案并回滚更新。若未来版本改变了已知代码结构，程序不会
+猜测偏移，而会安全使用 CPU 解码并保留所选 NVIDIA 设备。
 
 ## 桌面后端
 

@@ -27,6 +27,7 @@
 #include <netioapi.h>
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,7 +37,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 18u
+#define HOOK_VERSION 19u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -63,11 +64,15 @@
 #define UI_HEALTH_RESUME_GAP_MS 3000u
 #define UI_HEALTH_HARD_STALL_TIMEOUTS 2
 #define UI_HEALTH_RECOVERY_RETRY_MS 5000u
+#define HOME_REPAINT_DELAY_MS 750u
+#define HOME_REPAINT_RESTORE_DELAY_MS 80u
+#define HOME_REPAINT_TIMER_ID ((UINT_PTR)0x55485250u)
 #define FOCUS_MAX_WINDOWS 64u
 #define FOCUS_MAX_MODULES 256u
 #define WM_UU_FOCUS_APPLY (WM_APP + 0x4b1u)
 #define WM_UU_UI_HEALTH (WM_APP + 0x4b3u)
 #define WM_UU_FOCUS_ARBITRATE (WM_APP + 0x4b4u)
+#define WM_UU_HOME_REPAINT (WM_APP + 0x4b5u)
 #define WM_QT_SENDPOSTEDEVENTS (WM_USER + 1u)
 
 enum focus_window_role {
@@ -240,6 +245,11 @@ static volatile LONG focus_apply_rate_limited;
 static volatile LONG focus_home_hidden_by_user;
 static volatile LONG focus_home_reopen_blocked;
 static volatile LONG focus_home_show_authorized;
+static volatile LONG focus_home_repaint_pending;
+static volatile LONG focus_home_repaint_pulses;
+static PVOID volatile focus_home_repaint_window;
+static volatile LONG focus_home_repaint_width;
+static volatile LONG focus_home_repaint_height;
 static volatile LONG focus_worker_heartbeats;
 static volatile LONG event_loop_empty_queue_wakes;
 static volatile LONG event_loop_guard_breaks;
@@ -2168,6 +2178,7 @@ static BOOL write_focus_hook_status_atomic(void) {
         "hidden_by_user=%ld\r\n"
         "reopen_blocked=%ld\r\n"
         "show_authorized=%ld\r\n"
+        "repaint_pulses=%ld\r\n"
         "[event_loop]\r\n"
         "mode=qt-wine-sticky-message-guard\r\n"
         "empty_queue_wakes=%ld\r\n"
@@ -2230,6 +2241,7 @@ static BOOL write_focus_hook_status_atomic(void) {
         InterlockedCompareExchange(&focus_home_hidden_by_user, 0, 0),
         InterlockedCompareExchange(&focus_home_reopen_blocked, 0, 0),
         InterlockedCompareExchange(&focus_home_show_authorized, 0, 0),
+        InterlockedCompareExchange(&focus_home_repaint_pulses, 0, 0),
         InterlockedCompareExchange(&event_loop_empty_queue_wakes, 0, 0),
         InterlockedCompareExchange(&event_loop_guard_breaks, 0, 0),
         (long long)InterlockedCompareExchange64(
@@ -2531,6 +2543,14 @@ static void write_focus_hook_status(void) {
     );
     WritePrivateProfileStringA(
         "home_window", "show_authorized", value, focus_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&focus_home_repaint_pulses, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "home_window", "repaint_pulses", value, focus_status_path
     );
     wsprintfA(
         value,
@@ -3257,6 +3277,7 @@ static BOOL focus_consume_home_show_request(void) {
     }
     InterlockedExchange(&focus_home_hidden_by_user, 0);
     InterlockedIncrement(&focus_home_show_authorized);
+    InterlockedCompareExchange(&focus_home_repaint_pending, 1, 0);
     focus_clear_latch();
     return TRUE;
 }
@@ -3290,14 +3311,14 @@ static BOOL focus_home_raise_is_blocked(HWND window) {
     ) {
         return FALSE;
     }
+    if (focus_consume_home_show_request()) {
+        return FALSE;
+    }
     remote = (HWND)InterlockedCompareExchangePointer(
         &focus_visible_remote_window, NULL, NULL
     );
     if (!remote || !IsWindow(remote) || !IsWindowVisible(remote)) {
         InterlockedExchange(&focus_home_hidden_by_user, 0);
-        return FALSE;
-    }
-    if (focus_consume_home_show_request()) {
         return FALSE;
     }
     InterlockedIncrement(&focus_home_reopen_blocked);
@@ -3507,6 +3528,103 @@ static BOOL focus_nonclient_right_click_is_unsafe(
         (wparam == HTCAPTION || wparam == HTSYSMENU);
 }
 
+static void focus_queue_home_repaint(HWND window) {
+    if (
+        !window ||
+        InterlockedCompareExchange(&focus_home_repaint_pending, 2, 1) != 1
+    ) {
+        return;
+    }
+    if (!PostMessageW(window, WM_UU_HOME_REPAINT, 0, 0)) {
+        InterlockedExchange(&focus_home_repaint_pending, 0);
+    }
+}
+
+static void focus_finish_home_repaint(HWND window) {
+    HWND stored_window;
+    LONG width;
+    LONG height;
+
+    if (InterlockedCompareExchange(&focus_home_repaint_pending, 0, 4) != 4) {
+        return;
+    }
+    stored_window = (HWND)InterlockedExchangePointer(
+        &focus_home_repaint_window, NULL
+    );
+    width = InterlockedExchange(&focus_home_repaint_width, 0);
+    height = InterlockedExchange(&focus_home_repaint_height, 0);
+    if (
+        stored_window == window && window && IsWindow(window) &&
+        width > 1 && height > 1 && original_set_window_pos
+    ) {
+        original_set_window_pos(
+            window,
+            NULL,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                SWP_NOOWNERZORDER
+        );
+    }
+    if (window && IsWindow(window)) {
+        RedrawWindow(
+            window,
+            NULL,
+            NULL,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+        );
+    }
+    InterlockedIncrement(&focus_home_repaint_pulses);
+}
+
+static void focus_begin_home_repaint(HWND window) {
+    RECT rectangle;
+    int width;
+    int height;
+
+    if (
+        InterlockedCompareExchange(&focus_home_repaint_pending, 4, 3) != 3 ||
+        !window || !IsWindow(window) || !IsWindowVisible(window)
+    ) {
+        InterlockedCompareExchange(&focus_home_repaint_pending, 0, 4);
+        return;
+    }
+    if (
+        original_set_window_pos &&
+        !IsIconic(window) && !IsZoomed(window) &&
+        GetWindowRect(window, &rectangle)
+    ) {
+        width = rectangle.right - rectangle.left;
+        height = rectangle.bottom - rectangle.top;
+        if (width > 1 && height > 1 && width < INT_MAX && height < INT_MAX) {
+            InterlockedExchangePointer(&focus_home_repaint_window, window);
+            InterlockedExchange(&focus_home_repaint_width, width);
+            InterlockedExchange(&focus_home_repaint_height, height);
+            original_set_window_pos(
+                window,
+                NULL,
+                0,
+                0,
+                width + 1,
+                height + 1,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                    SWP_NOOWNERZORDER
+            );
+            if (SetTimer(
+                    window,
+                    HOME_REPAINT_TIMER_ID,
+                    HOME_REPAINT_RESTORE_DELAY_MS,
+                    NULL
+                )) {
+                return;
+            }
+        }
+    }
+    focus_finish_home_repaint(window);
+}
+
 static LRESULT CALLBACK focus_subclass_window_proc(
     HWND window,
     UINT message,
@@ -3569,6 +3687,37 @@ static LRESULT CALLBACK focus_subclass_window_proc(
             if (original_set_foreground_window) {
                 original_set_foreground_window(window);
             }
+        }
+        return 0;
+    }
+    if (message == WM_UU_HOME_REPAINT) {
+        if (
+            InterlockedCompareExchange(
+                &focus_home_repaint_pending, 3, 2
+            ) == 2
+        ) {
+            if (!SetTimer(
+                    window,
+                    HOME_REPAINT_TIMER_ID,
+                    HOME_REPAINT_DELAY_MS,
+                    NULL
+                )) {
+                InterlockedCompareExchange(
+                    &focus_home_repaint_pending, 4, 3
+                );
+                focus_finish_home_repaint(window);
+            }
+        }
+        return 0;
+    }
+    if (message == WM_TIMER && wparam == HOME_REPAINT_TIMER_ID) {
+        KillTimer(window, HOME_REPAINT_TIMER_ID);
+        if (InterlockedCompareExchange(
+                &focus_home_repaint_pending, 0, 0
+            ) == 3) {
+            focus_begin_home_repaint(window);
+        } else {
+            focus_finish_home_repaint(window);
         }
         return 0;
     }
@@ -3693,6 +3842,19 @@ static LRESULT CALLBACK focus_subclass_window_proc(
     result = CallWindowProcW(
         original_proc, window, message, wparam, lparam
     );
+    if (
+        role == FOCUS_ROLE_HOME &&
+        (
+            (message == WM_SHOWWINDOW && wparam) ||
+            (
+                message == WM_WINDOWPOSCHANGED &&
+                lparam &&
+                (((WINDOWPOS *)lparam)->flags & SWP_SHOWWINDOW)
+            )
+        )
+    ) {
+        focus_queue_home_repaint(window);
+    }
     if (message == WM_NCDESTROY) {
         focus_remove_window(window);
     }
@@ -3767,6 +3929,10 @@ static BOOL focus_ensure_window_subclassed(
         return FALSE;
     }
     InterlockedIncrement(&focus_subclass_installations);
+    if (role == FOCUS_ROLE_HOME && IsWindowVisible(window)) {
+        InterlockedCompareExchange(&focus_home_repaint_pending, 1, 0);
+        focus_queue_home_repaint(window);
+    }
     return TRUE;
 }
 

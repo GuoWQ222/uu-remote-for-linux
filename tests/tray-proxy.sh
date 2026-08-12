@@ -28,6 +28,67 @@ namespace = runpy.run_path(proxy)
 proxy_class = namespace["TrayProxy"]
 
 
+class CompletedProcess:
+    returncode = 0
+
+
+class DummyIndicator:
+    def __init__(self):
+        self.statuses = []
+
+    def set_status(self, status):
+        self.statuses.append(status)
+
+
+class ExitGtk:
+    quit_calls = 0
+
+    @classmethod
+    def main_quit(cls):
+        cls.quit_calls += 1
+
+
+class ExitIndicatorStatus:
+    PASSIVE = "passive"
+    ACTIVE = "active"
+
+
+class ExitAppIndicator:
+    IndicatorStatus = ExitIndicatorStatus
+
+
+with tempfile.TemporaryDirectory() as state:
+    exiting = proxy_class.__new__(proxy_class)
+    exiting.exit_in_progress = False
+    exiting.indicator = DummyIndicator()
+    exiting.AppIndicator3 = ExitAppIndicator
+    exiting.launcher = "/mock/uu-remote-for-linux"
+    exiting.log_file = Path(state) / "tray.log"
+    exiting.Gtk = ExitGtk
+    exiting.write_status = lambda *_args: None
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return CompletedProcess()
+
+    exit_globals = exiting.request_full_exit.__globals__
+    original_which = exit_globals["shutil_which"]
+    exit_globals["shutil_which"] = lambda _command: "/mock/tool"
+    try:
+        with mock.patch.object(namespace["subprocess"], "run", fake_run):
+            exiting.request_full_exit("test")
+    finally:
+        exit_globals["shutil_which"] = original_which
+
+    systemd_run = next(
+        command for command, _kwargs in calls if command[0] == "systemd-run"
+    )
+    assert "--setenv=UU_REMOTE_TRAY_EXIT_HELPER=1" in systemd_run
+    assert systemd_run[-2:] == ["/mock/uu-remote-for-linux", "--stop"]
+    assert ExitGtk.quit_calls == 1
+
+
 class RunningProcess:
     def poll(self):
         return None
@@ -374,6 +435,60 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
             "Session: 123 Old state: stable New state: closed\n"
         )
     assert active.controlled_session_state() == "idle"
+
+
+class RepaintX11:
+    pid_atom = 1
+    wm_state_atom = 2
+
+    def __init__(self):
+        self.resizes = []
+
+    @staticmethod
+    def windows():
+        return [0x100, 0x200]
+
+    @staticmethod
+    def window_class(window):
+        if window == 0x200:
+            return "gameviewer.exe", "gameviewer.exe"
+        return "other.exe", "other.exe"
+
+    @staticmethod
+    def property_first_cardinal(window, atom):
+        if window != 0x200:
+            return None
+        return 4242 if atom == 1 else 1
+
+    @staticmethod
+    def geometry(window):
+        return (920, 680) if window == 0x200 else (10, 10)
+
+    def resize(self, window, width, height):
+        self.resizes.append((window, width, height))
+
+    def close(self):
+        pass
+
+repaint_x11 = RepaintX11()
+repaint_globals = namespace["repaint_home_window"].__globals__
+original_controller_processes = repaint_globals["controller_processes"]
+original_x11 = repaint_globals["X11"]
+repaint_globals["controller_processes"] = lambda *_args: {4242}
+repaint_globals["X11"] = lambda *_args: repaint_x11
+try:
+    with mock.patch.object(namespace["time"], "sleep") as sleep:
+        assert namespace["repaint_home_window"](
+            "/mock-prefix", namespace["HOME_REPAINT_DELAY_MS"]
+        )
+    assert [call.args[0] for call in sleep.call_args_list] == [2.5, 0.08]
+    assert repaint_x11.resizes == [
+        (0x200, 921, 681),
+        (0x200, 920, 680),
+    ]
+finally:
+    repaint_globals["controller_processes"] = original_controller_processes
+    repaint_globals["X11"] = original_x11
 
 display = os.environ.get("DISPLAY")
 if display:

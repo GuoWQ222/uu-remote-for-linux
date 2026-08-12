@@ -31,6 +31,12 @@ check "keyboard bridge Python syntax" /usr/bin/python3 -c \
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
+check "NVDEC profiler self-test" \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
+    --self-test
 check "autostart bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
@@ -58,6 +64,8 @@ check "proxy gsettings fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/proxy-gsettings"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
+check "DXGI probe builder syntax" bash -n \
+    "$project_root/scripts/build-dxgi-probe.sh"
 check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \
@@ -129,6 +137,20 @@ check "input bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
 check "update compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
+check "NVDEC compatibility profiles exist" test -s \
+    "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv"
+check "NVDEC automatic profiler exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
+check "DXGI adapter probe exists" test -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
+# shellcheck disable=SC2016
+check "DXGI adapter probe is Win64 console PE" bash -c \
+    'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
+# shellcheck disable=SC2016
+check "DXGI adapter probe imports factory API" bash -c \
+    'objdump -p "$1" | grep -q "CreateDXGIFactory1"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
 check "NVDEC probe exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe"
 # shellcheck disable=SC2016
@@ -225,6 +247,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" \
         "$project_root/scripts/install-user.sh" \
         "$project_root/scripts/build-nvdec-probe.sh" \
+        "$project_root/scripts/build-dxgi-probe.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
         "$project_root/scripts/build-powershell-bridge.sh" \

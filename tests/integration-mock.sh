@@ -128,6 +128,9 @@ grep -q '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE"
 test -f "$state_dir/setup.log"
 grep -q '^REG_ADD_GAMEVIEWER_USEXIM=N$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^REG_ADD_GAMEVIEWER_USETAKEFOCUS=Y$' "$UU_REMOTE_FAKE_TRACE"
+grep -q '^REG_ADD_GAMEVIEWERSERVER_VERSION=win7$' "$UU_REMOTE_FAKE_TRACE"
+"$launcher" --diagnose | grep -q \
+    'Wine 服务端兼容.*已隔离 Windows 内核驱动'
 "$launcher" --diagnose | grep -q \
     'Wine 本地输入法.*已禁用（远端输入法接管）'
 "$launcher" --diagnose | grep -q \
@@ -217,7 +220,8 @@ test "$(sha256sum "$streamer_original" | cut -d' ' -f1)" = \
 test ! -e "$decoder_cache"
 grep -q '"mock":"original-cache"' "$decoder_cache_backup"
 "$launcher" --diagnose | grep -q '硬解桥开关.*已启用'
-"$launcher" --diagnose | grep -q 'UU 自动更新开关.*开启'
+"$launcher" --diagnose | grep -q 'UU 内置更新开关.*开启'
+"$launcher" --diagnose | grep -q 'Linux 自动更新.*每次启动检查'
 "$launcher" --diagnose | grep -q '官方更新器保护.*完整'
 "$launcher" --diagnose | grep -q 'Win64 输入钩子.*完整'
 
@@ -232,22 +236,50 @@ sha256sum \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
     "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" \
     "$prefix/drive_c/uu-remote-input-hook.dll" >"$protected_before"
-UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 "$launcher" --check-update
+if UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+    UU_REMOTE_FAKE_INSTALLER_VERSION=4.34.0.8979 \
+    "$launcher" --check-update; then
+    printf '版本核验失败的通用更新被意外接受。\n' >&2
+    exit 1
+fi
 sha256sum \
     "$install_dir/bin/Upgrade.exe" \
     "$install_dir/bin/Upgrade.uu-remote-original.exe" \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
     "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" \
     "$prefix/drive_c/uu-remote-input-hook.dll" >"$protected_after"
 cmp -s "$protected_before" "$protected_after"
-"$launcher" --diagnose | grep -q '安全更新状态.*已暂缓 4.35.0.9000'
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-enabled"
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-manifest"
+
+UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \
+    "$launcher" --check-update
+"$launcher" --diagnose | grep -q 'UU 版本.*4.35.0.9000'
+"$launcher" --diagnose | grep -q '安全更新状态.*已更新到 4.35.0.9000'
+test ! -e "$install_dir/bin/d3d11.dll"
+test ! -e "$install_dir/bin/dxgi.dll"
+test ! -e "$streamer_original"
+grep -q '^selection=nvidia:0$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/decoder-selection"
+cmp -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" \
+    "$install_dir/bin/Upgrade.exe"
+cmp -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" \
+    "$prefix/drive_c/uu-remote-input-hook.dll"
 
 handoff_clients_before=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_UPDATE_NO_RESTART=0 \
 UU_REMOTE_UPSTREAM_UPDATE_EXIT_GRACE=0 \
 UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \
     "$launcher" --upstream-update-handoff
 for _attempt in {1..50}; do
     handoff_clients_after=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
@@ -282,7 +314,9 @@ sha256sum \
     "$install_dir/bin/Upgrade.uu-remote-original.exe" \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
-    "$install_dir/bin/streamer.dll" >"$protected_before"
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" >"$protected_before"
 if UU_REMOTE_FAKE_CORRUPT_STREAMER=1 \
     UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES="$test_profile" \
     "$launcher" --check-update; then
@@ -294,7 +328,9 @@ sha256sum \
     "$install_dir/bin/Upgrade.uu-remote-original.exe" \
     "$install_dir/bin/d3d11.dll" \
     "$install_dir/bin/dxgi.dll" \
-    "$install_dir/bin/streamer.dll" >"$protected_after"
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" >"$protected_after"
 cmp -s "$protected_before" "$protected_after"
 "$launcher" --diagnose | grep -q 'UU 版本.*4.33.0.8000'
 "$launcher" --diagnose | grep -q '安全更新状态.*更新失败并已回滚'
@@ -445,7 +481,38 @@ grep -q \
     'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client .*--property=ExitType=cgroup.*--restart-selected-decoder' \
     "$UU_REMOTE_FAKE_TRACE"
 
+# A normal graphical launch checks the official version before starting. An
+# unknown newer version is installed with the generic bridges, while the
+# requested NVIDIA choice is retained for a future package with a matching
+# binary profile.
+printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
+client_count_before_startup_update=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \
+    "$launcher"
+"$launcher" --diagnose | grep -q 'UU 版本.*4.35.0.9000'
+test ! -e "$install_dir/bin/d3d11.dll"
+grep -q '^selection=nvidia:0$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/decoder-selection"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
+    "$client_count_before_startup_update"
+
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"
+
+tray_exit_trace="$test_root/tray-exit-stop.log"
+UU_REMOTE_FAKE_TRACE="$tray_exit_trace" \
+UU_REMOTE_TRAY_EXIT_HELPER=1 \
+    "$launcher" --stop
+grep -q \
+    '^SYSTEMCTL --user stop uu-remote-for-linux-tray.service$' \
+    "$tray_exit_trace"
+if grep -q \
+    'SYSTEMCTL --user stop .*uu-remote-for-linux-tray-exit.service' \
+    "$tray_exit_trace"; then
+    printf '托盘退出助手尝试停止自身。\n' >&2
+    exit 1
+fi
+grep -q '^WINESERVER -k$' "$tray_exit_trace"
 
 printf '模拟 Wine 安装状态机检查通过。\n'

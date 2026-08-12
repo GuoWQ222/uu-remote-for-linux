@@ -159,10 +159,13 @@ watch_auto_update() {
             state=disabled
         fi
         if [[ $state != "$previous_state" ]]; then
-            log_message "$log_file" "UU 自动更新开关：$state"
+            log_message "$log_file" "UU 内置自动更新开关：$state"
             previous_state=$state
         fi
-        if [[ $state == enabled ]] && ! $manual_consumed; then
+        # Linux owns the safe update policy.  UU's in-app switch is still
+        # observed for diagnostics, but disabling it must not suppress the
+        # launcher's periodic official-version check.
+        if ! $manual_consumed; then
             if ! "$launcher" --auto-update-check \
                 >>"$log_file" 2>&1; then
                 log_message "$log_file" \

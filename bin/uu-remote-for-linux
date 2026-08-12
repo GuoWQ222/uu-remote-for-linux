@@ -52,6 +52,9 @@ readonly wol_configure="$runtime_dir/uu-remote-wol-configure"
 readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
 readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
 readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
+readonly hwdecode_compatibility_profiles="${UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES:-$runtime_dir/hwdecode-compatibility.tsv}"
+readonly hwdecode_profiler="$runtime_dir/uu-remote-hwdecode-profiler"
+readonly hwdecode_dxgi_probe_source="$runtime_dir/uu-remote-dxgi-probe.exe"
 
 detect_desktop_backend() {
     case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
@@ -120,6 +123,7 @@ readonly service_name='GameViewerService'
 readonly service_key='HKLM\System\CurrentControlSet\Services\GameViewerService'
 readonly installed_version_key='HKCU\Software\Netease\GameViewer'
 readonly controller_xim_key='HKCU\Software\Wine\AppDefaults\gameviewer.exe\X11 Driver'
+readonly server_compat_key='HKCU\Software\Wine\AppDefaults\GameViewerServer.exe'
 readonly package_stamp="$prefix/.uu-remote-for-linux-package"
 readonly eula_stamp="$data_dir/eula-accepted"
 readonly installer="$cache_dir/UURemote_Setup.exe"
@@ -186,19 +190,27 @@ readonly hwdecode_wine_dir="$hwdecode_runtime_dir/wine"
 readonly hwdecode_dxvk_dir="$hwdecode_runtime_dir/dxvk/x64"
 readonly hwdecode_enabled_stamp="$data_dir/hwdecode-enabled"
 readonly hwdecode_manifest="$data_dir/hwdecode-manifest"
+readonly hwdecode_generated_profiles="$data_dir/hwdecode-generated.tsv"
 readonly hwdecode_d3d11="$install_dir/bin/d3d11.dll"
 readonly hwdecode_dxgi="$install_dir/bin/dxgi.dll"
 readonly hwdecode_nvcuda="$prefix/drive_c/windows/system32/nvcuda.dll"
 readonly hwdecode_nvcuvid="$prefix/drive_c/windows/system32/nvcuvid.dll"
+readonly hwdecode_dxgi_probe="$install_dir/bin/uu-remote-dxgi-probe.exe"
+readonly codec_detector="$install_dir/bin/StreamerCodecDetector.exe"
 readonly streamer_dll="$install_dir/bin/streamer.dll"
 readonly streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
 readonly streamer_archive="$data_dir/hwdecode-streamer-originals"
 readonly decoder_cache="$install_dir/config/streamer/decoder_codec_capability_cache.json"
 readonly decoder_cache_backup="$data_dir/decoder-cache-before-hwdecode.json"
-readonly streamer_patch_offset_1=$((0x94dc03))
-readonly streamer_patch_offset_2=$((0x94e4ee))
-readonly streamer_original_sha="${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-2144cd9c199ee21ef55da984ef38d719e337a8202b26522458e56bff648ffb60}"
-readonly streamer_patched_sha="${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-abf2e482c65397138aa69430e3413a10f80d942a28817c22f8f8ff78e3c5ca70}"
+streamer_profile_version=""
+streamer_patch_offset_1=0
+streamer_patch_offset_2=0
+streamer_patch_before_1=""
+streamer_patch_before_2=""
+streamer_patch_after_1=""
+streamer_patch_after_2=""
+streamer_original_sha=""
+streamer_patched_sha=""
 
 readonly wine="${UU_REMOTE_WINE_BIN:-wine}"
 readonly wineboot="${UU_REMOTE_WINEBOOT_BIN:-wineboot}"
@@ -364,7 +376,7 @@ usage() {
   --setup-only         安装或修复前缀，但不启动客户端
   --repair             强制重新检查和修复前缀
   --refresh-installer  从网易官方接口重新下载最新版安装程序
-  --check-update       立即检查并安全应用受支持的官方更新
+  --check-update       立即检查并安装网易官方最新版本
   --enable-hwdecode    启用 NVIDIA NVDEC→D3D11 实验兼容桥
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
   --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 识别桥
@@ -388,7 +400,6 @@ setup_only=false
 repair=false
 refresh_installer=false
 update_check_requested=false
-automatic_update_check=false
 upstream_update_handoff=false
 stop_requested=false
 diagnose_requested=false
@@ -427,7 +438,6 @@ while (($# > 0)); do
             ;;
         --auto-update-check)
             update_check_requested=true
-            automatic_update_check=true
             ;;
         --upstream-update-handoff)
             update_check_requested=true
@@ -704,6 +714,179 @@ update_version_supported() {
         $wol_sha =~ ^[[:xdigit:]]{64}$ ]]
 }
 
+load_hwdecode_profile() {
+    local version=${1:-} row_version original_sha patched_sha
+    local offset_1 before_1 after_1 offset_2 before_2 after_2
+    local override_version="${UU_REMOTE_HWDECODE_STREAMER_VERSION:-4.34.0.8979}"
+    local profile_file
+    local found=false
+
+    if [[ -z $version ]]; then
+        version=$(registry_value "$installed_version_key" Version || true)
+    fi
+    [[ -n $version ]] || return 1
+    if [[ $streamer_profile_version == "$version" ]]; then
+        return 0
+    fi
+
+    if [[ $version == "$override_version" &&
+        -n ${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-} &&
+        -n ${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-} ]]; then
+        original_sha=$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA
+        patched_sha=$UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA
+        offset_1=0x94dc03
+        before_1=8955d0
+        after_1=b22190
+        offset_2=0x94e4ee
+        before_2=8b45d0
+        after_2=6a2158
+    else
+        for profile_file in \
+            "$hwdecode_compatibility_profiles" \
+            "$hwdecode_generated_profiles"; do
+            [[ -r $profile_file ]] || continue
+            while IFS=$'\t' read -r \
+                row_version original_sha patched_sha \
+                offset_1 before_1 after_1 offset_2 before_2 after_2; do
+                [[ -n $row_version && $row_version != \#* ]] || continue
+                [[ $row_version == "$version" ]] || continue
+                found=true
+                break
+            done <"$profile_file"
+            $found && break
+        done
+        $found || return 1
+    fi
+
+    [[ $original_sha =~ ^[[:xdigit:]]{64}$ &&
+        $patched_sha =~ ^[[:xdigit:]]{64}$ &&
+        $offset_1 =~ ^0[xX][[:xdigit:]]+$ &&
+        $offset_2 =~ ^0[xX][[:xdigit:]]+$ &&
+        $before_1 =~ ^[[:xdigit:]]{6}$ &&
+        $before_2 =~ ^[[:xdigit:]]{6}$ &&
+        $after_1 =~ ^[[:xdigit:]]{6}$ &&
+        $after_2 =~ ^[[:xdigit:]]{6}$ ]] || return 1
+
+    streamer_profile_version=$version
+    streamer_original_sha=${original_sha,,}
+    streamer_patched_sha=${patched_sha,,}
+    streamer_patch_offset_1=$((offset_1))
+    streamer_patch_offset_2=$((offset_2))
+    streamer_patch_before_1=${before_1,,}
+    streamer_patch_before_2=${before_2,,}
+    streamer_patch_after_1=${after_1,,}
+    streamer_patch_after_2=${after_2,,}
+}
+
+hwdecode_version_supported() {
+    load_hwdecode_profile "$1"
+}
+
+hwdecode_profile_generated() {
+    local version=$1 row_version remainder
+
+    [[ -r $hwdecode_generated_profiles ]] || return 1
+    while IFS=$'\t' read -r row_version remainder; do
+        [[ -n $row_version && $row_version != \#* ]] || continue
+        [[ $row_version == "$version" ]] && return 0
+    done <"$hwdecode_generated_profiles"
+    return 1
+}
+
+generate_hwdecode_profile() {
+    local version=$1 row row_version original_sha remainder current_sha
+    local temp existing_version existing_remainder
+
+    [[ -x $hwdecode_profiler && -f $streamer_dll ]] || return 1
+    row=$("$hwdecode_profiler" \
+        --derive "$streamer_dll" --version "$version" 2>>"$setup_log") ||
+        return 1
+    IFS=$'\t' read -r row_version original_sha remainder <<<"$row"
+    [[ $row_version == "$version" &&
+        $original_sha =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    current_sha=$(file_sha256 "$streamer_dll") || return 1
+    [[ ${original_sha,,} == "$current_sha" ]] || return 1
+
+    temp=$(mktemp "$data_dir/.hwdecode-generated.XXXXXX")
+    printf '# Automatically derived, fail-closed NVDEC profiles.\n' >"$temp"
+    if [[ -r $hwdecode_generated_profiles ]]; then
+        while IFS=$'\t' read -r existing_version existing_remainder; do
+            [[ -n $existing_version && $existing_version != \#* ]] || continue
+            [[ $existing_version == "$version" ]] && continue
+            printf '%s\t%s\n' "$existing_version" "$existing_remainder" >>"$temp"
+        done <"$hwdecode_generated_profiles"
+    fi
+    printf '%s\n' "$row" >>"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$hwdecode_generated_profiles"
+    streamer_profile_version=""
+    load_hwdecode_profile "$version" || return 1
+    printf '已为 UU %s 自动生成并校验 NVDEC 二进制档案。\n' "$version"
+}
+
+remove_generated_hwdecode_profile() {
+    local version=$1 temp existing_version existing_remainder
+
+    [[ -r $hwdecode_generated_profiles ]] || return 0
+    temp=$(mktemp "$data_dir/.hwdecode-generated.XXXXXX")
+    printf '# Automatically derived, fail-closed NVDEC profiles.\n' >"$temp"
+    while IFS=$'\t' read -r existing_version existing_remainder; do
+        [[ -n $existing_version && $existing_version != \#* ]] || continue
+        [[ $existing_version == "$version" ]] && continue
+        printf '%s\t%s\n' "$existing_version" "$existing_remainder" >>"$temp"
+    done <"$hwdecode_generated_profiles"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$hwdecode_generated_profiles"
+    if [[ $streamer_profile_version == "$version" ]]; then
+        streamer_profile_version=""
+    fi
+}
+
+ensure_hwdecode_profile() {
+    local version=$1
+
+    hwdecode_version_supported "$version" && return 0
+    generate_hwdecode_profile "$version"
+}
+
+load_hwdecode_profile_from_streamer_files() {
+    local original_hash="" patched_hash=""
+    local row_version original_sha patched_sha unused profile_file
+    local override_version="${UU_REMOTE_HWDECODE_STREAMER_VERSION:-4.34.0.8979}"
+
+    [[ -f $streamer_original ]] &&
+        original_hash=$(file_sha256 "$streamer_original")
+    [[ -f $streamer_dll ]] &&
+        patched_hash=$(file_sha256 "$streamer_dll")
+    [[ -n $original_hash || -n $patched_hash ]] || return 1
+
+    if [[ -n ${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-} &&
+        -n ${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-} ]] &&
+        { [[ -n $original_hash &&
+            $original_hash == "${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA,,}" ]] ||
+          [[ -n $patched_hash &&
+            $patched_hash == "${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA,,}" ]]; }; then
+        load_hwdecode_profile "$override_version"
+        return
+    fi
+
+    for profile_file in \
+        "$hwdecode_compatibility_profiles" \
+        "$hwdecode_generated_profiles"; do
+        [[ -r $profile_file ]] || continue
+        while IFS=$'\t' read -r \
+            row_version original_sha patched_sha unused; do
+            [[ -n $row_version && $row_version != \#* ]] || continue
+            if [[ -n $original_hash && ${original_sha,,} == "$original_hash" ]] ||
+                [[ -n $patched_hash && ${patched_sha,,} == "$patched_hash" ]]; then
+                load_hwdecode_profile "$row_version"
+                return
+            fi
+        done <"$profile_file"
+    done
+    return 1
+}
+
 write_update_status() {
     local status=$1 installed=$2 latest=$3 message=$4 temp
 
@@ -836,6 +1019,13 @@ controller_take_focus_enabled() {
     [[ ${value^^} == Y ]]
 }
 
+server_windows_driver_compat_enabled() {
+    local value
+
+    value=$(registry_value "$server_compat_key" Version) || return 1
+    [[ ${value,,} == win7 ]]
+}
+
 webview_ready() {
     local version
 
@@ -870,6 +1060,8 @@ input_hook_ready() {
 hwdecode_runtime_ready() {
     [[ -r "$hwdecode_dxvk_dir/d3d11.dll" &&
         -r "$hwdecode_dxvk_dir/dxgi.dll" &&
+        -r "$hwdecode_dxgi_probe_source" &&
+        -x "$hwdecode_profiler" &&
         -r "$hwdecode_wine_dir/x86_64-unix/nvcuda.dll.so" &&
         -r "$hwdecode_wine_dir/x86_64-unix/nvcuvid.dll.so" &&
         -r "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll" &&
@@ -912,11 +1104,22 @@ write_decoder_selection() {
 }
 
 effective_decoder_selection() {
-    local selection
+    local selection installed_version
 
     selection=$(saved_decoder_selection || true)
     if [[ $selection == auto ]]; then
         "$decoder_selector" --best-id 2>/dev/null || printf 'cpu\n'
+    elif [[ $selection =~ ^nvidia:[0-9]+$ ]]; then
+        installed_version=$(
+            registry_value "$installed_version_key" Version || true
+        )
+        if [[ -n $installed_version ]] &&
+            ! hwdecode_version_supported "$installed_version"; then
+            printf '%s（UU %s 暂用 CPU）\n' \
+                "$selection" "$installed_version"
+        else
+            printf '%s\n' "$selection"
+        fi
     elif [[ -n $selection ]]; then
         printf '%s\n' "$selection"
     elif hwdecode_enabled; then
@@ -934,6 +1137,8 @@ file_sha256() {
 }
 
 streamer_bridge_ready() {
+    load_hwdecode_profile ||
+        load_hwdecode_profile_from_streamer_files || return 1
     [[ -f $streamer_dll && -f $streamer_original ]] &&
         [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]] &&
         [[ $(file_sha256 "$streamer_original") == "$streamer_original_sha" ]]
@@ -945,6 +1150,7 @@ hwdecode_files_deployed() {
         cmp -s "$hwdecode_dxvk_dir/dxgi.dll" "$hwdecode_dxgi" &&
         cmp -s "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll" "$hwdecode_nvcuda" &&
         cmp -s "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll" "$hwdecode_nvcuvid" &&
+        cmp -s "$hwdecode_dxgi_probe_source" "$hwdecode_dxgi_probe" &&
         streamer_bridge_ready
 }
 
@@ -1330,6 +1536,7 @@ controller_focus_hook_status_label() {
     local guard_breaks="" health_timeouts="" recoveries="" health_suppressed=""
     local sticky_detected="" sticky_filtered="" hard_stalls=""
     local consecutive_timeouts=""
+    local repaint_pulses=""
 
     if [[ ! -r $controller_focus_hook_status ]]; then
         printf '就绪（待主控窗口启动）'
@@ -1368,7 +1575,17 @@ controller_focus_hook_status_label() {
         "$controller_focus_hook_status" ui_health hard_stalls_detected)
     consecutive_timeouts=$(ini_section_value \
         "$controller_focus_hook_status" ui_health consecutive_timeouts)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 18 &&
+    repaint_pulses=$(ini_section_value \
+        "$controller_focus_hook_status" home_window repaint_pulses)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 19 &&
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
+        printf '生效中（v%s；托盘重绘 %s，空队列/粘滞消息纠正 %s/%s，UI 超时/连续/硬卡死/恢复 %s/%s/%s/%s，顶层窗口 %s）' \
+            "$version" "${repaint_pulses:-0}" \
+            "${guard_breaks:-0}" "${sticky_detected:-0}" \
+            "${health_timeouts:-0}" "${consecutive_timeouts:-0}" \
+            "${hard_stalls:-0}" "${recoveries:-0}" \
+            "${subclassed:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 18 &&
         $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 959) == 959 )); then
         printf '生效中（v%s；空队列/粘滞消息纠正 %s/%s，UI 超时/连续/硬卡死/恢复 %s/%s/%s/%s，顶层窗口 %s）' \
             "$version" "${guard_breaks:-0}" "${sticky_detected:-0}" \
@@ -1863,14 +2080,20 @@ stop_update_bridge_runtime() {
 
 stop_tray_proxy_runtime() {
     local pid="" key value cmdline=""
+    local -a tray_units=("$tray_runtime_unit.service")
+
+    # The native tray launches --stop from the transient tray-exit unit.  A
+    # process running inside that unit must never ask systemd to stop its own
+    # unit: systemd would terminate the helper before it reaches wineserver -k,
+    # leaving UU alive in a half-finished exit state.
+    if [[ ${UU_REMOTE_TRAY_EXIT_HELPER:-0} != 1 ]]; then
+        tray_units+=("$tray_exit_runtime_unit.service")
+    fi
 
     if systemd_user_available; then
-        systemctl --user stop \
-            "$tray_runtime_unit.service" \
-            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user stop "${tray_units[@]}" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
-            "$tray_runtime_unit.service" \
-            "$tray_exit_runtime_unit.service" >/dev/null 2>&1 || true
+            "${tray_units[@]}" >/dev/null 2>&1 || true
     fi
     if [[ -r $tray_proxy_status ]]; then
         while IFS='=' read -r key value; do
@@ -2177,6 +2400,15 @@ authorize_controller_home_show() {
         umask 077
         : >"$controller_home_show_request"
     )
+}
+
+repaint_controller_home_window() {
+    [[ -x $tray_proxy ]] || return 1
+    "$tray_proxy" \
+        --repaint-home-window \
+        --prefix "$prefix" \
+        --repaint-delay-ms 2500 \
+        </dev/null >>"$tray_proxy_log" 2>&1
 }
 
 wol_hook_runtime_label() {
@@ -2496,6 +2728,7 @@ print_diagnostics() {
         "前缀状态" "$([[ -f $prefix/system.reg ]] && printf '存在' || printf '未创建')" \
         "UU 版本" "$app_version" \
         "客户端文件" "$(app_files_present && printf '完整' || printf '缺失')" \
+        "Wine 服务端兼容" "$(server_windows_driver_compat_enabled && printf '已隔离 Windows 内核驱动' || printf '未启用')" \
         "WebView2" "$(webview_ready && printf '就绪' || printf '未就绪/未安装')" \
         "兼容 DLL" "$(shim_ready && printf '就绪' || printf '未安装/不匹配')" \
         "Linux 系统代理" "$(system_proxy_bridge_label)" \
@@ -2523,7 +2756,8 @@ print_diagnostics() {
         "UU 防休眠开关" "$(uu_remote_prevent_sleep_label)" \
         "Linux 休眠抑制" "$(native_sleep_inhibition_active && printf '生效中' || printf '未生效')" \
         "防休眠兼容桥" "$([[ -x $sleep_bridge ]] && printf '就绪' || printf '缺失')" \
-        "UU 自动更新开关" "$(uu_remote_auto_update_enabled && printf '开启' || printf '关闭')" \
+        "UU 内置更新开关" "$(uu_remote_auto_update_enabled && printf '开启' || printf '关闭')" \
+        "Linux 自动更新" "每次启动检查，运行期间每 ${update_bridge_interval} 秒检查" \
         "安全更新状态" "$(update_status_label)" \
         "自动更新兼容桥" "$(update_runtime_label)" \
         "官方更新器保护" "$(update_blocker_ready && printf '完整' || printf '未安装/不匹配')" \
@@ -2602,7 +2836,8 @@ check_base_requirements
 [[ -r $powershell_bridge_source ]] ||
     die "缺少 Win64 WOL 电源属性兼容桥：$powershell_bridge_source。请重新安装本项目"
 [[ -x $update_bridge && -r $update_blocker_source &&
-    -r $update_compatibility_profiles ]] ||
+    -r $update_compatibility_profiles &&
+    -r $hwdecode_compatibility_profiles ]] ||
     die "缺少自动更新兼容桥或兼容档案。请重新安装本项目"
 
 mkdir -p "$data_dir" "$state_dir" "$cache_dir"
@@ -2667,10 +2902,14 @@ if controller_focus_hook_live; then
         authorize_controller_home_show ||
             die "无法授权 UU 自身恢复主界面"
         cd "$install_dir"
-        exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        show_result=0
+        env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
             -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
             -u ALL_PROXY -u NO_PROXY \
-            "$wine" "$client"
+            "$wine" "$client" || show_result=$?
+        repaint_controller_home_window ||
+            printf '警告：无法刷新 UU 主界面的 X11 表面。\n' >&2
+        exit "$show_result"
     fi
 fi
 
@@ -2753,22 +2992,6 @@ download_installer() {
 
 if $refresh_installer; then
     download_installer
-    if app_files_present; then
-        refreshed_version=$(<"$installer_version_file")
-        installed_before_refresh=$(
-            registry_value "$installed_version_key" Version || true
-        )
-        if [[ -n $installed_before_refresh ]] &&
-            version_greater "$refreshed_version" "$installed_before_refresh" &&
-            { hwdecode_enabled || wol_enabled; } &&
-            ! update_version_supported "$refreshed_version"; then
-            write_update_status paused \
-                "$installed_before_refresh" \
-                "$refreshed_version" \
-                "当前 Linux 包尚无该版本的桥接兼容档案"
-            die "已缓存 UU $refreshed_version，但为保护已启用的兼容桥未安装；请等待 Linux 包提供该版本兼容档案"
-        fi
-    fi
 fi
 
 stop_prefix_for_setup() {
@@ -2801,7 +3024,16 @@ streamer_bytes_at() {
 }
 
 deploy_streamer_patch() {
-    local current_sha original_sha patched_temp
+    local current_sha original_sha patched_temp installed_version
+
+    if ! load_hwdecode_profile; then
+        installed_version=$(
+            registry_value "$installed_version_key" Version || true
+        )
+        [[ -n $installed_version ]] &&
+            ensure_hwdecode_profile "$installed_version" ||
+            die "当前 UU 版本无法安全生成 NVDEC 兼容档案；未修改客户端"
+    fi
 
     [[ -f $streamer_dll || -f $streamer_original ]] ||
         die "UU streamer.dll 缺失，请先运行：uu-remote-for-linux --repair"
@@ -2809,7 +3041,7 @@ deploy_streamer_patch() {
     if [[ -f $streamer_original ]]; then
         original_sha=$(file_sha256 "$streamer_original")
         [[ $original_sha == "$streamer_original_sha" ]] ||
-            die "streamer.dll 原版备份不属于受支持的 UU 4.34.0.8979；拒绝覆盖"
+            die "streamer.dll 原版备份不属于受支持的 UU $streamer_profile_version；拒绝覆盖"
 
         if [[ -f $streamer_dll ]]; then
             current_sha=$(file_sha256 "$streamer_dll")
@@ -2830,22 +3062,22 @@ deploy_streamer_patch() {
             die "发现已修改的 streamer.dll，但原版备份缺失；拒绝继续以避免数据丢失"
         fi
         [[ $current_sha == "$streamer_original_sha" ]] ||
-            die "当前 streamer.dll 不属于受支持的 UU 4.34.0.8979；未应用版本相关补丁"
+            die "当前 streamer.dll 不属于受支持的 UU $streamer_profile_version；未应用版本相关补丁"
         mv "$streamer_dll" "$streamer_original" ||
             die "无法备份原版 UU streamer.dll"
     fi
 
-    [[ $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_1") == 8955d0 &&
-        $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_2") == 8b45d0 ]] ||
+    [[ $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_1") == "$streamer_patch_before_1" &&
+        $(streamer_bytes_at "$streamer_original" "$streamer_patch_offset_2") == "$streamer_patch_before_2" ]] ||
         die "streamer.dll 补丁位置校验失败；未修改客户端"
 
     patched_temp="${streamer_dll}.uu-remote-new"
     install -Dm0644 "$streamer_original" "$patched_temp" ||
         die "无法暂存 UU streamer.dll"
-    printf '\262\041\220' |
+    printf '%b' "\\x${streamer_patch_after_1:0:2}\\x${streamer_patch_after_1:2:2}\\x${streamer_patch_after_1:4:2}" |
         dd of="$patched_temp" bs=1 seek="$streamer_patch_offset_1" conv=notrunc status=none ||
         die "无法写入 NVDEC 选择补丁"
-    printf '\152\041\130' |
+    printf '%b' "\\x${streamer_patch_after_2:0:2}\\x${streamer_patch_after_2:2:2}\\x${streamer_patch_after_2:4:2}" |
         dd of="$patched_temp" bs=1 seek="$streamer_patch_offset_2" conv=notrunc status=none ||
         die "无法写入 NVDEC 能力回填补丁"
     [[ $(file_sha256 "$patched_temp") == "$streamer_patched_sha" ]] || {
@@ -2866,6 +3098,9 @@ deploy_streamer_patch() {
 
 remove_streamer_patch() {
     local current_sha original_sha
+
+    load_hwdecode_profile || load_hwdecode_profile_from_streamer_files ||
+        die "当前 UU 版本没有经过校验的 NVDEC 兼容档案；未修改客户端"
 
     if [[ -f $streamer_original ]]; then
         original_sha=$(file_sha256 "$streamer_original")
@@ -2902,7 +3137,7 @@ remove_streamer_patch() {
 }
 
 deploy_hwdecode_bridge() {
-    local name source target temp_manifest hash i
+    local name source target temp_manifest hash i generated_version
     local -a names sources targets
 
     hwdecode_runtime_ready ||
@@ -2912,18 +3147,20 @@ deploy_hwdecode_bridge() {
     app_files_present ||
         die "UU 远程客户端尚未完整安装，请先运行：uu-remote-for-linux --setup-only"
 
-    names=(d3d11 dxgi nvcuda nvcuvid)
+    names=(d3d11 dxgi nvcuda nvcuvid dxgi-probe)
     sources=(
         "$hwdecode_dxvk_dir/d3d11.dll"
         "$hwdecode_dxvk_dir/dxgi.dll"
         "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll"
         "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll"
+        "$hwdecode_dxgi_probe_source"
     )
     targets=(
         "$hwdecode_d3d11"
         "$hwdecode_dxgi"
         "$hwdecode_nvcuda"
         "$hwdecode_nvcuvid"
+        "$hwdecode_dxgi_probe"
     )
 
     for ((i = 0; i < ${#names[@]}; i++)); do
@@ -2957,24 +3194,38 @@ deploy_hwdecode_bridge() {
 
     hwdecode_files_deployed ||
         die "硬件解码桥写入后核验失败"
+
+    if hwdecode_profile_generated "$streamer_profile_version"; then
+        generated_version=$streamer_profile_version
+        if ! probe_hwdecode_bridge; then
+            printf '自动生成的 NVDEC 档案未通过真实运行验证，正在恢复官方解码文件。\n' >&2
+            remove_hwdecode_bridge
+            remove_generated_hwdecode_profile "$generated_version"
+            die "UU $generated_version 的自动 NVDEC 补丁已安全撤销；客户端未保留未经验证的二进制修改"
+        fi
+        printf 'UU %s 的自动 NVDEC 补丁已通过 DXGI 与官方解码探测器验证。\n' \
+            "$generated_version"
+    fi
 }
 
 remove_hwdecode_bridge() {
     local name source target i
     local -a names sources targets
 
-    names=(d3d11 dxgi nvcuda nvcuvid)
+    names=(d3d11 dxgi nvcuda nvcuvid dxgi-probe)
     sources=(
         "$hwdecode_dxvk_dir/d3d11.dll"
         "$hwdecode_dxvk_dir/dxgi.dll"
         "$hwdecode_wine_dir/x86_64-windows/nvcuda.dll"
         "$hwdecode_wine_dir/x86_64-windows/nvcuvid.dll"
+        "$hwdecode_dxgi_probe_source"
     )
     targets=(
         "$hwdecode_d3d11"
         "$hwdecode_dxgi"
         "$hwdecode_nvcuda"
         "$hwdecode_nvcuvid"
+        "$hwdecode_dxgi_probe"
     )
 
     remove_streamer_patch
@@ -2998,8 +3249,79 @@ configure_hwdecode_environment() {
     export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
 }
 
+probe_hwdecode_bridge() {
+    local adapters results device_id adapter_id vendor_id adapter_index
+    local detector_ok=false
+
+    [[ -f $hwdecode_dxgi_probe && -f $codec_detector ]] || return 1
+    adapters=$(mktemp "$cache_dir/.hwdecode-adapters.XXXXXX")
+    results=$(mktemp "$cache_dir/.hwdecode-results.XXXXXX")
+    configure_hwdecode_environment
+
+    if ! (
+        cd "$install_dir/bin"
+        env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+            -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+            -u ALL_PROXY -u NO_PROXY \
+            timeout 30s "$wine" "$hwdecode_dxgi_probe"
+    ) >"$adapters" 2>>"$setup_log"; then
+        rm -f -- "$adapters" "$results"
+        printf 'DXGI 无法枚举可用于 UU 的真实显卡。\n' >&2
+        return 1
+    fi
+    sed -i 's/\r$//' "$adapters"
+
+    while IFS=$'\t' read -r \
+        device_id adapter_id vendor_id adapter_index; do
+        [[ $device_id =~ ^[0-9]+$ &&
+            $adapter_id =~ ^-?[0-9]+$ &&
+            $vendor_id =~ ^[0-9]+$ &&
+            $adapter_index =~ ^[0-9]+$ ]] || continue
+        : >"$results"
+        if (
+            cd "$install_dir/bin"
+            env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+                -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+                -u ALL_PROXY -u NO_PROXY \
+                timeout 60s "$wine" "$codec_detector" \
+                    --batch 33 "$device_id" "$adapter_id"
+        ) >"$results" 2>>"$setup_log"; then
+            sed -i 's/\r$//' "$results"
+            if grep -qx 'BATCH_DONE' "$results" &&
+                awk -F, '
+                $1 == "RESULT" && $2 == 1 && $3 == 1 && $4 == 8 &&
+                    $5 >= 1920 && $6 >= 1080 && $7 == 1 { h264 = 1 }
+                $1 == "RESULT" && $2 == 2 && $3 == 1 && $4 == 8 &&
+                    $5 >= 1920 && $6 >= 1080 && $7 == 1 { h265 = 1 }
+                END { exit !(h264 && h265) }
+                ' "$results"; then
+                detector_ok=true
+                {
+                    printf '\n[%(%FT%T%z)T] NVDEC 自动补丁运行验证通过；' -1
+                    printf 'DXGI adapter=%s device=%s luid=%s vendor=%s\n' \
+                        "$adapter_index" "$device_id" "$adapter_id" "$vendor_id"
+                    sed -n '/^RESULT,/p; /^BATCH_DONE$/p' "$results"
+                } >>"$setup_log"
+                break
+            fi
+        fi
+    done <"$adapters"
+
+    $detector_ok || {
+        {
+            printf '\n[%(%FT%T%z)T] NVDEC 自动补丁运行验证失败；' -1
+            printf '仅记录解码能力结果\n'
+            sed -n '/^RESULT,/p; /^BATCH_/p' "$results"
+        } >>"$setup_log"
+        rm -f -- "$adapters" "$results"
+        printf 'UU 自带解码探测器未确认 H.264/H.265 NVDEC 能力。\n' >&2
+        return 1
+    }
+    rm -f -- "$adapters" "$results"
+}
+
 apply_decoder_selection() {
-    local requested effective cuda_index
+    local requested effective cuda_index installed_version
 
     requested=$(saved_decoder_selection || true)
     [[ -n $requested ]] || return 0
@@ -3018,17 +3340,30 @@ apply_decoder_selection() {
             fi
             ;;
         nvidia:*)
+            installed_version=$(
+                registry_value "$installed_version_key" Version || true
+            )
+            if [[ -n $installed_version ]] &&
+                ! ensure_hwdecode_profile "$installed_version"; then
+                if hwdecode_enabled || streamer_bridge_ready; then
+                    stop_prefix_for_setup
+                    remove_hwdecode_bridge
+                fi
+                printf 'UU %s 的 NVDEC 指令布局无法安全自动识别；本次使用 CPU 解码，已保留所选 NVIDIA 设备。\n' \
+                    "$installed_version"
+                return 0
+            fi
             cuda_index=${effective#nvidia:}
             [[ $cuda_index =~ ^[0-9]+$ ]] ||
                 die "无效的 NVIDIA 解码设备：$effective"
             "$decoder_selector" --supports-id "$effective" ||
                 die "选定的 NVIDIA 解码设备当前不可用：$effective。请重新运行 --select-decoder"
+            export UU_REMOTE_CUDA_DEVICE="$cuda_index"
             if ! hwdecode_enabled || ! hwdecode_files_deployed; then
                 stop_prefix_for_setup
                 deploy_hwdecode_bridge
                 printf '已按设备策略启用 NVIDIA NVDEC 桥。\n'
             fi
-            export UU_REMOTE_CUDA_DEVICE="$cuda_index"
             ;;
         *)
             die "不支持的解码设备选择：$effective"
@@ -3150,6 +3485,16 @@ configure_compatibility() {
         'HKCU\Software\Wine\AppDefaults\msedgewebview2.exe' \
         /v Version /t REG_SZ /d win8 /f ||
         die "无法配置 WebView2 兼容模式"
+    # The Linux host supplies display and input integration.  Reporting Win7
+    # only to the server prevents UU 4.36+ from installing Windows IDD,
+    # gvInput, and ViGEm kernel drivers into Wine's emulated device database.
+    # Repeated installs otherwise leave phantom devices and can terminate the
+    # server before its IPC runtime starts, leaving only a transparent client
+    # shell for tray activation.  The Qt controller keeps Wine's default
+    # version so WebView2 and the visible application are unaffected.
+    run_logged "$wine" reg add "$server_compat_key" \
+        /v Version /t REG_SZ /d win7 /f ||
+        die "无法隔离 UU 服务端的 Windows 内核驱动初始化"
     run_logged "$wine" reg add 'HKCU\Software\Wine\X11 Driver' \
         /v UseTakeFocus /t REG_SZ /d N /f ||
         die "无法配置 Wine X11 焦点处理"
@@ -3173,6 +3518,8 @@ configure_compatibility() {
     shim_ready || die "Event Log 兼容 DLL 核验失败"
     input_hook_ready || die "Win64 输入钩子核验失败"
     update_blocker_ready || die "自动更新保护程序核验失败"
+    server_windows_driver_compat_enabled ||
+        die "UU 服务端 Windows 内核驱动隔离设置核验失败"
     controller_xim_disabled || die "Wine 主控窗口 XIM 禁用设置核验失败"
     controller_take_focus_enabled ||
         die "Wine 主控窗口 WM_TAKE_FOCUS 设置核验失败"
@@ -3189,6 +3536,7 @@ prefix_needs_configuration() {
     webview_ready || return 0
     shim_ready || return 0
     update_blocker_ready || return 0
+    server_windows_driver_compat_enabled || return 0
     controller_xim_disabled || return 0
     controller_take_focus_enabled || return 0
     if wol_enabled; then
@@ -3217,6 +3565,10 @@ create_update_snapshot() {
         paths+=("drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini")
     [[ -d "$local_appdata/upgrade" ]] &&
         paths+=("drive_c/users/$(id -un)/AppData/Local/GameViewer/upgrade")
+    [[ -f $hwdecode_nvcuda ]] &&
+        paths+=("drive_c/windows/system32/nvcuda.dll")
+    [[ -f $hwdecode_nvcuvid ]] &&
+        paths+=("drive_c/windows/system32/nvcuvid.dll")
 
     notify_status "正在创建更新回滚点"
     if ! tar --format=pax -C "$prefix" -cf "$temp" "${paths[@]}"; then
@@ -3227,8 +3579,45 @@ create_update_snapshot() {
     printf '%s\n' "$snapshot"
 }
 
+create_version_bridge_state_snapshot() {
+    local snapshot="$update_rollback_dir/pre-update-bridge-state.tar"
+    local name
+    local -a paths=()
+
+    mkdir -p "$update_rollback_dir"
+    for name in \
+        hwdecode-enabled \
+        hwdecode-manifest \
+        hwdecode-generated.tsv \
+        decoder-cache-before-hwdecode.json \
+        wol-enabled; do
+        [[ -e $data_dir/$name ]] && paths+=("$name")
+    done
+    if ((${#paths[@]} > 0)); then
+        tar --format=pax -C "$data_dir" -cf "$snapshot" "${paths[@]}" ||
+            die "无法保存版本绑定兼容桥状态；现有客户端未作修改"
+    else
+        tar --format=pax -cf "$snapshot" --files-from /dev/null ||
+            die "无法创建空的兼容桥状态快照"
+    fi
+    printf '%s\n' "$snapshot"
+}
+
+restore_version_bridge_state_snapshot() {
+    local snapshot=$1
+
+    [[ -f $snapshot ]] || return 1
+    rm -f -- \
+        "$hwdecode_enabled_stamp" \
+        "$hwdecode_manifest" \
+        "$hwdecode_generated_profiles" \
+        "$decoder_cache_backup" \
+        "$wol_enabled_stamp"
+    tar -C "$data_dir" -xf "$snapshot"
+}
+
 restore_update_snapshot() {
-    local snapshot=$1 failed_dir
+    local snapshot=$1 bridge_state_snapshot=${2:-} failed_dir
 
     [[ -f $snapshot ]] || {
         printf '回滚快照不存在：%s\n' "$snapshot" >&2
@@ -3241,6 +3630,11 @@ restore_update_snapshot() {
     fi
     if ! tar -C "$prefix" -xf "$snapshot"; then
         printf '无法从更新快照恢复旧版 UU 文件。\n' >&2
+        return 1
+    fi
+    if [[ -n $bridge_state_snapshot ]] &&
+        ! restore_version_bridge_state_snapshot "$bridge_state_snapshot"; then
+        printf '无法恢复更新前的版本绑定兼容桥状态。\n' >&2
         return 1
     fi
     app_files_present &&
@@ -3264,7 +3658,8 @@ restart_client_after_update() {
     launcher_path=$(resolve_launcher_path) || return 1
     (
         cd "$data_dir"
-        nohup "$launcher_path" --autostart \
+        nohup env UU_REMOTE_SKIP_STARTUP_UPDATE=1 \
+            "$launcher_path" --autostart \
             9>&- </dev/null >>"$update_bridge_log" 2>&1 &
     )
 }
@@ -3284,12 +3679,16 @@ update_restart_ready() {
     fi
 }
 
-run_supported_update_transaction() {
+run_update_transaction() {
     local latest=$1 expected_installer_sha actual_installer_sha
-    local snapshot installed_after
+    local snapshot bridge_state_snapshot installed_after
+    local profile_supported=false
 
-    expected_installer_sha=$(update_profile_value "$latest" installer) ||
-        die "缺少 UU $latest 的安装包兼容哈希"
+    if update_version_supported "$latest"; then
+        profile_supported=true
+        expected_installer_sha=$(update_profile_value "$latest" installer) ||
+            die "缺少 UU $latest 的安装包兼容哈希"
+    fi
 
     download_installer
     [[ -r $installer_version_file &&
@@ -3297,7 +3696,8 @@ run_supported_update_transaction() {
         die "官方安装包版本与更新检查结果不一致；现有客户端未作修改"
     actual_installer_sha=$(file_sha256 "$installer") ||
         die "无法计算已下载安装包的哈希"
-    if [[ $actual_installer_sha != "$expected_installer_sha" ]]; then
+    if $profile_supported &&
+        [[ $actual_installer_sha != "$expected_installer_sha" ]]; then
         write_update_status paused \
             "$(registry_value "$installed_version_key" Version || printf unknown)" \
             "$latest" \
@@ -3306,13 +3706,28 @@ run_supported_update_transaction() {
     fi
 
     snapshot=$(create_update_snapshot)
+    bridge_state_snapshot=$(create_version_bridge_state_snapshot)
     if (
         stop_prefix_for_setup
+        if ! $profile_supported; then
+            if hwdecode_enabled || streamer_bridge_ready; then
+                remove_hwdecode_bridge
+                printf '正在为最新版准备自动 NVDEC 档案，已先安全恢复官方解码文件。\n'
+            fi
+            if wol_enabled; then
+                remove_wol_bridge
+                printf '最新版尚无 WOL 二进制补丁，已在更新前安全恢复官方服务文件。\n'
+            fi
+        fi
         prepare_prefix
         install_or_update_app
         configure_compatibility
 
-        if wol_enabled; then
+        installed_after=$(registry_value "$installed_version_key" Version || true)
+        [[ $installed_after == "$latest" ]] ||
+            die "更新后版本核验失败：${installed_after:-unknown}"
+
+        if $profile_supported && wol_enabled; then
             "$wol_bridge" patch \
                 "$server" \
                 "$wol_server_original" \
@@ -3325,9 +3740,6 @@ run_supported_update_transaction() {
         fi
         apply_decoder_selection
 
-        installed_after=$(registry_value "$installed_version_key" Version || true)
-        [[ $installed_after == "$latest" ]] ||
-            die "更新后版本核验失败：${installed_after:-unknown}"
         shim_ready || die "更新后 Event Log 兼容 DLL 核验失败"
         update_blocker_ready ||
             die "更新后官方更新器保护未恢复"
@@ -3335,7 +3747,7 @@ run_supported_update_transaction() {
             hwdecode_files_deployed ||
                 die "更新后解码兼容 DLL 或 streamer 补丁核验失败"
         fi
-        if wol_enabled; then
+        if $profile_supported && wol_enabled; then
             wol_patch_ready || die "更新后 WOL 兼容补丁核验失败"
             wol_hook_config_ready ||
                 die "更新后 WOL 物理网卡映射核验失败"
@@ -3343,18 +3755,33 @@ run_supported_update_transaction() {
                 die "更新后 WOL 电源属性兼容桥核验失败"
         fi
     ); then
-        rm -f -- "$snapshot"
-        write_update_status updated "$latest" "$latest" \
-            "兼容 DLL 与版本补丁均已恢复并校验"
-        notify_status "UU 已安全更新到 $latest，兼容桥校验通过"
-        printf 'UU 已安全更新到 %s，所有已启用兼容桥均已重新部署并校验。\n' \
-            "$latest"
+        rm -f -- "$snapshot" "$bridge_state_snapshot"
+        if $profile_supported; then
+            write_update_status updated "$latest" "$latest" \
+                "客户端与版本绑定兼容桥均已更新并校验"
+            notify_status "UU 已更新到 $latest，兼容桥校验通过"
+            printf 'UU 已更新到 %s，所有已启用兼容桥均已重新部署并校验。\n' \
+                "$latest"
+        elif hwdecode_enabled; then
+            write_update_status updated "$latest" "$latest" \
+                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证，WOL 版本补丁已安全停用"
+            notify_status "UU 已更新到 $latest，NVDEC 自动补丁验证通过"
+            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁和硬件解码桥已自动生成、部署并通过真实解码验证，WOL 版本补丁暂时停用。\n' \
+                "$latest"
+        else
+            write_update_status updated "$latest" "$latest" \
+                "已安装官方最新版；版本绑定的 NVDEC/WOL 补丁已安全停用"
+            notify_status "UU 已更新到 $latest，版本绑定补丁已安全降级"
+            printf 'UU 已更新到官方最新版 %s；通用兼容层已部署，版本绑定的 NVDEC/WOL 补丁暂时停用。\n' \
+                "$latest"
+        fi
         restart_client_after_update || true
         return 0
     fi
 
     printf '更新事务失败，正在恢复更新前文件……\n' >&2
-    if restore_update_snapshot "$snapshot"; then
+    if restore_update_snapshot "$snapshot" "$bridge_state_snapshot"; then
+        rm -f -- "$bridge_state_snapshot"
         write_update_status rolled-back \
             "$(registry_value "$installed_version_key" Version || printf unknown)" \
             "$latest" \
@@ -3372,10 +3799,6 @@ run_supported_update_transaction() {
 perform_update_check() {
     local installed latest
 
-    if $automatic_update_check && ! uu_remote_auto_update_enabled; then
-        printf 'UU 自动更新开关已关闭；跳过检查。\n'
-        return
-    fi
     app_files_present ||
         die "UU 客户端尚未安装，无法检查更新"
     installed=$(registry_value "$installed_version_key" Version || true)
@@ -3393,17 +3816,7 @@ perform_update_check() {
         return
     fi
 
-    if ! update_version_supported "$latest"; then
-        write_update_status paused "$installed" "$latest" \
-            "当前 Linux 包尚无该版本的桥接兼容档案"
-        notify_status "发现 UU $latest，已为保护解码桥暂缓安装"
-        printf '发现 UU %s；当前 Linux 包尚无对应桥接兼容档案，已暂缓安装。\n' \
-            "$latest"
-        printf '当前 %s 与全部兼容 DLL 保持原样。\n' "$installed"
-        return
-    fi
-
-    run_supported_update_transaction "$latest"
+    run_update_transaction "$latest"
 }
 
 perform_upstream_update_handoff() {
@@ -3433,11 +3846,11 @@ perform_upstream_update_handoff() {
     if update_restart_ready; then
         restart_client_after_update || restart_status=$?
         if ((restart_status == 0)); then
-            notify_status "UU 安全更新检查完成，正在恢复兼容版本"
-            printf '安全更新检查完成；已请求重新启动当前兼容版本。\n'
+            notify_status "UU 更新检查完成，正在启动最新可用版本"
+            printf '更新检查完成；已请求启动最新可用版本。\n'
         else
             notify_status "UU 更新检查完成，但主程序恢复启动失败"
-            printf '错误：无法重新启动当前兼容版本。\n' >&2
+            printf '错误：无法重新启动最新可用版本。\n' >&2
         fi
     else
         restart_status=1
@@ -3458,8 +3871,31 @@ if $update_check_requested; then
     exit
 fi
 
+startup_update_requested=false
+if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
+    app_files_present &&
+    ! $setup_only && ! $repair && ! $refresh_installer &&
+    ! $stop_requested && ! $diagnose_requested &&
+    ! $enable_hwdecode && ! $disable_hwdecode &&
+    ! $enable_wol && ! $disable_wol &&
+    ! $select_decoder_requested && ! $select_decoder_restart_requested &&
+    ! $restart_selected_decoder && ! $list_decoders_requested &&
+    [[ -z $decoder_direct_choice ]]; then
+    startup_update_requested=true
+fi
+if $startup_update_requested; then
+    if ! (
+        export UU_REMOTE_UPDATE_NO_RESTART=1
+        perform_update_check
+    ); then
+        notify_status "启动时自动更新未完成，将继续打开当前版本"
+        printf '警告：启动时自动更新未完成；继续打开当前已安装版本。\n' >&2
+    fi
+fi
+
 if $enable_hwdecode; then
     stop_prefix_for_setup
+    export UU_REMOTE_CUDA_DEVICE=0
     deploy_hwdecode_bridge
     write_decoder_selection "nvidia:0"
     notify_status "NVIDIA 硬件解码桥已启用"
