@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Atomically prefer UU's NVENC capabilities while retaining a safe backup."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+
+NVENC_V8_IMPL = 0
+NVENC_V11_IMPL = 1
+OPENH264_IMPL = 6
+PATCHED_NVDEC_IMPL = 33
+
+
+def read_u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def read_u32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def read_u64(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"错误：{message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        fail(f"编码器能力缓存尚未生成：{path}")
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"无法读取编码器能力缓存：{error}")
+    if not isinstance(data, dict) or not isinstance(
+        data.get("encoder_capabilities"), list
+    ):
+        fail("编码器能力缓存结构无效")
+    return data
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def capability_is_nvenc(row: object) -> bool:
+    return isinstance(row, dict) and row.get("codec_impl") == NVENC_V8_IMPL
+
+
+def capability_is_nvenc_source(row: object) -> bool:
+    return isinstance(row, dict) and row.get("codec_impl") in {
+        NVENC_V8_IMPL,
+        NVENC_V11_IMPL,
+        PATCHED_NVDEC_IMPL,
+    }
+
+
+def capability_is_openh264(row: object) -> bool:
+    return isinstance(row, dict) and row.get("codec_impl") == OPENH264_IMPL
+
+
+def validate_nvenc_rows(rows: list, device_id: int, adapter_id: int) -> None:
+    codecs = {
+        row.get("video_codec")
+        for row in rows
+        if capability_is_nvenc(row)
+        and row.get("device_id") == device_id
+        and row.get("adapter_id") == adapter_id
+        and row.get("bit_depth") == 8
+        and row.get("width", 0) >= 1920
+        and row.get("height", 0) >= 1080
+    }
+    if not {1, 2}.issubset(codecs):
+        fail("能力缓存没有同时包含可用的 H.264 与 HEVC NVENC 档案")
+
+
+def enable(cache: Path, backup: Path, device_id: int, adapter_id: int) -> None:
+    data = load_cache(cache)
+    rows = data["encoder_capabilities"]
+    hardware_rows = [row for row in rows if capability_is_nvenc_source(row)]
+    if not hardware_rows:
+        fail("UU 尚未探测到 NVIDIA 硬件编码器，拒绝移除 OpenH264 回退项")
+
+    migrated = 0
+    for row in hardware_rows:
+        if row.get("codec_impl") != NVENC_V8_IMPL:
+            migrated += 1
+        row["codec_impl"] = NVENC_V8_IMPL
+        row["device_id"] = device_id
+        row["adapter_id"] = adapter_id
+    validate_nvenc_rows(hardware_rows, device_id, adapter_id)
+
+    if not backup.is_file() and (
+        any(capability_is_openh264(row) for row in rows) or migrated
+    ):
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        temporary = backup.with_name(f".{backup.name}.new")
+        shutil.copy2(cache, temporary)
+        os.replace(temporary, backup)
+
+    data["encoder_capabilities"] = [
+        row for row in rows if not capability_is_openh264(row)
+    ]
+    atomic_write_json(cache, data)
+    verify(cache, device_id, adapter_id)
+    print(
+        f"NVENC_POLICY_OK\tdevice={device_id}\tadapter={adapter_id}"
+        f"\timpl={NVENC_V8_IMPL}\tmigrated={migrated}"
+        f"\tentries={len(data['encoder_capabilities'])}"
+    )
+
+
+def verify(cache: Path, device_id: int, adapter_id: int) -> None:
+    rows = load_cache(cache)["encoder_capabilities"]
+    if any(capability_is_openh264(row) for row in rows):
+        fail("OpenH264 仍位于活动能力缓存中")
+    if any(
+        capability_is_nvenc_source(row) and not capability_is_nvenc(row)
+        for row in rows
+    ):
+        fail("活动能力缓存仍包含未迁移的 NVENC V11/NVDEC 实现编号")
+    validate_nvenc_rows(rows, device_id, adapter_id)
+
+
+def disable(cache: Path, backup: Path) -> None:
+    if not backup.is_file():
+        print("没有 NVENC 策略备份，无需恢复。")
+        return
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache.with_name(f".{cache.name}.restore")
+    shutil.copy2(backup, temporary)
+    os.replace(temporary, cache)
+    backup.unlink()
+    print("已恢复包含 OpenH264 安全回退项的原始编码器能力缓存。")
+
+
+def parse_id(value: str, label: str) -> int:
+    try:
+        result = int(value, 10)
+    except ValueError:
+        fail(f"{label} 不是十进制整数：{value}")
+    if result < 0 or result > 0xFFFFFFFF:
+        fail(f"{label} 超出有效范围：{value}")
+    return result
+
+
+def probe_streamer(path: Path) -> None:
+    """Find the GDI RawVideoFrame adapter-id vtable slot without fixed RVAs."""
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        fail(f"无法读取 streamer.dll：{error}")
+    try:
+        if data[:2] != b"MZ":
+            raise ValueError("缺少 MZ 文件头")
+        pe_offset = read_u32(data, 0x3C)
+        if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+            raise ValueError("缺少 PE 文件头")
+        section_count = read_u16(data, pe_offset + 6)
+        optional_size = read_u16(data, pe_offset + 20)
+        optional_offset = pe_offset + 24
+        if read_u16(data, optional_offset) != 0x20B:
+            raise ValueError("不是 Win64 PE32+ 文件")
+        image_base = read_u64(data, optional_offset + 24)
+        section_offset = optional_offset + optional_size
+        sections: dict[str, tuple[int, int, int, int]] = {}
+        for index in range(section_count):
+            offset = section_offset + index * 40
+            name = data[offset : offset + 8].split(b"\0", 1)[0].decode(
+                "ascii", errors="strict"
+            )
+            virtual_size = read_u32(data, offset + 8)
+            virtual_address = read_u32(data, offset + 12)
+            raw_size = read_u32(data, offset + 16)
+            raw_offset = read_u32(data, offset + 20)
+            sections[name] = (
+                virtual_address,
+                virtual_size,
+                raw_offset,
+                raw_size,
+            )
+        text = sections[".text"]
+        rdata = sections[".rdata"]
+    except (IndexError, KeyError, UnicodeDecodeError, struct.error, ValueError) as error:
+        fail(f"streamer.dll 的 PE 结构无效：{error}")
+
+    def rva_to_offset(rva: int, size: int) -> int:
+        for virtual_address, virtual_size, raw_offset, raw_size in sections.values():
+            span = max(virtual_size, raw_size)
+            if (
+                virtual_address <= rva
+                and size <= span
+                and rva - virtual_address <= span - size
+            ):
+                result = raw_offset + rva - virtual_address
+                if result < 0 or result + size > len(data):
+                    break
+                return result
+        raise ValueError(f"RVA 0x{rva:x} 不在有效节内")
+
+    def offset_to_rva(offset: int, size: int) -> int:
+        for virtual_address, virtual_size, raw_offset, raw_size in sections.values():
+            if (
+                raw_offset <= offset
+                and size <= raw_size
+                and offset - raw_offset <= raw_size - size
+            ):
+                return virtual_address + offset - raw_offset
+        raise ValueError(f"文件偏移 0x{offset:x} 不在有效节内")
+
+    text_rva, text_virtual_size, text_offset, text_raw_size = text
+    rdata_rva, rdata_virtual_size, _, rdata_raw_size = rdata
+    text_size = min(text_virtual_size, text_raw_size)
+    text_end = text_offset + text_size
+    candidates: list[tuple[int, int]] = []
+    prefix = bytes.fromhex("e80000000090488d05")
+    suffix = bytes.fromhex("4989074989b7a8000000")
+
+    for offset in range(text_offset, max(text_offset, text_end - 22)):
+        instruction = data[offset : offset + 23]
+        if (
+            len(instruction) != 23
+            or instruction[0] != prefix[0]
+            or instruction[5:9] != prefix[5:9]
+            or instruction[13:23] != suffix
+        ):
+            continue
+        instruction_rva = text_rva + offset - text_offset
+        displacement = struct.unpack_from("<i", instruction, 9)[0]
+        vtable_rva = instruction_rva + 13 + displacement
+        if not (
+            rdata_rva <= vtable_rva
+            and vtable_rva + 7 * 8
+            <= rdata_rva + max(rdata_virtual_size, rdata_raw_size)
+        ):
+            continue
+        try:
+            vtable_offset = rva_to_offset(vtable_rva, 7 * 8)
+            entries = struct.unpack_from("<7Q", data, vtable_offset)
+
+            def function_bytes(address: int, size: int) -> bytes:
+                return data[rva_to_offset(address - image_base, size) :][
+                    :size
+                ]
+
+            valid = (
+                entries[4] == entries[5]
+                and function_bytes(entries[1], 6) == bytes.fromhex("b801000000c3")
+                and function_bytes(entries[2], 3) == bytes.fromhex("b001c3")
+                and function_bytes(entries[3], 12)
+                == bytes.fromhex("4883b9a8000000000f95c0c3")
+                and function_bytes(entries[5], 3) == bytes.fromhex("33c0c3")
+            )
+        except (ValueError, struct.error):
+            continue
+        if valid:
+            candidates.append((vtable_rva, vtable_rva + 5 * 8))
+
+    if len(candidates) != 1:
+        fail(
+            "无法唯一定位 GDI 捕获帧的适配器 LUID 虚函数；"
+            f"候选数={len(candidates)}"
+        )
+    vtable_rva, slot_rva = candidates[0]
+
+    adapter_getter_pattern = bytes.fromhex("8b4144c3")
+    adapter_getter_offsets: list[int] = []
+    search_offset = text_offset
+    while True:
+        search_offset = data.find(
+            adapter_getter_pattern, search_offset, text_end
+        )
+        if search_offset < 0:
+            break
+        adapter_getter_offsets.append(search_offset)
+        search_offset += 1
+    if len(adapter_getter_offsets) != 1:
+        fail(
+            "无法唯一定位 RawVideoFrame 的适配器 LUID 基类函数；"
+            f"候选数={len(adapter_getter_offsets)}"
+        )
+    adapter_getter_rva = (
+        text_rva + adapter_getter_offsets[0] - text_offset
+    )
+    encoder_accessor_prefix = bytes.fromhex(
+        "48895c2410574883ec20488bf9488b5928"
+    )
+    encoder_adapter_call = bytes.fromhex("488b00ff5030")
+    encoder_accessor_offsets: list[int] = []
+    search_offset = text_offset
+    while True:
+        search_offset = data.find(
+            encoder_accessor_prefix, search_offset, text_end
+        )
+        if search_offset < 0:
+            break
+        window_end = min(search_offset + 96, text_end)
+        if data.find(
+            encoder_adapter_call,
+            search_offset + len(encoder_accessor_prefix),
+            window_end,
+        ) >= 0:
+            encoder_accessor_offsets.append(search_offset)
+        search_offset += 1
+    if len(encoder_accessor_offsets) != 1:
+        fail(
+            "无法唯一定位编码器实际读取的队列包装帧适配器方法；"
+            f"候选数={len(encoder_accessor_offsets)}"
+        )
+    encoder_accessor_rva = (
+        text_rva + encoder_accessor_offsets[0] - text_offset
+    )
+
+    def unique_ascii_rva(value: bytes) -> int:
+        needle = value + b"\0"
+        offsets: list[int] = []
+        offset = 0
+        while True:
+            offset = data.find(needle, offset)
+            if offset < 0:
+                break
+            offsets.append(offset)
+            offset += 1
+        if len(offsets) != 1:
+            raise ValueError(
+                f"字符串 {value!r} 的候选数={len(offsets)}"
+            )
+        return offset_to_rva(offsets[0], len(needle))
+
+    try:
+        nvenc_v8_name_rva = unique_ascii_rva(b"Nvenc V8")
+        nvenc_v11_name_rva = unique_ascii_rva(b"Nvenc V11")
+        software_name_rva = unique_ascii_rva(b"SoftWare")
+    except ValueError as error:
+        fail(f"无法验证编码器实现编号字符串：{error}")
+
+    def has_rip_lea(
+        start: int, end: int, opcode: bytes, target_rva: int
+    ) -> bool:
+        matches = 0
+        offset = start
+        while True:
+            offset = data.find(opcode, offset, end)
+            if offset < 0 or offset + 7 > end:
+                break
+            instruction_rva = text_rva + offset - text_offset
+            displacement = struct.unpack_from("<i", data, offset + 3)[0]
+            if instruction_rva + 7 + displacement == target_rva:
+                matches += 1
+            offset += 1
+        return matches == 1
+
+    impl_switch_candidates: list[int] = []
+    switch_prefix = bytes.fromhex("0fb6432083f806")
+    offset = text_offset
+    while True:
+        offset = data.find(switch_prefix, offset, text_end)
+        if offset < 0:
+            break
+        if (
+            offset + 22 > text_end
+            or data[offset + 7] != 0x77
+            or data[offset + 9 : offset + 13] != bytes.fromhex("418b8c87")
+            or data[offset + 17 : offset + 22]
+            != bytes.fromhex("4903cfffe1")
+        ):
+            offset += 1
+            continue
+        switch_rva = text_rva + offset - text_offset
+        default_rva = switch_rva + 9 + struct.unpack_from(
+            "<b", data, offset + 8
+        )[0]
+        table_rva = read_u32(data, offset + 13)
+        try:
+            table_offset = rva_to_offset(table_rva, 7 * 4)
+            targets = struct.unpack_from("<7I", data, table_offset)
+            target_offsets = [rva_to_offset(target, 7) for target in targets]
+        except (ValueError, struct.error):
+            offset += 1
+            continue
+        expected_cases = (
+            bytes.fromhex("488955c7"),
+            bytes.fromhex("4c8945c7"),
+            bytes.fromhex("4c894dc7"),
+            bytes.fromhex("4c8955c7"),
+            bytes.fromhex("4c895dc7"),
+            bytes.fromhex("488d05"),
+            bytes.fromhex("4c8965c7"),
+        )
+        if any(
+            data[target_offset : target_offset + len(pattern)] != pattern
+            for target_offset, pattern in zip(target_offsets, expected_cases)
+        ):
+            offset += 1
+            continue
+        load_start = max(text_offset, offset - 512)
+        if (
+            default_rva == targets[6]
+            and has_rip_lea(
+                load_start, offset, bytes.fromhex("488d15"), nvenc_v8_name_rva
+            )
+            and has_rip_lea(
+                load_start, offset, bytes.fromhex("4c8d05"), nvenc_v11_name_rva
+            )
+            and has_rip_lea(
+                load_start, offset, bytes.fromhex("4c8d25"), software_name_rva
+            )
+        ):
+            impl_switch_candidates.append(switch_rva)
+        offset += 1
+    if len(impl_switch_candidates) != 1:
+        fail(
+            "无法唯一验证编码器实现编号分发表；"
+            f"候选数={len(impl_switch_candidates)}"
+        )
+
+    adapter_getter_address = image_base + adapter_getter_rva
+    _, _, rdata_offset, _ = rdata
+    rdata_size = min(rdata_virtual_size, rdata_raw_size)
+    pointer = struct.pack("<Q", adapter_getter_address)
+    getter_slots = 0
+    base_slots = 0
+    long_slots = 0
+    rtti_named_slots = 0
+    wrapper_candidates: list[tuple[int, int, int, str | None]] = []
+    text_address_start = image_base + text_rva
+    text_address_end = text_address_start + max(
+        text_virtual_size, text_raw_size
+    )
+
+    def points_into_text(address: int) -> bool:
+        return text_address_start <= address < text_address_end
+
+    def vtable_start_offset(slot_offset: int) -> int:
+        start = slot_offset
+        methods = 0
+        while (
+            start >= rdata_offset + 8
+            and methods < 128
+            and points_into_text(read_u64(data, start - 8))
+        ):
+            start -= 8
+            methods += 1
+        return start
+
+    def rtti_class_name(vtable_offset: int) -> str | None:
+        if vtable_offset < rdata_offset + 8:
+            return None
+        locator_address = read_u64(data, vtable_offset - 8)
+        locator_rva = locator_address - image_base
+        try:
+            locator_offset = rva_to_offset(locator_rva, 24)
+            (
+                signature,
+                _object_offset,
+                _constructor_displacement,
+                type_descriptor_rva,
+                _class_descriptor_rva,
+                self_rva,
+            ) = struct.unpack_from("<IIIIII", data, locator_offset)
+            if signature != 1 or self_rva != locator_rva:
+                return None
+            type_offset = rva_to_offset(type_descriptor_rva, 17)
+            name_offset = type_offset + 16
+            name_end = data.find(b"\0", name_offset, name_offset + 256)
+            if name_end < 0:
+                return None
+            name = data[name_offset:name_end].decode("ascii", errors="strict")
+        except (UnicodeDecodeError, ValueError, struct.error):
+            return None
+        return name if name.startswith(".?A") else None
+
+    def adapter_constructor_references(vtable_rva: int) -> int:
+        references = 0
+        offset = text_offset
+        pattern = bytes.fromhex("488d05")
+        while True:
+            offset = data.find(pattern, offset, text_end)
+            if offset < 0:
+                break
+            if offset + 104 > text_end:
+                break
+            instruction_rva = text_rva + offset - text_offset
+            displacement = struct.unpack_from("<i", data, offset + 3)[0]
+            target_rva = instruction_rva + 7 + displacement
+            if (
+                target_rva == vtable_rva
+                and data[offset + 7 : offset + 10]
+                == bytes.fromhex("488906")
+            ):
+                for store_offset in range(offset + 10, offset + 102):
+                    if (
+                        data[store_offset] == 0x89
+                        and data[store_offset + 1] & 0xC7 == 0x46
+                        and data[store_offset + 2] == 0x44
+                    ):
+                        references += 1
+                        break
+            offset += 1
+        return references
+
+    for offset in range(
+        rdata_offset,
+        rdata_offset + rdata_size - 8,
+        8,
+    ):
+        if data[offset : offset + 8] != pointer:
+            continue
+        getter_slots += 1
+        following = read_u64(data, offset + 8)
+        if points_into_text(following):
+            long_slots += 1
+            vtable_offset = vtable_start_offset(offset)
+            long_vtable_rva = rdata_rva + vtable_offset - rdata_offset
+            name = rtti_class_name(vtable_offset)
+            if name is not None:
+                rtti_named_slots += 1
+            constructor_references = adapter_constructor_references(
+                long_vtable_rva
+            )
+            rtti_is_frame = name is None or (
+                "Frame" in name
+                and "@streamer@@" in name
+                and "@webrtc@@" not in name
+            )
+            if constructor_references and rtti_is_frame:
+                wrapper_candidates.append(
+                    (
+                        rdata_rva + offset - rdata_offset,
+                        long_vtable_rva,
+                        constructor_references,
+                        name,
+                    )
+                )
+            continue
+        if offset < rdata_offset + 5 * 8:
+            continue
+        preceding = struct.unpack_from("<5Q", data, offset - 5 * 8)
+        if all(points_into_text(address) for address in preceding):
+            base_slots += 1
+    if base_slots < 1 or long_slots < 1:
+        fail("没有找到以适配器函数结尾的 RawVideoFrame 六槽虚表")
+    if getter_slots != base_slots + long_slots:
+        fail(
+            "RawVideoFrame 适配器函数还存在无法分类的引用；"
+            f"总数={getter_slots}，短虚表={base_slots}，长虚表={long_slots}"
+        )
+    if len(wrapper_candidates) != 1:
+        fail(
+            "无法用构造器与 adapter_id 字段布局唯一识别编码包装帧；"
+            f"候选数={len(wrapper_candidates)}"
+        )
+    wrapper_slot_rva, wrapper_vtable_rva, wrapper_ctor_refs, wrapper_rtti = (
+        wrapper_candidates[0]
+    )
+    print(
+        f"STREAMER_GDI_ADAPTER_OK\tvtable_rva=0x{vtable_rva:x}"
+        f"\tslot_rva=0x{slot_rva:x}"
+        f"\tbase_getter_rva=0x{adapter_getter_rva:x}"
+        f"\tbase_slots={base_slots}"
+        f"\tlong_slots={long_slots}"
+        f"\twrapper_vtable_rva=0x{wrapper_vtable_rva:x}"
+        f"\twrapper_slot_rva=0x{wrapper_slot_rva:x}"
+        f"\twrapper_ctor_refs={wrapper_ctor_refs}"
+        f"\twrapper_rtti={wrapper_rtti or 'none'}"
+        f"\trtti_named_slots={rtti_named_slots}"
+        f"\tencoder_accessor_rva=0x{encoder_accessor_rva:x}"
+        f"\tencoder_path_candidates={len(encoder_accessor_offsets)}"
+        f"\tnvenc_v8_impl={NVENC_V8_IMPL}"
+        f"\tnvenc_v11_impl={NVENC_V11_IMPL}"
+        f"\timpl_33=software"
+        f"\timpl_switch_candidates={len(impl_switch_candidates)}"
+    )
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) == 3 and argv[1] == "probe-streamer":
+        probe_streamer(Path(argv[2]))
+        return
+    if len(argv) < 4 or argv[1] not in {"enable", "disable", "verify"}:
+        fail(
+            "用法：uu-remote-encoder-policy "
+            "enable|verify CACHE BACKUP DEVICE_ID ADAPTER_ID；"
+            "或 disable CACHE BACKUP；或 probe-streamer STREAMER_DLL"
+        )
+    command = argv[1]
+    cache = Path(argv[2])
+    backup = Path(argv[3])
+    if command == "disable":
+        if len(argv) != 4:
+            fail("disable 只接受 CACHE 和 BACKUP")
+        disable(cache, backup)
+        return
+    if len(argv) != 6:
+        fail(f"{command} 需要 DEVICE_ID 和 ADAPTER_ID")
+    device_id = parse_id(argv[4], "DEVICE_ID")
+    adapter_id = parse_id(argv[5], "ADAPTER_ID")
+    if command == "enable":
+        enable(cache, backup, device_id, adapter_id)
+    else:
+        verify(cache, device_id, adapter_id)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

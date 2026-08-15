@@ -55,6 +55,8 @@ readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILE
 readonly hwdecode_compatibility_profiles="${UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES:-$runtime_dir/hwdecode-compatibility.tsv}"
 readonly hwdecode_profiler="$runtime_dir/uu-remote-hwdecode-profiler"
 readonly hwdecode_dxgi_probe_source="$runtime_dir/uu-remote-dxgi-probe.exe"
+readonly hwencode_policy="$runtime_dir/uu-remote-encoder-policy"
+readonly hwencode_probe_source="$runtime_dir/uu-remote-nvenc-d3d11-probe.exe"
 
 detect_desktop_backend() {
     case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
@@ -179,6 +181,7 @@ readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
 readonly update_original_archive="$data_dir/update-originals"
 readonly update_rollback_dir="$cache_dir/update-rollback"
 readonly client_log_dir="$install_dir/log/client/Log"
+readonly streamer_log_dir="$install_dir/log/server/log"
 readonly mobile_download_dir="$install_dir/Download"
 readonly wol_enabled_stamp="$data_dir/wol-enabled"
 readonly wol_server_original_sha="${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
@@ -202,6 +205,16 @@ readonly streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
 readonly streamer_archive="$data_dir/hwdecode-streamer-originals"
 readonly decoder_cache="$install_dir/config/streamer/decoder_codec_capability_cache.json"
 readonly decoder_cache_backup="$data_dir/decoder-cache-before-hwdecode.json"
+readonly encoder_cache="$install_dir/config/streamer/encoder_codec_capability_cache.json"
+readonly encoder_cache_backup="$data_dir/encoder-cache-before-hwencode.json"
+readonly hwencode_enabled_stamp="$data_dir/hwencode-enabled"
+readonly hwencode_disabled_stamp="$data_dir/hwencode-disabled"
+readonly hwencode_failed_stamp="$data_dir/hwencode-failed"
+readonly hwencode_manifest="$data_dir/hwencode-manifest"
+readonly hwencode_probe_status="$state_dir/hwencode-probe-status"
+readonly hwencode_dxvk_config="$data_dir/dxvk-hwencode.conf"
+readonly hwencode_nvencode="$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+readonly hwencode_probe="$install_dir/bin/uu-remote-nvenc-d3d11-probe.exe"
 streamer_profile_version=""
 streamer_patch_offset_1=0
 streamer_patch_offset_2=0
@@ -245,6 +258,7 @@ eula_gui_prompt_allowed() {
     $autostart_launch && return 1
     if $update_check_requested || $stop_requested || $diagnose_requested ||
         $enable_hwdecode || $disable_hwdecode ||
+        $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
         $select_decoder_requested || $select_decoder_restart_requested ||
         $restart_selected_decoder || $list_decoders_requested ||
@@ -379,6 +393,8 @@ usage() {
   --check-update       立即检查并安装网易官方最新版本
   --enable-hwdecode    启用 NVIDIA NVDEC→D3D11 实验兼容桥
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
+  --enable-hwencode    强制启用 NVIDIA NVENC/HEVC 被控端编码桥
+  --disable-hwencode   禁用自动 NVENC 并恢复 OpenH264 安全回退
   --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 识别桥
   --disable-wol        关闭 UU WOL 识别桥（保留 Linux 网卡设置）
   --select-decoder     打开 CPU/GPU 解码设备选择窗口
@@ -405,6 +421,8 @@ stop_requested=false
 diagnose_requested=false
 enable_hwdecode=false
 disable_hwdecode=false
+enable_hwencode=false
+disable_hwencode=false
 enable_wol=false
 disable_wol=false
 select_decoder_requested=false
@@ -454,6 +472,12 @@ while (($# > 0)); do
             ;;
         --disable-hwdecode)
             disable_hwdecode=true
+            ;;
+        --enable-hwencode)
+            enable_hwencode=true
+            ;;
+        --disable-hwencode)
+            disable_hwencode=true
             ;;
         --enable-wol)
             enable_wol=true
@@ -522,6 +546,9 @@ done
 if $enable_hwdecode && $disable_hwdecode; then
     die "--enable-hwdecode 和 --disable-hwdecode 不能同时使用"
 fi
+if $enable_hwencode && $disable_hwencode; then
+    die "--enable-hwencode 和 --disable-hwencode 不能同时使用"
+fi
 if $enable_wol && $disable_wol; then
     die "--enable-wol 和 --disable-wol 不能同时使用"
 fi
@@ -530,6 +557,7 @@ if $autostart_launch && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested ||
         $diagnose_requested || $enable_hwdecode || $disable_hwdecode ||
+        $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
         $select_decoder_requested || $select_decoder_restart_requested ||
         $restart_selected_decoder ||
@@ -544,6 +572,7 @@ if $restart_selected_decoder && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested || $diagnose_requested ||
         $enable_hwdecode || $disable_hwdecode ||
+        $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
         $select_decoder_requested || $select_decoder_restart_requested ||
         $list_decoders_requested || $accept_eula ||
@@ -556,6 +585,7 @@ fi
 
 if $stop_requested || $diagnose_requested || $update_check_requested ||
     $enable_hwdecode || $disable_hwdecode ||
+    $enable_hwencode || $disable_hwencode ||
     $enable_wol || $disable_wol ||
     $select_decoder_requested || $select_decoder_restart_requested ||
     $list_decoders_requested ||
@@ -580,6 +610,8 @@ $update_check_requested &&
     maintenance_action_count=$((maintenance_action_count + 1))
 $enable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
+$enable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
+$disable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
 $enable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 if ((maintenance_action_count > 1)); then
@@ -598,7 +630,8 @@ if ((maintenance_selection_count > 1)); then
 fi
 if ((maintenance_selection_count > 0)) &&
     { $stop_requested || $diagnose_requested || $enable_hwdecode ||
-        $disable_hwdecode || $enable_wol || $disable_wol ||
+        $disable_hwdecode || $enable_hwencode || $disable_hwencode ||
+        $enable_wol || $disable_wol ||
         $update_check_requested; }; then
     die "解码设备选择选项不能和其他维护选项组合"
 fi
@@ -1178,6 +1211,206 @@ hwdecode_file_owned() {
     actual=$(sha256sum "$target")
     actual=${actual%% *}
     [[ $actual == "$expected" ]]
+}
+
+hwencode_runtime_ready() {
+    [[ -x $hwencode_policy && -r $hwencode_probe_source &&
+        -r "$hwdecode_dxvk_dir/d3d11.dll" &&
+        -r "$hwdecode_dxvk_dir/dxgi.dll" &&
+        -r "$hwdecode_wine_dir/x86_64-unix/nvencodeapi64.dll.so" &&
+        -r "$hwdecode_wine_dir/x86_64-windows/nvencodeapi64.dll" ]]
+}
+
+hwencode_host_libraries_ready() {
+    local libraries
+
+    if [[ ${UU_REMOTE_HWENCODE_ASSUME_HOST_READY:-0} == 1 ]]; then
+        return
+    fi
+    libraries=$(ldconfig -p 2>/dev/null || true)
+    [[ $libraries == *"libcuda.so.1"* &&
+        $libraries == *"libnvidia-encode.so.1"* ]]
+}
+
+hwencode_enabled() {
+    [[ -r $hwencode_enabled_stamp ]]
+}
+
+hwencode_disabled() {
+    [[ -r $hwencode_disabled_stamp ]]
+}
+
+hwencode_manifest_hash() {
+    local name=$1 key value
+
+    [[ -r $hwencode_manifest ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ $key == "$name" && $value =~ ^[[:xdigit:]]{64}$ ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+    done <"$hwencode_manifest"
+    return 1
+}
+
+hwencode_file_owned() {
+    local name=$1 source=$2 target=$3 expected actual
+
+    [[ -f $target ]] || return 1
+    if [[ -r $source ]] && cmp -s "$source" "$target"; then
+        return
+    fi
+    expected=$(hwencode_manifest_hash "$name") || return 1
+    actual=$(file_sha256 "$target") || return 1
+    [[ $actual == "$expected" ]]
+}
+
+hwencode_files_deployed() {
+    hwencode_runtime_ready &&
+        cmp -s "$hwdecode_dxvk_dir/d3d11.dll" "$hwdecode_d3d11" &&
+        cmp -s "$hwdecode_dxvk_dir/dxgi.dll" "$hwdecode_dxgi" &&
+        cmp -s "$hwdecode_wine_dir/x86_64-windows/nvencodeapi64.dll" \
+            "$hwencode_nvencode" &&
+        cmp -s "$hwencode_probe_source" "$hwencode_probe" &&
+        [[ -r $hwencode_dxvk_config ]] &&
+        grep -qx 'dxgi.hideNvidiaGpu = False' "$hwencode_dxvk_config"
+}
+
+configure_hwencode_environment() {
+    local ids device_id adapter_id
+
+    export WINEDLLPATH="${hwdecode_wine_dir}${WINEDLLPATH:+:$WINEDLLPATH}"
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}d3d11=n;dxgi=n;nvencodeapi64=b"
+    export DXVK_CONFIG_FILE="$hwencode_dxvk_config"
+    export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+    export UU_REMOTE_CUDA_DEVICE="${UU_REMOTE_CUDA_DEVICE:-0}"
+    if ids=$(hwencode_probe_ids 2>/dev/null); then
+        IFS=$'\t' read -r device_id adapter_id <<<"$ids"
+        export UU_REMOTE_NVENC_ADAPTER_LUID="$adapter_id"
+    fi
+}
+
+hwencode_signature() {
+    local app_version bridge_hash dxvk_hash capture_hook_hash
+
+    app_version=$(registry_value "$installed_version_key" Version || printf unknown)
+    bridge_hash=$(file_sha256 \
+        "$hwdecode_wine_dir/x86_64-unix/nvencodeapi64.dll.so") || return 1
+    dxvk_hash=$(file_sha256 "$hwdecode_dxvk_dir/d3d11.dll") || return 1
+    capture_hook_hash=$(file_sha256 "$input_hook_source") || return 1
+    printf '%s:%s:%s:%s:%s\n' \
+        "$package_version" "$app_version" "$bridge_hash" "$dxvk_hash" \
+        "$capture_hook_hash"
+}
+
+hwencode_probe_current() {
+    local expected recorded
+
+    [[ -r $hwencode_probe_status ]] || return 1
+    expected=$(hwencode_signature) || return 1
+    recorded=$(sed -n 's/^signature=//p' "$hwencode_probe_status" | head -n1)
+    [[ $recorded == "$expected" ]] &&
+        grep -q $'^NVENC_D3D11_OK\t.*\th264=1\thevc=1\ttexture_upload=1$' \
+            "$hwencode_probe_status"
+}
+
+hwencode_probe_ids() {
+    local line field device="" adapter=""
+
+    [[ -r $hwencode_probe_status ]] || return 1
+    line=$(grep -m1 $'^NVENC_D3D11_OK\t' "$hwencode_probe_status") || return 1
+    while IFS= read -r field; do
+        case $field in
+            device=*) device=${field#device=} ;;
+            luid=*) adapter=${field#luid=} ;;
+        esac
+    done < <(tr '\t' '\n' <<<"$line")
+    [[ $device =~ ^[0-9]+$ && $adapter =~ ^[0-9]+$ ]] || return 1
+    printf '%s\t%s\n' "$device" "$adapter"
+}
+
+probe_hwencode_bridge() {
+    local output line signature temp
+
+    [[ -f $hwencode_probe ]] || return 1
+    "$hwencode_policy" probe-streamer "$streamer_dll" >>"$setup_log" 2>&1 ||
+        return 1
+    configure_hwencode_environment
+    output=$(mktemp "$cache_dir/.hwencode-probe.XXXXXX")
+    if ! (
+        cd "$install_dir/bin"
+        env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+            -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+            -u ALL_PROXY -u NO_PROXY \
+            timeout 60s "$wine" "$hwencode_probe" 9>&-
+    ) >"$output" 2>>"$setup_log"; then
+        sed -i 's/\r$//' "$output"
+        sed -n '1,40p' "$output" >>"$setup_log"
+        rm -f -- "$output"
+        return 1
+    fi
+    sed -i 's/\r$//' "$output"
+    line=$(grep -m1 $'^NVENC_D3D11_OK\t' "$output") || {
+        rm -f -- "$output"
+        return 1
+    }
+    grep -q $'\th264=1\thevc=1\ttexture_upload=1$' <<<"$line" || {
+        rm -f -- "$output"
+        return 1
+    }
+    signature=$(hwencode_signature) || {
+        rm -f -- "$output"
+        return 1
+    }
+    temp=$(mktemp "$state_dir/.hwencode-probe-status.XXXXXX")
+    {
+        printf 'signature=%s\n' "$signature"
+        printf 'checked_at=%(%FT%T%z)T\n' -1
+        printf '%s\n' "$line"
+    } >"$temp"
+    mv -f "$temp" "$hwencode_probe_status"
+    {
+        printf '\n[%(%FT%T%z)T] NVENC D3D11→CUDA 深层探测通过\n' -1
+        printf '%s\n' "$line"
+    } >>"$setup_log"
+    rm -f -- "$output"
+}
+
+apply_hwencode_policy() {
+    local ids device_id adapter_id
+
+    [[ -f $encoder_cache ]] || return 2
+    ids=$(hwencode_probe_ids) || return 1
+    IFS=$'\t' read -r device_id adapter_id <<<"$ids"
+    "$hwencode_policy" enable \
+        "$encoder_cache" "$encoder_cache_backup" \
+        "$device_id" "$adapter_id" >>"$setup_log" 2>&1
+}
+
+hwencode_policy_ready() {
+    local ids device_id adapter_id
+
+    ids=$(hwencode_probe_ids) || return 1
+    IFS=$'\t' read -r device_id adapter_id <<<"$ids"
+    "$hwencode_policy" verify \
+        "$encoder_cache" "$encoder_cache_backup" \
+        "$device_id" "$adapter_id" >/dev/null 2>&1
+}
+
+mark_hwencode_failure() {
+    local signature
+
+    signature=$(hwencode_signature 2>/dev/null || printf unknown)
+    printf '%s\n' "$signature" >"${hwencode_failed_stamp}.tmp"
+    mv -f "${hwencode_failed_stamp}.tmp" "$hwencode_failed_stamp"
+}
+
+hwencode_failure_current() {
+    local signature
+
+    [[ -r $hwencode_failed_stamp ]] || return 1
+    signature=$(hwencode_signature 2>/dev/null || printf unknown)
+    [[ $(<"$hwencode_failed_stamp") == "$signature" ]]
 }
 
 update_blocker_manifest_hash() {
@@ -2686,6 +2919,45 @@ path_writable_for_current_user() {
     (( (8#$mode & 0002) != 0 ))
 }
 
+hwencode_status_label() {
+    if hwencode_disabled; then
+        printf '用户已禁用'
+    elif hwencode_enabled && hwencode_files_deployed &&
+        hwencode_probe_current && hwencode_policy_ready; then
+        printf '已启用（NVENC/HEVC 深层验证通过）'
+    elif hwencode_failure_current; then
+        printf '当前版本验证失败（OpenH264 安全回退）'
+    elif hwencode_enabled; then
+        printf '已启用但策略待核验'
+    else
+        printf '等待自动探测'
+    fi
+}
+
+hwencode_last_session_label() {
+    local latest line
+
+    [[ -d $streamer_log_dir ]] || {
+        printf '尚无被控会话日志'
+        return
+    }
+    latest=$(find "$streamer_log_dir" -maxdepth 1 -type f \
+        -name 'streamer_log_*.txt' -printf '%T@\t%p\n' 2>/dev/null |
+        sort -nr | sed -n '1s/^[^\t]*\t//p')
+    [[ -n $latest ]] || {
+        printf '尚无被控会话日志'
+        return
+    }
+    line=$(grep '"encoder_impl"' "$latest" 2>/dev/null | tail -n1 || true)
+    if [[ $line == *'"encoder_impl":"OpenH264"'* ]]; then
+        printf 'OpenH264（需在新会话复验）'
+    elif [[ $line == *'"encoder_impl"'* ]]; then
+        sed -n 's/.*"encoder_impl":"\([^"]*\)".*/\1/p' <<<"$line"
+    else
+        printf '日志尚未记录编码器'
+    fi
+}
+
 print_diagnostics() {
     local os_name="unknown"
     local detected_wine="missing"
@@ -2748,6 +3020,9 @@ print_diagnostics() {
         "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
         "输入桥日志" "$input_bridge_log" \
         "NVIDIA 解码库" "$(hwdecode_host_libraries_ready && printf '就绪' || printf '缺失')" \
+        "NVIDIA 编码库" "$(hwencode_host_libraries_ready && printf '就绪' || printf '缺失')" \
+        "NVENC 编码策略" "$(hwencode_status_label)" \
+        "最近被控编码器" "$(hwencode_last_session_label)" \
         "解码设备策略" "$decoder_policy" \
         "实际解码选择" "$decoder_effective" \
         "UU 自启动开关" "$(windows_autostart_enabled && printf '开启' || printf '关闭')" \
@@ -3234,13 +3509,204 @@ remove_hwdecode_bridge() {
         source=${sources[i]}
         target=${targets[i]}
         if hwdecode_file_owned "$name" "$source" "$target"; then
-            rm -f -- "$target"
+            if [[ $name == d3d11 || $name == dxgi ]] && hwencode_enabled; then
+                :
+            else
+                rm -f -- "$target"
+            fi
         elif [[ -e $target ]]; then
             printf '保留非本项目管理或已被修改的文件：%s\n' "$target" >&2
         fi
         rm -f -- "${target}.uu-remote-new"
     done
     rm -f -- "$hwdecode_enabled_stamp" "$hwdecode_manifest"
+}
+
+deploy_hwencode_bridge() {
+    local name source target temp_manifest hash i status=0
+    local -a names sources targets
+
+    hwencode_runtime_ready || {
+        printf '软件包未包含完整 NVENC 编码桥。\n' >&2
+        return 1
+    }
+    hwencode_host_libraries_ready || {
+        printf '未找到 NVIDIA libcuda.so.1 或 libnvidia-encode.so.1。\n' >&2
+        return 1
+    }
+    app_files_present || {
+        printf 'UU 远程客户端尚未完整安装。\n' >&2
+        return 1
+    }
+
+    names=(d3d11 dxgi nvencodeapi64 nvenc-probe)
+    sources=(
+        "$hwdecode_dxvk_dir/d3d11.dll"
+        "$hwdecode_dxvk_dir/dxgi.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvencodeapi64.dll"
+        "$hwencode_probe_source"
+    )
+    targets=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwencode_nvencode"
+        "$hwencode_probe"
+    )
+
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        name=${names[i]}
+        source=${sources[i]}
+        target=${targets[i]}
+        if [[ -e $target ]] && ! cmp -s "$source" "$target" &&
+            ! hwencode_file_owned "$name" "$source" "$target"; then
+            printf '发现非本项目管理的 %s；拒绝覆盖。\n' "$target" >&2
+            return 1
+        fi
+    done
+
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        source=${sources[i]}
+        target=${targets[i]}
+        install -Dm0644 "$source" "${target}.uu-remote-new" || {
+            status=1
+            break
+        }
+        mv -f "${target}.uu-remote-new" "$target" || {
+            status=1
+            break
+        }
+    done
+    if ((status != 0)); then
+        printf '无法安装 NVENC/DXVK 编码桥文件。\n' >&2
+        return 1
+    fi
+    printf 'dxgi.hideNvidiaGpu = False\n' >"${hwencode_dxvk_config}.tmp"
+    mv -f "${hwencode_dxvk_config}.tmp" "$hwencode_dxvk_config"
+
+    temp_manifest=$(mktemp "$data_dir/.hwencode-manifest.XXXXXX")
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        hash=$(file_sha256 "${sources[i]}") || return 1
+        printf '%s=%s\n' "${names[i]}" "$hash" >>"$temp_manifest"
+    done
+    mv -f "$temp_manifest" "$hwencode_manifest"
+
+    if ! hwencode_files_deployed || ! probe_hwencode_bridge; then
+        printf 'NVENC 深层探测失败，正在保留 OpenH264 安全回退。\n' >&2
+        "$hwencode_policy" disable \
+            "$encoder_cache" "$encoder_cache_backup" \
+            >>"$setup_log" 2>&1 || true
+        rm -f -- "$hwencode_enabled_stamp"
+        return 1
+    fi
+
+    printf '%s\n' "$package_version" >"${hwencode_enabled_stamp}.tmp"
+    mv -f "${hwencode_enabled_stamp}.tmp" "$hwencode_enabled_stamp"
+    rm -f -- "$hwencode_disabled_stamp" "$hwencode_failed_stamp"
+    apply_hwencode_policy || status=$?
+    if ((status != 0 && status != 2)); then
+        printf 'NVENC 已通过深层探测，但编码能力缓存尚未能切换。\n' >&2
+        return 1
+    fi
+}
+
+remove_hwencode_bridge() {
+    local name source target i
+    local -a names sources targets
+
+    "$hwencode_policy" disable \
+        "$encoder_cache" "$encoder_cache_backup" \
+        >>"$setup_log" 2>&1 || true
+    names=(d3d11 dxgi nvencodeapi64 nvenc-probe)
+    sources=(
+        "$hwdecode_dxvk_dir/d3d11.dll"
+        "$hwdecode_dxvk_dir/dxgi.dll"
+        "$hwdecode_wine_dir/x86_64-windows/nvencodeapi64.dll"
+        "$hwencode_probe_source"
+    )
+    targets=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwencode_nvencode"
+        "$hwencode_probe"
+    )
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        name=${names[i]}
+        source=${sources[i]}
+        target=${targets[i]}
+        if [[ $name == d3d11 || $name == dxgi ]] && hwdecode_enabled; then
+            continue
+        fi
+        if hwencode_file_owned "$name" "$source" "$target"; then
+            rm -f -- "$target"
+        elif [[ -e $target && $name != d3d11 && $name != dxgi ]]; then
+            printf '保留非本项目管理或已被修改的文件：%s\n' "$target" >&2
+        fi
+        rm -f -- "${target}.uu-remote-new"
+    done
+    rm -f -- "$hwencode_enabled_stamp" "$hwencode_manifest" \
+        "$hwencode_probe_status" "$hwencode_dxvk_config"
+}
+
+ensure_auto_hwencode() {
+    local status=0
+
+    [[ ${UU_REMOTE_DISABLE_AUTO_HWENCODE:-0} != 1 ]] || return 0
+    hwencode_disabled && return 0
+    hwencode_runtime_ready && hwencode_host_libraries_ready || return 0
+    if hwencode_failure_current; then
+        return 0
+    fi
+    if hwencode_files_deployed && hwencode_probe_current; then
+        configure_hwencode_environment
+        apply_hwencode_policy || status=$?
+        ((status == 0 || status == 2)) && return 0
+    fi
+
+    stop_prefix_for_setup
+    if deploy_hwencode_bridge; then
+        notify_status "NVIDIA NVENC/HEVC 编码桥已自动验证并启用"
+        printf 'NVIDIA NVENC/HEVC 编码桥已自动验证并启用。\n'
+        return 0
+    fi
+    mark_hwencode_failure
+    notify_status "NVENC 深层验证失败，已保留 OpenH264 回退"
+    printf '警告：NVENC 深层验证失败；当前客户端版本安全保留 OpenH264，更新后将重新探测。\n' >&2
+}
+
+finalize_hwencode_policy() {
+    local attempt status=0 previous_hash="" current_hash="" stable=0
+
+    hwencode_enabled || return 0
+    # GameViewerServer may regenerate this cache just after process startup
+    # when DXVK exposes the real NVIDIA PCI ID.  Wait for the file to settle,
+    # then apply the policy after that official probe instead of accepting the
+    # stale pre-start cache as final.
+    for ((attempt = 0; attempt < 60; attempt++)); do
+        if [[ -f $encoder_cache ]]; then
+            current_hash=$(file_sha256 "$encoder_cache" 2>/dev/null || true)
+            if [[ -n $current_hash && $current_hash == "$previous_hash" ]]; then
+                stable=$((stable + 1))
+                ((stable >= 10)) && break
+            else
+                stable=0
+                previous_hash=$current_hash
+            fi
+        fi
+        sleep 0.2
+    done
+    apply_hwencode_policy || status=$?
+    if ((status == 0)); then
+        printf 'UU 编码器能力缓存已切换为 NVIDIA NVENC 优先。\n'
+        return 0
+    fi
+    "$hwencode_policy" disable \
+        "$encoder_cache" "$encoder_cache_backup" \
+        >>"$setup_log" 2>&1 || true
+    rm -f -- "$hwencode_enabled_stamp"
+    mark_hwencode_failure
+    notify_status "NVENC 能力缓存验证失败，已恢复 OpenH264"
+    printf '警告：NVENC 能力缓存验证失败；已恢复 OpenH264 安全回退。\n' >&2
+    return 1
 }
 
 configure_hwdecode_environment() {
@@ -3569,6 +4035,8 @@ create_update_snapshot() {
         paths+=("drive_c/windows/system32/nvcuda.dll")
     [[ -f $hwdecode_nvcuvid ]] &&
         paths+=("drive_c/windows/system32/nvcuvid.dll")
+    [[ -f $hwencode_nvencode ]] &&
+        paths+=("drive_c/windows/system32/nvEncodeAPI64.dll")
 
     notify_status "正在创建更新回滚点"
     if ! tar --format=pax -C "$prefix" -cf "$temp" "${paths[@]}"; then
@@ -3590,6 +4058,12 @@ create_version_bridge_state_snapshot() {
         hwdecode-manifest \
         hwdecode-generated.tsv \
         decoder-cache-before-hwdecode.json \
+        hwencode-enabled \
+        hwencode-disabled \
+        hwencode-failed \
+        hwencode-manifest \
+        encoder-cache-before-hwencode.json \
+        dxvk-hwencode.conf \
         wol-enabled; do
         [[ -e $data_dir/$name ]] && paths+=("$name")
     done
@@ -3612,6 +4086,12 @@ restore_version_bridge_state_snapshot() {
         "$hwdecode_manifest" \
         "$hwdecode_generated_profiles" \
         "$decoder_cache_backup" \
+        "$hwencode_enabled_stamp" \
+        "$hwencode_disabled_stamp" \
+        "$hwencode_failed_stamp" \
+        "$hwencode_manifest" \
+        "$encoder_cache_backup" \
+        "$hwencode_dxvk_config" \
         "$wol_enabled_stamp"
     tar -C "$data_dir" -xf "$snapshot"
 }
@@ -3643,6 +4123,9 @@ restore_update_snapshot() {
     if hwdecode_enabled; then
         hwdecode_files_deployed || return 1
     fi
+    if hwencode_enabled; then
+        hwencode_files_deployed && hwencode_probe_current || return 1
+    fi
     if wol_enabled; then
         wol_patch_ready &&
             wol_hook_config_ready &&
@@ -3671,6 +4154,9 @@ update_restart_ready() {
         update_blocker_ready || return 1
     if hwdecode_enabled; then
         hwdecode_files_deployed || return 1
+    fi
+    if hwencode_enabled; then
+        hwencode_files_deployed && hwencode_probe_current || return 1
     fi
     if wol_enabled; then
         wol_patch_ready &&
@@ -3727,6 +4213,8 @@ run_update_transaction() {
         [[ $installed_after == "$latest" ]] ||
             die "更新后版本核验失败：${installed_after:-unknown}"
 
+        ensure_auto_hwencode
+
         if $profile_supported && wol_enabled; then
             "$wol_bridge" patch \
                 "$server" \
@@ -3746,6 +4234,10 @@ run_update_transaction() {
         if hwdecode_enabled; then
             hwdecode_files_deployed ||
                 die "更新后解码兼容 DLL 或 streamer 补丁核验失败"
+        fi
+        if hwencode_enabled; then
+            hwencode_files_deployed && hwencode_probe_current ||
+                die "更新后 NVENC/HEVC 编码桥深层核验失败"
         fi
         if $profile_supported && wol_enabled; then
             wol_patch_ready || die "更新后 WOL 兼容补丁核验失败"
@@ -3877,6 +4369,7 @@ if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
     ! $setup_only && ! $repair && ! $refresh_installer &&
     ! $stop_requested && ! $diagnose_requested &&
     ! $enable_hwdecode && ! $disable_hwdecode &&
+    ! $enable_hwencode && ! $disable_hwencode &&
     ! $enable_wol && ! $disable_wol &&
     ! $select_decoder_requested && ! $select_decoder_restart_requested &&
     ! $restart_selected_decoder && ! $list_decoders_requested &&
@@ -3912,6 +4405,27 @@ if $disable_hwdecode; then
     notify_status "硬件解码桥已关闭"
     printf '硬件解码桥已关闭，项目管理的注入 DLL 已移除。\n'
     printf '解码设备已切换到 UU CPU 解码路径。\n'
+    exit 0
+fi
+
+if $enable_hwencode; then
+    stop_prefix_for_setup
+    rm -f -- "$hwencode_disabled_stamp" "$hwencode_failed_stamp"
+    deploy_hwencode_bridge ||
+        die "NVENC/HEVC 编码桥未通过 D3D11→CUDA 纹理上传验证；已保留 OpenH264"
+    notify_status "NVIDIA NVENC/HEVC 编码桥已启用"
+    printf 'NVIDIA NVENC/HEVC 被控端编码桥已启用并通过真实纹理上传验证。\n'
+    exit 0
+fi
+
+if $disable_hwencode; then
+    stop_prefix_for_setup
+    remove_hwencode_bridge
+    printf '%s\n' "$package_version" >"${hwencode_disabled_stamp}.tmp"
+    mv -f "${hwencode_disabled_stamp}.tmp" "$hwencode_disabled_stamp"
+    rm -f -- "$hwencode_failed_stamp"
+    notify_status "自动 NVENC 编码已关闭"
+    printf '自动 NVENC 编码已关闭，OpenH264 安全回退能力已恢复。\n'
     exit 0
 fi
 
@@ -3987,6 +4501,8 @@ if wol_enabled; then
     deploy_wol_powershell_bridge
 fi
 
+ensure_auto_hwencode
+
 apply_decoder_selection
 
 if ! sync_linux_system_proxy; then
@@ -4009,6 +4525,17 @@ if hwdecode_enabled; then
     hwdecode_files_deployed ||
         die "硬件解码桥注入文件缺失或版本不匹配；请运行：uu-remote-for-linux --enable-hwdecode"
     configure_hwdecode_environment
+fi
+if hwencode_enabled; then
+    hwencode_runtime_ready ||
+        die "NVENC 编码桥已启用，但运行库不完整；请重新安装本项目"
+    hwencode_host_libraries_ready ||
+        die "NVENC 编码桥已启用，但 NVIDIA CUDA/NVENC 主机库不可用"
+    hwencode_files_deployed ||
+        die "NVENC 编码桥注入文件缺失或版本不匹配；请运行：uu-remote-for-linux --enable-hwencode"
+    hwencode_probe_current ||
+        die "NVENC 编码桥未通过当前 UU 版本的深层探测"
+    configure_hwencode_environment
 fi
 
 app_files_present ||
@@ -4083,7 +4610,8 @@ start_systemd_wine_image() {
         "--setenv=WINEDEBUG=$WINEDEBUG"
     )
     for variable in \
-        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL UU_REMOTE_CUDA_DEVICE \
+        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL DXVK_CONFIG_FILE \
+        UU_REMOTE_CUDA_DEVICE UU_REMOTE_NVENC_ADAPTER_LUID \
         DISPLAY WAYLAND_DISPLAY XAUTHORITY; do
         if [[ -v $variable ]]; then
             command+=("--setenv=$variable=${!variable}")
@@ -4207,6 +4735,9 @@ ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
     die "GameViewerHealthd.exe 未能启动"
 ensure_wine_image_running "$server_runtime_unit" "$server" ||
     die "GameViewerServer.exe 未能启动"
+if ! finalize_hwencode_policy; then
+    printf '当前被控会话将使用 UU 的安全软件编码回退。\n' >&2
+fi
 wait_input_hook_active ||
     printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
         "$input_bridge_log" >&2

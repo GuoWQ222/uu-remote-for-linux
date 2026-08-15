@@ -28,6 +28,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
@@ -35,6 +36,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" &&
     -r "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
@@ -72,6 +74,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" 
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-update-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
@@ -86,6 +90,9 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
+install -Dm0644 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
     "$stage_dir/usr/lib/uu-remote-for-linux/update-compatibility.tsv"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" \

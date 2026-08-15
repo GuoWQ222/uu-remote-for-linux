@@ -10,5 +10,6 @@ Suggests: vainfo
 Description: unofficial UU Remote compatibility wrapper for Linux
  Runs the official NetEase UU Remote Windows client in an isolated Wine prefix
  with native Linux integration for controller and X11 or Portal-bridged Wayland
- controlled-host workflows. The proprietary upstream installer is downloaded
+ controlled-host workflows, including optional NVIDIA NVDEC decoding and NVENC
+ H.264/HEVC encoding bridges. The proprietary upstream installer is downloaded
  from NetEase on first setup and is not included in this package.

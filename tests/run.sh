@@ -37,6 +37,9 @@ check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
 check "NVDEC profiler self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     --self-test
+check "NVENC encoder policy Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
 check "autostart bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
@@ -66,6 +69,10 @@ check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "DXGI probe builder syntax" bash -n \
     "$project_root/scripts/build-dxgi-probe.sh"
+check "NVENC D3D11 probe builder syntax" bash -n \
+    "$project_root/scripts/build-nvenc-d3d11-probe.sh"
+check "NVENC Wine bridge builder syntax" bash -n \
+    "$project_root/scripts/build-nvencode-bridge.sh"
 check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \
@@ -151,6 +158,18 @@ check "DXGI adapter probe is Win64 console PE" bash -c \
 check "DXGI adapter probe imports factory API" bash -c \
     'objdump -p "$1" | grep -q "CreateDXGIFactory1"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
+check "NVENC encoder policy exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
+check "NVENC D3D11 probe exists" test -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe"
+# shellcheck disable=SC2016
+check "NVENC D3D11 probe is Win64 console PE" bash -c \
+    'file "$1" | grep -q "PE32+ executable (console).*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe"
+# shellcheck disable=SC2016
+check "NVENC D3D11 probe imports D3D11" bash -c \
+    'objdump -p "$1" | grep -qi "D3D11CreateDevice"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe"
 check "NVDEC probe exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe"
 # shellcheck disable=SC2016
@@ -233,6 +252,14 @@ check "nvcuda bridge is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB shared object"' _ \
     "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/nvcuda.dll.so"
 # shellcheck disable=SC2016
+check "nvencodeapi bridge is ELF" bash -c \
+    'file "$1" | grep -q "ELF 64-bit LSB shared object"' _ \
+    "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/nvencodeapi64.dll.so"
+# shellcheck disable=SC2016
+check "nvencodeapi fake DLL is PE" bash -c \
+    'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-windows/nvencodeapi64.dll"
+# shellcheck disable=SC2016
 check "DXVK d3d11 is PE DLL" bash -c \
     'file "$1" | grep -q "PE32+ executable (DLL).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/hwdecode/dxvk/x64/d3d11.dll"
@@ -248,6 +275,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/install-user.sh" \
         "$project_root/scripts/build-nvdec-probe.sh" \
         "$project_root/scripts/build-dxgi-probe.sh" \
+        "$project_root/scripts/build-nvenc-d3d11-probe.sh" \
+        "$project_root/scripts/build-nvencode-bridge.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
         "$project_root/scripts/build-powershell-bridge.sh" \

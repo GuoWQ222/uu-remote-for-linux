@@ -30,6 +30,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define UUIP_MAGIC 0x50495555u
@@ -37,7 +38,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 19u
+#define HOOK_VERSION 22u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -175,6 +176,17 @@ static BOOL streamer_send_input_hooked;
 static BOOL streamer_cursor_info_hooked;
 static BOOL streamer_bit_blt_hooked;
 static BOOL streamer_stretch_blt_hooked;
+static BOOL streamer_frame_adapter_hooked;
+static DWORD configured_frame_adapter_luid;
+static void *original_frame_adapter_id;
+static volatile LONG frame_adapter_hook_calls;
+static volatile LONG frame_adapter_wrapper_hook_calls;
+static volatile LONG frame_adapter_slots_patched;
+static volatile LONG frame_adapter_long_candidates;
+static volatile LONG frame_adapter_wrapper_candidates;
+static volatile LONG frame_adapter_rtti_named_candidates;
+static volatile LONG frame_adapter_encoder_path_candidates;
+static BOOL streamer_wrapper_frame_adapter_hooked;
 static BOOL adapters_addresses_hooked;
 static BOOL adapters_info_hooked;
 static BOOL if_table2_hooked;
@@ -934,6 +946,84 @@ static void write_frame_hook_status(void) {
     WritePrivateProfileStringA("capture", "fallbacks", value, frame_status_path);
     wsprintfA(value, "%lu", (unsigned long)frame_last_sequence);
     WritePrivateProfileStringA("capture", "sequence", value, frame_status_path);
+    wsprintfA(
+        value, "%lu", (unsigned long)configured_frame_adapter_luid
+    );
+    WritePrivateProfileStringA(
+        "encoder", "adapter_luid", value, frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "encoder",
+        "gdi_adapter_hooked",
+        streamer_frame_adapter_hooked ? "1" : "0",
+        frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "encoder",
+        "wrapper_adapter_hooked",
+        streamer_wrapper_frame_adapter_hooked ? "1" : "0",
+        frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_adapter_hook_calls, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "adapter_queries", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_adapter_wrapper_hook_calls, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "wrapper_adapter_queries", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_adapter_slots_patched, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "adapter_slots_patched", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_adapter_long_candidates, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "long_candidates", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_adapter_wrapper_candidates, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "wrapper_candidates", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &frame_adapter_rtti_named_candidates, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "encoder", "rtti_named_candidates", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &frame_adapter_encoder_path_candidates, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "encoder", "encoder_path_candidates", value, frame_status_path
+    );
 }
 
 static BOOL refresh_frame_mapping(void) {
@@ -1611,6 +1701,573 @@ static BOOL patch_import(
         }
     }
     return FALSE;
+}
+
+static BOOL bytes_equal(
+    const unsigned char *actual,
+    const unsigned char *expected,
+    SIZE_T size
+) {
+    return actual && expected && memcmp(actual, expected, size) == 0;
+}
+
+static BOOL address_in_image_section(
+    const unsigned char *base,
+    const IMAGE_SECTION_HEADER *section,
+    const void *address,
+    SIZE_T size
+) {
+    const unsigned char *start;
+    SIZE_T span;
+    const unsigned char *value = (const unsigned char *)address;
+
+    if (!base || !section || !address) {
+        return FALSE;
+    }
+    start = base + section->VirtualAddress;
+    span = section->Misc.VirtualSize;
+    if (span < section->SizeOfRawData) {
+        span = section->SizeOfRawData;
+    }
+    return value >= start && size <= span &&
+        (SIZE_T)(value - start) <= span - size;
+}
+
+static DWORD WINAPI hooked_frame_adapter_id(void *frame) {
+    typedef DWORD(WINAPI *frame_adapter_id_fn)(void *);
+    frame_adapter_id_fn original =
+        (frame_adapter_id_fn)original_frame_adapter_id;
+
+    InterlockedIncrement(&frame_adapter_hook_calls);
+    if (configured_frame_adapter_luid) {
+        return configured_frame_adapter_luid;
+    }
+    return original ? original(frame) : 0u;
+}
+
+static ULONGLONG WINAPI hooked_wrapper_frame_adapter_id(void *frame) {
+    (void)frame;
+    InterlockedIncrement(&frame_adapter_hook_calls);
+    InterlockedIncrement(&frame_adapter_wrapper_hook_calls);
+    return (ULONGLONG)configured_frame_adapter_luid;
+}
+
+static BOOL patch_frame_adapter_slot(
+    void **slot,
+    void *replacement,
+    void **original
+) {
+    DWORD old_protection;
+    void *previous;
+
+    if (!slot || !replacement || !VirtualProtect(
+            slot, sizeof(*slot), PAGE_READWRITE, &old_protection
+        )) {
+        return FALSE;
+    }
+    previous = InterlockedExchangePointer(
+        (void *volatile *)slot,
+        replacement
+    );
+    VirtualProtect(slot, sizeof(*slot), old_protection, &old_protection);
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
+    if (original && previous != replacement) {
+        *original = previous;
+    }
+    if (previous != replacement) {
+        InterlockedIncrement(&frame_adapter_slots_patched);
+    }
+    return TRUE;
+}
+
+static BOOL patch_frame_adapter_accessor(void *function) {
+    unsigned char jump[12];
+    DWORD old_protection;
+    void *replacement = (void *)hooked_wrapper_frame_adapter_id;
+
+    if (!function || !replacement) {
+        return FALSE;
+    }
+    jump[0] = 0x48;
+    jump[1] = 0xb8;
+    CopyMemory(jump + 2, &replacement, sizeof(replacement));
+    jump[10] = 0xff;
+    jump[11] = 0xe0;
+    if (!VirtualProtect(
+            function, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protection
+        )) {
+        return FALSE;
+    }
+    CopyMemory(function, jump, sizeof(jump));
+    VirtualProtect(
+        function, sizeof(jump), old_protection, &old_protection
+    );
+    FlushInstructionCache(GetCurrentProcess(), function, sizeof(jump));
+    return TRUE;
+}
+
+struct msvc_complete_object_locator_x64 {
+    uint32_t signature;
+    uint32_t object_offset;
+    uint32_t constructor_displacement;
+    uint32_t type_descriptor_rva;
+    uint32_t class_descriptor_rva;
+    uint32_t self_rva;
+};
+
+static BOOL address_in_image(
+    const unsigned char *base,
+    SIZE_T image_size,
+    const void *address,
+    SIZE_T size
+) {
+    const unsigned char *value = (const unsigned char *)address;
+
+    if (!base || !address || size > image_size || value < base) {
+        return FALSE;
+    }
+    return (SIZE_T)(value - base) <= image_size - size;
+}
+
+static void **streamer_frame_vtable_start(
+    const unsigned char *base,
+    const IMAGE_SECTION_HEADER *text,
+    const IMAGE_SECTION_HEADER *rdata,
+    void **adapter_slot
+) {
+    unsigned char *rdata_start;
+    void **start = adapter_slot;
+    unsigned int methods = 0;
+
+    if (!base || !text || !rdata || !adapter_slot) {
+        return NULL;
+    }
+    rdata_start = (unsigned char *)base + rdata->VirtualAddress;
+    while (
+        methods < 128u &&
+        (unsigned char *)start >= rdata_start + sizeof(*start) &&
+        address_in_image_section(base, text, start[-1], 1u)
+    ) {
+        --start;
+        ++methods;
+    }
+    return start;
+}
+
+static const char *streamer_vtable_rtti_class_name(
+    const unsigned char *base,
+    const IMAGE_NT_HEADERS64 *nt,
+    const IMAGE_SECTION_HEADER *rdata,
+    void **vtable
+) {
+    struct msvc_complete_object_locator_x64 locator;
+    const struct msvc_complete_object_locator_x64 *locator_address;
+    const unsigned char *type_descriptor;
+    const char *name;
+    SIZE_T image_size;
+    SIZE_T length;
+
+    if (!base || !nt || !rdata || !vtable) {
+        return NULL;
+    }
+    if (!address_in_image_section(
+            base, rdata, vtable - 1, sizeof(void *)
+        )) {
+        return NULL;
+    }
+    locator_address = (const struct msvc_complete_object_locator_x64 *)
+        vtable[-1];
+    if (!address_in_image_section(
+            base, rdata, locator_address, sizeof(locator)
+        )) {
+        return NULL;
+    }
+    CopyMemory(&locator, locator_address, sizeof(locator));
+    if (
+        locator.signature != 1u ||
+        base + locator.self_rva != (const unsigned char *)locator_address
+    ) {
+        return NULL;
+    }
+    image_size = nt->OptionalHeader.SizeOfImage;
+    type_descriptor = base + locator.type_descriptor_rva;
+    if (!address_in_image(
+            base,
+            image_size,
+            type_descriptor,
+            2u * sizeof(void *) + 4u
+        )) {
+        return NULL;
+    }
+    name = (const char *)(type_descriptor + 2u * sizeof(void *));
+    if (name[0] != '.' || name[1] != '?' || name[2] != 'A') {
+        return NULL;
+    }
+    for (length = 3u; length < 256u; ++length) {
+        if (!address_in_image(base, image_size, name, length + 1u)) {
+            return NULL;
+        }
+        if (!name[length]) {
+            return name;
+        }
+    }
+    return NULL;
+}
+
+static unsigned int streamer_adapter_constructor_references(
+    const unsigned char *base,
+    const IMAGE_SECTION_HEADER *text,
+    void **vtable
+) {
+    SIZE_T text_span;
+    SIZE_T index;
+    unsigned int references = 0;
+
+    if (!base || !text || !vtable) {
+        return 0u;
+    }
+    text_span = text->Misc.VirtualSize;
+    if (text_span < text->SizeOfRawData) {
+        text_span = text->SizeOfRawData;
+    }
+    for (index = 0; index + 104u <= text_span; ++index) {
+        const unsigned char *instruction =
+            base + text->VirtualAddress + index;
+        int32_t displacement;
+        const unsigned char *target;
+        SIZE_T lookahead;
+
+        if (
+            instruction[0] != 0x48 || instruction[1] != 0x8d ||
+            instruction[2] != 0x05 || instruction[7] != 0x48 ||
+            instruction[8] != 0x89 || instruction[9] != 0x06
+        ) {
+            continue;
+        }
+        CopyMemory(&displacement, instruction + 3, sizeof(displacement));
+        target = instruction + 7 + displacement;
+        if (target != (const unsigned char *)vtable) {
+            continue;
+        }
+        for (lookahead = 10u; lookahead + 3u <= 104u; ++lookahead) {
+            const unsigned char *store = instruction + lookahead;
+            if (
+                store[0] == 0x89 && (store[1] & 0xc7u) == 0x46u &&
+                store[2] == 0x44
+            ) {
+                ++references;
+                break;
+            }
+        }
+    }
+    return references;
+}
+
+static BOOL streamer_rtti_name_is_video_frame(const char *name) {
+    if (!name) {
+        return TRUE;
+    }
+    return
+        strstr(name, "Frame") != NULL &&
+        strstr(name, "@streamer@@") != NULL &&
+        strstr(name, "@webrtc@@") == NULL;
+}
+
+/*
+ * UU's GDI RawVideoFrame reports adapter LUID 0 even when DXVK exposes a real
+ * NVIDIA adapter.  VideoEncoderFactory therefore refuses its matching NVENC
+ * entry and deliberately falls across adapters to OpenH264.  Locate the GDI
+ * frame vtable from its constructor rather than a version-specific RVA, then
+ * override only the adapter-id virtual method.  The constructor/vtable
+ * fingerprints are also checked offline by uu-remote-encoder-policy before an
+ * updated official client is allowed to enable the bridge.
+ */
+static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
+    static const unsigned char constructor_prefix[] = {
+        0xe8, 0, 0, 0, 0, 0x90, 0x48, 0x8d, 0x05
+    };
+    static const unsigned char constructor_suffix[] = {
+        0x49, 0x89, 0x07, 0x49, 0x89, 0xb7, 0xa8, 0, 0, 0
+    };
+    static const unsigned char returns_true_dword[] = {
+        0xb8, 0x01, 0, 0, 0, 0xc3
+    };
+    static const unsigned char returns_true_byte[] = {0xb0, 0x01, 0xc3};
+    static const unsigned char has_cursor[] = {
+        0x48, 0x83, 0xb9, 0xa8, 0, 0, 0, 0,
+        0x0f, 0x95, 0xc0, 0xc3
+    };
+    static const unsigned char returns_zero[] = {0x33, 0xc0, 0xc3};
+    static const unsigned char base_adapter_getter_code[] = {
+        0x8b, 0x41, 0x44, 0xc3
+    };
+    static const unsigned char encoder_path_accessor_prefix[] = {
+        0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec,
+        0x20, 0x48, 0x8b, 0xf9, 0x48, 0x8b, 0x59, 0x28
+    };
+    static const unsigned char encoder_path_adapter_call[] = {
+        0x48, 0x8b, 0x00, 0xff, 0x50, 0x30
+    };
+    unsigned char *base = (unsigned char *)module;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *sections;
+    IMAGE_SECTION_HEADER *text = NULL;
+    IMAGE_SECTION_HEADER *rdata = NULL;
+    void **candidate_slot = NULL;
+    void **base_slots[16];
+    void **wrapper_slot = NULL;
+    void *base_adapter_getter = NULL;
+    void *encoder_path_accessor = NULL;
+    unsigned int candidate_count = 0;
+    unsigned int base_getter_count = 0;
+    unsigned int base_slot_count = 0;
+    unsigned int getter_slot_count = 0;
+    unsigned int long_slot_count = 0;
+    unsigned int wrapper_slot_count = 0;
+    unsigned int rtti_named_count = 0;
+    unsigned int encoder_path_accessor_count = 0;
+    unsigned int section_index;
+    SIZE_T index;
+
+    if (!configured_frame_adapter_luid) {
+        return TRUE;
+    }
+    if (streamer_frame_adapter_hooked) {
+        return TRUE;
+    }
+    if (!base) {
+        return FALSE;
+    }
+    dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return FALSE;
+    }
+    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    if (
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    ) {
+        return FALSE;
+    }
+    sections = IMAGE_FIRST_SECTION(nt);
+    for (section_index = 0;
+         section_index < nt->FileHeader.NumberOfSections;
+         ++section_index) {
+        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
+            text = &sections[section_index];
+        } else if (
+            memcmp(sections[section_index].Name, ".rdata", 6) == 0
+        ) {
+            rdata = &sections[section_index];
+        }
+    }
+    if (!text || !rdata || text->Misc.VirtualSize < 23u) {
+        return FALSE;
+    }
+    for (index = 0;
+         index + sizeof(base_adapter_getter_code) <= text->Misc.VirtualSize;
+         ++index) {
+        unsigned char *function = base + text->VirtualAddress + index;
+        if (bytes_equal(
+                function,
+                base_adapter_getter_code,
+                sizeof(base_adapter_getter_code)
+            )) {
+            base_adapter_getter = function;
+            ++base_getter_count;
+        }
+    }
+    if (base_getter_count != 1u || !base_adapter_getter) {
+        return FALSE;
+    }
+    for (index = 0;
+         index + 96u <= text->Misc.VirtualSize;
+         ++index) {
+        unsigned char *function = base + text->VirtualAddress + index;
+        SIZE_T method_offset;
+
+        if (!bytes_equal(
+                function,
+                encoder_path_accessor_prefix,
+                sizeof(encoder_path_accessor_prefix)
+            )) {
+            continue;
+        }
+        for (method_offset = sizeof(encoder_path_accessor_prefix);
+             method_offset + sizeof(encoder_path_adapter_call) <= 96u;
+             ++method_offset) {
+            if (bytes_equal(
+                    function + method_offset,
+                    encoder_path_adapter_call,
+                    sizeof(encoder_path_adapter_call)
+                )) {
+                encoder_path_accessor = function;
+                ++encoder_path_accessor_count;
+                break;
+            }
+        }
+    }
+    for (index = 0; index + 23u <= text->Misc.VirtualSize; ++index) {
+        unsigned char *instruction = base + text->VirtualAddress + index;
+        int32_t displacement;
+        void **vtable;
+
+        if (
+            instruction[0] != constructor_prefix[0] ||
+            !bytes_equal(
+                instruction + 5, constructor_prefix + 5,
+                sizeof(constructor_prefix) - 5u
+            ) ||
+            !bytes_equal(
+                instruction + 13,
+                constructor_suffix,
+                sizeof(constructor_suffix)
+            )
+        ) {
+            continue;
+        }
+        CopyMemory(&displacement, instruction + 9, sizeof(displacement));
+        vtable = (void **)(instruction + 13 + displacement);
+        if (!address_in_image_section(
+                base, rdata, vtable, 7u * sizeof(*vtable)
+            ) ||
+            !address_in_image_section(base, text, vtable[1], 6u) ||
+            !address_in_image_section(base, text, vtable[2], 3u) ||
+            !address_in_image_section(base, text, vtable[3], 12u) ||
+            !address_in_image_section(base, text, vtable[5], 3u) ||
+            vtable[4] != vtable[5] ||
+            !bytes_equal(vtable[1], returns_true_dword, 6u) ||
+            !bytes_equal(vtable[2], returns_true_byte, 3u) ||
+            !bytes_equal(vtable[3], has_cursor, 12u) ||
+            !bytes_equal(vtable[5], returns_zero, 3u)
+        ) {
+            continue;
+        }
+        candidate_slot = &vtable[5];
+        ++candidate_count;
+    }
+    if (candidate_count != 1u || !candidate_slot) {
+        return FALSE;
+    }
+    {
+        SIZE_T rdata_span = rdata->Misc.VirtualSize;
+        if (rdata_span < rdata->SizeOfRawData) {
+            rdata_span = rdata->SizeOfRawData;
+        }
+        for (index = 0u;
+             index + 2u * sizeof(void *) <= rdata_span;
+             index += sizeof(void *)) {
+            void **slot = (void **)(base + rdata->VirtualAddress + index);
+            BOOL preceding_are_text = TRUE;
+            unsigned int method_index;
+
+            if (*slot != base_adapter_getter) {
+                continue;
+            }
+            ++getter_slot_count;
+            /*
+             * Three RawVideoFrame base tables end at this getter.  Four much
+             * longer tables also reuse it in UU 4.37, but live tracing proved
+             * that none is the adapter path consumed by VideoEncoderFactory.
+             * Keep classifying these tables as a version guard, but never
+             * patch them: doing so corrupts WebRTC media negotiation.
+             */
+            if (address_in_image_section(base, text, slot[1], 1u)) {
+                void **vtable = streamer_frame_vtable_start(
+                    base, text, rdata, slot
+                );
+                const char *rtti_name = streamer_vtable_rtti_class_name(
+                    base, nt, rdata, vtable
+                );
+                unsigned int constructor_references =
+                    streamer_adapter_constructor_references(
+                        base, text, vtable
+                    );
+
+                ++long_slot_count;
+                if (rtti_name) {
+                    ++rtti_named_count;
+                }
+                if (
+                    constructor_references &&
+                    streamer_rtti_name_is_video_frame(rtti_name)
+                ) {
+                    wrapper_slot = slot;
+                    ++wrapper_slot_count;
+                }
+                continue;
+            }
+            if (index < 5u * sizeof(void *)) {
+                continue;
+            }
+            for (method_index = 1u; method_index <= 5u; ++method_index) {
+                if (!address_in_image_section(
+                        base, text, *(slot - method_index), 1u
+                    )) {
+                    preceding_are_text = FALSE;
+                    break;
+                }
+            }
+            if (!preceding_are_text) {
+                continue;
+            }
+            if (base_slot_count >= sizeof(base_slots) / sizeof(base_slots[0])) {
+                return FALSE;
+            }
+            base_slots[base_slot_count] = slot;
+            ++base_slot_count;
+        }
+    }
+    InterlockedExchange(
+        &frame_adapter_long_candidates, (LONG)long_slot_count
+    );
+    InterlockedExchange(
+        &frame_adapter_wrapper_candidates, (LONG)wrapper_slot_count
+    );
+    InterlockedExchange(
+        &frame_adapter_rtti_named_candidates, (LONG)rtti_named_count
+    );
+    InterlockedExchange(
+        &frame_adapter_encoder_path_candidates,
+        (LONG)encoder_path_accessor_count
+    );
+    if (
+        !base_slot_count || !long_slot_count || wrapper_slot_count != 1u ||
+        !wrapper_slot || getter_slot_count != base_slot_count + long_slot_count ||
+        encoder_path_accessor_count != 1u || !encoder_path_accessor
+    ) {
+        return FALSE;
+    }
+    if (!patch_frame_adapter_slot(
+            candidate_slot,
+            (void *)hooked_frame_adapter_id,
+            &original_frame_adapter_id
+        )) {
+        return FALSE;
+    }
+    for (section_index = 0u; section_index < base_slot_count; ++section_index) {
+        if (!patch_frame_adapter_slot(
+                base_slots[section_index],
+                (void *)hooked_frame_adapter_id,
+                NULL
+            )) {
+            return FALSE;
+        }
+    }
+    /*
+     * The encoder does not call the RawVideoFrame getter directly.  Its
+     * queued-frame wrapper locks the frame store and invokes virtual slot
+     * +0x30 on the concrete frame.  This uniquely-shaped accessor is the
+     * value that appears in "frame from adapter {}" and is therefore the
+     * narrowest safe place to supply DXGI's adapter LUID.
+     */
+    if (!patch_frame_adapter_accessor(encoder_path_accessor)) {
+        return FALSE;
+    }
+    streamer_wrapper_frame_adapter_hooked = TRUE;
+    streamer_frame_adapter_hooked = TRUE;
+    return TRUE;
 }
 
 static void event_loop_reset_false_wakes(
@@ -4662,6 +5319,7 @@ static BOOL initialize_controller_focus_hook(void) {
 
 static BOOL patch_streamer_imports(void) {
     HMODULE module = GetModuleHandleW(L"streamer.dll");
+    BOOL adapter_ready;
 
     if (!module) {
         return FALSE;
@@ -4672,7 +5330,18 @@ static BOOL patch_streamer_imports(void) {
         streamer_cursor_info_hooked = FALSE;
         streamer_bit_blt_hooked = FALSE;
         streamer_stretch_blt_hooked = FALSE;
+        streamer_frame_adapter_hooked = FALSE;
+        streamer_wrapper_frame_adapter_hooked = FALSE;
+        original_frame_adapter_id = NULL;
+        InterlockedExchange(&frame_adapter_hook_calls, 0);
+        InterlockedExchange(&frame_adapter_wrapper_hook_calls, 0);
+        InterlockedExchange(&frame_adapter_slots_patched, 0);
+        InterlockedExchange(&frame_adapter_long_candidates, 0);
+        InterlockedExchange(&frame_adapter_wrapper_candidates, 0);
+        InterlockedExchange(&frame_adapter_rtti_named_candidates, 0);
+        InterlockedExchange(&frame_adapter_encoder_path_candidates, 0);
     }
+    adapter_ready = patch_streamer_gdi_frame_adapter(module);
     if (!streamer_send_input_hooked) {
         streamer_send_input_hooked = patch_import(
             module,
@@ -4712,7 +5381,7 @@ static BOOL patch_streamer_imports(void) {
     return streamer_send_input_hooked &&
         streamer_cursor_info_hooked &&
         streamer_bit_blt_hooked &&
-        streamer_stretch_blt_hooked;
+        streamer_stretch_blt_hooked && adapter_ready;
 }
 
 static enum hook_process_kind identify_process(void) {
@@ -4805,6 +5474,28 @@ static void initialize_endpoint_path(void) {
         "C:\\uu-remote-controller-restart.request",
         MAX_PATH
     );
+}
+
+static void initialize_frame_adapter_luid(void) {
+    CHAR value[32];
+    CHAR *end = NULL;
+    unsigned long parsed;
+    DWORD length;
+
+    length = GetEnvironmentVariableA(
+        "UU_REMOTE_NVENC_ADAPTER_LUID", value, sizeof(value)
+    );
+    if (!length || length >= sizeof(value)) {
+        return;
+    }
+    parsed = strtoul(value, &end, 10);
+    if (
+        !end || *end != '\0' || parsed == 0ul ||
+        parsed > (unsigned long)UINT32_MAX
+    ) {
+        return;
+    }
+    configured_frame_adapter_luid = (DWORD)parsed;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookVersion(void) {
@@ -4913,6 +5604,9 @@ __declspec(dllexport) DWORD WINAPI UURemoteFrameHookStatus(void) {
     }
     if (frame_view) {
         status |= 16u;
+    }
+    if (streamer_frame_adapter_hooked) {
+        status |= 32u;
     }
     return status;
 }
@@ -5092,6 +5786,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         return TRUE;
     }
     initialize_endpoint_path();
+    initialize_frame_adapter_luid();
     if (process_kind == HOOK_PROCESS_CONTROLLER) {
         return TRUE;
     }

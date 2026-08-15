@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Correct the encoder-capability implementation enum: `0` is NVENC V8 and
+  `1` is NVENC V11, while the previously reused NVDEC batch ID `33` falls
+  through the streamer's implementation switch to `SoftWare`. Migrate only
+  deeply verified H.264/HEVC rows to NVENC V8 and prove the enum mapping from
+  the official binary before removing OpenH264.
+- Fix the final controlled-host NVENC fallback at the value actually consumed
+  by `VideoEncoderFactory`: the queued-frame accessor that locks the frame
+  store and calls concrete-frame virtual slot `+0x30`.
+- Leave all four long getter-sharing vtables untouched. Live call counters and
+  encoder-log disassembly proved that the constructor/`+0x44` candidate is not
+  on the encoding path, while patching the other three corrupts WebRTC media
+  negotiation and causes a reconnect loop.
+- Fail closed after an official client update unless both the offline policy
+  probe and runtime hook find exactly one encoder-path accessor fingerprint;
+  expose its independent call count for real-session verification.
+
 ## [1.1.24] - 2026-08-11
 
 - Derive a fail-closed NVDEC `streamer.dll` patch profile automatically after

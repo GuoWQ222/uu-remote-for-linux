@@ -13,7 +13,8 @@
 - Checks for an official UU update on every launch and periodically while
   running, then installs the latest version transactionally.
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
-- CPU/OpenH264 decoding and experimental NVIDIA NVDEC decoding.
+- CPU/OpenH264 decoding, experimental NVIDIA NVDEC decoding, and NVIDIA
+  NVENC H.264/HEVC encoding when Linux is the controlled host.
 - Native Linux tray menu with decoder selection and automatic restart.
 - Native mouse, keyboard, and remote-cursor support when Linux is controlled:
   XTest on X11, or the RemoteDesktop portal on Wayland.
@@ -24,6 +25,9 @@
 
 - Ubuntu 24.04 (tested)
 - Wine 11.1 or newer
+- NVENC/NVDEC requires the proprietary NVIDIA driver with usable
+  `libcuda.so.1` and `libnvidia-encode.so.1`; the launcher probes and validates
+  both automatically.
 - X11, or GNOME Wayland with XWayland and XDG Desktop Portal. The launcher
   detects the current session automatically. The first Wayland controlled-host
   start asks the user to authorize screen sharing and remote interaction.
@@ -83,6 +87,10 @@ uu-remote-for-linux --decoder auto
 uu-remote-for-linux --decoder cpu
 uu-remote-for-linux --decoder nvidia:0
 
+# Enable or disable the automatic NVENC controlled-host policy
+uu-remote-for-linux --enable-hwencode
+uu-remote-for-linux --disable-hwencode
+
 # Stop only this project's dedicated Wine prefix
 uu-remote-for-linux --stop
 
@@ -109,6 +117,37 @@ profile, and rolls back the update. If a future binary changes the known code
 structure, no offsets are guessed: CPU decoding is used safely and the selected
 NVIDIA device is retained.
 
+## Controlled-host encoder support
+
+| Device/backend | UU integration | Codecs |
+|---|---:|---|
+| NVIDIA NVENC | Automatically probed and preferred | H.264, HEVC |
+| CPU / OpenH264 | Safe fallback when NVENC validation fails | H.264 |
+| Intel/AMD hardware encoding | Not implemented | Unavailable |
+
+The launcher exposes the real NVIDIA adapter through DXVK and deploys a Wine
+`nvencodeapi64.dll` relay that uploads UU's D3D11 capture textures to Linux
+`libnvidia-encode.so.1`. A process-local hook also corrects the GDI frame's
+formerly hard-coded adapter LUID of zero and the queued frame wrappers that
+carry it, allowing UU to match captured frames to the NVENC capability. On
+first use and after every official client update, the launcher relocates those
+call paths and validates H.264/HEVC sessions plus a D3D11-to-CUDA texture
+upload. OpenH264 is removed from the active cache only after all checks pass;
+otherwise it is retained or restored so the controlled connection remains
+usable.
+The encoder capability byte is also validated against the official binary's
+implementation switch. NVENC V8/V11 are values `0`/`1`; the codec detector's
+NVDEC batch value `33` is not an NVENC encoder ID and otherwise falls through
+to `SoftWare`. After the deep H.264/HEVC probe, affected rows are migrated to
+NVENC V8 (`0`) before the client is restarted.
+The current UU build strips application-level MSVC RTTI. Live call counts also
+prove that none of the four long getter-sharing vtables is the final adapter-ID
+entry consumed by the encoder, so the hook leaves all four untouched. Instead,
+it fingerprints the unique queued-frame accessor on the real
+`VideoEncoderFactory` path: the method locks the frame store and calls concrete
+frame virtual slot `+0x30`. An ambiguous future build fails closed and retains
+OpenH264.
+
 ## Desktop backends
 
 | Session | Wine UI | Controlled-host input | Native desktop capture |
@@ -127,7 +166,7 @@ Portal session, so X11 remains the safer choice for pre-login unattended use.
 ## License and attribution
 
 Original project code is available under the Zero-Clause BSD license
-([LICENSE](LICENSE)). Bundled optional decoding components retain their
+([LICENSE](LICENSE)). Bundled optional hardware codec components retain their
 respective zlib and LGPL licenses. Exact revisions, corresponding source, and
 checksums are documented in [NOTICE.md](NOTICE.md) and
 [third_party/HWDECODE.md](third_party/HWDECODE.md).

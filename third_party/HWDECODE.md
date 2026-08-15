@@ -1,4 +1,4 @@
-# Hardware-decoding bridge provenance
+# NVIDIA hardware-codec bridge provenance
 
 The optional bridge is an NVIDIA-only, correctness-first compatibility path:
 
@@ -84,6 +84,41 @@ ninja -C build-nvcuda
 The resulting Unix relay is
 `build-nvcuda/dlls/nvcuda/nvcuda.dll.so`; the Wine fake DLL is
 `build-nvcuda/dlls/nvcuda_fdll/nvcuda.dll`.
+
+## Controlled-host NVENC bridge
+
+The controlled-host path exposes the real NVIDIA adapter through DXVK and
+loads the bundled `nvencodeapi64.dll` Wine relay. The relay translates UU's
+D3D11 NVENC session to a CUDA session, copies each D3D11 input texture through
+a CPU-readable staging texture into pitched CUDA memory, and registers that
+CUDA allocation with Linux `libnvidia-encode.so.1`. H.264 and HEVC are both
+required by the activation policy.
+
+UU's GDI capture frame and its queued wrappers report adapter LUID zero in the
+official Windows binary. The project Win64 input hook locates their adapter
+queries from validated constructor, vtable, and base-method fingerprints, then
+replaces only those query slots with the LUID returned by the live DXGI/NVENC
+probe. No fixed UU version offset is used. The launcher performs this
+relocation check and a real D3D11 texture register/map/unmap cycle after every
+official client update. OpenH264 is removed from UU's active encoder capability
+cache only after both checks succeed.
+
+The relay source is pinned in
+`third_party/sources/nvenc-nvcuvid-v0.5.tar.xz`. The local changes are recorded
+in `third_party/nvenc/nvencodeapi-uu-remote.patch` and
+`third_party/nvenc/uu-remote-nvenc-bridge.h`. Rebuild it with Wine development
+headers, Meson, and Ninja:
+
+```bash
+./scripts/build-nvencode-bridge.sh
+```
+
+The Win64 end-to-end probe additionally needs MinGW-w64 and
+`libffmpeg-nvenc-dev`:
+
+```bash
+./scripts/build-nvenc-d3d11-probe.sh
+```
 
 ## Licenses
 

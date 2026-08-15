@@ -29,8 +29,10 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" &&
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" &&
     -r "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
@@ -68,6 +70,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" 
     "$runtime_target/uu-remote-update-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     "$runtime_target/uu-remote-hwdecode-profiler"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
+    "$runtime_target/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
     "$runtime_target/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
@@ -82,6 +86,9 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.
     "$runtime_target/uu-remote-update-blocker.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" \
     "$runtime_target/uu-remote-dxgi-probe.exe"
+install -Dm0644 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" \
+    "$runtime_target/uu-remote-nvenc-d3d11-probe.exe"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
     "$runtime_target/update-compatibility.tsv"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" \

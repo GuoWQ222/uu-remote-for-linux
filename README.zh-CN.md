@@ -10,7 +10,8 @@
 - 图形化 GUI 界面，支持 Ubuntu 24.04、X11/Wayland。
 - 每次启动及运行期间定期检查网易官方更新，并以事务方式安装最新版本。
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
-- CPU/OpenH264 解码，以及实验性的 NVIDIA NVDEC 解码。
+- CPU/OpenH264 解码、实验性的 NVIDIA NVDEC 解码，以及 Linux 被控端的
+  NVIDIA NVENC H.264/HEVC 硬件编码。
 - 原生 Linux 托盘菜单，支持选择解码器和自动重启。
 - Linux 作为被控端时支持原生鼠标、键盘和远端光标：X11 使用 XTest，
   Wayland 使用 RemoteDesktop Portal。
@@ -20,6 +21,8 @@
 
 - Ubuntu 24.04（已验证）
 - Wine 11.1 或更高版本
+- 使用 NVENC/NVDEC 时，需要 NVIDIA 专有驱动以及可用的
+  `libcuda.so.1`、`libnvidia-encode.so.1`；启动器会自动探测和验证。
 - X11，或带 XWayland 与 XDG Desktop Portal 的 GNOME Wayland。启动器会
   自动识别当前会话。Wayland 首次作为被控端启动时，系统会要求用户授权
   屏幕共享和远程交互。
@@ -77,6 +80,10 @@ uu-remote-for-linux --decoder auto
 uu-remote-for-linux --decoder cpu
 uu-remote-for-linux --decoder nvidia:0
 
+# 手动启用或关闭 Linux 被控端的 NVENC 自动策略
+uu-remote-for-linux --enable-hwencode
+uu-remote-for-linux --disable-hwencode
+
 # 仅停止本项目的独立 Wine 前缀
 uu-remote-for-linux --stop
 
@@ -100,6 +107,32 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 官方 DLL、删除自动档案并回滚更新。若未来版本改变了已知代码结构，程序不会
 猜测偏移，而会安全使用 CPU 解码并保留所选 NVIDIA 设备。
 
+## 被控端编码器支持
+
+| 设备/后端 | UU 集成状态 | 编码格式 |
+|---|---:|---|
+| NVIDIA NVENC | 自动探测并优先启用 | H.264、HEVC |
+| CPU / OpenH264 | NVENC 验证失败时的安全回退 | H.264 |
+| Intel/AMD 硬件编码 | 尚未实现 | 不可用 |
+
+启动器会让 DXVK 暴露真实 NVIDIA 适配器，并部署 Wine
+`nvencodeapi64.dll` 转发层，把 UU 的 D3D11 捕获纹理上传到 Linux
+`libnvidia-encode.so.1`。进程内钩子同时修正 GDI 捕获帧及队列包装帧原先
+固定为 0 的适配器 LUID，使 UU 能把捕获帧与 NVENC 能力正确匹配。首次运行
+以及每次官方客户端更新后，程序都会重新定位这些调用路径、验证 H.264/HEVC
+会话和 D3D11→CUDA 纹理上传；只有验证全部通过才移除活动缓存中的
+OpenH264 项。
+验证失败时会保留或恢复 OpenH264，避免客户端无法建立被控连接。
+编码能力字节也会和官方二进制中的实现分发表交叉验证：NVENC V8/V11 分别为
+`0`/`1`；探测器的 NVDEC 批次值 `33` 并不是 NVENC 编码器编号，否则会落入
+`SoftWare`。H.264/HEVC 深层探测通过后，程序才会把受影响的行迁移成 NVENC
+V8（`0`），并在重启后交给客户端使用。
+UU 当前发布版裁剪了应用层 MSVC RTTI。实机调用计数进一步证明，4 个复用
+getter 的长虚表都不是编码器最终读取适配器 ID 的入口；程序不会修改它们。
+它会从 `VideoEncoderFactory` 的真实调用链定位唯一的队列帧访问器：该方法先锁定
+帧存储，再调用具体帧的虚表 `+0x30` 槽。离线探针或运行时若不能唯一确认这一
+机器码语义，就拒绝启用 NVENC 并保留 OpenH264。
+
 ## 桌面后端
 
 | 会话 | Wine 界面 | 被控端输入 | 原生桌面采集 |
@@ -116,7 +149,7 @@ Portal 授权是 Wayland 的安全边界，应用不能绕过。画面桥请求�
 ## 许可证与署名
 
 本项目的原创代码采用零条款 BSD 许可证
-（[LICENSE](LICENSE)）。随附的可选解码组件继续使用各自的 zlib 和 LGPL
+（[LICENSE](LICENSE)）。随附的可选硬件编解码组件继续使用各自的 zlib 和 LGPL
 许可证。准确的修订版本、对应源代码和校验和记录在
 [NOTICE.md](NOTICE.md) 与
 [third_party/HWDECODE.md](third_party/HWDECODE.md) 中。

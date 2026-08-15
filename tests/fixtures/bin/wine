@@ -116,6 +116,196 @@ case ${1:-} in
         install -Dm0644 /dev/null "$install_dir/bin/GameViewerHealthd.exe"
         install -Dm0644 /dev/null "$install_dir/bin/Upgrade.exe"
         truncate -s $((0x94e4ee + 3)) "$install_dir/bin/streamer.dll"
+        python3 - "$install_dir/bin/streamer.dll" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+image_base = 0x180000000
+pe_offset = 0x80
+optional_size = 0xF0
+section_offset = pe_offset + 24 + optional_size
+text_rva, text_raw, text_size = 0x1000, 0x400, 0x1000
+rdata_rva, rdata_raw, rdata_size = 0x3000, 0x1400, 0x1000
+
+with open(path, "r+b") as stream:
+    def put(offset, data):
+        stream.seek(offset)
+        stream.write(data)
+
+    put(0, b"MZ")
+    put(0x3C, struct.pack("<I", pe_offset))
+    put(pe_offset, b"PE\0\0")
+    put(pe_offset + 4, struct.pack("<HHIIIHH", 0x8664, 2, 0, 0, 0, optional_size, 0x2022))
+    put(pe_offset + 24, struct.pack("<H", 0x20B))
+    put(pe_offset + 24 + 24, struct.pack("<Q", image_base))
+
+    def section(index, name, rva, raw, size, flags):
+        put(
+            section_offset + index * 40,
+            struct.pack(
+                "<8sIIIIIIHHI",
+                name.ljust(8, b"\0"), size, rva, size, raw,
+                0, 0, 0, 0, flags,
+            ),
+        )
+
+    section(0, b".text", text_rva, text_raw, text_size, 0x60000020)
+    section(1, b".rdata", rdata_rva, rdata_raw, rdata_size, 0x40000040)
+
+    constructor_rva = 0x1100
+    vtable_rva = 0x3100
+    displacement = vtable_rva - (constructor_rva + 13)
+    constructor = (
+        b"\xe8\0\0\0\0\x90\x48\x8d\x05"
+        + struct.pack("<i", displacement)
+        + bytes.fromhex("4989074989b7a8000000")
+    )
+    put(text_raw + constructor_rva - text_rva, constructor)
+
+    functions = {
+        0x1200: bytes.fromhex("b801000000c3"),
+        0x1210: bytes.fromhex("b001c3"),
+        0x1220: bytes.fromhex("4883b9a8000000000f95c0c3"),
+        0x1230: bytes.fromhex("33c0c3"),
+        0x1240: bytes.fromhex("8b4144c3"),
+    }
+    for rva, code in functions.items():
+        put(text_raw + rva - text_rva, code)
+    entries = [0, 0x1200, 0x1210, 0x1220, 0x1230, 0x1230, 0]
+    put(
+        rdata_raw + vtable_rva - rdata_rva,
+        struct.pack("<7Q", *(image_base + rva if rva else 0 for rva in entries)),
+    )
+    # RawVideoFrame has exactly six methods; the adapter getter is the final
+    # slot.  Four longer tables reuse that getter.  Only the queued-frame
+    # wrapper has a constructor that installs the table and writes the
+    # adapter_id field at object offset 0x44; the three WebRTC tables must not
+    # be selected by the encoder policy/hook.
+    raw_frame_entries = [0x1200, 0x1210, 0x1220, 0x1230, 0x1230, 0x1240]
+    put(
+        rdata_raw + 0x200,
+        struct.pack("<6Q", *(image_base + rva for rva in raw_frame_entries)),
+    )
+
+    wrapper_vtable_rva = rdata_rva + 0x280
+    wrapper_entries = [0x1200, 0x1210, 0x1230, 0x1240, 0x1200]
+    put(
+        rdata_raw + 0x280,
+        struct.pack("<5Q", *(image_base + rva for rva in wrapper_entries)),
+    )
+    wrapper_constructor_rva = 0x1300
+    wrapper_displacement = wrapper_vtable_rva - (wrapper_constructor_rva + 7)
+    wrapper_constructor = (
+        bytes.fromhex("488d05")
+        + struct.pack("<i", wrapper_displacement)
+        + bytes.fromhex("4889069090909090909090895e44c3")
+    )
+    put(
+        text_raw + wrapper_constructor_rva - text_rva,
+        wrapper_constructor,
+    )
+
+    web_rtc_tables = [
+        (
+            0x300,
+            [0x1200, 0x1210, 0x1220, 0x1230, 0x1230, 0x1240, 0x1200],
+        ),
+        (
+            0x380,
+            [
+                0x1200, 0x1210, 0x1220, 0x1230, 0x1200, 0x1210,
+                0x1220, 0x1230, 0x1200, 0x1210, 0x1240, 0x1200,
+            ],
+        ),
+        (
+            0x400,
+            [
+                0x1200, 0x1210, 0x1220, 0x1230, 0x1200, 0x1210,
+                0x1220, 0x1230, 0x1200, 0x1210, 0x1240, 0x1200,
+                0x1210,
+            ],
+        ),
+    ]
+    for table_offset, table_entries in web_rtc_tables:
+        put(
+            rdata_raw + table_offset,
+            struct.pack(
+                f"<{len(table_entries)}Q",
+                *(image_base + rva for rva in table_entries),
+            ),
+        )
+
+    # The encoder's queued-frame wrapper has four adjacent accessors with the
+    # same prologue.  Only the adapter accessor invokes concrete-frame virtual
+    # slot +0x30; the other three use format/validity slots and must not match.
+    accessor_prefix = bytes.fromhex(
+        "48895c2410574883ec20488bf9488b5928"
+    )
+    for accessor_rva, virtual_slot in (
+        (0x1400, 0x30),
+        (0x1500, 0x38),
+        (0x1600, 0x20),
+        (0x1700, 0x28),
+    ):
+        accessor = (
+            accessor_prefix
+            + bytes.fromhex("909090488b00ff50")
+            + bytes([virtual_slot])
+            + b"\xc3"
+        )
+        put(text_raw + accessor_rva - text_rva, accessor)
+
+    # The cache implementation byte is a separate enum from the NVDEC batch
+    # ID.  Model the streamer's fail-closed switch proof: 0/1 are NVENC V8/V11,
+    # while values greater than 6 (including the patched detector's 33) jump
+    # to the same Software case as enum value 6.
+    nvenc_v8_rva = 0x3C00
+    nvenc_v11_rva = 0x3C10
+    software_rva = 0x3C20
+    put(rdata_raw + nvenc_v8_rva - rdata_rva, b"Nvenc V8\0")
+    put(rdata_raw + nvenc_v11_rva - rdata_rva, b"Nvenc V11\0")
+    put(rdata_raw + software_rva - rdata_rva, b"SoftWare\0")
+
+    impl_switch_rva = 0x1815
+    impl_table_rva = 0x1900
+    loads = bytearray()
+    for opcode, target_rva in (
+        (bytes.fromhex("4c8d25"), software_rva),
+        (bytes.fromhex("4c8d05"), nvenc_v11_rva),
+        (bytes.fromhex("488d15"), nvenc_v8_rva),
+    ):
+        instruction_rva = 0x1800 + len(loads)
+        loads.extend(opcode)
+        loads.extend(struct.pack("<i", target_rva - (instruction_rva + 7)))
+    put(text_raw + 0x1800 - text_rva, loads)
+
+    case_rvas = [0x1860, 0x1868, 0x1870, 0x1878, 0x1880, 0x1888, 0x1890]
+    default_displacement = case_rvas[6] - (impl_switch_rva + 9)
+    impl_switch = (
+        bytes.fromhex("0fb6432083f80677")
+        + struct.pack("<b", default_displacement)
+        + bytes.fromhex("418b8c87")
+        + struct.pack("<I", impl_table_rva)
+        + bytes.fromhex("4903cfffe1")
+    )
+    put(text_raw + impl_switch_rva - text_rva, impl_switch)
+    case_codes = (
+        bytes.fromhex("488955c7c3"),
+        bytes.fromhex("4c8945c7c3"),
+        bytes.fromhex("4c894dc7c3"),
+        bytes.fromhex("4c8955c7c3"),
+        bytes.fromhex("4c895dc7c3"),
+        bytes.fromhex("488d0500000000c3"),
+        bytes.fromhex("4c8965c7c3"),
+    )
+    for case_rva, code in zip(case_rvas, case_codes):
+        put(text_raw + case_rva - text_rva, code)
+    put(
+        text_raw + impl_table_rva - text_rva,
+        struct.pack("<7I", *case_rvas),
+    )
+PY
         printf '\211\125\320' |
             dd of="$install_dir/bin/streamer.dll" bs=1 seek=$((0x94dc03)) \
                 conv=notrunc status=none
@@ -132,6 +322,11 @@ case ${1:-} in
         printf '{"mock":"original-cache"}\n' \
             >"$install_dir/config/streamer/decoder_codec_capability_cache.json"
         install -Dm0600 /dev/null \
+            "$install_dir/config/streamer/encoder_codec_capability_cache.json"
+        printf '%s\n' \
+            '{"version":2,"gpu_fingerprint":"mock","encoder_capabilities":[{"video_codec":1,"adapter_id":0,"device_id":0,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":6,"chroma_sampling":1,"bit_depth":8},{"video_codec":1,"adapter_id":1012,"device_id":8578,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":33,"chroma_sampling":1,"bit_depth":8},{"video_codec":2,"adapter_id":1012,"device_id":8578,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":33,"chroma_sampling":1,"bit_depth":8}]}' \
+            >"$install_dir/config/streamer/encoder_codec_capability_cache.json"
+        install -Dm0600 /dev/null \
             "$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
         printf '[settingCenter]\nAutoUpdate=1\n' \
             >"$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
@@ -147,6 +342,17 @@ case ${1:-} in
         install -Dm0644 /dev/null "$install_dir/bin/.webview-ready"
         printf 'WEBVIEW\n' >>"$trace_file"
         exit 0
+        ;;
+    *uu-remote-nvenc-d3d11-probe.exe)
+        if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
+            ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvencodeapi64=b"* &&
+            -r ${DXVK_CONFIG_FILE:-} ]]; then
+            printf '%s\n' \
+                $'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=1012\tapi=0x000000d0\th264=1\thevc=1\ttexture_upload=1'
+            printf 'HWENCODE_PROBE\n' >>"$trace_file"
+            exit 0
+        fi
+        exit 1
         ;;
     *GameViewerHealthd.exe)
         for proxy_variable in \
@@ -183,6 +389,11 @@ case ${1:-} in
         if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
             ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
             printf 'HWDECODE_ENV\n' >>"$trace_file"
+        fi
+        if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
+            ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvencodeapi64=b"* &&
+            -r ${DXVK_CONFIG_FILE:-} ]]; then
+            printf 'HWENCODE_ENV\n' >>"$trace_file"
         fi
         printf 'CUDA_DEVICE=%s\n' "${UU_REMOTE_CUDA_DEVICE:-unset}" >>"$trace_file"
         printf 'CLIENT\n' >>"$trace_file"

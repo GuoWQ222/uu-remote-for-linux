@@ -16,6 +16,8 @@ export XDG_CACHE_HOME="$test_root/cache"
 export UU_REMOTE_RUNTIME_DIR="$project_root/lib/uu-remote-for-linux"
 export UU_REMOTE_FAKE_TRACE="$test_root/fake-tools.log"
 export UU_REMOTE_HWDECODE_ASSUME_HOST_READY=1
+export UU_REMOTE_HWENCODE_ASSUME_HOST_READY=1
+export UU_REMOTE_DISABLE_AUTO_HWENCODE=1
 export UU_REMOTE_DISABLE_AUTOSTART_WATCHER=1
 export UU_REMOTE_DISABLE_SLEEP_WATCHER=1
 export UU_REMOTE_DISABLE_UPDATE_WATCHER=1
@@ -180,6 +182,60 @@ webview_count=$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")
 
 test "$(grep -c '^INSTALL$' "$UU_REMOTE_FAKE_TRACE")" -eq "$install_count"
 test "$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")" -eq "$webview_count"
+
+encoder_cache="$install_dir/config/streamer/encoder_codec_capability_cache.json"
+encoder_cache_backup="$XDG_DATA_HOME/uu-remote-for-linux/encoder-cache-before-hwencode.json"
+"$launcher" --enable-hwencode
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-manifest"
+test -e "$state_dir/hwencode-probe-status"
+grep -q 'base_slots=1' "$state_dir/setup.log"
+grep -q 'long_slots=4' "$state_dir/setup.log"
+grep -q 'wrapper_vtable_rva=0x3280' "$state_dir/setup.log"
+grep -q 'wrapper_slot_rva=0x3298' "$state_dir/setup.log"
+grep -q 'wrapper_ctor_refs=1' "$state_dir/setup.log"
+grep -q 'wrapper_rtti=none' "$state_dir/setup.log"
+grep -q 'encoder_accessor_rva=0x1400' "$state_dir/setup.log"
+grep -q 'encoder_path_candidates=1' "$state_dir/setup.log"
+grep -q 'nvenc_v8_impl=0' "$state_dir/setup.log"
+grep -q 'nvenc_v11_impl=1' "$state_dir/setup.log"
+grep -q 'impl_33=software' "$state_dir/setup.log"
+grep -q 'impl_switch_candidates=1' "$state_dir/setup.log"
+grep -q '^HWENCODE_PROBE$' "$UU_REMOTE_FAKE_TRACE"
+cmp -s \
+    "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-windows/nvencodeapi64.dll" \
+    "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+cmp -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" \
+    "$install_dir/bin/uu-remote-nvenc-d3d11-probe.exe"
+python3 - "$encoder_cache" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))["encoder_capabilities"]
+assert not any(row.get("codec_impl") == 6 for row in rows)
+assert not any(row.get("codec_impl") in {1, 33} for row in rows)
+assert {row.get("video_codec") for row in rows if row.get("codec_impl") == 0} >= {1, 2}
+assert all(
+    row.get("adapter_id") == 1012 and row.get("device_id") == 8578
+    for row in rows
+    if row.get("codec_impl") == 0
+)
+PY
+test -e "$encoder_cache_backup"
+"$launcher" --diagnose | grep -q \
+    'NVENC 编码策略.*已启用（NVENC/HEVC 深层验证通过）'
+"$launcher" --disable-hwencode
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
+test ! -e "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+test ! -e "$encoder_cache_backup"
+python3 - "$encoder_cache" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))["encoder_capabilities"]
+assert any(row.get("codec_impl") == 6 for row in rows)
+PY
 
 streamer="$install_dir/bin/streamer.dll"
 streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
