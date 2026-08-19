@@ -8,7 +8,7 @@ readonly launcher_target="$user_prefix/bin/uu-remote-for-linux"
 readonly runtime_target="$user_prefix/lib/uu-remote-for-linux"
 readonly desktop_target="$user_prefix/share/applications/uu-remote-for-linux.desktop"
 readonly metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
-readonly legacy_png_icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
+readonly icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
 readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-remote-for-linux.svg"
 
 [[ -r "$project_root/lib/uu-remote-for-linux/wevtapi.dll" ]] || {
@@ -101,7 +101,10 @@ install -Dm0644 "$project_root/share/applications/uu-remote-for-linux.desktop" \
 install -Dm0644 \
     "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml" \
     "$metainfo_target"
-rm -f -- "$legacy_png_icon_target" "$legacy_icon_target"
+install -Dm0644 \
+    "$project_root/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" \
+    "$icon_target"
+rm -f -- "$legacy_icon_target"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$user_prefix/share/applications" >/dev/null 2>&1 || true
