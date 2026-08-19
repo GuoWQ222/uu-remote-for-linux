@@ -2363,7 +2363,7 @@ start_tray_proxy() {
         --log-file "$tray_proxy_log"
         --window-layout-file "$window_layout_file"
         --monitor-selection-file "$controlled_monitor_file"
-        --icon "$app_id"
+        --icon "video-display"
     )
     if systemd_user_available; then
         if runtime_unit_active "$tray_runtime_unit"; then

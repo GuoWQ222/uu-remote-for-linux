@@ -103,9 +103,6 @@ cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
 install -Dm0644 "$project_root/share/applications/uu-remote-for-linux.desktop" \
     "$stage_dir/usr/share/applications/uu-remote-for-linux.desktop"
 install -Dm0644 \
-    "$project_root/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" \
-    "$stage_dir/usr/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
-install -Dm0644 \
     "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml" \
     "$stage_dir/usr/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
 install -Dm0644 "$project_root/README.md" \

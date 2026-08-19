@@ -130,7 +130,7 @@ write_native_autostart() {
             'Comment=Start UU Remote after logging in' \
             'Comment[zh_CN]=登录 Linux 后自动启动网易 UU 远程' \
             "Exec=$exec_argument --autostart" \
-            'Icon=uu-remote-for-linux' \
+            'Icon=video-display' \
             'Terminal=false' \
             'StartupNotify=false' \
             'X-GNOME-Autostart-enabled=true' \

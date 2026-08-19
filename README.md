@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" width="112" alt="UU Remote for Linux icon">
-</p>
-
 <h1 align="center">UU Remote for Linux</h1>
 
 <p align="center">
@@ -142,5 +138,3 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ## 📄 License and attribution
 
 Original project code uses the [Zero-Clause BSD license](LICENSE). Optional hardware-codec components retain their zlib or LGPL licenses; exact revisions, source links, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).
-
-The bundled official icon is used only for product identification. Its artwork and all NetEase/UU marks remain the property of NetEase.

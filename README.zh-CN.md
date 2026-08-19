@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="share/icons/hicolor/256x256/apps/uu-remote-for-linux.png" width="112" alt="UU 远程 Linux 版图标">
-</p>
-
 <h1 align="center">UU 远程 Linux 版</h1>
 
 <p align="center">
@@ -142,5 +138,3 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ## 📄 许可证与署名
 
 本项目原创代码采用[零条款 BSD 许可证](LICENSE)。可选硬件编解码组件继续使用各自的 zlib 或 LGPL 许可证；准确的修订版本、源代码链接与校验和记录在 [NOTICE.md](NOTICE.md) 和 [third_party/HWDECODE.md](third_party/HWDECODE.md) 中。
-
-随附的官方图标仅用于产品识别；其美术作品以及所有网易/UU 标志仍属于网易所有。

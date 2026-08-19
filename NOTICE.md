@@ -1,12 +1,9 @@
 # Third-party notices
 
 NetEase UU Remote is proprietary software. This repository does not include or
-redistribute the NetEase installer, application binaries, or account data. The
-desktop/tray identification icon is the icon resource from the official
-`GameViewer.exe`; the artwork and all NetEase/UU names and trademarks remain
-the property of their respective owner. At runtime, users may explicitly
-request a download from the official NetEase release endpoint and remain
-subject to the upstream license:
+redistribute the NetEase installer, application binaries, or account data. At
+runtime, users may explicitly request a download from the official NetEase
+release endpoint and remain subject to the upstream license:
 
 https://uuyc.163.com/contact/20240402/40294_1146065.html
 
