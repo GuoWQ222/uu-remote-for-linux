@@ -14,7 +14,7 @@
 - [Install from Release (recommended)](#install-from-release-recommended)
   - [Install from source (optional)](#install-from-source-optional)
 - [Tray icon (right-click menu)](#tray-icon-right-click-menu)
-- [Usage (command line)](#usage-command-line)
+  - [Usage (command line)](#usage-command-line)
 - [Decoder support](#decoder-support)
 - [Controlled-host encoder support](#controlled-host-encoder-support)
 - [Desktop backends](#desktop-backends)
@@ -95,7 +95,7 @@ or system tray to open these actions:
 - **退出 (Exit)** — stops the dedicated UU Wine client and removes the native
   tray icon.
 
-## Usage (command line)
+### Usage (command line)
 
 ```bash
 # Start UU Remote
