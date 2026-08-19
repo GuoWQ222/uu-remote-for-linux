@@ -7,6 +7,18 @@
 > [!IMPORTANT]
 > An unofficial implementation of NetEase UU Remote.
 
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install from Release (recommended)](#install-from-release-recommended)
+  - [Install from source (optional)](#install-from-source-optional)
+- [Usage (command line)](#usage-command-line)
+- [Decoder support](#decoder-support)
+- [Controlled-host encoder support](#controlled-host-encoder-support)
+- [Desktop backends](#desktop-backends)
+- [License and attribution](#license-and-attribution)
+
 ## Features
 
 - Graphical user interface (GUI), with support for Ubuntu 24.04 on X11 and Wayland.
@@ -107,17 +119,6 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 | NVIDIA NVDEC | Experimental | UU menu up to 4K/144 fps; measure on the actual stream |
 | Intel/AMD VA-API | Not implemented | Unavailable |
 
-The launcher always keeps the official UU client current. If an updated build
-does not yet have a bundled profile, it locates two unique, relationally
-verified NVDEC instruction fingerprints in the official `streamer.dll`, derives
-the new offsets and original/patched SHA-256 values, and redeploys the hardware
-decoder bridge. Before the new client may start, it enumerates the real adapter
-inside Wine/DXVK and asks UU's own `StreamerCodecDetector.exe` to confirm H.264
-and H.265 NVDEC. Any failure restores the official DLL, discards the generated
-profile, and rolls back the update. If a future binary changes the known code
-structure, no offsets are guessed: CPU decoding is used safely and the selected
-NVIDIA device is retained.
-
 ## Controlled-host encoder support
 
 | Device/backend | UU integration | Codecs |
@@ -125,29 +126,6 @@ NVIDIA device is retained.
 | NVIDIA NVENC | Automatically probed and preferred | H.264, HEVC |
 | CPU / OpenH264 | Safe fallback when NVENC validation fails | H.264 |
 | Intel/AMD hardware encoding | Not implemented | Unavailable |
-
-The launcher exposes the real NVIDIA adapter through DXVK and deploys a Wine
-`nvencodeapi64.dll` relay that uploads UU's D3D11 capture textures to Linux
-`libnvidia-encode.so.1`. A process-local hook also corrects the GDI frame's
-formerly hard-coded adapter LUID of zero and the queued frame wrappers that
-carry it, allowing UU to match captured frames to the NVENC capability. On
-first use and after every official client update, the launcher relocates those
-call paths and validates H.264/HEVC sessions plus a D3D11-to-CUDA texture
-upload. OpenH264 is removed from the active cache only after all checks pass;
-otherwise it is retained or restored so the controlled connection remains
-usable.
-The encoder capability byte is also validated against the official binary's
-implementation switch. NVENC V8/V11 are values `0`/`1`; the codec detector's
-NVDEC batch value `33` is not an NVENC encoder ID and otherwise falls through
-to `SoftWare`. After the deep H.264/HEVC probe, affected rows are migrated to
-NVENC V8 (`0`) before the client is restarted.
-The current UU build strips application-level MSVC RTTI. Live call counts also
-prove that none of the four long getter-sharing vtables is the final adapter-ID
-entry consumed by the encoder, so the hook leaves all four untouched. Instead,
-it fingerprints the unique queued-frame accessor on the real
-`VideoEncoderFactory` path: the method locks the frame store and calls concrete
-frame virtual slot `+0x30`. An ambiguous future build fails closed and retains
-OpenH264.
 
 ## Desktop backends
 
