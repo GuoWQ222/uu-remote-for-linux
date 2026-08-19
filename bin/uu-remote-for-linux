@@ -929,10 +929,10 @@ hwdecode_version_supported() {
 }
 
 hwdecode_profile_generated() {
-    local version=$1 row_version remainder
+    local version=$1 row_version
 
     [[ -r $hwdecode_generated_profiles ]] || return 1
-    while IFS=$'\t' read -r row_version remainder; do
+    while IFS=$'\t' read -r row_version _; do
         [[ -n $row_version && $row_version != \#* ]] || continue
         [[ $row_version == "$version" ]] && return 0
     done <"$hwdecode_generated_profiles"
@@ -940,14 +940,14 @@ hwdecode_profile_generated() {
 }
 
 generate_hwdecode_profile() {
-    local version=$1 row row_version original_sha remainder current_sha
+    local version=$1 row row_version original_sha current_sha
     local temp existing_version existing_remainder
 
     [[ -x $hwdecode_profiler && -f $streamer_dll ]] || return 1
     row=$("$hwdecode_profiler" \
         --derive "$streamer_dll" --version "$version" 2>>"$setup_log") ||
         return 1
-    IFS=$'\t' read -r row_version original_sha remainder <<<"$row"
+    IFS=$'\t' read -r row_version original_sha _ <<<"$row"
     [[ $row_version == "$version" &&
         $original_sha =~ ^[[:xdigit:]]{64}$ ]] || return 1
     current_sha=$(file_sha256 "$streamer_dll") || return 1
@@ -997,7 +997,7 @@ ensure_hwdecode_profile() {
 
 load_hwdecode_profile_from_streamer_files() {
     local original_hash="" patched_hash=""
-    local row_version original_sha patched_sha unused profile_file
+    local row_version original_sha patched_sha profile_file
     local override_version="${UU_REMOTE_HWDECODE_STREAMER_VERSION:-4.34.0.8979}"
 
     [[ -f $streamer_original ]] &&
@@ -1021,7 +1021,7 @@ load_hwdecode_profile_from_streamer_files() {
         "$hwdecode_generated_profiles"; do
         [[ -r $profile_file ]] || continue
         while IFS=$'\t' read -r \
-            row_version original_sha patched_sha unused; do
+            row_version original_sha patched_sha _; do
             [[ -n $row_version && $row_version != \#* ]] || continue
             if [[ -n $original_hash && ${original_sha,,} == "$original_hash" ]] ||
                 [[ -n $patched_hash && ${patched_sha,,} == "$patched_hash" ]]; then
@@ -3419,9 +3419,10 @@ deploy_streamer_patch() {
         installed_version=$(
             registry_value "$installed_version_key" Version || true
         )
-        [[ -n $installed_version ]] &&
-            ensure_hwdecode_profile "$installed_version" ||
+        if [[ -z $installed_version ]] ||
+            ! ensure_hwdecode_profile "$installed_version"; then
             die "当前 UU 版本无法安全生成 NVDEC 兼容档案；未修改客户端"
+        fi
     fi
 
     [[ -f $streamer_dll || -f $streamer_original ]] ||
@@ -4441,10 +4442,7 @@ perform_upstream_update_handoff() {
 
     # The handoff owns the single restart decision.  Supported update and
     # rollback paths must not launch a competing client from the subshell.
-    if (
-        export UU_REMOTE_UPDATE_NO_RESTART=1
-        perform_update_check
-    ); then
+    if UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check; then
         check_status=0
     else
         check_status=$?
@@ -4492,10 +4490,7 @@ if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
     startup_update_requested=true
 fi
 if $startup_update_requested; then
-    if ! (
-        export UU_REMOTE_UPDATE_NO_RESTART=1
-        perform_update_check
-    ); then
+    if ! UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check; then
         notify_status "启动时自动更新未完成，将继续打开当前版本"
         printf '警告：启动时自动更新未完成；继续打开当前已安装版本。\n' >&2
     fi
