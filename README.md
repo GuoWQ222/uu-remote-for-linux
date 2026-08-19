@@ -13,8 +13,8 @@
 - [Requirements](#requirements)
 - [Install from Release (recommended)](#install-from-release-recommended)
   - [Install from source (optional)](#install-from-source-optional)
+- [Tray icon (right-click menu)](#tray-icon-right-click-menu)
 - [Usage (command line)](#usage-command-line)
-  - [Tray icon (right-click menu)](#tray-icon-right-click-menu)
 - [Decoder support](#decoder-support)
 - [Controlled-host encoder support](#controlled-host-encoder-support)
 - [Desktop backends](#desktop-backends)
@@ -76,6 +76,25 @@ cd uu-remote-for-linux
 ~/.local/bin/uu-remote-for-linux
 ```
 
+## Tray icon (right-click menu)
+
+While UU Remote is running, right-click its native icon in the Ubuntu top bar
+or system tray to open these actions:
+
+- **显示主界面 (Show main window)** — restores the hidden or minimized UU main
+  window.
+- **远控窗口布局 (Remote-window layout)** — selects and remembers how existing
+  remote viewer windows are arranged:
+  - **单窗口（主屏） (Single window, primary display)** places the first viewer
+    window in the primary monitor's work area. This is the default.
+  - **双窗口（每屏一个） (Dual windows, one per display)** places up to one
+    existing viewer window on each detected monitor. It does not create another
+    remote session or viewer window.
+- **选择解码器… (Select decoder…)** — opens the decoder/device selector. Saving
+  a new choice restarts UU automatically so it takes effect.
+- **退出 (Exit)** — stops the dedicated UU Wine client and removes the native
+  tray icon.
+
 ## Usage (command line)
 
 ```bash
@@ -111,25 +130,6 @@ uu-remote-for-linux --stop
 # Emergency fallback if controller focus handling is incompatible
 UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
-
-### Tray icon (right-click menu)
-
-While UU Remote is running, right-click its native icon in the Ubuntu top bar
-or system tray to open these actions:
-
-- **显示主界面 (Show main window)** — restores the hidden or minimized UU main
-  window.
-- **远控窗口布局 (Remote-window layout)** — selects and remembers how existing
-  remote viewer windows are arranged:
-  - **单窗口（主屏） (Single window, primary display)** places the first viewer
-    window in the primary monitor's work area. This is the default.
-  - **双窗口（每屏一个） (Dual windows, one per display)** places up to one
-    existing viewer window on each detected monitor. It does not create another
-    remote session or viewer window.
-- **选择解码器… (Select decoder…)** — opens the decoder/device selector. Saving
-  a new choice restarts UU automatically so it takes effect.
-- **退出 (Exit)** — stops the dedicated UU Wine client and removes the native
-  tray icon.
 
 ## Decoder support
 
