@@ -284,6 +284,37 @@ grep -q '"mock":"original-cache"' "$decoder_cache_backup"
 "$launcher" --check-update
 "$launcher" --diagnose | grep -q '安全更新状态.*已是最新版本'
 
+assert_update_check_failure() {
+    local failure=$1 expected=$2
+    local stdout_file="$test_root/update-${failure}.out"
+    local stderr_file="$test_root/update-${failure}.err"
+
+    if UU_REMOTE_FAKE_CURL_FAILURE="$failure" \
+        "$launcher" --check-update >"$stdout_file" 2>"$stderr_file"; then
+        printf '模拟更新检查故障 %s 被意外接受。\n' "$failure" >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$stderr_file"
+    grep -Fq "$expected" "$state_dir/update-status"
+}
+
+assert_update_check_failure \
+    dns 'DNS 解析失败：无法解析网易官方域名 api.nrd.nie.163.com（curl 错误 6）'
+assert_update_check_failure \
+    dns-timeout 'DNS 解析超时：未能解析网易官方域名 api.nrd.nie.163.com（curl 错误 28）'
+assert_update_check_failure \
+    proxy '代理解析失败：无法解析当前代理服务器（curl 错误 5）'
+assert_update_check_failure \
+    connect '连接失败：无法连接网易官方接口 api.nrd.nie.163.com（curl 错误 7）'
+assert_update_check_failure \
+    tls 'TLS 证书校验失败：系统不信任网易官方接口返回的证书链（curl 错误 60）'
+assert_update_check_failure \
+    http '网易官方接口返回 HTTP 503（curl 错误 22）'
+assert_update_check_failure \
+    reset '接收网易官方接口响应失败或连接被重置（curl 错误 56）'
+assert_update_check_failure \
+    version-format '网易官方接口已响应，但下载文件名无法识别版本（文件名：UURemote_Setup_latest_gwqd.exe）'
+
 protected_before="$test_root/protected-before.sha256"
 protected_after="$test_root/protected-after.sha256"
 sha256sum \

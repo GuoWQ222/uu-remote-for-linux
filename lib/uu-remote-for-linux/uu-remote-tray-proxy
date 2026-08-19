@@ -27,6 +27,11 @@ import uuid
 APP_ID = "uu-remote-for-linux"
 TITLE = "网易 UU 远程"
 LEGACY_SCAN_INTERVAL_MS = 750
+WINDOW_LAYOUT_SINGLE = "single-primary"
+WINDOW_LAYOUT_DUAL = "dual-monitor"
+WINDOW_LAYOUT_REFLOW_ATTEMPTS = 3
+WINDOW_LAYOUT_REFLOW_INTERVAL_SECONDS = 2.0
+WINDOW_LAYOUT_RESTORE_DELAY_MS = 80
 HOME_REPAINT_DELAY_MS = 2500
 HOME_REPAINT_RETRY_MS = 100
 HOME_REPAINT_RESTORE_DELAY_MS = 80
@@ -82,6 +87,9 @@ class X11:
         self.wm_state_atom = self.lib.XInternAtom(
             self.display, b"WM_STATE", False
         )
+        self.net_wm_name_atom = self.lib.XInternAtom(
+            self.display, b"_NET_WM_NAME", False
+        )
 
     def _configure_prototypes(self) -> None:
         lib = self.lib
@@ -111,6 +119,12 @@ class X11:
             ctypes.POINTER(XClassHint),
         ]
         lib.XGetClassHint.restype = ctypes.c_int
+        lib.XFetchName.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.XFetchName.restype = ctypes.c_int
         lib.XGetGeometry.argtypes = [
             ctypes.c_void_p,
             ctypes.c_ulong,
@@ -147,6 +161,15 @@ class X11:
             ctypes.c_uint,
         ]
         lib.XResizeWindow.restype = ctypes.c_int
+        lib.XMoveResizeWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        lib.XMoveResizeWindow.restype = ctypes.c_int
         lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.XFree.argtypes = [ctypes.c_void_p]
 
@@ -247,7 +270,58 @@ class X11:
         finally:
             self.lib.XFree(data)
 
-    def geometry(self, window: int) -> tuple[int, int] | None:
+    def window_title(self, window: int) -> str:
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        item_count = ctypes.c_ulong()
+        remaining = ctypes.c_ulong()
+        data = ctypes.POINTER(ctypes.c_ubyte)()
+        status = self.lib.XGetWindowProperty(
+            self.display,
+            window,
+            self.net_wm_name_atom,
+            0,
+            1024,
+            False,
+            0,
+            ctypes.byref(actual_type),
+            ctypes.byref(actual_format),
+            ctypes.byref(item_count),
+            ctypes.byref(remaining),
+            ctypes.byref(data),
+        )
+        if (
+            status == 0
+            and actual_type.value
+            and actual_format.value == 8
+            and item_count.value
+            and data
+        ):
+            try:
+                return ctypes.string_at(data, item_count.value).decode(
+                    errors="replace"
+                )
+            finally:
+                self.lib.XFree(data)
+        if data:
+            self.lib.XFree(data)
+
+        name = ctypes.c_void_p()
+        if not self.lib.XFetchName(
+            self.display, window, ctypes.byref(name)
+        ):
+            return ""
+        try:
+            if not name.value:
+                return ""
+            return ctypes.cast(name, ctypes.c_char_p).value.decode(
+                errors="replace"
+            )
+        finally:
+            if name.value:
+                self.lib.XFree(name)
+
+    def window_rect(self, window: int) -> tuple[int, int, int, int] | None:
         root = ctypes.c_ulong()
         x = ctypes.c_int()
         y = ctypes.c_int()
@@ -267,7 +341,18 @@ class X11:
             ctypes.byref(depth),
         ):
             return None
-        return int(width.value), int(height.value)
+        return (
+            int(x.value),
+            int(y.value),
+            int(width.value),
+            int(height.value),
+        )
+
+    def geometry(self, window: int) -> tuple[int, int] | None:
+        rect = self.window_rect(window)
+        if rect is None:
+            return None
+        return rect[2], rect[3]
 
     def destroy(self, window: int) -> None:
         self.lib.XDestroyWindow(self.display, window)
@@ -276,6 +361,107 @@ class X11:
     def resize(self, window: int, width: int, height: int) -> None:
         self.lib.XResizeWindow(self.display, window, width, height)
         self.lib.XSync(self.display, False)
+
+    def move_resize(
+        self, window: int, x: int, y: int, width: int, height: int
+    ) -> None:
+        self.lib.XMoveResizeWindow(
+            self.display, window, x, y, width, height
+        )
+        self.lib.XSync(self.display, False)
+
+
+def normalize_window_layout(value: str) -> str:
+    if value == WINDOW_LAYOUT_DUAL:
+        return WINDOW_LAYOUT_DUAL
+    return WINDOW_LAYOUT_SINGLE
+
+
+def read_window_layout(path: Path) -> str:
+    try:
+        return normalize_window_layout(path.read_text().strip())
+    except OSError:
+        return WINDOW_LAYOUT_SINGLE
+
+
+def write_window_layout(path: Path, value: str) -> None:
+    value = normalize_window_layout(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f".tmp.{os.getpid()}")
+    temporary.write_text(value + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def is_home_window_title(title: str) -> bool:
+    compact = "".join(title.split()).casefold()
+    return compact in {"gameviewer", "网易uu远程"}
+
+
+def mapped_remote_windows(
+    x11: X11, prefix: str
+) -> list[tuple[int, int, int, int, int]]:
+    """Return mapped remote-view windows owned by this Wine prefix."""
+
+    controller_pids = controller_processes(prefix)
+    if not controller_pids:
+        return []
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for window in x11.windows():
+        window_class = x11.window_class(window)
+        if not window_class or not any(
+            value.casefold() == "gameviewer.exe" for value in window_class
+        ):
+            continue
+        if (
+            x11.property_first_cardinal(window, x11.pid_atom)
+            not in controller_pids
+        ):
+            continue
+        if x11.property_first_cardinal(window, x11.wm_state_atom) != 1:
+            continue
+        title = x11.window_title(window)
+        if not title or is_home_window_title(title):
+            continue
+        rect = x11.window_rect(window)
+        if rect is None:
+            continue
+        x, y, width, height = rect
+        if width < 640 or height < 480:
+            continue
+        candidates.append((window, x, y, width, height))
+    return sorted(
+        candidates,
+        key=lambda candidate: (-candidate[3] * candidate[4], candidate[0]),
+    )
+
+
+def gdk_monitor_workareas(gdk) -> list[tuple[int, int, int, int]]:
+    """Return the primary work area first, in X11-compatible coordinates."""
+
+    display = gdk.Display.get_default()
+    if display is None:
+        return []
+    primary = display.get_primary_monitor()
+    monitors: list[tuple[bool, int, int, int, int]] = []
+    for index in range(display.get_n_monitors()):
+        monitor = display.get_monitor(index)
+        if monitor is None:
+            continue
+        area = monitor.get_workarea()
+        if area.width <= 0 or area.height <= 0:
+            continue
+        monitors.append(
+            (
+                monitor == primary,
+                int(area.x),
+                int(area.y),
+                int(area.width),
+                int(area.height),
+            )
+        )
+    monitors.sort(key=lambda row: (not row[0], row[1], row[2]))
+    return [row[1:] for row in monitors]
 
 
 def mapped_home_window(
@@ -525,14 +711,26 @@ class TrayProxy:
         self.prefix = canonical_path(args.prefix)
         self.launcher = canonical_path(args.launcher)
         self.state_dir = Path(args.state_dir)
+        self.window_layout_file = Path(args.window_layout_file)
+        self.window_layout = read_window_layout(self.window_layout_file)
         self.status_file = self.state_dir / "tray-proxy-status"
         self.log_file = Path(args.log_file)
         self.x11: X11 | None = None
         self.indicator = None
         self.decoder_item = None
+        self.single_layout_item = None
+        self.dual_layout_item = None
         self.decoder_process: subprocess.Popen | None = None
         self.Gtk = None
         self.GLib = None
+        self.Gdk = None
+        self.window_layout_monitor_signature: tuple[
+            tuple[int, int, int, int], ...
+        ] = ()
+        self.window_layout_state: dict[
+            int,
+            tuple[tuple[int, int, int, int], int, float],
+        ] = {}
         self.ever_saw_client = False
         self.client_missing_ticks = 0
         self.removed_icons = 0
@@ -951,6 +1149,8 @@ class TrayProxy:
                     f"{getattr(self, 'controller_recovery_suppressed', 0)}",
                     "recovery_deferred="
                     f"{getattr(self, 'controller_recovery_deferred', 0)}",
+                    "window_layout="
+                    f"{getattr(self, 'window_layout', WINDOW_LAYOUT_SINGLE)}",
                     f"detail={detail.replace(chr(10), ' ')}",
                     f"updated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
                     "",
@@ -964,10 +1164,12 @@ class TrayProxy:
         import gi
 
         gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
         gi.require_version("AppIndicator3", "0.1")
-        from gi.repository import AppIndicator3, GLib, Gtk
+        from gi.repository import AppIndicator3, Gdk, GLib, Gtk
 
         self.AppIndicator3 = AppIndicator3
+        self.Gdk = Gdk
         self.GLib = GLib
         self.Gtk = Gtk
 
@@ -989,6 +1191,33 @@ class TrayProxy:
         show_item.connect("activate", self.show_main_window)
         menu.append(show_item)
 
+        layout_item = self.Gtk.MenuItem.new_with_label("远控窗口布局")
+        layout_menu = self.Gtk.Menu()
+        self.single_layout_item = self.Gtk.RadioMenuItem.new_with_label(
+            None, "单窗口（主屏）"
+        )
+        self.dual_layout_item = (
+            self.Gtk.RadioMenuItem.new_with_label_from_widget(
+                self.single_layout_item, "双窗口（每屏一个）"
+            )
+        )
+        self.single_layout_item.set_active(
+            self.window_layout == WINDOW_LAYOUT_SINGLE
+        )
+        self.dual_layout_item.set_active(
+            self.window_layout == WINDOW_LAYOUT_DUAL
+        )
+        self.single_layout_item.connect(
+            "toggled", self.select_window_layout, WINDOW_LAYOUT_SINGLE
+        )
+        self.dual_layout_item.connect(
+            "toggled", self.select_window_layout, WINDOW_LAYOUT_DUAL
+        )
+        layout_menu.append(self.single_layout_item)
+        layout_menu.append(self.dual_layout_item)
+        layout_item.set_submenu(layout_menu)
+        menu.append(layout_item)
+
         self.decoder_item = self.Gtk.MenuItem.new_with_label("选择解码器…")
         self.decoder_item.connect(
             "activate", self.select_decoder_and_restart
@@ -1002,6 +1231,137 @@ class TrayProxy:
         menu.append(exit_item)
         menu.show_all()
         self.indicator.set_menu(menu)
+
+    def select_window_layout(self, item, layout: str) -> None:
+        if not item.get_active():
+            return
+        layout = normalize_window_layout(layout)
+        if layout == self.window_layout:
+            return
+        self.window_layout = layout
+        write_window_layout(self.window_layout_file, layout)
+        self.window_layout_state.clear()
+        self.apply_window_layout(force=True)
+        label = "单窗口（主屏）" if layout == WINDOW_LAYOUT_SINGLE else (
+            "双窗口（每屏一个）"
+        )
+        logging.info("远控窗口布局已切换：%s", label)
+        self.write_status("active", f"远控窗口布局：{label}")
+
+    @staticmethod
+    def rect_center_in_area(
+        rect: tuple[int, int, int, int],
+        area: tuple[int, int, int, int],
+    ) -> bool:
+        x, y, width, height = rect
+        area_x, area_y, area_width, area_height = area
+        center_x = x + width // 2
+        center_y = y + height // 2
+        return (
+            area_x <= center_x < area_x + area_width
+            and area_y <= center_y < area_y + area_height
+        )
+
+    def restore_window_layout(
+        self, window: int, area: tuple[int, int, int, int]
+    ) -> bool:
+        if self.x11 is None:
+            return False
+        try:
+            self.x11.move_resize(window, *area)
+        except Exception:
+            logging.exception(
+                "恢复远控窗口目标尺寸失败：window=0x%x", window
+            )
+        return False
+
+    def reflow_remote_window(
+        self, window: int, area: tuple[int, int, int, int]
+    ) -> None:
+        if self.x11 is None:
+            return
+        x, y, width, height = area
+        pulse_width = width - 1 if width > 1 else width
+        self.x11.move_resize(window, x, y, pulse_width, height)
+        self.GLib.timeout_add(
+            WINDOW_LAYOUT_RESTORE_DELAY_MS,
+            self.restore_window_layout,
+            window,
+            area,
+        )
+        logging.info(
+            "重排远控窗口：window=0x%x layout=%s target=%d,%d %dx%d",
+            window,
+            self.window_layout,
+            x,
+            y,
+            width,
+            height,
+        )
+
+    def apply_window_layout(self, force: bool = False) -> int:
+        if getattr(self, "x11", None) is None or getattr(
+            self, "Gdk", None
+        ) is None:
+            return 0
+        monitor_areas = gdk_monitor_workareas(self.Gdk)
+        if not monitor_areas:
+            return 0
+        monitor_signature = tuple(monitor_areas)
+        if monitor_signature != self.window_layout_monitor_signature:
+            self.window_layout_monitor_signature = monitor_signature
+            self.window_layout_state.clear()
+            force = True
+
+        windows = mapped_remote_windows(self.x11, self.prefix)
+        window_ids = {window[0] for window in windows}
+        self.window_layout_state = {
+            window: state
+            for window, state in self.window_layout_state.items()
+            if window in window_ids
+        }
+        if not windows:
+            return 0
+
+        if self.window_layout == WINDOW_LAYOUT_DUAL:
+            plans = [
+                (window[0], monitor_areas[index])
+                for index, window in enumerate(windows[: len(monitor_areas)])
+            ]
+        else:
+            plans = [(windows[0][0], monitor_areas[0])]
+
+        now = time.monotonic()
+        applied = 0
+        for window, area in plans:
+            state = self.window_layout_state.get(window)
+            rect = self.x11.window_rect(window)
+            outside_target = (
+                rect is not None and not self.rect_center_in_area(rect, area)
+            )
+            if force or state is None or state[0] != area or outside_target:
+                state = (area, 0, 0.0)
+            target, attempts, next_attempt = state
+            if (
+                attempts >= WINDOW_LAYOUT_REFLOW_ATTEMPTS
+                or now < next_attempt
+            ):
+                self.window_layout_state[window] = state
+                continue
+            try:
+                self.reflow_remote_window(window, target)
+            except Exception:
+                logging.exception(
+                    "远控窗口布局应用失败：window=0x%x", window
+                )
+                continue
+            self.window_layout_state[window] = (
+                target,
+                attempts + 1,
+                now + WINDOW_LAYOUT_REFLOW_INTERVAL_SECONDS,
+            )
+            applied += 1
+        return applied
 
     def command_log_handle(self):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1220,6 +1580,7 @@ class TrayProxy:
 
     def periodic_check(self) -> bool:
         removed = self.remove_legacy_icons()
+        self.apply_window_layout()
         client_running = bool(controller_processes(self.prefix))
         decoder_workflow_running = (
             self.decoder_process is not None
@@ -1303,6 +1664,7 @@ class TrayProxy:
         self.build_indicator()
         self.x11 = X11(os.environ.get("DISPLAY"))
         self.remove_legacy_icons()
+        self.apply_window_layout(force=True)
         self.prime_client_quit_monitor()
         self.controlled_session_state()
         self.write_status("active", "原生托盘已注册")
@@ -1373,6 +1735,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--launcher")
     parser.add_argument("--state-dir")
     parser.add_argument("--log-file")
+    parser.add_argument("--window-layout-file")
     parser.add_argument("--icon", default=APP_ID)
     parser.add_argument("--icon-theme-path", default="")
     args = parser.parse_args()
@@ -1401,7 +1764,13 @@ def parse_args() -> argparse.Namespace:
     elif not args.check:
         missing = [
             name
-            for name in ("prefix", "launcher", "state_dir", "log_file")
+            for name in (
+                "prefix",
+                "launcher",
+                "state_dir",
+                "log_file",
+                "window_layout_file",
+            )
             if not getattr(args, name)
         ]
         if missing:

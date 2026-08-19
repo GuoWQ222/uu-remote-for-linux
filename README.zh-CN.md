@@ -12,7 +12,8 @@
 - 在 Ubuntu 24.04 中使用 UU 远程官方客户端登录并进行远程控制。
 - CPU/OpenH264 解码、实验性的 NVIDIA NVDEC 解码，以及 Linux 被控端的
   NVIDIA NVENC H.264/HEVC 硬件编码。
-- 原生 Linux 托盘菜单，支持选择解码器和自动重启。
+- 原生 Linux 托盘菜单，支持选择解码器、自动重启，以及远控窗口单主屏或
+  双屏分布布局。
 - Linux 作为被控端时支持原生鼠标、键盘和远端光标：X11 使用 XTest，
   Wayland 使用 RemoteDesktop Portal。
 - 支持自启动、防休眠、安全更新、Linux 系统代理、文件传输与远程开机兼容桥。
@@ -33,7 +34,7 @@
 下载最新的 `.deb`，然后运行：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.24_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.25_amd64.deb
 ```
 
 安装完成后，从 Ubuntu 应用菜单点击“UU 远程（Linux 版本）”，或运行

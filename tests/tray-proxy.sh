@@ -22,10 +22,159 @@ proxy = os.environ["PROXY_PATH"]
 source = Path(proxy).read_text()
 ast.parse(source, filename=proxy)
 assert '"选择解码器…"' in source
+assert '"远控窗口布局"' in source
+assert '"单窗口（主屏）"' in source
+assert '"双窗口（每屏一个）"' in source
 assert '"--select-decoder-and-restart"' in source
 assert "self.select_decoder_and_restart" in source
 namespace = runpy.run_path(proxy)
 proxy_class = namespace["TrayProxy"]
+
+with tempfile.TemporaryDirectory() as state:
+    layout_file = Path(state) / "window-layout"
+    assert namespace["read_window_layout"](layout_file) == (
+        namespace["WINDOW_LAYOUT_SINGLE"]
+    )
+    namespace["write_window_layout"](
+        layout_file, namespace["WINDOW_LAYOUT_DUAL"]
+    )
+    assert layout_file.read_text() == namespace["WINDOW_LAYOUT_DUAL"] + "\n"
+    assert namespace["read_window_layout"](layout_file) == (
+        namespace["WINDOW_LAYOUT_DUAL"]
+    )
+
+
+class LayoutArea:
+    def __init__(self, x, y, width, height):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+
+
+class LayoutMonitor:
+    def __init__(self, area):
+        self.area = LayoutArea(*area)
+
+    def get_workarea(self):
+        return self.area
+
+
+class LayoutDisplay:
+    def __init__(self):
+        self.monitors = [
+            LayoutMonitor((0, 0, 1440, 2560)),
+            LayoutMonitor((1506, 32, 2494, 1408)),
+        ]
+
+    def get_primary_monitor(self):
+        return self.monitors[1]
+
+    def get_n_monitors(self):
+        return len(self.monitors)
+
+    def get_monitor(self, index):
+        return self.monitors[index]
+
+
+layout_display = LayoutDisplay()
+
+
+class LayoutGdk:
+    class Display:
+        @staticmethod
+        def get_default():
+            return layout_display
+
+
+assert namespace["gdk_monitor_workareas"](LayoutGdk) == [
+    (1506, 32, 2494, 1408),
+    (0, 0, 1440, 2560),
+]
+
+
+class LayoutX11:
+    pid_atom = 1
+    wm_state_atom = 2
+
+    def __init__(self):
+        self.moves = []
+
+    @staticmethod
+    def windows():
+        return [0x300, 0x301, 0x302]
+
+    @staticmethod
+    def window_class(window):
+        if window in (0x300, 0x301, 0x302):
+            return "gameviewer.exe", "gameviewer.exe"
+        return "other.exe", "other.exe"
+
+    @staticmethod
+    def property_first_cardinal(window, atom):
+        if window not in (0x300, 0x301, 0x302):
+            return None
+        return 4242 if atom == 1 else 1
+
+    @staticmethod
+    def window_title(window):
+        return {
+            0x300: "DESKTOP-PRIMARY",
+            0x301: "DESKTOP-SECONDARY",
+            0x302: "网易UU远程",
+        }[window]
+
+    @staticmethod
+    def window_rect(window):
+        return {
+            0x300: (0, 0, 1200, 800),
+            0x301: (0, 0, 1000, 700),
+            0x302: (100, 100, 920, 680),
+        }[window]
+
+    def move_resize(self, window, x, y, width, height):
+        self.moves.append((window, x, y, width, height))
+
+
+class ImmediateGLib:
+    @staticmethod
+    def timeout_add(_delay, callback, *args):
+        callback(*args)
+        return 1
+
+
+layout_x11 = LayoutX11()
+layout_proxy = proxy_class.__new__(proxy_class)
+layout_proxy.x11 = layout_x11
+layout_proxy.Gdk = LayoutGdk
+layout_proxy.GLib = ImmediateGLib
+layout_proxy.prefix = "/mock-prefix"
+layout_proxy.window_layout = namespace["WINDOW_LAYOUT_SINGLE"]
+layout_proxy.window_layout_monitor_signature = ()
+layout_proxy.window_layout_state = {}
+layout_globals = namespace["mapped_remote_windows"].__globals__
+original_layout_controller_processes = layout_globals["controller_processes"]
+layout_globals["controller_processes"] = lambda *_args: {4242}
+try:
+    assert layout_proxy.apply_window_layout(force=True) == 1
+    assert layout_x11.moves == [
+        (0x300, 1506, 32, 2493, 1408),
+        (0x300, 1506, 32, 2494, 1408),
+    ]
+    layout_proxy.window_layout = namespace["WINDOW_LAYOUT_DUAL"]
+    layout_proxy.window_layout_state.clear()
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout(force=True) == 2
+    assert layout_x11.moves == [
+        (0x300, 1506, 32, 2493, 1408),
+        (0x300, 1506, 32, 2494, 1408),
+        (0x301, 0, 0, 1439, 2560),
+        (0x301, 0, 0, 1440, 2560),
+    ]
+finally:
+    layout_globals["controller_processes"] = (
+        original_layout_controller_processes
+    )
 
 
 class CompletedProcess:

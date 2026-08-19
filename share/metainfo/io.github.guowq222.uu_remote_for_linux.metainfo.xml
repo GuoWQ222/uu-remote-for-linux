@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.25" date="2026-08-19">
+      <description>
+        <p>Add persistent single-primary and dual-monitor remote-window layouts, repair Qt canvas sizing on mixed-orientation displays, and report the exact DNS, proxy, HTTP, TLS, timeout, or version-format cause when an official update check fails.</p>
+      </description>
+    </release>
     <release version="1.1.24" date="2026-08-11">
       <description>
         <p>Automatically derive fail-closed NVDEC profiles after official UU updates, validate the bridge with the real DXGI adapter and UU's own codec detector, and restore or roll back before launch if hardware decoding is not confirmed.</p>

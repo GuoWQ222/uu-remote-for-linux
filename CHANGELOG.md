@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.25] - 2026-08-19
+
+- Add a persistent native-tray remote-window layout selector. Single-window
+  mode keeps the real viewer on the primary monitor work area, while
+  dual-window mode distributes two real viewer windows across two monitors.
+- Read monitor work areas through GDK and pulse only prefix-owned remote-view
+  windows so mixed portrait/landscape setups cannot leave Qt rendering a
+  1440-pixel canvas inside a 2494-pixel primary-screen window.
+- Distinguish the UTF-8 UU home-window title from real viewer windows and retry
+  the finite reflow during viewer initialization without creating a periodic
+  resize loop.
+- Preserve and surface the exact cause of official update-check failures,
+  including DNS, proxy, connection, HTTP, TLS, timeout, reset, empty-response,
+  redirect, CA configuration, and unrecognized-version errors.
+
+## [1.1.24] - 2026-08-11
+
 - Correct the encoder-capability implementation enum: `0` is NVENC V8 and
   `1` is NVENC V11, while the previously reused NVDEC batch ID `33` falls
   through the streamer's implementation switch to `SoftWare`. Migrate only
@@ -19,8 +36,6 @@ All notable changes to this project are documented here.
 - Fail closed after an official client update unless both the offline policy
   probe and runtime hook find exactly one encoder-path accessor fingerprint;
   expose its independent call count for real-session verification.
-
-## [1.1.24] - 2026-08-11
 
 - Derive a fail-closed NVDEC `streamer.dll` patch profile automatically after
   an official UU client update when both semantic instruction fingerprints

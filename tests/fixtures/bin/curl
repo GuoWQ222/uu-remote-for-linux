@@ -7,6 +7,47 @@ request_url=""
 latest_version=${UU_REMOTE_FAKE_LATEST_VERSION:-4.34.0.8979}
 effective_url="https://a56.gdl.netease.com/UURemote_Setup_${latest_version}_0723104500_gwqd.exe?test=1"
 
+case ${UU_REMOTE_FAKE_CURL_FAILURE:-} in
+    dns)
+        printf 'curl: (6) Could not resolve host: api.nrd.nie.163.com\n' >&2
+        exit 6
+        ;;
+    dns-timeout)
+        printf 'curl: (28) Resolving timed out after 15000 milliseconds\n' >&2
+        exit 28
+        ;;
+    proxy)
+        printf 'curl: (5) Could not resolve proxy: proxy.invalid\n' >&2
+        exit 5
+        ;;
+    connect)
+        printf 'curl: (7) Failed to connect to api.nrd.nie.163.com port 443\n' >&2
+        exit 7
+        ;;
+    tls)
+        printf '%s\n' \
+            'curl: (60) SSL certificate problem: unable to get local issuer certificate' >&2
+        exit 60
+        ;;
+    http)
+        printf 'curl: (22) The requested URL returned error: 503\n' >&2
+        exit 22
+        ;;
+    reset)
+        printf 'curl: (56) Recv failure: Connection reset by peer\n' >&2
+        exit 56
+        ;;
+    version-format)
+        effective_url='https://a56.gdl.netease.com/UURemote_Setup_latest_gwqd.exe?test=1'
+        ;;
+    '')
+        ;;
+    *)
+        printf '未知的模拟 curl 故障：%s\n' "$UU_REMOTE_FAKE_CURL_FAILURE" >&2
+        exit 2
+        ;;
+esac
+
 if [[ -e /proc/$$/fd/9 ]]; then
     printf 'FD9_LEAK curl %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
 fi

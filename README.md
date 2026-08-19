@@ -15,7 +15,8 @@
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding, experimental NVIDIA NVDEC decoding, and NVIDIA
   NVENC H.264/HEVC encoding when Linux is the controlled host.
-- Native Linux tray menu with decoder selection and automatic restart.
+- Native Linux tray menu with decoder selection, automatic restart, and
+  single-primary or dual-monitor remote-window layouts.
 - Native mouse, keyboard, and remote-cursor support when Linux is controlled:
   XTest on X11, or the RemoteDesktop portal on Wayland.
 - Compatibility bridges for autostart, sleep inhibition, safe updates, the
@@ -39,7 +40,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.24_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.25_amd64.deb
 ```
 
 Then launch **UU Remote for Linux** from the Ubuntu application menu, or run

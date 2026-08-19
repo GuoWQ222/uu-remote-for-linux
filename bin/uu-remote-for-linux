@@ -136,6 +136,7 @@ readonly setup_log="$state_dir/setup.log"
 readonly runtime_log="$state_dir/runtime.log"
 readonly tray_proxy_log="$state_dir/tray-proxy.log"
 readonly tray_proxy_status="$state_dir/tray-proxy-status"
+readonly window_layout_file="$data_dir/window-layout"
 readonly autostart_log="$state_dir/autostart-bridge.log"
 readonly autostart_lock="$state_dir/autostart-bridge.lock"
 readonly autostart_desktop="$config_home/autostart/$app_id.desktop"
@@ -691,20 +692,132 @@ version_greater() {
         [[ $candidate != "$installed" ]]
 }
 
-official_latest_version() {
-    local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
-    local effective_url clean_url filename
+official_update_request_error() {
+    local curl_status=$1 source_host=$2 curl_detail=$3
+    local http_status=""
 
-    effective_url=$(curl --silent --show-error --fail --head --location \
-        --retry 2 --connect-timeout 15 --max-time 45 \
-        --output /dev/null --write-out '%{url_effective}' "$source_url" 9>&-) ||
+    if [[ $curl_detail =~ returned[[:space:]]+error:[[:space:]]+([0-9]{3}) ]]; then
+        http_status=${BASH_REMATCH[1]}
+    fi
+
+    case $curl_detail in
+        *"Could not resolve proxy"*)
+            printf '代理解析失败：无法解析当前代理服务器（curl 错误 %s）' \
+                "$curl_status"
+            return
+            ;;
+        *"Could not resolve host"*)
+            printf 'DNS 解析失败：无法解析网易官方域名 %s（curl 错误 %s）' \
+                "$source_host" "$curl_status"
+            return
+            ;;
+        *"Resolving timed out"*)
+            printf 'DNS 解析超时：未能解析网易官方域名 %s（curl 错误 %s）' \
+                "$source_host" "$curl_status"
+            return
+            ;;
+    esac
+
+    case $curl_status in
+        3)
+            printf '网易官方接口地址格式无效（curl 错误 3）'
+            ;;
+        5)
+            printf '代理解析失败：无法解析当前代理服务器（curl 错误 5）'
+            ;;
+        6)
+            printf 'DNS 解析失败：无法解析网易官方域名 %s（curl 错误 6）' \
+                "$source_host"
+            ;;
+        7)
+            printf '连接失败：无法连接网易官方接口 %s（curl 错误 7）' \
+                "$source_host"
+            ;;
+        22)
+            if [[ -n $http_status ]]; then
+                printf '网易官方接口返回 HTTP %s（curl 错误 22）' "$http_status"
+            else
+                printf '网易官方接口返回 HTTP 错误（curl 错误 22）'
+            fi
+            ;;
+        28)
+            printf '连接网易官方接口超时（curl 错误 28）'
+            ;;
+        35)
+            printf '与网易官方接口进行 TLS 握手失败（curl 错误 35）'
+            ;;
+        47)
+            printf '网易官方接口重定向次数过多（curl 错误 47）'
+            ;;
+        52)
+            printf '网易官方接口返回空响应（curl 错误 52）'
+            ;;
+        56)
+            printf '接收网易官方接口响应失败或连接被重置（curl 错误 56）'
+            ;;
+        60)
+            printf 'TLS 证书校验失败：系统不信任网易官方接口返回的证书链（curl 错误 60）'
+            ;;
+        77)
+            printf 'TLS CA 证书配置不可用（curl 错误 77）'
+            ;;
+        *)
+            printf '请求网易官方接口失败（curl 错误 %s）' "$curl_status"
+            ;;
+    esac
+}
+
+official_latest_version() {
+    local version_variable=$1 error_variable=$2
+    local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+    local source_host effective_url clean_url filename
+    local curl_error_file curl_detail="" curl_status=0
+
+    printf -v "$version_variable" '%s' ""
+    printf -v "$error_variable" '%s' ""
+    source_host=${source_url#*://}
+    source_host=${source_host%%/*}
+    source_host=${source_host%%:*}
+
+    curl_error_file=$(mktemp "$state_dir/.official-version-curl.XXXXXX") || {
+        printf -v "$error_variable" '%s' \
+            '无法创建官方版本检查的临时错误文件'
         return 1
+    }
+    if effective_url=$(curl --silent --show-error --fail --head --location \
+        --retry 2 --connect-timeout 15 --max-time 45 \
+        --output /dev/null --write-out '%{url_effective}' "$source_url" \
+        2>"$curl_error_file" 9>&-); then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
+    curl_detail=$(<"$curl_error_file")
+    rm -f -- "$curl_error_file"
+
+    if ((curl_status != 0)); then
+        printf -v "$error_variable" '%s' \
+            "$(official_update_request_error \
+                "$curl_status" "$source_host" "$curl_detail")"
+        return 1
+    fi
+    if [[ -z $effective_url ]]; then
+        printf -v "$error_variable" '%s' \
+            '网易官方接口已响应，但没有返回最终下载地址'
+        return 1
+    fi
+
     clean_url=${effective_url%%\?*}
     filename=${clean_url##*/}
     if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
+        printf -v "$version_variable" '%s' "${BASH_REMATCH[1]}"
         return
     fi
+    filename=${filename//$'\n'/ }
+    filename=${filename//$'\r'/ }
+    printf -v "$error_variable" \
+        '网易官方接口已响应，但下载文件名无法识别版本（文件名：%.160s）' \
+        "${filename:-空}"
     return 1
 }
 
@@ -2220,6 +2333,7 @@ start_tray_proxy() {
         --launcher "$launcher_path"
         --state-dir "$state_dir"
         --log-file "$tray_proxy_log"
+        --window-layout-file "$window_layout_file"
         --icon "$app_id"
     )
     if systemd_user_available; then
@@ -4289,7 +4403,7 @@ run_update_transaction() {
 }
 
 perform_update_check() {
-    local installed latest
+    local installed latest="" check_error=""
 
     app_files_present ||
         die "UU 客户端尚未安装，无法检查更新"
@@ -4297,10 +4411,11 @@ perform_update_check() {
     [[ -n $installed ]] || die "无法读取当前 UU 版本"
 
     notify_status "正在检查 UU 官方更新"
-    latest=$(official_latest_version) || {
-        write_update_status error "$installed" unknown "无法解析网易官方发布版本"
-        die "无法从网易官方接口解析最新版本；现有客户端未作修改"
-    }
+    if ! official_latest_version latest check_error; then
+        check_error=${check_error:-官方版本检查失败，未返回具体原因}
+        write_update_status error "$installed" unknown "$check_error"
+        die "检查网易官方版本失败：$check_error；现有客户端未作修改"
+    fi
     if ! version_greater "$latest" "$installed"; then
         write_update_status up-to-date "$installed" "$latest" "无需更新"
         printf 'UU 当前版本 %s，官方版本 %s；无需更新。\n' \
