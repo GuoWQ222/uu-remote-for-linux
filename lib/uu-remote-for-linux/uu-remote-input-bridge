@@ -49,6 +49,7 @@ MOUSE_XDOWN = 0x0080
 MOUSE_XUP = 0x0100
 MOUSE_WHEEL = 0x0800
 MOUSE_HWHEEL = 0x1000
+MOUSE_VIRTUAL_DESKTOP = 0x4000
 MOUSE_ABSOLUTE = 0x8000
 MOUSE_BUTTON_FLAGS = (
     MOUSE_LEFTDOWN
@@ -68,8 +69,10 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 3
+STATE_VERSION = 5
 DEFAULT_RELEASE_TIMEOUT = 15.0
+X11_MONITOR_REFRESH_SECONDS = 2.0
+XKB_USE_CORE_KBD = 0x0100
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
 PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
@@ -134,6 +137,128 @@ class Logger:
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(f"[{timestamp}] {message}\n")
+
+
+def map_absolute_point(
+    dx: int,
+    dy: int,
+    geometry: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Map Win32 0..65535 absolute input into one X11 monitor rectangle."""
+    origin_x, origin_y, width, height = geometry
+    if width <= 0 or height <= 0:
+        raise ValueError("显示器坐标范围无效")
+    normalized_x = max(0, min(int(dx), 65535))
+    normalized_y = max(0, min(int(dy), 65535))
+    x = origin_x + round(normalized_x * (width - 1) / 65535)
+    y = origin_y + round(normalized_y * (height - 1) / 65535)
+    return x, y
+
+
+def x11_monitor_descriptors() -> list[dict[str, Any]]:
+    """Return every X11 monitor with a stable connector-derived identity."""
+    try:
+        import gi
+
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk
+    except (ImportError, ValueError):
+        return []
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        return []
+    primary = display.get_primary_monitor()
+    descriptors: list[dict[str, Any]] = []
+    duplicate_counts: dict[str, int] = {}
+    for index in range(display.get_n_monitors()):
+        monitor = display.get_monitor(index)
+        if monitor is None:
+            continue
+        rectangle = monitor.get_geometry()
+        geometry = (
+            int(rectangle.x),
+            int(rectangle.y),
+            int(rectangle.width),
+            int(rectangle.height),
+        )
+        if geometry[2] <= 0 or geometry[3] <= 0:
+            continue
+        manufacturer = (monitor.get_manufacturer() or "").strip()
+        model = (monitor.get_model() or "").strip()
+        base_id = f"{manufacturer}|{model}" if manufacturer or model else (
+            f"monitor-{index + 1}"
+        )
+        duplicate_counts[base_id] = duplicate_counts.get(base_id, 0) + 1
+        occurrence = duplicate_counts[base_id]
+        monitor_id = base_id if occurrence == 1 else f"{base_id}#{occurrence}"
+        descriptors.append(
+            {
+                "id": monitor_id,
+                "index": index,
+                "manufacturer": manufacturer,
+                "model": model,
+                "geometry": geometry,
+                "primary": monitor == primary,
+            }
+        )
+    return descriptors
+
+
+def read_monitor_selection(path: Path | None) -> str:
+    if path is None:
+        return "primary"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "primary"
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return "primary"
+    monitor_id = payload.get("monitor_id")
+    if not isinstance(monitor_id, str) or not monitor_id.strip():
+        return "primary"
+    return monitor_id.strip()
+
+
+def x11_selected_monitor(
+    selection_path: Path | None,
+) -> tuple[
+    str,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+] | None:
+    descriptors = x11_monitor_descriptors()
+    if not descriptors:
+        return None
+    selected_id = read_monitor_selection(selection_path)
+    selected = None
+    if selected_id != "primary":
+        for descriptor in descriptors:
+            if descriptor["id"] == selected_id:
+                selected = descriptor
+                break
+    primary = next(
+        (descriptor for descriptor in descriptors if descriptor["primary"]),
+        descriptors[0],
+    )
+    if selected is None:
+        selected_id = "primary"
+        selected = primary
+    geometry = selected["geometry"]
+    primary_geometry = primary["geometry"]
+    # Wine exposes the X11 primary monitor at (0, 0), even when that monitor
+    # has a non-zero XRandR origin.  GetCursorPos/GetCursorInfo therefore use
+    # coordinates relative to the primary monitor rather than X11 root
+    # coordinates.  Publish the selected monitor in that exact coordinate
+    # system so the hook can transform the final native cursor position back
+    # to screen-local coordinates without guessing from an input packet.
+    feedback_geometry = (
+        geometry[0] - primary_geometry[0],
+        geometry[1] - primary_geometry[1],
+        geometry[2],
+        geometry[3],
+    )
+    return selected_id, geometry, feedback_geometry
 
 
 VK_KEYSYMS = {
@@ -264,7 +389,8 @@ ASCII_KEYSYMS = {
 class XTestBackend:
     name = "x11-xtest"
 
-    def __init__(self) -> None:
+    def __init__(self, monitor_selection_path: Path | None = None) -> None:
+        self.monitor_selection_path = monitor_selection_path
         self.x11 = ctypes.CDLL(
             os.environ.get("UU_REMOTE_INPUT_BRIDGE_X11_LIBRARY", "libX11.so.6")
         )
@@ -293,6 +419,12 @@ class XTestBackend:
         ):
             self.close()
             raise RuntimeError("当前 X11 服务器不支持 XTEST 扩展")
+        self.absolute_geometry = self.virtual_desktop_geometry()
+        self.virtual_geometry = self.absolute_geometry
+        self.absolute_geometry_source = "virtual-desktop-fallback"
+        self.cursor_feedback_geometry = self.absolute_geometry
+        self.geometry_checked_at = 0.0
+        self.refresh_absolute_geometry(force=True)
 
     def _configure_signatures(self) -> None:
         self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -308,6 +440,12 @@ class XTestBackend:
         self.x11.XStringToKeysym.restype = ctypes.c_ulong
         self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         self.x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        self.x11.XkbGetIndicatorState.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self.x11.XkbGetIndicatorState.restype = ctypes.c_int
         self.x11.XFlush.argtypes = [ctypes.c_void_p]
 
         self.xtst.XTestQueryExtension.argtypes = [
@@ -356,12 +494,50 @@ class XTestBackend:
     def flush(self) -> None:
         self.x11.XFlush(self.display)
 
-    def motion(self, dx: int, dy: int, absolute: bool) -> None:
+    def virtual_desktop_geometry(self) -> tuple[int, int, int, int]:
+        return (
+            0,
+            0,
+            max(self.x11.XDisplayWidth(self.display, self.screen), 1),
+            max(self.x11.XDisplayHeight(self.display, self.screen), 1),
+        )
+
+    def refresh_absolute_geometry(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and now - self.geometry_checked_at
+            < X11_MONITOR_REFRESH_SECONDS
+        ):
+            return
+        self.geometry_checked_at = now
+        self.virtual_geometry = self.virtual_desktop_geometry()
+        selected = x11_selected_monitor(self.monitor_selection_path)
+        if selected is not None:
+            monitor_id, geometry, feedback_geometry = selected
+            self.absolute_geometry = geometry
+            self.absolute_geometry_source = f"monitor:{monitor_id}"
+            self.cursor_feedback_geometry = feedback_geometry
+        else:
+            self.absolute_geometry = self.virtual_geometry
+            self.absolute_geometry_source = "virtual-desktop-fallback"
+            self.cursor_feedback_geometry = self.absolute_geometry
+
+    def motion(
+        self,
+        dx: int,
+        dy: int,
+        absolute: bool,
+        virtual_desktop: bool = False,
+    ) -> None:
         if absolute:
-            width = max(self.x11.XDisplayWidth(self.display, self.screen), 1)
-            height = max(self.x11.XDisplayHeight(self.display, self.screen), 1)
-            x = round(max(0, min(dx, 65535)) * (width - 1) / 65535)
-            y = round(max(0, min(dy, 65535)) * (height - 1) / 65535)
+            self.refresh_absolute_geometry()
+            geometry = (
+                self.virtual_geometry
+                if virtual_desktop
+                else self.absolute_geometry
+            )
+            x, y = map_absolute_point(dx, dy, geometry)
             result = self.xtst.XTestFakeMotionEvent(
                 self.display, self.screen, x, y, 0
             )
@@ -385,6 +561,18 @@ class XTestBackend:
             self.display, keycode, int(pressed), 0
         ):
             raise RuntimeError(f"XTest 键盘键码 {keycode} 注入失败")
+
+    def lock_mask(self) -> int | None:
+        indicators = ctypes.c_uint()
+        if self.x11.XkbGetIndicatorState(
+            self.display,
+            XKB_USE_CORE_KBD,
+            ctypes.byref(indicators),
+        ) != 0:
+            return None
+        # XKB core indicators 0/1/2 are Caps/Num/Scroll Lock.  Restrict the
+        # published value to the three Win32 toggle keys mirrored by the hook.
+        return int(indicators.value & 0x7)
 
     def keysym_keycode(self, name: str) -> int:
         keysym = self.x11.XStringToKeysym(name.encode("ascii"))
@@ -959,7 +1147,14 @@ class WaylandPortalBackend:
     def flush(self) -> None:
         return
 
-    def motion(self, dx: int, dy: int, absolute: bool) -> None:
+    def motion(
+        self,
+        dx: int,
+        dy: int,
+        absolute: bool,
+        virtual_desktop: bool = False,
+    ) -> None:
+        del virtual_desktop
         options = {}
         if absolute:
             x = max(0, min(dx, 65535)) * (self.stream_width - 1) / 65535
@@ -1021,6 +1216,54 @@ class FakeBackend:
 
     def __init__(self, trace_path: Path):
         self.trace_path = trace_path
+        self.fake_lock_mask = int(
+            os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK", "0"), 0
+        ) & 0x7
+        fake_geometry = os.environ.get(
+            "UU_REMOTE_INPUT_BRIDGE_FAKE_GEOMETRY", ""
+        )
+        if fake_geometry:
+            values = tuple(int(value) for value in fake_geometry.split(","))
+            if len(values) != 4 or values[2] <= 0 or values[3] <= 0:
+                raise ValueError("测试显示器坐标必须是 x,y,width,height")
+            self.absolute_geometry = values
+            fake_virtual_geometry = os.environ.get(
+                "UU_REMOTE_INPUT_BRIDGE_FAKE_VIRTUAL_GEOMETRY", ""
+            )
+            if fake_virtual_geometry:
+                virtual_values = tuple(
+                    int(value) for value in fake_virtual_geometry.split(",")
+                )
+                if (
+                    len(virtual_values) != 4
+                    or virtual_values[2] <= 0
+                    or virtual_values[3] <= 0
+                ):
+                    raise ValueError(
+                        "测试虚拟桌面坐标必须是 x,y,width,height"
+                    )
+                self.virtual_geometry = virtual_values
+            else:
+                self.virtual_geometry = values
+            self.absolute_geometry_source = "test-monitor"
+            fake_feedback_geometry = os.environ.get(
+                "UU_REMOTE_INPUT_BRIDGE_FAKE_CURSOR_GEOMETRY", ""
+            )
+            if fake_feedback_geometry:
+                feedback_values = tuple(
+                    int(value) for value in fake_feedback_geometry.split(",")
+                )
+                if (
+                    len(feedback_values) != 4
+                    or feedback_values[2] <= 0
+                    or feedback_values[3] <= 0
+                ):
+                    raise ValueError(
+                        "测试光标反馈坐标必须是 x,y,width,height"
+                    )
+                self.cursor_feedback_geometry = feedback_values
+            else:
+                self.cursor_feedback_geometry = (0, 0, values[2], values[3])
 
     def _write(self, event: str) -> None:
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1033,14 +1276,36 @@ class FakeBackend:
     def flush(self) -> None:
         self._write("flush")
 
-    def motion(self, dx: int, dy: int, absolute: bool) -> None:
-        self._write(f"motion {dx} {dy} {int(absolute)}")
+    def motion(
+        self,
+        dx: int,
+        dy: int,
+        absolute: bool,
+        virtual_desktop: bool = False,
+    ) -> None:
+        self._write(
+            f"motion {dx} {dy} {int(absolute)} {int(virtual_desktop)}"
+        )
+        if absolute and hasattr(self, "absolute_geometry"):
+            geometry = (
+                self.virtual_geometry
+                if virtual_desktop
+                else self.absolute_geometry
+            )
+            x, y = map_absolute_point(dx, dy, geometry)
+            self._write(f"motion-target {x} {y}")
 
     def button(self, button: int, pressed: bool) -> None:
         self._write(f"button {button} {int(pressed)}")
 
     def keycode(self, keycode: int, pressed: bool) -> None:
         self._write(f"keycode {keycode} {int(pressed)}")
+        if pressed:
+            lock_bit = {66: 0x1, 77: 0x2, 78: 0x4}.get(keycode, 0)
+            self.fake_lock_mask ^= lock_bit
+
+    def lock_mask(self) -> int:
+        return self.fake_lock_mask
 
     @staticmethod
     def keysym_keycode(name: str) -> int:
@@ -1051,6 +1316,9 @@ class FakeBackend:
         return {
             "Shift_L": 50,
             "Control_L": 37,
+            "Caps_Lock": 66,
+            "Num_Lock": 77,
+            "Scroll_Lock": 78,
             "Return": 36,
             "space": 65,
             "Left": 113,
@@ -1070,6 +1338,7 @@ def selected_backend() -> str:
 def make_backend(
     state_dir: Path | None = None,
     frame_path: Path | None = None,
+    monitor_selection_path: Path | None = None,
 ):
     fake_trace = os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE")
     if fake_trace:
@@ -1080,7 +1349,7 @@ def make_backend(
         if frame_path is None:
             raise RuntimeError("Wayland 画面桥缺少共享帧路径")
         return WaylandPortalBackend(state_dir, frame_path)
-    return XTestBackend()
+    return XTestBackend(monitor_selection_path)
 
 
 class InputController:
@@ -1089,6 +1358,7 @@ class InputController:
         self.logger = logger
         self.pressed_keys: set[int] = set()
         self.pressed_buttons: set[int] = set()
+        self.last_absolute_space = ""
 
     def emit_keycode(self, keycode: int, pressed: bool) -> None:
         if not keycode:
@@ -1202,7 +1472,21 @@ class InputController:
         flags: int,
     ) -> None:
         if flags & MOUSE_MOVE:
-            self.backend.motion(dx, dy, bool(flags & MOUSE_ABSOLUTE))
+            absolute = bool(flags & MOUSE_ABSOLUTE)
+            virtual_desktop = bool(flags & MOUSE_VIRTUAL_DESKTOP)
+            if absolute:
+                space = (
+                    "virtual-desktop"
+                    if virtual_desktop
+                    else "selected-monitor"
+                )
+                if space != self.last_absolute_space:
+                    self.logger.write(
+                        "绝对鼠标坐标域："
+                        f"{space}（flags=0x{flags:04x}）"
+                    )
+                    self.last_absolute_space = space
+            self.backend.motion(dx, dy, absolute, virtual_desktop)
         for mask, button, pressed in (
             (MOUSE_LEFTDOWN, 1, True),
             (MOUSE_LEFTUP, 1, False),
@@ -1242,15 +1526,68 @@ class InputController:
         self.pressed_buttons.clear()
 
 
-def endpoint_content(port: int, token: bytes) -> str:
-    return (
+def cursor_feedback_geometry(
+    backend,
+) -> tuple[int, int, int, int] | None:
+    geometry = getattr(backend, "cursor_feedback_geometry", None)
+    if geometry is None:
+        absolute_geometry = getattr(backend, "absolute_geometry", None)
+        if absolute_geometry is not None and len(absolute_geometry) == 4:
+            geometry = (0, 0, absolute_geometry[2], absolute_geometry[3])
+    if geometry is not None and len(geometry) == 4:
+        origin_x = int(geometry[0])
+        origin_y = int(geometry[1])
+        width = int(geometry[2])
+        height = int(geometry[3])
+    elif hasattr(backend, "stream_width") and hasattr(
+        backend, "stream_height"
+    ):
+        origin_x = 0
+        origin_y = 0
+        width = int(backend.stream_width)
+        height = int(backend.stream_height)
+    else:
+        return None
+    if (
+        not -(2**31) <= origin_x < 2**31
+        or not -(2**31) <= origin_y < 2**31
+        or not 1 <= width <= 65535
+        or not 1 <= height <= 65535
+    ):
+        return None
+    return origin_x, origin_y, width, height
+
+
+def endpoint_content(
+    port: int,
+    token: bytes,
+    cursor_geometry: tuple[int, int, int, int] | None = None,
+    native_lock_keys: bool = False,
+    lock_mask: int | None = None,
+) -> str:
+    content = (
         "[bridge]\n"
         f"version={PROTOCOL_VERSION}\n"
         f"port={port}\n"
         f"token={token.hex()}\n"
         "force_cursor=1\n"
-        f"pid={os.getpid()}\n"
+        f"native_lock_keys={int(native_lock_keys)}\n"
     )
+    if lock_mask is not None:
+        content += (
+            "lock_state_valid=1\n"
+            f"lock_mask={lock_mask & 0x7}\n"
+        )
+    if cursor_geometry is not None:
+        origin_x, origin_y, width, height = cursor_geometry
+        content += (
+            "cursor_space=screen-local\n"
+            f"cursor_origin_x={origin_x}\n"
+            f"cursor_origin_y={origin_y}\n"
+            f"cursor_width={width}\n"
+            f"cursor_height={height}\n"
+        )
+    return content + f"pid={os.getpid()}\n"
 
 
 def status_paths(state_dir: Path) -> dict[str, Path]:
@@ -1276,6 +1613,8 @@ def write_status(
     portal_stream: int = 0,
     capture_state: str = "inactive",
     capture_frames: int = 0,
+    absolute_target: tuple[int, int, int, int] | None = None,
+    absolute_target_source: str = "",
     detail: str = "",
 ) -> None:
     atomic_write_json(
@@ -1296,10 +1635,21 @@ def write_status(
             "last_mouse_dx": last_mouse_dx,
             "last_mouse_dy": last_mouse_dy,
             "last_mouse_flags": last_mouse_flags,
+            "last_mouse_coordinate_space": (
+                "virtual-desktop"
+                if last_mouse_flags & MOUSE_VIRTUAL_DESKTOP
+                else "selected-monitor"
+                if last_mouse_flags & MOUSE_ABSOLUTE
+                else "relative"
+            ),
             "backend": backend,
             "portal_stream": portal_stream,
             "capture_state": capture_state,
             "capture_frames": capture_frames,
+            "absolute_target": (
+                list(absolute_target) if absolute_target is not None else None
+            ),
+            "absolute_target_source": absolute_target_source,
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
@@ -1343,6 +1693,7 @@ def watch(
     log_path: Path,
     lock_path: Path,
     release_timeout: float,
+    monitor_selection_path: Path | None = None,
 ) -> int:
     logger = Logger(log_path)
     status_path = status_paths(state_dir)["status"]
@@ -1375,6 +1726,8 @@ def watch(
     capture_state = "inactive"
     last_event = 0.0
     last_status = 0.0
+    endpoint_cursor_geometry: tuple[int, int, int, int] | None = None
+    endpoint_lock_mask: int | None = None
 
     def publish_status(state: str, detail: str = "") -> None:
         current_capture_frames = int(
@@ -1399,12 +1752,51 @@ def watch(
             portal_stream=portal_stream,
             capture_state=capture_state,
             capture_frames=current_capture_frames,
+            absolute_target=getattr(backend, "absolute_geometry", None),
+            absolute_target_source=str(
+                getattr(backend, "absolute_geometry_source", "")
+            ),
             detail=detail,
         )
 
     def request_stop(_signum, _frame) -> None:
         nonlocal running
         running = False
+
+    def sync_endpoint(force: bool = False) -> None:
+        nonlocal endpoint_cursor_geometry, endpoint_lock_mask
+        if backend is None or port == 0:
+            return
+        if hasattr(backend, "refresh_absolute_geometry"):
+            backend.refresh_absolute_geometry()
+        current_geometry = cursor_feedback_geometry(backend)
+        current_lock_mask = (
+            backend.lock_mask() if hasattr(backend, "lock_mask") else None
+        )
+        if (
+            not force
+            and current_geometry == endpoint_cursor_geometry
+            and current_lock_mask == endpoint_lock_mask
+        ):
+            return
+        atomic_write(
+            endpoint,
+            endpoint_content(
+                port,
+                token,
+                current_geometry,
+                selected_backend() == "x11",
+                current_lock_mask,
+            ),
+        )
+        endpoint_cursor_geometry = current_geometry
+        endpoint_lock_mask = current_lock_mask
+        if current_geometry is not None:
+            logger.write(
+                "UU 光标反馈坐标已同步为所选屏幕局部范围："
+                f"origin=({current_geometry[0]},{current_geometry[1]}) "
+                f"size={current_geometry[2]}x{current_geometry[3]}"
+            )
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -1420,16 +1812,25 @@ def watch(
         backend = make_backend(
             state_dir,
             endpoint.parent / "uu-remote-wayland-frame.bin",
+            monitor_selection_path,
         )
         backend_name = getattr(backend, "name", selected_backend())
         portal_stream = int(getattr(backend, "stream_node", 0))
         capture_state = str(getattr(backend, "capture_state", "inactive"))
+        absolute_target = getattr(backend, "absolute_geometry", None)
+        if absolute_target is not None:
+            origin_x, origin_y, width, height = absolute_target
+            logger.write(
+                "X11 绝对鼠标坐标目标："
+                f"{getattr(backend, 'absolute_geometry_source', 'unknown')} "
+                f"{width}x{height}+{origin_x}+{origin_y}"
+            )
         controller = InputController(backend, logger)
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(("127.0.0.1", 0))
         listener.settimeout(0.25)
         port = int(listener.getsockname()[1])
-        atomic_write(endpoint, endpoint_content(port, token))
+        sync_endpoint(force=True)
         publish_status("waiting-hook")
         logger.write(
             f"{backend_name} 原生输入桥已启动，监听回环端口 {port}；"
@@ -1437,6 +1838,7 @@ def watch(
         )
 
         while running:
+            sync_endpoint()
             try:
                 data, address = listener.recvfrom(512)
             except socket.timeout:
@@ -1577,6 +1979,12 @@ def main() -> int:
         type=float,
         default=DEFAULT_RELEASE_TIMEOUT,
     )
+    watch_parser.add_argument(
+        "monitor_selection_file",
+        nargs="?",
+        type=Path,
+        default=None,
+    )
 
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("state_dir", type=Path)
@@ -1593,6 +2001,7 @@ def main() -> int:
             arguments.log,
             arguments.lock,
             arguments.release_timeout,
+            arguments.monitor_selection_file,
         )
     if arguments.mode == "status":
         return print_status(arguments.state_dir)

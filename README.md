@@ -28,8 +28,8 @@
 - Sign in to the official UU Remote client and use remote control on Ubuntu 24.04.
 - CPU/OpenH264 decoding, experimental NVIDIA NVDEC decoding, and NVIDIA
   NVENC H.264/HEVC encoding when Linux is the controlled host.
-- Native Linux tray menu with decoder selection, automatic restart, and
-  single-primary or dual-monitor remote-window layouts.
+- Native Linux tray menu with controlled-display selection, decoder selection,
+  automatic restart, and single-primary or dual-monitor remote-window layouts.
 - Native mouse, keyboard, and remote-cursor support when Linux is controlled:
   XTest on X11, or the RemoteDesktop portal on Wayland.
 - Compatibility bridges for autostart, sleep inhibition, safe updates, the
@@ -53,7 +53,7 @@ Download the latest `.deb` from
 then run:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.25_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.26_amd64.deb
 ```
 
 Then launch **UU Remote for Linux** from the Ubuntu application menu, or run
@@ -83,6 +83,11 @@ or system tray to open these actions:
 
 - **显示主界面 (Show main window)** — restores the hidden or minimized UU main
   window.
+- **被控屏幕 (Controlled display)** — selects which Ubuntu monitor receives
+  absolute mouse coordinates while this machine is controlled. It defaults to
+  the primary display, lists every detected monitor by connector and
+  resolution, and follows hot-plug, rotation, and layout changes. Select the
+  same monitor when the Windows viewer switches the UU video track.
 - **远控窗口布局 (Remote-window layout)** — selects and remembers how existing
   remote viewer windows are arranged:
   - **单窗口（主屏） (Single window, primary display)** places the first viewer

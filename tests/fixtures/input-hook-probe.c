@@ -7,7 +7,9 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 
-typedef int(WINAPI *probe_streamer_cursor_fn)(LONG, LONG, LONG, LONG);
+typedef int(WINAPI *probe_streamer_cursor_fn)(
+    LONG, LONG, LONG, LONG, DWORD
+);
 typedef int(WINAPI *probe_streamer_frame_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
 typedef DWORD(WINAPI *frame_hook_status_fn)(void);
@@ -174,6 +176,43 @@ static int close_enough(LONG actual, LONG expected) {
     return difference >= -1 && difference <= 1;
 }
 
+static int set_lock_state(int virtual_key, int enabled) {
+    INPUT inputs[2];
+    int current = (GetKeyState(virtual_key) & 1) != 0;
+
+    if (current == enabled) {
+        return 0;
+    }
+    ZeroMemory(inputs, sizeof(inputs));
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = (WORD)virtual_key;
+    inputs[1] = inputs[0];
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(2, inputs, sizeof(INPUT)) == 2 ? 0 : 10;
+}
+
+static int probe_caps_lock_state(void) {
+    SHORT initial;
+    SHORT toggled;
+    SHORT restored;
+
+    initial = GetKeyState(VK_CAPITAL);
+    if (set_lock_state(VK_CAPITAL, (initial & 1) == 0)) {
+        return 10;
+    }
+    Sleep(100);
+    toggled = GetKeyState(VK_CAPITAL);
+    if (((initial ^ toggled) & 1) == 0) {
+        return 10;
+    }
+    if (set_lock_state(VK_CAPITAL, (initial & 1) != 0)) {
+        return 10;
+    }
+    Sleep(100);
+    restored = GetKeyState(VK_CAPITAL);
+    return ((initial ^ restored) & 1) == 0 ? 0 : 10;
+}
+
 static int probe_frame_capture(BOOL stretch) {
     const int width = 128;
     const int height = 72;
@@ -240,7 +279,6 @@ int WINAPI WinMain(
     int show
 ) {
     INPUT input;
-    CURSORINFO cursor;
     POINT position;
     LONG expected_x;
     LONG expected_y;
@@ -318,39 +356,66 @@ int WINAPI WinMain(
     ) {
         return 9;
     }
+    if (probe_caps_lock_state()) {
+        return 10;
+    }
+
+    /* The fixture's final USER32/Wine cursor position is (500, 300). */
+    if (!SetCursorPos(500, 300)) {
+        return 3;
+    }
 
     ZeroMemory(&input, sizeof(input));
     input.type = INPUT_MOUSE;
     input.mi.dx = 32768;
     input.mi.dy = 16384;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+        MOUSEEVENTF_VIRTUALDESK;
     if (SendInput(1, &input, sizeof(input)) != 1) {
         return 2;
     }
-    expected_x = (LONG)(
-        (32768LL * (GetSystemMetrics(SM_CXSCREEN) - 1) + 32767) /
-        65535
-    );
-    expected_y = (LONG)(
-        (16384LL * (GetSystemMetrics(SM_CYSCREEN) - 1) + 32767) /
-        65535
-    );
+    expected_x = 500;
+    expected_y = 300;
     streamer_result = probe_streamer_cursor(
-        32768, 16384, expected_x, expected_y
+        32768,
+        16384,
+        expected_x,
+        expected_y,
+        MOUSEEVENTF_VIRTUALDESK
     );
     if (streamer_result != 0) {
         return streamer_result;
     }
 
-    ZeroMemory(&cursor, sizeof(cursor));
-    cursor.cbSize = sizeof(cursor);
+    /*
+     * UU 4.37 no longer imports GetCursorInfo in GameViewerServer.exe.  The
+     * cursor query lives in streamer.dll, where ProbeStreamerCursor verifies
+     * the required hook.  Keep this executable free of that redundant import
+     * so the integration test matches the official module split.
+     */
     if (
-        !GetCursorInfo(&cursor) ||
-        cursor.flags != CURSOR_SHOWING ||
-        !close_enough(cursor.ptScreenPos.x, expected_x) ||
-        !close_enough(cursor.ptScreenPos.y, expected_y)
+        !GetCursorPos(&position) ||
+        !close_enough(position.x, expected_x) ||
+        !close_enough(position.y, expected_y)
     ) {
-        return 3;
+        return 4;
+    }
+
+    /*
+     * Without VIRTUALDESK, the same real cursor is exposed in the configured
+     * monitor-local space.  That monitor starts at (100, 50).
+     */
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    if (SendInput(1, &input, sizeof(input)) != 1) {
+        return 2;
+    }
+    expected_x = 400;
+    expected_y = 250;
+    streamer_result = probe_streamer_cursor(
+        32768, 16384, expected_x, expected_y, 0
+    );
+    if (streamer_result != 0) {
+        return streamer_result;
     }
     if (
         !GetCursorPos(&position) ||

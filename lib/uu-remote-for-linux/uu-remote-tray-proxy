@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import fcntl
+import json
 import logging
 import os
 from pathlib import Path
@@ -393,6 +394,87 @@ def write_window_layout(path: Path, value: str) -> None:
     os.replace(temporary, path)
 
 
+def gdk_monitor_descriptors(gdk) -> list[dict[str, object]]:
+    """Enumerate every monitor with a connector-derived stable identity."""
+
+    display = gdk.Display.get_default()
+    if display is None:
+        return []
+    primary = display.get_primary_monitor()
+    descriptors: list[dict[str, object]] = []
+    duplicate_counts: dict[str, int] = {}
+    for index in range(display.get_n_monitors()):
+        monitor = display.get_monitor(index)
+        if monitor is None:
+            continue
+        geometry = monitor.get_geometry()
+        rectangle = (
+            int(geometry.x),
+            int(geometry.y),
+            int(geometry.width),
+            int(geometry.height),
+        )
+        if rectangle[2] <= 0 or rectangle[3] <= 0:
+            continue
+        manufacturer = (monitor.get_manufacturer() or "").strip()
+        model = (monitor.get_model() or "").strip()
+        base_id = f"{manufacturer}|{model}" if manufacturer or model else (
+            f"monitor-{index + 1}"
+        )
+        duplicate_counts[base_id] = duplicate_counts.get(base_id, 0) + 1
+        occurrence = duplicate_counts[base_id]
+        monitor_id = base_id if occurrence == 1 else f"{base_id}#{occurrence}"
+        descriptors.append(
+            {
+                "id": monitor_id,
+                "index": index,
+                "manufacturer": manufacturer,
+                "model": model,
+                "geometry": rectangle,
+                "primary": monitor == primary,
+            }
+        )
+    return descriptors
+
+
+def read_monitor_selection(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "primary"
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return "primary"
+    monitor_id = payload.get("monitor_id")
+    if not isinstance(monitor_id, str) or not monitor_id.strip():
+        return "primary"
+    return monitor_id.strip()
+
+
+def write_monitor_selection(path: Path, monitor_id: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f".tmp.{os.getpid()}")
+    temporary.write_text(
+        json.dumps(
+            {"version": 1, "monitor_id": monitor_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def monitor_menu_label(descriptor: dict[str, object]) -> str:
+    _x, _y, width, height = descriptor["geometry"]
+    name = str(descriptor["model"] or descriptor["manufacturer"])
+    if not name:
+        name = f"显示器 {int(descriptor['index']) + 1}"
+    suffix = "（主显示器）" if descriptor["primary"] else ""
+    return f"{name} — {width}×{height}{suffix}"
+
+
 def is_home_window_title(title: str) -> bool:
     compact = "".join(title.split()).casefold()
     return compact in {"gameviewer", "网易uu远程"}
@@ -713,6 +795,10 @@ class TrayProxy:
         self.state_dir = Path(args.state_dir)
         self.window_layout_file = Path(args.window_layout_file)
         self.window_layout = read_window_layout(self.window_layout_file)
+        self.monitor_selection_file = Path(args.monitor_selection_file)
+        self.controlled_monitor_id = read_monitor_selection(
+            self.monitor_selection_file
+        )
         self.status_file = self.state_dir / "tray-proxy-status"
         self.log_file = Path(args.log_file)
         self.x11: X11 | None = None
@@ -720,6 +806,9 @@ class TrayProxy:
         self.decoder_item = None
         self.single_layout_item = None
         self.dual_layout_item = None
+        self.controlled_monitor_menu = None
+        self.controlled_monitor_menu_signature: tuple[object, ...] = ()
+        self.controlled_monitor_items: list[object] = []
         self.decoder_process: subprocess.Popen | None = None
         self.Gtk = None
         self.GLib = None
@@ -1151,6 +1240,8 @@ class TrayProxy:
                     f"{getattr(self, 'controller_recovery_deferred', 0)}",
                     "window_layout="
                     f"{getattr(self, 'window_layout', WINDOW_LAYOUT_SINGLE)}",
+                    "controlled_monitor="
+                    f"{getattr(self, 'controlled_monitor_id', 'primary')}",
                     f"detail={detail.replace(chr(10), ' ')}",
                     f"updated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
                     "",
@@ -1190,6 +1281,12 @@ class TrayProxy:
         show_item = self.Gtk.MenuItem.new_with_label("显示主界面")
         show_item.connect("activate", self.show_main_window)
         menu.append(show_item)
+
+        monitor_item = self.Gtk.MenuItem.new_with_label("被控屏幕")
+        self.controlled_monitor_menu = self.Gtk.Menu()
+        monitor_item.set_submenu(self.controlled_monitor_menu)
+        menu.append(monitor_item)
+        self.refresh_controlled_monitor_menu(force=True)
 
         layout_item = self.Gtk.MenuItem.new_with_label("远控窗口布局")
         layout_menu = self.Gtk.Menu()
@@ -1231,6 +1328,75 @@ class TrayProxy:
         menu.append(exit_item)
         menu.show_all()
         self.indicator.set_menu(menu)
+
+    def select_controlled_monitor(self, item, monitor_id: str) -> None:
+        if not item.get_active():
+            return
+        if monitor_id == self.controlled_monitor_id:
+            return
+        write_monitor_selection(self.monitor_selection_file, monitor_id)
+        self.controlled_monitor_id = monitor_id
+        # Do not destroy and rebuild this menu from inside its own toggled
+        # signal.  Some GTK/AppIndicator combinations dispatch another radio
+        # item signal while the old submenu is being removed.  Mark the cache
+        # stale and let periodic_check rebuild it after this activation has
+        # returned to the GTK main loop.
+        self.controlled_monitor_menu_signature = ()
+        label = "主显示器（自动）" if monitor_id == "primary" else monitor_id
+        logging.info("被控屏幕已切换：%s", label)
+        self.write_status("active", f"被控屏幕：{label}")
+
+    def refresh_controlled_monitor_menu(self, force: bool = False) -> None:
+        if (
+            getattr(self, "controlled_monitor_menu", None) is None
+            or getattr(self, "Gdk", None) is None
+        ):
+            return
+        descriptors = gdk_monitor_descriptors(self.Gdk)
+        signature = tuple(
+            (
+                descriptor["id"],
+                descriptor["geometry"],
+                descriptor["primary"],
+            )
+            for descriptor in descriptors
+        )
+        current_id = read_monitor_selection(self.monitor_selection_file)
+        available_ids = {str(row["id"]) for row in descriptors}
+        if current_id != "primary" and current_id not in available_ids:
+            current_id = "primary"
+            write_monitor_selection(self.monitor_selection_file, current_id)
+        self.controlled_monitor_id = current_id
+        menu_signature = (current_id, signature)
+        if not force and menu_signature == self.controlled_monitor_menu_signature:
+            return
+        self.controlled_monitor_menu_signature = menu_signature
+        for child in self.controlled_monitor_menu.get_children():
+            self.controlled_monitor_menu.remove(child)
+        self.controlled_monitor_items = []
+
+        automatic = self.Gtk.RadioMenuItem.new_with_label(
+            None, "主显示器（自动）"
+        )
+        automatic.set_active(current_id == "primary")
+        automatic.connect(
+            "toggled", self.select_controlled_monitor, "primary"
+        )
+        self.controlled_monitor_menu.append(automatic)
+        self.controlled_monitor_items.append(automatic)
+
+        for descriptor in descriptors:
+            monitor_id = str(descriptor["id"])
+            item = self.Gtk.RadioMenuItem.new_with_label_from_widget(
+                automatic, monitor_menu_label(descriptor)
+            )
+            item.set_active(current_id == monitor_id)
+            item.connect(
+                "toggled", self.select_controlled_monitor, monitor_id
+            )
+            self.controlled_monitor_menu.append(item)
+            self.controlled_monitor_items.append(item)
+        self.controlled_monitor_menu.show_all()
 
     def select_window_layout(self, item, layout: str) -> None:
         if not item.get_active():
@@ -1580,6 +1746,7 @@ class TrayProxy:
 
     def periodic_check(self) -> bool:
         removed = self.remove_legacy_icons()
+        self.refresh_controlled_monitor_menu()
         self.apply_window_layout()
         client_running = bool(controller_processes(self.prefix))
         decoder_workflow_running = (
@@ -1736,6 +1903,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-dir")
     parser.add_argument("--log-file")
     parser.add_argument("--window-layout-file")
+    parser.add_argument("--monitor-selection-file")
     parser.add_argument("--icon", default=APP_ID)
     parser.add_argument("--icon-theme-path", default="")
     args = parser.parse_args()
@@ -1770,6 +1938,7 @@ def parse_args() -> argparse.Namespace:
                 "state_dir",
                 "log_file",
                 "window_layout_file",
+                "monitor_selection_file",
             )
             if not getattr(args, name)
         ]

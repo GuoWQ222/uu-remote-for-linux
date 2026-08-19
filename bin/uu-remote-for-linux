@@ -137,6 +137,7 @@ readonly runtime_log="$state_dir/runtime.log"
 readonly tray_proxy_log="$state_dir/tray-proxy.log"
 readonly tray_proxy_status="$state_dir/tray-proxy-status"
 readonly window_layout_file="$data_dir/window-layout"
+readonly controlled_monitor_file="$data_dir/controlled-monitor.json"
 readonly autostart_log="$state_dir/autostart-bridge.log"
 readonly autostart_lock="$state_dir/autostart-bridge.lock"
 readonly autostart_desktop="$config_home/autostart/$app_id.desktop"
@@ -1813,6 +1814,31 @@ input_bridge_event_label() {
         "${keyboard_packets:-0}"
 }
 
+input_bridge_target_label() {
+    local target="" source="" origin_x="" origin_y="" width="" height=""
+
+    [[ -r $input_bridge_status ]] || {
+        printf '默认主显示器（待应用启动）'
+        return
+    }
+    target=$(sed -n \
+        's/.*"absolute_target": \[\([^]]*\)\].*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    source=$(sed -n \
+        's/.*"absolute_target_source": "\([^"]*\)".*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    target=${target//,/ }
+    read -r origin_x origin_y width height <<<"$target"
+    if [[ $origin_x =~ ^-?[0-9]+$ && $origin_y =~ ^-?[0-9]+$ &&
+        $width =~ ^[0-9]+$ && $height =~ ^[0-9]+$ ]]; then
+        printf '%sx%s+%s+%s（%s）' \
+            "$width" "$height" "$origin_x" "$origin_y" \
+            "${source:-unknown}"
+    else
+        printf '尚未解析'
+    fi
+}
+
 wayland_capture_status_label() {
     local state="" bridge_state="" frames=""
 
@@ -2084,6 +2110,7 @@ start_input_bridge() {
             "$input_bridge_log"
             "$input_bridge_lock"
             "$input_bridge_release_timeout"
+            "$controlled_monitor_file"
         )
         if "${command[@]}" 9>&-; then
             systemd_launched=true
@@ -2100,6 +2127,7 @@ start_input_bridge() {
             "$input_bridge_log" \
             "$input_bridge_lock" \
             "$input_bridge_release_timeout" \
+            "$controlled_monitor_file" \
             9>&- </dev/null >>"$input_bridge_log" 2>&1 &
     fi
 
@@ -2334,6 +2362,7 @@ start_tray_proxy() {
         --state-dir "$state_dir"
         --log-file "$tray_proxy_log"
         --window-layout-file "$window_layout_file"
+        --monitor-selection-file "$controlled_monitor_file"
         --icon "$app_id"
     )
     if systemd_user_available; then
@@ -2539,6 +2568,73 @@ start_systemd_decoder_restart() {
         fi
     done
     command+=("$launcher_path" --restart-selected-decoder)
+    "${command[@]}" 9>&-
+}
+
+start_systemd_client_launch() {
+    local wine_path variable attempt load_state
+    local -a command
+
+    wine_path=$(command -v -- "$wine") || return 1
+
+    # The outer GameViewer.exe is only a launcher: it creates
+    # bin/GameViewer.exe and exits successfully.  Keep the transient unit
+    # alive until the entire Wine cgroup exits, otherwise systemd tears down
+    # the real Qt client as soon as the short-lived launcher returns.
+    if runtime_unit_active "$client_runtime_unit" &&
+        wine_image_running "$client_image"; then
+        env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+            -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+            -u ALL_PROXY -u NO_PROXY \
+            "$wine_path" "$client" "$@" 9>&-
+        return
+    fi
+
+    systemctl --user stop \
+        "$client_runtime_unit.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed \
+        "$client_runtime_unit.service" >/dev/null 2>&1 || true
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        load_state=$(systemctl --user show \
+            --property=LoadState \
+            --value \
+            "$client_runtime_unit.service" 2>/dev/null || true)
+        if [[ -z $load_state || $load_state == not-found ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    ((attempt < 200)) || return 1
+
+    command=(
+        systemd-run
+        --user
+        "--unit=$client_runtime_unit"
+        --collect
+        --quiet
+        --property=ExitType=cgroup
+        --property=TimeoutStopSec=15s
+        "--property=StandardOutput=append:$runtime_log"
+        "--property=StandardError=append:$runtime_log"
+        "--working-directory=$install_dir"
+        "--setenv=WINEPREFIX=$WINEPREFIX"
+        "--setenv=WINEDEBUG=$WINEDEBUG"
+    )
+    for variable in \
+        WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL DXVK_CONFIG_FILE \
+        UU_REMOTE_CUDA_DEVICE UU_REMOTE_NVENC_ADAPTER_LUID \
+        DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+        DBUS_SESSION_BUS_ADDRESS XDG_CURRENT_DESKTOP PATH; do
+        if [[ -v $variable ]]; then
+            command+=("--setenv=$variable=${!variable}")
+        fi
+    done
+    command+=(
+        env
+        -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy -u no_proxy
+        -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY -u NO_PROXY
+        "$wine_path" "$client" "$@"
+    )
     "${command[@]}" 9>&-
 }
 
@@ -3128,6 +3224,7 @@ print_diagnostics() {
         "键盘桥日志" "$keyboard_bridge_log" \
         "被控端原生输入" "$(input_bridge_status_label)" \
         "被控端输入事件" "$(input_bridge_event_label)" \
+        "被控端鼠标屏幕" "$(input_bridge_target_label)" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
@@ -4889,6 +4986,11 @@ if $select_decoder_restart_requested; then
         -u ALL_PROXY -u NO_PROXY \
         "$wine" "$client" "${client_args[@]}" 9>&- </dev/null \
         >>"$runtime_log" 2>&1 &
+    exit 0
+fi
+if systemd_user_available; then
+    start_systemd_client_launch "${client_args[@]}" ||
+        die "无法创建持久的 UU 主界面服务，详见 $runtime_log"
     exit 0
 fi
 exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \

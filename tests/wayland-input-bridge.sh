@@ -43,6 +43,11 @@ for _ in {1..100}; do
     sleep 0.02
 done
 [[ -s $endpoint ]]
+grep -q '^native_lock_keys=0$' "$endpoint"
+if grep -q '^lock_state_valid=' "$endpoint"; then
+    printf 'Wayland 端点不应发布 XKB 锁定状态。\n' >&2
+    exit 1
+fi
 
 /usr/bin/python3 - "$endpoint" <<'PY'
 import configparser

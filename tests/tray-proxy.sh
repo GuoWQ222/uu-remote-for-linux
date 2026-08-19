@@ -23,6 +23,8 @@ source = Path(proxy).read_text()
 ast.parse(source, filename=proxy)
 assert '"选择解码器…"' in source
 assert '"远控窗口布局"' in source
+assert '"被控屏幕"' in source
+assert '"主显示器（自动）"' in source
 assert '"单窗口（主屏）"' in source
 assert '"双窗口（每屏一个）"' in source
 assert '"--select-decoder-and-restart"' in source
@@ -53,18 +55,29 @@ class LayoutArea:
 
 
 class LayoutMonitor:
-    def __init__(self, area):
+    def __init__(self, area, manufacturer, model):
         self.area = LayoutArea(*area)
+        self.manufacturer = manufacturer
+        self.model = model
 
     def get_workarea(self):
         return self.area
+
+    def get_geometry(self):
+        return self.area
+
+    def get_manufacturer(self):
+        return self.manufacturer
+
+    def get_model(self):
+        return self.model
 
 
 class LayoutDisplay:
     def __init__(self):
         self.monitors = [
-            LayoutMonitor((0, 0, 1440, 2560)),
-            LayoutMonitor((1506, 32, 2494, 1408)),
+            LayoutMonitor((0, 0, 1440, 2560), "PHL", "HDMI-0"),
+            LayoutMonitor((1506, 32, 2494, 1408), "AOC", "HDMI-1"),
         ]
 
     def get_primary_monitor(self):
@@ -91,6 +104,26 @@ assert namespace["gdk_monitor_workareas"](LayoutGdk) == [
     (1506, 32, 2494, 1408),
     (0, 0, 1440, 2560),
 ]
+
+monitor_descriptors = namespace["gdk_monitor_descriptors"](LayoutGdk)
+assert [row["id"] for row in monitor_descriptors] == [
+    "PHL|HDMI-0",
+    "AOC|HDMI-1",
+]
+assert [row["primary"] for row in monitor_descriptors] == [False, True]
+assert namespace["monitor_menu_label"](monitor_descriptors[1]) == (
+    "HDMI-1 — 2494×1408（主显示器）"
+)
+
+with tempfile.TemporaryDirectory() as state:
+    selection_file = Path(state) / "controlled-monitor.json"
+    assert namespace["read_monitor_selection"](selection_file) == "primary"
+    namespace["write_monitor_selection"](
+        selection_file, "PHL|HDMI-0"
+    )
+    assert namespace["read_monitor_selection"](selection_file) == (
+        "PHL|HDMI-0"
+    )
 
 
 class LayoutX11:

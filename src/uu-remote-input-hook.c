@@ -38,7 +38,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 22u
+#define HOOK_VERSION 28u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -90,6 +90,7 @@ enum hook_process_kind {
 };
 
 typedef UINT(WINAPI *send_input_fn)(UINT, LPINPUT, int);
+typedef SHORT(WINAPI *get_key_state_fn)(int);
 typedef BOOL(WINAPI *get_cursor_info_fn)(PCURSORINFO);
 typedef BOOL(WINAPI *get_cursor_pos_fn)(LPPOINT);
 typedef BOOL(WINAPI *bit_blt_fn)(
@@ -126,6 +127,7 @@ typedef ULONG(WINAPI *get_adapters_info_fn)(PIP_ADAPTER_INFO, PULONG);
 typedef NETIO_STATUS(WINAPI *get_if_table2_fn)(PMIB_IF_TABLE2 *);
 
 static send_input_fn original_send_input;
+static get_key_state_fn original_get_key_state;
 static get_cursor_info_fn original_get_cursor_info;
 static get_cursor_pos_fn original_get_cursor_pos;
 static bit_blt_fn original_bit_blt;
@@ -166,7 +168,15 @@ static volatile LONG sequence_number;
 static ULONGLONG endpoint_checked_at;
 static BOOL endpoint_valid;
 static BOOL force_cursor_visible;
+static volatile LONG native_lock_keys;
+static volatile LONG lock_state_valid;
+static volatile LONG native_lock_mask;
+static volatile LONG cursor_feedback_origin_x;
+static volatile LONG cursor_feedback_origin_y;
+static volatile LONG cursor_feedback_width;
+static volatile LONG cursor_feedback_height;
 static BOOL send_input_hooked;
+static BOOL get_key_state_hooked;
 static BOOL cursor_info_hooked;
 static BOOL cursor_pos_hooked;
 static BOOL bit_blt_hooked;
@@ -200,6 +210,7 @@ static volatile LONG if_table2_patched;
 static SRWLOCK cursor_lock = SRWLOCK_INIT;
 static POINT tracked_cursor_position;
 static BOOL tracked_cursor_valid;
+static BOOL tracked_cursor_virtual_desktop;
 static SRWLOCK frame_lock = SRWLOCK_INIT;
 static HANDLE frame_file = INVALID_HANDLE_VALUE;
 static HANDLE frame_mapping;
@@ -511,7 +522,43 @@ static void send_hello(void) {
 static void clear_tracked_cursor(void) {
     AcquireSRWLockExclusive(&cursor_lock);
     tracked_cursor_valid = FALSE;
+    tracked_cursor_virtual_desktop = FALSE;
     ReleaseSRWLockExclusive(&cursor_lock);
+}
+
+static LONG read_profile_long(
+    LPCWSTR section,
+    LPCWSTR key,
+    LONG fallback,
+    LPCWSTR path
+) {
+    WCHAR text[64];
+    WCHAR *end;
+    long value;
+
+    text[0] = L'\0';
+    GetPrivateProfileStringW(
+        section,
+        key,
+        L"",
+        text,
+        (DWORD)(sizeof(text) / sizeof(text[0])),
+        path
+    );
+    if (!text[0]) {
+        return fallback;
+    }
+    end = NULL;
+    value = wcstol(text, &end, 10);
+    if (
+        end == text ||
+        (end && *end != L'\0') ||
+        value < LONG_MIN ||
+        value > LONG_MAX
+    ) {
+        return fallback;
+    }
+    return (LONG)value;
 }
 
 static BOOL refresh_endpoint(void) {
@@ -519,6 +566,20 @@ static BOOL refresh_endpoint(void) {
     WCHAR token_text[64];
     unsigned char new_token[16];
     UINT port;
+    UINT new_cursor_width;
+    UINT new_cursor_height;
+    LONG new_cursor_origin_x;
+    LONG new_cursor_origin_y;
+    LONG new_native_lock_keys;
+    LONG new_lock_state_valid;
+    LONG new_lock_mask;
+    LONG old_cursor_origin_x;
+    LONG old_cursor_origin_y;
+    LONG old_cursor_width;
+    LONG old_cursor_height;
+    LONG old_native_lock_keys;
+    LONG old_lock_state_valid;
+    LONG old_lock_mask;
     BOOL changed;
     BOOL ready;
 
@@ -545,6 +606,36 @@ static BOOL refresh_endpoint(void) {
     force_cursor_visible = GetPrivateProfileIntW(
         L"bridge", L"force_cursor", 1, endpoint_path
     ) != 0;
+    new_native_lock_keys = GetPrivateProfileIntW(
+        L"bridge", L"native_lock_keys", 0, endpoint_path
+    ) != 0;
+    new_lock_state_valid = GetPrivateProfileIntW(
+        L"bridge", L"lock_state_valid", 0, endpoint_path
+    ) != 0;
+    new_lock_mask = GetPrivateProfileIntW(
+        L"bridge", L"lock_mask", 0, endpoint_path
+    ) & 0x7;
+    new_cursor_origin_x = read_profile_long(
+        L"bridge", L"cursor_origin_x", 0, endpoint_path
+    );
+    new_cursor_origin_y = read_profile_long(
+        L"bridge", L"cursor_origin_y", 0, endpoint_path
+    );
+    new_cursor_width = GetPrivateProfileIntW(
+        L"bridge", L"cursor_width", 0, endpoint_path
+    );
+    new_cursor_height = GetPrivateProfileIntW(
+        L"bridge", L"cursor_height", 0, endpoint_path
+    );
+    if (
+        new_cursor_width == 0 ||
+        new_cursor_width > 65535 ||
+        new_cursor_height == 0 ||
+        new_cursor_height > 65535
+    ) {
+        new_cursor_width = 0;
+        new_cursor_height = 0;
+    }
     if (
         port == 0 ||
         port > 65535 ||
@@ -556,14 +647,53 @@ static BOOL refresh_endpoint(void) {
         return FALSE;
     }
 
+    old_cursor_width = InterlockedCompareExchange(
+        &cursor_feedback_width, 0, 0
+    );
+    old_cursor_height = InterlockedCompareExchange(
+        &cursor_feedback_height, 0, 0
+    );
+    old_cursor_origin_x = InterlockedCompareExchange(
+        &cursor_feedback_origin_x, 0, 0
+    );
+    old_cursor_origin_y = InterlockedCompareExchange(
+        &cursor_feedback_origin_y, 0, 0
+    );
+    old_native_lock_keys = InterlockedCompareExchange(
+        &native_lock_keys, 0, 0
+    );
+    old_lock_state_valid = InterlockedCompareExchange(
+        &lock_state_valid, 0, 0
+    );
+    old_lock_mask = InterlockedCompareExchange(
+        &native_lock_mask, 0, 0
+    );
     changed = !endpoint_valid ||
         bridge_address.sin_port != htons((u_short)port) ||
-        memcmp(bridge_token, new_token, sizeof(bridge_token)) != 0;
+        memcmp(bridge_token, new_token, sizeof(bridge_token)) != 0 ||
+        old_cursor_origin_x != new_cursor_origin_x ||
+        old_cursor_origin_y != new_cursor_origin_y ||
+        old_cursor_width != (LONG)new_cursor_width ||
+        old_cursor_height != (LONG)new_cursor_height ||
+        old_native_lock_keys != new_native_lock_keys ||
+        old_lock_state_valid != new_lock_state_valid ||
+        old_lock_mask != new_lock_mask;
     ZeroMemory(&bridge_address, sizeof(bridge_address));
     bridge_address.sin_family = AF_INET;
     bridge_address.sin_port = htons((u_short)port);
     bridge_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CopyMemory(bridge_token, new_token, sizeof(bridge_token));
+    InterlockedExchange(&cursor_feedback_origin_x, new_cursor_origin_x);
+    InterlockedExchange(&cursor_feedback_origin_y, new_cursor_origin_y);
+    InterlockedExchange(
+        &cursor_feedback_width, (LONG)new_cursor_width
+    );
+    InterlockedExchange(
+        &cursor_feedback_height, (LONG)new_cursor_height
+    );
+    InterlockedExchange(&native_lock_keys, new_native_lock_keys);
+    InterlockedExchange(&lock_state_valid, new_lock_state_valid);
+    InterlockedExchange(&native_lock_mask, new_lock_mask);
     endpoint_valid = TRUE;
     if (changed) {
         clear_tracked_cursor();
@@ -604,6 +734,7 @@ static LONG normalized_to_pixel(LONG value, LONG origin, LONG extent) {
 }
 
 static void track_mouse_position(const MOUSEINPUT *input) {
+    BOOL virtual_desktop;
     LONG origin_x;
     LONG origin_y;
     LONG width;
@@ -612,16 +743,29 @@ static void track_mouse_position(const MOUSEINPUT *input) {
     if (!(input->dwFlags & MOUSEEVENTF_MOVE)) {
         return;
     }
-    if (input->dwFlags & MOUSEEVENTF_VIRTUALDESK) {
+    virtual_desktop = !!(input->dwFlags & MOUSEEVENTF_VIRTUALDESK);
+    if (virtual_desktop) {
+        /*
+         * MOUSEEVENTF_VIRTUALDESK is semantic, not decorative: UU uses the
+         * normalized value for the complete multi-monitor desktop.  Keep the
+         * feedback in Wine's primary-relative virtual coordinate space.
+         */
         origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
         origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     } else {
-        origin_x = 0;
-        origin_y = 0;
-        width = GetSystemMetrics(SM_CXSCREEN);
-        height = GetSystemMetrics(SM_CYSCREEN);
+        width = InterlockedCompareExchange(&cursor_feedback_width, 0, 0);
+        height = InterlockedCompareExchange(&cursor_feedback_height, 0, 0);
+        if (width > 0 && height > 0) {
+            origin_x = 0;
+            origin_y = 0;
+        } else {
+            origin_x = 0;
+            origin_y = 0;
+            width = GetSystemMetrics(SM_CXSCREEN);
+            height = GetSystemMetrics(SM_CYSCREEN);
+        }
     }
     width = width > 0 ? width : 1;
     height = height > 0 ? height : 1;
@@ -635,6 +779,7 @@ static void track_mouse_position(const MOUSEINPUT *input) {
             input->dy, origin_y, height
         );
         tracked_cursor_valid = TRUE;
+        tracked_cursor_virtual_desktop = virtual_desktop;
     } else {
         if (
             !tracked_cursor_valid &&
@@ -654,19 +799,60 @@ static void track_mouse_position(const MOUSEINPUT *input) {
             origin_y + height - 1
         );
         tracked_cursor_valid = TRUE;
+        tracked_cursor_virtual_desktop = virtual_desktop;
     }
     ReleaseSRWLockExclusive(&cursor_lock);
 }
 
-static BOOL read_tracked_cursor(LPPOINT point) {
+static BOOL read_tracked_cursor(LPPOINT point, BOOL *virtual_desktop) {
     BOOL ready;
     AcquireSRWLockShared(&cursor_lock);
     ready = tracked_cursor_valid;
     if (ready) {
         *point = tracked_cursor_position;
+        if (virtual_desktop) {
+            *virtual_desktop = tracked_cursor_virtual_desktop;
+        }
     }
     ReleaseSRWLockShared(&cursor_lock);
     return ready;
+}
+
+static BOOL actual_cursor_to_screen_local(
+    const POINT *actual,
+    LPPOINT local
+) {
+    LONG origin_x = InterlockedCompareExchange(
+        &cursor_feedback_origin_x, 0, 0
+    );
+    LONG origin_y = InterlockedCompareExchange(
+        &cursor_feedback_origin_y, 0, 0
+    );
+    LONG width = InterlockedCompareExchange(
+        &cursor_feedback_width, 0, 0
+    );
+    LONG height = InterlockedCompareExchange(
+        &cursor_feedback_height, 0, 0
+    );
+    LONGLONG right;
+    LONGLONG bottom;
+
+    if (!actual || !local || width <= 0 || height <= 0) {
+        return FALSE;
+    }
+    right = (LONGLONG)origin_x + width;
+    bottom = (LONGLONG)origin_y + height;
+    if (
+        actual->x < origin_x ||
+        (LONGLONG)actual->x >= right ||
+        actual->y < origin_y ||
+        (LONGLONG)actual->y >= bottom
+    ) {
+        return FALSE;
+    }
+    local->x = actual->x - origin_x;
+    local->y = actual->y - origin_y;
+    return TRUE;
 }
 
 static BOOL forward_mouse(const MOUSEINPUT *input) {
@@ -712,6 +898,79 @@ static BOOL forward_keyboard(const KEYBDINPUT *input) {
     return sent == (int)sizeof(packet);
 }
 
+static LONG lock_key_bit(const KEYBDINPUT *input) {
+    WORD virtual_key;
+    WORD scan_code;
+
+    if (!input || (input->dwFlags & KEYEVENTF_UNICODE)) {
+        return 0;
+    }
+    virtual_key = input->wVk;
+    if (virtual_key == VK_CAPITAL) {
+        return 0x1;
+    }
+    if (virtual_key == VK_NUMLOCK) {
+        return 0x2;
+    }
+    if (virtual_key == VK_SCROLL) {
+        return 0x4;
+    }
+    if (!(input->dwFlags & KEYEVENTF_SCANCODE)) {
+        return 0;
+    }
+    scan_code = input->wScan & 0xffu;
+    if (scan_code == 0x3au) {
+        return 0x1;
+    }
+    if (scan_code == 0x45u) {
+        return 0x2;
+    }
+    return scan_code == 0x46u ? 0x4 : 0;
+}
+
+static void toggle_native_lock_state(LONG bit) {
+    LONG previous;
+
+    if (!bit || !InterlockedCompareExchange(&lock_state_valid, 0, 0)) {
+        return;
+    }
+    do {
+        previous = InterlockedCompareExchange(&native_lock_mask, 0, 0);
+    } while (
+        InterlockedCompareExchange(
+            &native_lock_mask, previous ^ bit, previous
+        ) != previous
+    );
+}
+
+static SHORT WINAPI hooked_get_key_state(int virtual_key) {
+    SHORT result = original_get_key_state
+        ? original_get_key_state(virtual_key)
+        : 0;
+    LONG bit;
+
+    if (virtual_key == VK_CAPITAL) {
+        bit = 0x1;
+    } else if (virtual_key == VK_NUMLOCK) {
+        bit = 0x2;
+    } else if (virtual_key == VK_SCROLL) {
+        bit = 0x4;
+    } else {
+        return result;
+    }
+    if (
+        !refresh_endpoint() ||
+        !InterlockedCompareExchange(&native_lock_keys, 0, 0) ||
+        !InterlockedCompareExchange(&lock_state_valid, 0, 0)
+    ) {
+        return result;
+    }
+    return (SHORT)(
+        (result & (SHORT)~1) |
+        ((InterlockedCompareExchange(&native_lock_mask, 0, 0) & bit) != 0)
+    );
+}
+
 static UINT WINAPI hooked_send_input(
     UINT count,
     LPINPUT inputs,
@@ -738,10 +997,14 @@ static UINT WINAPI hooked_send_input(
             }
             track_mouse_position(&inputs[index].mi);
         } else if (inputs[index].type == INPUT_KEYBOARD) {
+            LONG lock_bit = lock_key_bit(&inputs[index].ki);
             if (!forward_keyboard(&inputs[index].ki)) {
                 return original_send_input
                     ? original_send_input(count, inputs, input_size)
                     : index;
+            }
+            if (lock_bit && !(inputs[index].ki.dwFlags & KEYEVENTF_KEYUP)) {
+                toggle_native_lock_state(lock_bit);
             }
         } else {
             return original_send_input
@@ -754,6 +1017,11 @@ static UINT WINAPI hooked_send_input(
 
 static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
     HCURSOR stable_cursor;
+    POINT actual;
+    POINT local;
+    POINT tracked;
+    BOOL tracked_virtual_desktop = FALSE;
+    BOOL tracked_ready;
     BOOL result = original_get_cursor_info
         ? original_get_cursor_info(cursor_info)
         : FALSE;
@@ -768,7 +1036,19 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
         if (stable_cursor) {
             cursor_info->hCursor = stable_cursor;
         }
-        if (read_tracked_cursor(&cursor_info->ptScreenPos)) {
+        tracked_ready = read_tracked_cursor(
+            &tracked, &tracked_virtual_desktop
+        );
+        actual = cursor_info->ptScreenPos;
+        if (tracked_ready && tracked_virtual_desktop) {
+            if (!result) {
+                cursor_info->ptScreenPos = tracked;
+                result = TRUE;
+            }
+        } else if (result && actual_cursor_to_screen_local(&actual, &local)) {
+            cursor_info->ptScreenPos = local;
+        } else if (tracked_ready) {
+            cursor_info->ptScreenPos = tracked;
             result = TRUE;
         } else if (!result) {
             GetCursorPos(&cursor_info->ptScreenPos);
@@ -779,15 +1059,34 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
 }
 
 static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
+    POINT actual;
+    POINT local;
+    POINT tracked;
+    BOOL tracked_virtual_desktop = FALSE;
+    BOOL tracked_ready;
     BOOL result = original_get_cursor_pos
         ? original_get_cursor_pos(point)
         : FALSE;
-    if (
-        point &&
-        refresh_endpoint() &&
-        read_tracked_cursor(point)
-    ) {
-        return TRUE;
+    if (point && refresh_endpoint()) {
+        tracked_ready = read_tracked_cursor(
+            &tracked, &tracked_virtual_desktop
+        );
+        actual = *point;
+        if (tracked_ready && tracked_virtual_desktop) {
+            if (!result) {
+                *point = tracked;
+                return TRUE;
+            }
+            return result;
+        }
+        if (result && actual_cursor_to_screen_local(&actual, &local)) {
+            *point = local;
+            return TRUE;
+        }
+        if (tracked_ready) {
+            *point = tracked;
+            return TRUE;
+        }
     }
     return result;
 }
@@ -5764,7 +6063,7 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     patch_streamer_imports();
     ready = (
         send_input_hooked &&
-        cursor_info_hooked &&
+        get_key_state_hooked &&
         cursor_pos_hooked &&
         refresh_endpoint()
     );
@@ -5797,6 +6096,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         "SendInput",
         (void *)hooked_send_input,
         (void **)&original_send_input
+    );
+    get_key_state_hooked = patch_import(
+        main_module,
+        "USER32.dll",
+        "GetKeyState",
+        (void *)hooked_get_key_state,
+        (void **)&original_get_key_state
     );
     cursor_info_hooked = patch_import(
         main_module,

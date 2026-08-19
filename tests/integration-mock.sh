@@ -90,13 +90,16 @@ state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
 # the client instead of exiting because the missing file makes sed fail under
 # `set -e -o pipefail`.
 rm -f -- "$state_dir/update-bridge-status"
-client_count_before_bridge_migration=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+client_unit_count_before_bridge_migration=$(grep -c \
+    'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client ' \
+    "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_DISABLE_UPDATE_WATCHER=0 \
 UU_REMOTE_FAKE_ACTIVE_UNITS=uu-remote-for-linux-update.service \
 UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC=1 \
     "$launcher"
-test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
-    "$((client_count_before_bridge_migration + 1))"
+test "$(grep -c 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client ' \
+    "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$((client_unit_count_before_bridge_migration + 1))"
 grep -q \
     'SYSTEMCTL --user stop uu-remote-for-linux-update.service' \
     "$UU_REMOTE_FAKE_TRACE"
@@ -428,6 +431,9 @@ printf '4.34.0.8979\n' >"$install_dir/bin/.installed-version"
 grep -q '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^SERVER$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^CLIENT$' "$UU_REMOTE_FAKE_TRACE"
+grep -q \
+    'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client .*--property=ExitType=cgroup.*GameViewer.exe' \
+    "$UU_REMOTE_FAKE_TRACE"
 if grep -q '^PROXY_ENV_LEAK=' "$UU_REMOTE_FAKE_TRACE"; then
     printf 'Wine 运行进程仍继承了 Linux 代理环境变量：\n' >&2
     grep '^PROXY_ENV_LEAK=' "$UU_REMOTE_FAKE_TRACE" >&2

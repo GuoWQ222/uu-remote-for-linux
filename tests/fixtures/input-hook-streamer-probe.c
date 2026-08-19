@@ -75,7 +75,8 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursor(
     LONG normalized_x,
     LONG normalized_y,
     LONG expected_x,
-    LONG expected_y
+    LONG expected_y,
+    DWORD coordinate_flags
 ) {
     INPUT input;
     CURSORINFO cursor;
@@ -85,7 +86,8 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursor(
     input.type = INPUT_MOUSE;
     input.mi.dx = normalized_x;
     input.mi.dy = normalized_y;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+        coordinate_flags;
     if (SendInput(1, &input, sizeof(input)) != 1) {
         return 10;
     }

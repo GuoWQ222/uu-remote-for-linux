@@ -124,6 +124,12 @@ export WINEDLLOVERRIDES='wevtapi=n'
     -lwevtapi \
     -lws2_32
 
+if objdump -p "$compiled_probe" | grep -Fq 'GetCursorInfo'; then
+    printf '测试主程序不应导入 GetCursorInfo。\n' >&2
+    exit 1
+fi
+objdump -p "$compiled_streamer_probe" | grep -Fq 'GetCursorInfo'
+
 WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
     >/dev/null 2>&1
 install -Dm0644 "$hook" "$prefix/drive_c/uu-remote-input-hook.dll"
@@ -175,7 +181,11 @@ for y in range(height):
 path.write_bytes(header + bytes(size) + frame)
 PY
 
-UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" XDG_SESSION_TYPE=x11 \
+UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_GEOMETRY='1440,0,2560,1440' \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_VIRTUAL_GEOMETRY='0,0,4000,2560' \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_CURSOR_GEOMETRY='100,50,2560,1440' \
+    XDG_SESSION_TYPE=x11 \
     "$bridge" watch \
     "$state_dir" "$endpoint" "$log" "$lock" 2 &
 bridge_pid=$!
@@ -214,9 +224,19 @@ for _ in {1..100}; do
     sleep 0.02
 done
 grep -q '"hook_pid": [1-9]' "$state_dir/input-bridge-status.json"
-grep -q '^motion 32768 16384 1$' "$trace"
+grep -q '^motion 32768 16384 1 1$' "$trace"
+grep -q '^motion-target 2000 640$' "$trace"
+grep -q '^motion 32768 16384 1 0$' "$trace"
+grep -q '^motion-target 2720 360$' "$trace"
 grep -q '^flush$' "$trace"
+if [[ $(grep -c '^keycode 66 1$' "$trace" || true) -ne 2 ]] ||
+    [[ $(grep -c '^keycode 66 0$' "$trace" || true) -ne 2 ]]; then
+    printf 'Caps Lock 没有按两组 down/up 转发到原生输入桥。\n' >&2
+    exit 1
+fi
 grep -q 'GameViewerServer 输入钩子已连接' "$log"
+grep -q '绝对鼠标坐标域：virtual-desktop（flags=0xc001）' "$log"
+grep -q '绝对鼠标坐标域：selected-monitor（flags=0x8001）' "$log"
 grep -Fq 'preloaded=1' "$wol_status"
 grep -Fq 'status_bits=15' "$wol_status"
 grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'addresses=2'
@@ -225,7 +245,7 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=22'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=28'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 

@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.26] - 2026-08-19
+
+- Keep the real Qt client alive in a transient user service with
+  `ExitType=cgroup`, so systemd does not tear it down when UU's short-lived
+  outer launcher exits and an application-menu click reliably opens UU.
+- Add a persistent native-tray controlled-display selector with stable monitor
+  identities, primary-display fallback, and automatic hot-plug, rotation, and
+  layout refresh.
+- Map absolute controlled-host input into the selected X11 monitor while
+  preserving the distinct virtual-desktop coordinate space, and return cursor
+  feedback in the same screen-local geometry used by the Windows viewer.
+- Mirror the real XKB Caps Lock, Num Lock, and Scroll Lock state through UU's
+  Win32 `GetKeyState` path while continuing to inject the key through XTest.
+  This makes each requested lock-state transition happen exactly once and
+  restores one-press switching between uppercase input and Rime.
+- Extend the fake-X11, Wine hook, tray, Wayland, and launcher regressions to
+  cover mixed-orientation monitors, both absolute coordinate domains, the UU
+  desired-lock-state algorithm, and the persistent systemd client lifecycle.
+
 ## [1.1.25] - 2026-08-19
 
 - Add a persistent native-tray remote-window layout selector. Single-window
