@@ -14,7 +14,7 @@
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 > [!IMPORTANT]
-> 这是非官方 Linux 兼容包装层，不分发网易专有安装程序或客户端二进制文件。下载默认直连，桌面代理设置不会复制到 Wine。
+> 这是非官方 Linux 兼容包装层，不分发网易专有安装程序或客户端二进制文件。
 
 ## 🗺️ 目录
 

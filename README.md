@@ -14,7 +14,7 @@
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
 > [!IMPORTANT]
-> This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries. Downloads use direct connections by default, and desktop proxy settings are not copied into Wine.
+> This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries.
 
 ## 🗺️ Contents
 
