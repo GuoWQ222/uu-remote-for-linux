@@ -20,6 +20,7 @@ trap cleanup EXIT
 
 readonly state_dir="$test_root/state"
 readonly endpoint="$test_root/drive_c/uu-remote-input-bridge.endpoint"
+readonly cursor_file="$test_root/drive_c/uu-remote-native-cursor.bin"
 readonly log="$test_root/input-bridge.log"
 readonly lock="$test_root/input-bridge.lock"
 readonly trace="$test_root/xtest.trace"
@@ -94,6 +95,8 @@ done
 [[ $(stat -c '%a' "$endpoint") == 600 ]]
 grep -q '^\[bridge\]$' "$endpoint"
 grep -q '^force_cursor=1$' "$endpoint"
+grep -q '^cursor_image=uu-remote-native-cursor.bin$' "$endpoint"
+grep -q '^cursor_image_version=1$' "$endpoint"
 grep -q '^native_lock_keys=1$' "$endpoint"
 grep -q '^lock_state_valid=1$' "$endpoint"
 grep -q '^lock_mask=0$' "$endpoint"
@@ -102,6 +105,19 @@ grep -q '^cursor_origin_x=0$' "$endpoint"
 grep -q '^cursor_origin_y=0$' "$endpoint"
 grep -q '^cursor_width=2560$' "$endpoint"
 grep -q '^cursor_height=1440$' "$endpoint"
+[[ -s $cursor_file ]]
+/usr/bin/python3 - "$cursor_file" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1]).read_bytes()
+header = struct.Struct("<9I28x")
+values = header.unpack_from(data)
+assert values == (0x49435555, 1, 64, 1, 4, 4, 1, 2, 64)
+assert len(data) == 128
+assert struct.unpack_from("<I", data, 64 + 5 * 4)[0] == 0xFF2050E0
+PY
 
 /usr/bin/python3 - "$endpoint" <<'PY'
 import configparser
@@ -164,6 +180,9 @@ grep -q '"mouse_packets": 5' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_moves": 2' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_buttons": 3' "$state_dir/input-bridge-status.json"
 grep -q '"keyboard_packets": 2' "$state_dir/input-bridge-status.json"
+grep -q '"cursor_state": "active"' "$state_dir/input-bridge-status.json"
+grep -q '"cursor_width": 4' "$state_dir/input-bridge-status.json"
+grep -q '"cursor_height": 4' "$state_dir/input-bridge-status.json"
 grep -q '"rejected": 1' "$state_dir/input-bridge-status.json"
 grep -q 'GameViewerServer 输入钩子已连接（PID 4242，v8）' "$log"
 grep -q '绝对鼠标坐标域：selected-monitor（flags=0x8001）' "$log"
@@ -174,6 +193,7 @@ kill "$bridge_pid"
 wait "$bridge_pid"
 bridge_pid=
 [[ ! -e $endpoint ]]
+[[ ! -e $cursor_file ]]
 [[ $("$bridge" status "$state_dir") == stopped ]]
 grep -q '^close$' "$trace"
 

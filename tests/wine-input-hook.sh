@@ -245,9 +245,16 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=30'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=34'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'active=1'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Eq 'updates=[2-9][0-9]*'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'sequence=2'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'width=6'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'height=8'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_x=3'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=4'
 
 kill "$bridge_pid" 2>/dev/null || true
 wait "$bridge_pid" 2>/dev/null || true

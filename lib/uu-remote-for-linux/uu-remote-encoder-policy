@@ -794,6 +794,153 @@ def probe_streamer(path: Path) -> None:
         if portrait_scale_offsets
         else 0
     )
+    portrait_capture_pattern = bytes.fromhex(
+        "41 8b 85 c0 00 00 00 89 86 24 01 00 00 "
+        "41 8b 85 c4 00 00 00 89 86 28 01 00 00"
+    )
+    portrait_capture_height_source_offset = 16
+    portrait_capture_offsets = []
+    for offset in range(
+        text_offset,
+        text_end - len(portrait_capture_pattern) + 1,
+    ):
+        if (
+            data[offset : offset + portrait_capture_height_source_offset]
+            == portrait_capture_pattern[
+                :portrait_capture_height_source_offset
+            ]
+            and data[
+                offset + portrait_capture_height_source_offset + 1 :
+                offset + len(portrait_capture_pattern)
+            ]
+            == portrait_capture_pattern[
+                portrait_capture_height_source_offset + 1 :
+            ]
+            and data[offset + portrait_capture_height_source_offset] == 0xC4
+        ):
+            portrait_capture_offsets.append(offset)
+    if implementation_profile == "unified-nvenc" and len(
+        portrait_capture_offsets
+    ) != 1:
+        fail(
+            "无法唯一验证竖屏采集器的最大高度复制点；"
+            f"候选数={len(portrait_capture_offsets)}"
+        )
+    portrait_capture_rva = (
+        offset_to_rva(
+            portrait_capture_offsets[0], len(portrait_capture_pattern)
+        )
+        if portrait_capture_offsets
+        else 0
+    )
+    portrait_update_pattern = bytes.fromhex(
+        "8b 86 28 01 00 00 41 3b 86 c4 00 00 00 75 12 "
+        "45 8b 86 c0 00 00 00 44 39 86 24 01 00 00 75 09 eb 32 "
+        "45 8b 86 c0 00 00 00 44 89 86 24 01 00 00 "
+        "41 8b 96 c4 00 00 00 89 96 28 01 00 00"
+    )
+    portrait_update_compare_offset = 9
+    portrait_update_apply_offset = 50
+    portrait_update_offsets = []
+    for offset in range(
+        text_offset,
+        text_end - len(portrait_update_pattern) + 1,
+    ):
+        if (
+            data[offset : offset + portrait_update_compare_offset]
+            == portrait_update_pattern[:portrait_update_compare_offset]
+            and data[
+                offset + portrait_update_compare_offset + 1 :
+                offset + portrait_update_apply_offset
+            ]
+            == portrait_update_pattern[
+                portrait_update_compare_offset + 1 :
+                portrait_update_apply_offset
+            ]
+            and data[
+                offset + portrait_update_apply_offset + 1 :
+                offset + len(portrait_update_pattern)
+            ]
+            == portrait_update_pattern[portrait_update_apply_offset + 1 :]
+            and data[offset + portrait_update_compare_offset]
+            in (0xC4, 0xC0)
+            and data[offset + portrait_update_apply_offset]
+            in (0xC4, 0xC0)
+        ):
+            portrait_update_offsets.append(offset)
+    if implementation_profile == "unified-nvenc" and len(
+        portrait_update_offsets
+    ) != 1:
+        fail(
+            "无法唯一验证竖屏采集器的运行期尺寸重写点；"
+            f"候选数={len(portrait_update_offsets)}"
+        )
+    portrait_update_rva = (
+        offset_to_rva(
+            portrait_update_offsets[0], len(portrait_update_pattern)
+        )
+        if portrait_update_offsets
+        else 0
+    )
+    portrait_scaler_pattern = bytes.fromhex(
+        "8b 97 90 00 00 00 2b 97 88 00 00 00 "
+        "44 8b 45 88 44 2b 45 80 44 8b 4d 8c 44 8b 55 84 "
+        "44 3b c2 7f 50 8b 8f 94 00 00 00 2b 8f 8c 00 00 00 "
+        "41 8b c1 41 2b c2 3b c1 7f 3a "
+        "0f 28 75 80 66 0f 6f c6 66 0f 73 d8 0c 66 0f 7e c3 "
+        "66 0f 6f ce 66 0f 73 d9 08 66 0f 7e ce 89 74 24 40 "
+        "66 0f 6f c6 66 0f 73 d8 04 66 41 0f 7e c7 "
+        "66 41 0f 7e f6 e9 8c 00 00 00 "
+        "66 41 0f 6e c0 0f 5b c0 66 0f 6e ca 0f 5b c9 "
+        "f3 0f 5e c8 45 2b ca 66 45 0f 6e c1 45 0f 5b c0 "
+        "8b 87 94 00 00 00 2b 87 8c 00 00 00 "
+        "66 0f 6e f8 0f 5b ff f3"
+    )
+    portrait_scaler_field_offsets = (35, 41, 146, 152)
+    portrait_scaler_original_fields = (0x94, 0x8C, 0x94, 0x8C)
+    portrait_scaler_patched_fields = (0x90, 0x88, 0x90, 0x88)
+    portrait_scaler_offsets = []
+    for offset in range(
+        text_offset,
+        text_end - len(portrait_scaler_pattern) + 1,
+    ):
+        segment_start = 0
+        matches = True
+        for index, field_offset in enumerate(portrait_scaler_field_offsets):
+            if (
+                data[offset + segment_start : offset + field_offset]
+                != portrait_scaler_pattern[segment_start:field_offset]
+                or data[offset + field_offset]
+                not in (
+                    portrait_scaler_original_fields[index],
+                    portrait_scaler_patched_fields[index],
+                )
+            ):
+                matches = False
+                break
+            segment_start = field_offset + 1
+        if (
+            matches
+            and data[offset + segment_start : offset + len(
+                portrait_scaler_pattern
+            )]
+            == portrait_scaler_pattern[segment_start:]
+        ):
+            portrait_scaler_offsets.append(offset)
+    if implementation_profile == "unified-nvenc" and len(
+        portrait_scaler_offsets
+    ) != 1:
+        fail(
+            "无法唯一验证竖屏采集的最终缩放器；"
+            f"候选数={len(portrait_scaler_offsets)}"
+        )
+    portrait_scaler_rva = (
+        offset_to_rva(
+            portrait_scaler_offsets[0], len(portrait_scaler_pattern)
+        )
+        if portrait_scaler_offsets
+        else 0
+    )
     print(
         f"STREAMER_GDI_ADAPTER_OK\tvtable_rva=0x{vtable_rva:x}"
         f"\tslot_rva=0x{slot_rva:x}"
@@ -815,6 +962,12 @@ def probe_streamer(path: Path) -> None:
         f"\timpl_switch_candidates={len(impl_switch_candidates)}"
         f"\tportrait_scale_rva=0x{portrait_scale_rva:x}"
         f"\tportrait_scale_candidates={len(portrait_scale_offsets)}"
+        f"\tportrait_capture_rva=0x{portrait_capture_rva:x}"
+        f"\tportrait_capture_candidates={len(portrait_capture_offsets)}"
+        f"\tportrait_update_rva=0x{portrait_update_rva:x}"
+        f"\tportrait_update_candidates={len(portrait_update_offsets)}"
+        f"\tportrait_scaler_rva=0x{portrait_scaler_rva:x}"
+        f"\tportrait_scaler_candidates={len(portrait_scaler_offsets)}"
     )
 
 

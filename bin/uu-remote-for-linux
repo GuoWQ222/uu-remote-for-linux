@@ -1911,6 +1911,46 @@ input_bridge_target_label() {
     fi
 }
 
+native_cursor_status_label() {
+    local bridge_state="" sequence="" width="" height=""
+    local hook_active="" calls="" updates="" fallbacks=""
+
+    if [[ ! -r $input_bridge_status ]]; then
+        printf '就绪（待应用启动）'
+        return
+    fi
+    bridge_state=$(sed -n \
+        's/.*"cursor_state": "\([^"]*\)".*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    sequence=$(sed -n \
+        's/.*"cursor_sequence": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    width=$(sed -n \
+        's/.*"cursor_width": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    height=$(sed -n \
+        's/.*"cursor_height": \([0-9][0-9]*\).*/\1/p' \
+        "$input_bridge_status" | head -n1)
+    if [[ -r $wayland_frame_hook_status ]]; then
+        hook_active=$(ini_section_value \
+            "$wayland_frame_hook_status" cursor active)
+        calls=$(ini_section_value "$wayland_frame_hook_status" cursor calls)
+        updates=$(ini_section_value \
+            "$wayland_frame_hook_status" cursor updates)
+        fallbacks=$(ini_section_value \
+            "$wayland_frame_hook_status" cursor fallbacks)
+    fi
+    if [[ $bridge_state != active ]]; then
+        printf 'X11 光标图像未建立'
+    elif [[ $hook_active == 1 ]]; then
+        printf '生效中（XFixes → HCURSOR；%sx%s；序列 %s；调用/更新/回退 %s/%s/%s）' \
+            "${width:-0}" "${height:-0}" "${sequence:-0}" \
+            "${calls:-0}" "${updates:-0}" "${fallbacks:-0}"
+    else
+        printf 'X11 图像已发布，等待 Win64 光标钩子'
+    fi
+}
+
 wayland_capture_status_label() {
     local state="" bridge_state="" frames=""
 
@@ -1976,6 +2016,9 @@ wayland_frame_hook_status_label() {
 
 portrait_original_quality_status_label() {
     local version="" hooked="" candidates="" patches=""
+    local capture_hooked="" capture_candidates="" capture_patches=""
+    local update_hooked="" update_candidates="" update_patches=""
+    local scaler_hooked="" scaler_candidates="" scaler_patches=""
     local source_width="" source_height=""
     local destination_width="" destination_height=""
 
@@ -1990,6 +2033,24 @@ portrait_original_quality_status_label() {
         "$wayland_frame_hook_status" encoder portrait_scale_limit_candidates)
     patches=$(ini_section_value \
         "$wayland_frame_hook_status" encoder portrait_scale_limit_patches)
+    capture_hooked=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_capture_limit_hooked)
+    capture_candidates=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_capture_limit_candidates)
+    capture_patches=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_capture_limit_patches)
+    update_hooked=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_update_limit_hooked)
+    update_candidates=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_update_limit_candidates)
+    update_patches=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_update_limit_patches)
+    scaler_hooked=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scaler_hooked)
+    scaler_candidates=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scaler_candidates)
+    scaler_patches=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scaler_patches)
     source_width=$(ini_section_value \
         "$wayland_frame_hook_status" capture source_width)
     source_height=$(ini_section_value \
@@ -1998,14 +2059,43 @@ portrait_original_quality_status_label() {
         "$wayland_frame_hook_status" capture destination_width)
     destination_height=$(ini_section_value \
         "$wayland_frame_hook_status" capture destination_height)
-    if [[ $version =~ ^[0-9]+$ && $version -ge 30 && $hooked == 1 &&
-        $candidates == 1 ]]; then
-        printf '已修复（运行时补丁 %s；采集 %sx%s ← %sx%s）' \
-            "${patches:-0}" \
+    if [[ $version =~ ^[0-9]+$ && $version -ge 33 && $hooked == 1 &&
+        $candidates == 1 && $capture_hooked == 1 &&
+        $capture_candidates == 1 && $update_hooked == 1 &&
+        $update_candidates == 1 && $scaler_hooked == 1 &&
+        $scaler_candidates == 1 ]]; then
+        if [[ $source_width =~ ^[1-9][0-9]*$ &&
+            $source_height =~ ^[1-9][0-9]*$ &&
+            $destination_width =~ ^[1-9][0-9]*$ &&
+            $destination_height =~ ^[1-9][0-9]*$ &&
+            $source_height -gt $source_width &&
+            $destination_width == "$source_width" &&
+            $destination_height == "$source_height" ]]; then
+            printf '已验证（补丁 %s/%s/%s/%s；竖屏原生采集 %sx%s）' \
+                "${patches:-0}" "${capture_patches:-0}" \
+                "${update_patches:-0}" "${scaler_patches:-0}" \
+                "$destination_width" "$destination_height"
+        elif [[ $source_width =~ ^[1-9][0-9]*$ &&
+            $source_height =~ ^[1-9][0-9]*$ &&
+            $source_height -gt $source_width ]]; then
+            printf '补丁已加载，但竖屏实采仍缩放（%sx%s ← %sx%s）' \
+                "${destination_width:-0}" "${destination_height:-0}" \
+                "$source_width" "$source_height"
+        else
+            printf '补丁已加载（等待切换竖屏实采验证）'
+        fi
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 33 ]]; then
+        printf '未生效（配置/建轨/更新/缩放器候选 %s/%s/%s/%s）' \
+            "${candidates:-0}" "${capture_candidates:-0}" \
+            "${update_candidates:-0}" "${scaler_candidates:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 32 ]]; then
+        printf '旧版试验补丁，最终缩放器尚未修复（采集 %sx%s ← %sx%s）' \
             "${destination_width:-0}" "${destination_height:-0}" \
             "${source_width:-0}" "${source_height:-0}"
-    elif [[ $version =~ ^[0-9]+$ && $version -ge 30 ]]; then
-        printf '未生效（唯一候选 %s）' "${candidates:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 31 ]]; then
+        printf '旧版试验补丁，运行期重写尚未修复（采集 %sx%s ← %sx%s）' \
+            "${destination_width:-0}" "${destination_height:-0}" \
+            "${source_width:-0}" "${source_height:-0}"
     else
         printf '旧版钩子，尚未修复'
     fi
@@ -3598,6 +3688,7 @@ print_diagnostics() {
         "被控端原生输入" "$(input_bridge_status_label)" \
         "被控端输入事件" "$(input_bridge_event_label)" \
         "被控端鼠标屏幕" "$(input_bridge_target_label)" \
+        "原生光标形状" "$(native_cursor_status_label)" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
         "竖屏原画缩放" "$(portrait_original_quality_status_label)" \

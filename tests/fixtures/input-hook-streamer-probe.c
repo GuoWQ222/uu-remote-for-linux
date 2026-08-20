@@ -76,11 +76,16 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursor(
     LONG normalized_y,
     LONG expected_x,
     LONG expected_y,
-    DWORD coordinate_flags
+    DWORD coordinate_flags,
+    DWORD expected_width,
+    DWORD expected_height,
+    DWORD expected_hotspot_x,
+    DWORD expected_hotspot_y
 ) {
     INPUT input;
     CURSORINFO cursor;
     ICONINFO icon;
+    BITMAP bitmap;
 
     ZeroMemory(&input, sizeof(input));
     input.type = INPUT_MOUSE;
@@ -108,7 +113,16 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursor(
     if (!GetIconInfo(cursor.hCursor, &icon)) {
         return 12;
     }
-    if (!icon.hbmMask && !icon.hbmColor) {
+    ZeroMemory(&bitmap, sizeof(bitmap));
+    if (
+        icon.fIcon ||
+        icon.xHotspot != expected_hotspot_x ||
+        icon.yHotspot != expected_hotspot_y ||
+        !icon.hbmColor ||
+        GetObjectW(icon.hbmColor, sizeof(bitmap), &bitmap) != sizeof(bitmap) ||
+        (DWORD)bitmap.bmWidth != expected_width ||
+        (DWORD)bitmap.bmHeight != expected_height
+    ) {
         return 13;
     }
     if (icon.hbmMask) {

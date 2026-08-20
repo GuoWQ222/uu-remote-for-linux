@@ -8,13 +8,28 @@
 #include <netioapi.h>
 
 typedef int(WINAPI *probe_streamer_cursor_fn)(
-    LONG, LONG, LONG, LONG, DWORD
+    LONG, LONG, LONG, LONG, DWORD, DWORD, DWORD, DWORD, DWORD
 );
 typedef int(WINAPI *probe_streamer_frame_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
 typedef DWORD(WINAPI *frame_hook_status_fn)(void);
 typedef HANDLE EVT_HANDLE;
 __declspec(dllimport) BOOL WINAPI EvtClose(EVT_HANDLE object);
+
+#pragma pack(push, 1)
+struct test_cursor_header {
+    DWORD magic;
+    DWORD version;
+    DWORD header_size;
+    DWORD sequence;
+    DWORD width;
+    DWORD height;
+    DWORD hotspot_x;
+    DWORD hotspot_y;
+    DWORD pixel_size;
+    BYTE reserved[28];
+};
+#pragma pack(pop)
 
 static const BYTE expected_mac[6] = {0x58, 0x11, 0x22, 0x76, 0x19, 0x64};
 
@@ -174,6 +189,66 @@ static int probe_if_table2(void) {
 static int close_enough(LONG actual, LONG expected) {
     LONG difference = actual - expected;
     return difference >= -1 && difference <= 1;
+}
+
+static int write_test_cursor(
+    DWORD sequence,
+    DWORD width,
+    DWORD height,
+    DWORD hotspot_x,
+    DWORD hotspot_y
+) {
+    struct test_cursor_header header;
+    HANDLE file;
+    DWORD *pixels;
+    DWORD pixel_size = width * height * sizeof(*pixels);
+    DWORD written;
+    DWORD index;
+    int result = 1;
+
+    ZeroMemory(&header, sizeof(header));
+    header.magic = 0x49435555u;
+    header.version = 1;
+    header.header_size = sizeof(header);
+    header.sequence = sequence;
+    header.width = width;
+    header.height = height;
+    header.hotspot_x = hotspot_x;
+    header.hotspot_y = hotspot_y;
+    header.pixel_size = pixel_size;
+    pixels = (DWORD *)HeapAlloc(GetProcessHeap(), 0, pixel_size);
+    if (!pixels) {
+        return 1;
+    }
+    for (index = 0; index < width * height; ++index) {
+        pixels[index] = (index % (width + 1u) == 0u)
+            ? 0xff20c060u
+            : 0x00000000u;
+    }
+    file = CreateFileW(
+        L"C:\\uu-remote-native-cursor.bin",
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        HeapFree(GetProcessHeap(), 0, pixels);
+        return 1;
+    }
+    if (
+        WriteFile(file, &header, sizeof(header), &written, NULL) &&
+        written == sizeof(header) &&
+        WriteFile(file, pixels, pixel_size, &written, NULL) &&
+        written == pixel_size
+    ) {
+        result = 0;
+    }
+    CloseHandle(file);
+    HeapFree(GetProcessHeap(), 0, pixels);
+    return result;
 }
 
 static int set_lock_state(int virtual_key, int enabled) {
@@ -381,7 +456,11 @@ int WINAPI WinMain(
         16384,
         expected_x,
         expected_y,
-        MOUSEEVENTF_VIRTUALDESK
+        MOUSEEVENTF_VIRTUALDESK,
+        4,
+        4,
+        1,
+        2
     );
     if (streamer_result != 0) {
         return streamer_result;
@@ -405,6 +484,10 @@ int WINAPI WinMain(
      * Without VIRTUALDESK, the same real cursor is exposed in the configured
      * monitor-local space.  That monitor starts at (100, 50).
      */
+    if (write_test_cursor(2, 6, 8, 3, 4)) {
+        return 14;
+    }
+    Sleep(30);
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     if (SendInput(1, &input, sizeof(input)) != 1) {
         return 2;
@@ -412,7 +495,7 @@ int WINAPI WinMain(
     expected_x = 400;
     expected_y = 250;
     streamer_result = probe_streamer_cursor(
-        32768, 16384, expected_x, expected_y, 0
+        32768, 16384, expected_x, expected_y, 0, 6, 8, 3, 4
     );
     if (streamer_result != 0) {
         return streamer_result;

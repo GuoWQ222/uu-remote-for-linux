@@ -69,9 +69,10 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 DEFAULT_RELEASE_TIMEOUT = 15.0
 X11_MONITOR_REFRESH_SECONDS = 2.0
+CURSOR_POLL_SECONDS = 1.0 / 60.0
 XKB_USE_CORE_KBD = 0x0100
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
@@ -91,6 +92,10 @@ FRAME_MAGIC = 0x46575555  # "UUWF" in little-endian byte order
 FRAME_VERSION = 1
 FRAME_HEADER = struct.Struct("<10I24x")
 FRAME_BUFFERS = 2
+CURSOR_MAGIC = 0x49435555  # "UUCI" in little-endian byte order
+CURSOR_VERSION = 1
+CURSOR_HEADER = struct.Struct("<9I28x")
+CURSOR_MAX_DIMENSION = 512
 
 # Linux input-event codes consumed by RemoteDesktop.NotifyPointerButton.
 EVDEV_BUTTONS = {
@@ -119,6 +124,39 @@ def atomic_write(path: Path, content: str) -> None:
         os.chmod(path, 0o600)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class XFixesCursorImage(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_short),
+        ("y", ctypes.c_short),
+        ("width", ctypes.c_ushort),
+        ("height", ctypes.c_ushort),
+        ("xhot", ctypes.c_ushort),
+        ("yhot", ctypes.c_ushort),
+        ("cursor_serial", ctypes.c_ulong),
+        ("pixels", ctypes.POINTER(ctypes.c_ulong)),
+        ("atom", ctypes.c_ulong),
+        ("name", ctypes.c_char_p),
+    ]
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -397,6 +435,15 @@ class XTestBackend:
         self.xtst = ctypes.CDLL(
             os.environ.get("UU_REMOTE_INPUT_BRIDGE_XTEST_LIBRARY", "libXtst.so.6")
         )
+        try:
+            self.xfixes = ctypes.CDLL(
+                os.environ.get(
+                    "UU_REMOTE_INPUT_BRIDGE_XFIXES_LIBRARY",
+                    "libXfixes.so.3",
+                )
+            )
+        except OSError:
+            self.xfixes = None
         self._configure_signatures()
         display_name = os.environ.get("DISPLAY")
         encoded = display_name.encode() if display_name else None
@@ -419,6 +466,15 @@ class XTestBackend:
         ):
             self.close()
             raise RuntimeError("当前 X11 服务器不支持 XTEST 扩展")
+        if self.xfixes is not None:
+            xfixes_event = ctypes.c_int()
+            xfixes_error = ctypes.c_int()
+            if not self.xfixes.XFixesQueryExtension(
+                self.display,
+                ctypes.byref(xfixes_event),
+                ctypes.byref(xfixes_error),
+            ):
+                self.xfixes = None
         self.absolute_geometry = self.virtual_desktop_geometry()
         self.virtual_geometry = self.absolute_geometry
         self.absolute_geometry_source = "virtual-desktop-fallback"
@@ -430,6 +486,8 @@ class XTestBackend:
         self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
         self.x11.XOpenDisplay.restype = ctypes.c_void_p
         self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x11.XFree.argtypes = [ctypes.c_void_p]
+        self.x11.XFree.restype = ctypes.c_int
         self.x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
         self.x11.XDefaultScreen.restype = ctypes.c_int
         self.x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -485,6 +543,18 @@ class XTestBackend:
             ctypes.c_ulong,
         ]
         self.xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+        if self.xfixes is not None:
+            self.xfixes.XFixesQueryExtension.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            self.xfixes.XFixesQueryExtension.restype = ctypes.c_int
+            self.xfixes.XFixesGetCursorImage.argtypes = [ctypes.c_void_p]
+            self.xfixes.XFixesGetCursorImage.restype = ctypes.POINTER(
+                XFixesCursorImage
+            )
 
     def close(self) -> None:
         if getattr(self, "display", None):
@@ -579,6 +649,41 @@ class XTestBackend:
         if not keysym:
             return 0
         return int(self.x11.XKeysymToKeycode(self.display, keysym))
+
+    def cursor_image(self) -> tuple[int, int, int, int, int, bytes] | None:
+        if self.xfixes is None:
+            return None
+        image_pointer = self.xfixes.XFixesGetCursorImage(self.display)
+        if not image_pointer:
+            return None
+        try:
+            image = image_pointer.contents
+            width = int(image.width)
+            height = int(image.height)
+            hot_x = int(image.xhot)
+            hot_y = int(image.yhot)
+            if (
+                not 1 <= width <= CURSOR_MAX_DIMENSION
+                or not 1 <= height <= CURSOR_MAX_DIMENSION
+                or hot_x >= width
+                or hot_y >= height
+            ):
+                return None
+            count = width * height
+            pixels = struct.pack(
+                f"<{count}I",
+                *(int(image.pixels[index]) & 0xFFFFFFFF for index in range(count)),
+            )
+            return (
+                int(image.cursor_serial),
+                width,
+                height,
+                hot_x,
+                hot_y,
+                pixels,
+            )
+        finally:
+            self.x11.XFree(image_pointer)
 
 
 class PortalRequestError(RuntimeError):
@@ -1308,6 +1413,30 @@ class FakeBackend:
         return self.fake_lock_mask
 
     @staticmethod
+    def cursor_image() -> tuple[int, int, int, int, int, bytes]:
+        width = 4
+        height = 4
+        pixels = (
+            0x00000000,
+            0xFFFFFFFF,
+            0x00000000,
+            0x00000000,
+            0xFFFFFFFF,
+            0xFF2050E0,
+            0xFFFFFFFF,
+            0x00000000,
+            0x00000000,
+            0xFFFFFFFF,
+            0x00000000,
+            0x00000000,
+            0x00000000,
+            0xFFFFFFFF,
+            0x00000000,
+            0x00000000,
+        )
+        return 1, width, height, 1, 2, struct.pack("<16I", *pixels)
+
+    @staticmethod
     def keysym_keycode(name: str) -> int:
         if len(name) == 1 and name.isalpha():
             return ord(name.upper()) - ord("A") + 38
@@ -1571,6 +1700,8 @@ def endpoint_content(
         f"port={port}\n"
         f"token={token.hex()}\n"
         "force_cursor=1\n"
+        "cursor_image=uu-remote-native-cursor.bin\n"
+        f"cursor_image_version={CURSOR_VERSION}\n"
         f"native_lock_keys={int(native_lock_keys)}\n"
     )
     if lock_mask is not None:
@@ -1615,6 +1746,12 @@ def write_status(
     capture_frames: int = 0,
     absolute_target: tuple[int, int, int, int] | None = None,
     absolute_target_source: str = "",
+    cursor_state: str = "inactive",
+    cursor_sequence: int = 0,
+    cursor_width: int = 0,
+    cursor_height: int = 0,
+    cursor_hotspot_x: int = 0,
+    cursor_hotspot_y: int = 0,
     detail: str = "",
 ) -> None:
     atomic_write_json(
@@ -1650,6 +1787,12 @@ def write_status(
                 list(absolute_target) if absolute_target is not None else None
             ),
             "absolute_target_source": absolute_target_source,
+            "cursor_state": cursor_state,
+            "cursor_sequence": cursor_sequence,
+            "cursor_width": cursor_width,
+            "cursor_height": cursor_height,
+            "cursor_hotspot_x": cursor_hotspot_x,
+            "cursor_hotspot_y": cursor_hotspot_y,
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
@@ -1697,6 +1840,7 @@ def watch(
 ) -> int:
     logger = Logger(log_path)
     status_path = status_paths(state_dir)["status"]
+    cursor_path = endpoint.parent / "uu-remote-native-cursor.bin"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_handle = lock_path.open("a+")
     try:
@@ -1728,6 +1872,10 @@ def watch(
     last_status = 0.0
     endpoint_cursor_geometry: tuple[int, int, int, int] | None = None
     endpoint_lock_mask: int | None = None
+    cursor_snapshot: tuple[int, int, int, int, int, bytes] | None = None
+    cursor_sequence = 0
+    cursor_checked_at = 0.0
+    cursor_logged_at = 0.0
 
     def publish_status(state: str, detail: str = "") -> None:
         current_capture_frames = int(
@@ -1756,6 +1904,12 @@ def watch(
             absolute_target_source=str(
                 getattr(backend, "absolute_geometry_source", "")
             ),
+            cursor_state="active" if cursor_snapshot is not None else "inactive",
+            cursor_sequence=cursor_sequence,
+            cursor_width=cursor_snapshot[1] if cursor_snapshot else 0,
+            cursor_height=cursor_snapshot[2] if cursor_snapshot else 0,
+            cursor_hotspot_x=cursor_snapshot[3] if cursor_snapshot else 0,
+            cursor_hotspot_y=cursor_snapshot[4] if cursor_snapshot else 0,
             detail=detail,
         )
 
@@ -1798,6 +1952,47 @@ def watch(
                 f"size={current_geometry[2]}x{current_geometry[3]}"
             )
 
+    def sync_cursor(force: bool = False) -> None:
+        nonlocal cursor_snapshot, cursor_sequence, cursor_checked_at
+        nonlocal cursor_logged_at
+        if backend is None or not hasattr(backend, "cursor_image"):
+            return
+        now = time.monotonic()
+        if not force and now - cursor_checked_at < CURSOR_POLL_SECONDS:
+            return
+        cursor_checked_at = now
+        current = backend.cursor_image()
+        if current is None or (
+            cursor_snapshot is not None and current[1:] == cursor_snapshot[1:]
+        ):
+            return
+        _serial, width, height, hot_x, hot_y, pixels = current
+        if len(pixels) != width * height * 4:
+            return
+        cursor_sequence = (cursor_sequence + 1) & 0xFFFFFFFF
+        if cursor_sequence == 0:
+            cursor_sequence = 1
+        header = CURSOR_HEADER.pack(
+            CURSOR_MAGIC,
+            CURSOR_VERSION,
+            CURSOR_HEADER.size,
+            cursor_sequence,
+            width,
+            height,
+            hot_x,
+            hot_y,
+            len(pixels),
+        )
+        atomic_write_bytes(cursor_path, header + pixels)
+        cursor_snapshot = current
+        if force or now - cursor_logged_at >= 1.0:
+            logger.write(
+                "原生光标图像已同步："
+                f"sequence={cursor_sequence} size={width}x{height} "
+                f"hotspot=({hot_x},{hot_y})"
+            )
+            cursor_logged_at = now
+
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGHUP, request_stop)
@@ -1828,8 +2023,13 @@ def watch(
         controller = InputController(backend, logger)
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(("127.0.0.1", 0))
-        listener.settimeout(0.25)
+        listener.settimeout(
+            CURSOR_POLL_SECONDS
+            if hasattr(backend, "cursor_image")
+            else 0.25
+        )
         port = int(listener.getsockname()[1])
+        sync_cursor(force=True)
         sync_endpoint(force=True)
         publish_status("waiting-hook")
         logger.write(
@@ -1839,6 +2039,7 @@ def watch(
 
         while running:
             sync_endpoint()
+            sync_cursor()
             try:
                 data, address = listener.recvfrom(512)
             except socket.timeout:
@@ -1928,6 +2129,8 @@ def watch(
         if backend is not None:
             backend.close()
         remove_owned_endpoint(endpoint, token)
+        cursor_path.unlink(missing_ok=True)
+        cursor_snapshot = None
         if not running:
             publish_status("stopped")
             logger.write(f"{backend_name} 原生输入桥已停止")
