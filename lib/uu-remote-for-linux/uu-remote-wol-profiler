@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Derive a fail-closed WOL capability patch profile from GameViewerServer.exe."""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import hashlib
+import re
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+PATCHED_BYTES = bytes.fromhex("b0 01 c3")  # mov al, 1; ret
+SOURCE_SUFFIX = b"wake_on_lan.cpp"
+ENABLED = b"Enabled"
+DISABLED = b"Disabled"
+FAILED = b"Failed to check WOL support"
+
+
+class ProfileError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Section:
+    name: bytes
+    virtual_size: int
+    rva: int
+    raw_size: int
+    raw_offset: int
+    characteristics: int
+
+
+@dataclass(frozen=True)
+class RuntimeFunction:
+    begin: int
+    end: int
+
+
+@dataclass(frozen=True)
+class PeImage:
+    data: bytes
+    sections: tuple[Section, ...]
+    text: Section
+    rdata: Section
+    pdata: Section
+
+    def file_offset(self, rva: int) -> int:
+        for section in self.sections:
+            span = max(section.virtual_size, section.raw_size)
+            if section.rva <= rva < section.rva + span:
+                offset = section.raw_offset + rva - section.rva
+                if offset >= len(self.data):
+                    break
+                return offset
+        raise ProfileError(f"RVA 不属于文件节：{rva:#x}")
+
+    def rva(self, file_offset: int) -> int:
+        for section in self.sections:
+            if section.raw_offset <= file_offset < section.raw_offset + section.raw_size:
+                return section.rva + file_offset - section.raw_offset
+        raise ProfileError(f"文件偏移不属于 PE 节：{file_offset:#x}")
+
+
+def parse_pe(data: bytes) -> PeImage:
+    if len(data) < 0x100 or data[:2] != b"MZ":
+        raise ProfileError("GameViewerServer.exe 不是有效的 PE 文件")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ProfileError("GameViewerServer.exe 缺少有效的 PE 签名")
+    machine, section_count = struct.unpack_from("<HH", data, pe_offset + 4)
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    if machine != 0x8664:
+        raise ProfileError("仅支持官方 Win64 GameViewerServer.exe")
+    optional = pe_offset + 24
+    if optional + optional_size > len(data) or struct.unpack_from("<H", data, optional)[0] != 0x20B:
+        raise ProfileError("PE32+ 可选头无效")
+    table = optional + optional_size
+    sections: list[Section] = []
+    for index in range(section_count):
+        header = table + index * 40
+        if header + 40 > len(data):
+            raise ProfileError("PE 节表越界")
+        name = data[header : header + 8].rstrip(b"\0")
+        virtual_size, rva, raw_size, raw_offset = struct.unpack_from(
+            "<IIII", data, header + 8
+        )
+        characteristics = struct.unpack_from("<I", data, header + 36)[0]
+        if raw_offset + raw_size > len(data):
+            raise ProfileError(f"PE 节范围越界：{name.decode(errors='replace')}")
+        sections.append(
+            Section(name, virtual_size, rva, raw_size, raw_offset, characteristics)
+        )
+
+    def required(name: bytes) -> Section:
+        matches = [section for section in sections if section.name == name]
+        if len(matches) != 1:
+            raise ProfileError(f"PE 缺少唯一的 {name.decode()} 节")
+        return matches[0]
+
+    text = required(b".text")
+    rdata = required(b".rdata")
+    pdata = required(b".pdata")
+    if not text.characteristics & 0x20000000:
+        raise ProfileError("PE .text 节不可执行")
+    return PeImage(data, tuple(sections), text, rdata, pdata)
+
+
+def printable_strings(image: PeImage) -> dict[bytes, list[int]]:
+    section = image.rdata
+    raw = image.data[section.raw_offset : section.raw_offset + section.raw_size]
+    strings: dict[bytes, list[int]] = {}
+    for match in re.finditer(rb"[ -~]{3,}\0", raw):
+        value = match.group()[:-1]
+        rva = section.rva + match.start()
+        strings.setdefault(value, []).append(rva)
+    return strings
+
+
+def runtime_functions(image: PeImage) -> list[RuntimeFunction]:
+    functions: list[RuntimeFunction] = []
+    start = image.pdata.raw_offset
+    end = start + image.pdata.raw_size
+    text_end = image.text.rva + max(image.text.virtual_size, image.text.raw_size)
+    for offset in range(start, end - 11, 12):
+        begin, finish, _ = struct.unpack_from("<III", image.data, offset)
+        if image.text.rva <= begin < finish <= text_end:
+            functions.append(RuntimeFunction(begin, finish))
+    functions.sort(key=lambda item: item.begin)
+    if not functions:
+        raise ProfileError("PE .pdata 中没有有效的 x64 函数边界")
+    return functions
+
+
+def rip_relative_lea_xrefs(image: PeImage) -> list[tuple[int, int]]:
+    """Return (instruction RVA, target RVA) for seven-byte RIP-relative LEAs."""
+
+    refs: list[tuple[int, int]] = []
+    start = image.text.raw_offset
+    end = start + image.text.raw_size
+    for offset in range(start, end - 6):
+        # REX + 8D /r, mod=00 and r/m=101 is LEA reg,[RIP+disp32].
+        if not 0x40 <= image.data[offset] <= 0x4F:
+            continue
+        if image.data[offset + 1] != 0x8D or image.data[offset + 2] & 0xC7 != 0x05:
+            continue
+        instruction_rva = image.text.rva + offset - start
+        displacement = struct.unpack_from("<i", image.data, offset + 3)[0]
+        refs.append((instruction_rva, instruction_rva + 7 + displacement))
+    return refs
+
+
+def has_bool_return(code: bytes) -> bool:
+    # MSVC emits movzx eax,<byte register> before the epilogue for this bool.
+    return bool(re.search(rb"(?:[\x40-\x4f])?\x0f\xb6[\xc0-\xc7]", code))
+
+
+def has_true_assignment(code: bytes) -> bool:
+    # mov r8b..r15b/legacy-byte-register, 1. Register allocation may change.
+    return bool(re.search(rb"(?:[\x40-\x4f])?[\xb0-\xb7]\x01", code))
+
+
+def derive_patch_offset(image: PeImage) -> int:
+    strings = printable_strings(image)
+    enabled = set(strings.get(ENABLED, ()))
+    disabled = set(strings.get(DISABLED, ()))
+    failed = set(strings.get(FAILED, ()))
+    source = {
+        rva
+        for value, rvas in strings.items()
+        if value.endswith(SOURCE_SUFFIX)
+        for rva in rvas
+    }
+    if not enabled or not disabled or not source:
+        raise ProfileError("缺少 WOL 源码路径或 Enabled/Disabled 语义标记")
+
+    functions = runtime_functions(image)
+    begins = [item.begin for item in functions]
+    refs: dict[RuntimeFunction, set[str]] = {}
+    targets = {
+        "enabled": enabled,
+        "disabled": disabled,
+        "source": source,
+        "failed": failed,
+    }
+    for instruction, target in rip_relative_lea_xrefs(image):
+        index = bisect.bisect_right(begins, instruction) - 1
+        if index < 0:
+            continue
+        function = functions[index]
+        if not function.begin <= instruction < function.end:
+            continue
+        for name, values in targets.items():
+            if target in values:
+                refs.setdefault(function, set()).add(name)
+
+    candidates: list[RuntimeFunction] = []
+    for function, names in refs.items():
+        if not {"enabled", "disabled", "source"}.issubset(names):
+            continue
+        # The larger command/configuration function also mentions these strings,
+        # but owns this failure message. The capability predicate does not.
+        if "failed" in names or not 0x80 <= function.end - function.begin <= 0x1000:
+            continue
+        start = image.file_offset(function.begin)
+        finish = image.file_offset(function.end - 1) + 1
+        code = image.data[start:finish]
+        if b"\xc3" not in code or not has_bool_return(code) or not has_true_assignment(code):
+            continue
+        candidates.append(function)
+
+    if len(candidates) != 1:
+        details = ", ".join(f"{item.begin:#x}-{item.end:#x}" for item in candidates)
+        raise ProfileError(
+            "WOL 能力判断函数不是唯一匹配："
+            f"候选数={len(candidates)}{('，' + details) if details else ''}"
+        )
+    patch_offset = image.file_offset(candidates[0].begin)
+    if patch_offset + len(PATCHED_BYTES) > len(image.data):
+        raise ProfileError("WOL 补丁位置越界")
+    if image.data[patch_offset : patch_offset + 3] == PATCHED_BYTES:
+        raise ProfileError("GameViewerServer.exe 已经包含 WOL 补丁，必须从官方原版生成档案")
+    return patch_offset
+
+
+def derive_profile(data: bytes, version: str) -> tuple[str, bytes]:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2,3}", version):
+        raise ProfileError("UU 版本号格式无效")
+    image = parse_pe(data)
+    patch_offset = derive_patch_offset(image)
+    before = data[patch_offset : patch_offset + 3]
+    patched = bytearray(data)
+    patched[patch_offset : patch_offset + 3] = PATCHED_BYTES
+    patched_bytes = bytes(patched)
+    row = "\t".join(
+        (
+            version,
+            hashlib.sha256(data).hexdigest(),
+            hashlib.sha256(patched_bytes).hexdigest(),
+            hex(patch_offset),
+            before.hex(),
+            PATCHED_BYTES.hex(),
+        )
+    )
+    return row, patched_bytes
+
+
+def add_lea(data: bytearray, file_offset: int, instruction_rva: int, target_rva: int) -> None:
+    data[file_offset : file_offset + 3] = b"\x48\x8d\x15"
+    struct.pack_into("<i", data, file_offset + 3, target_rva - instruction_rva - 7)
+
+
+def synthetic_pe(duplicate: bool = False) -> bytes:
+    data = bytearray(0x2600)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HH", data, 0x84, 0x8664, 3)
+    struct.pack_into("<H", data, 0x94, 0xF0)
+    struct.pack_into("<H", data, 0x98, 0x20B)
+    table = 0x80 + 24 + 0xF0
+    sections = (
+        (b".text", 0x1000, 0x1000, 0x1000, 0x400, 0x60000020),
+        (b".rdata", 0x800, 0x3000, 0x800, 0x1400, 0x40000040),
+        (b".pdata", 0x200, 0x4000, 0x200, 0x1C00, 0x40000040),
+    )
+    for index, (name, virtual_size, rva, raw_size, raw_offset, flags) in enumerate(sections):
+        header = table + index * 40
+        data[header : header + len(name)] = name
+        struct.pack_into("<IIII", data, header + 8, virtual_size, rva, raw_size, raw_offset)
+        struct.pack_into("<I", data, header + 36, flags)
+
+    string_values = (
+        b"S:\\repo_remote\\src\\server_core\\support\\wol\\wake_on_lan.cpp\0",
+        b"Enabled\0",
+        b"Disabled\0",
+        b"Failed to check WOL support\0",
+    )
+    string_rvas: list[int] = []
+    cursor = 0x1500
+    for value in string_values:
+        data[cursor : cursor + len(value)] = value
+        string_rvas.append(0x3000 + cursor - 0x1400)
+        cursor += len(value) + 8
+
+    def add_function(raw: int, rva: int, targets: tuple[int, ...]) -> None:
+        data[raw : raw + 8] = bytes.fromhex("48 89 5c 24 08 90 90 90")
+        for index, target in enumerate(targets):
+            instruction_raw = raw + 0x20 + index * 8
+            add_lea(data, instruction_raw, rva + 0x20 + index * 8, target)
+        data[raw + 0x70 : raw + 0x78] = bytes.fromhex("41 b5 01 41 0f b6 c5 c3")
+
+    add_function(0x500, 0x1100, tuple(string_rvas[:3]))
+    pdata_cursor = 0x1C00
+    struct.pack_into("<III", data, pdata_cursor, 0x1100, 0x1180, 0x5000)
+    pdata_cursor += 12
+    # A configuration helper owns the failure string and must not be selected.
+    add_function(0x700, 0x1300, tuple(string_rvas))
+    struct.pack_into("<III", data, pdata_cursor, 0x1300, 0x1380, 0x5010)
+    pdata_cursor += 12
+    if duplicate:
+        add_function(0x900, 0x1500, tuple(string_rvas[:3]))
+        struct.pack_into("<III", data, pdata_cursor, 0x1500, 0x1580, 0x5020)
+    return bytes(data)
+
+
+def self_test() -> None:
+    fixture = synthetic_pe()
+    row, patched = derive_profile(fixture, "9.9.9.9")
+    columns = row.split("\t")
+    if len(columns) != 6 or columns[3] != "0x500":
+        raise ProfileError("自检生成的 WOL 偏移或字段数错误")
+    if patched[0x500:0x503] != PATCHED_BYTES:
+        raise ProfileError("自检 WOL 补丁未写入")
+    try:
+        derive_profile(synthetic_pe(duplicate=True), "9.9.9.9")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检未拒绝重复的 WOL 语义候选")
+    print("WOL 自动档案生成器自检通过")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--derive", type=Path)
+    parser.add_argument("--version")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.self_test:
+            self_test()
+            return 0
+        if args.derive is None or not args.version:
+            parser.error("--derive 和 --version 必须同时提供")
+        row, _ = derive_profile(args.derive.read_bytes(), args.version)
+        print(row)
+        return 0
+    except (OSError, ProfileError) as error:
+        print(f"错误：{error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

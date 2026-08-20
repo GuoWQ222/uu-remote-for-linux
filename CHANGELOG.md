@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Derive fail-closed Wake-on-LAN patch profiles automatically from the
+  official `GameViewerServer.exe` after UU updates. The profiler requires a
+  unique PE exception-function boundary that references the WOL source path
+  and both `Enabled`/`Disabled` capability states, then records the original
+  and patched SHA-256 hashes, entry offset, and before/after bytes locally.
+- Restore the verified original server before an update, regenerate and
+  deploy the profile afterward, and include generated WOL profiles in the
+  transactional rollback snapshot. Ambiguous future binaries remain
+  untouched and continue through the Win32 adapter-mapping fallback.
+
 ## [1.1.26] - 2026-08-19
 
 - Keep the real Qt client alive in a transient user service with

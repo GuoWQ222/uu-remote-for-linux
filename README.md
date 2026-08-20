@@ -27,6 +27,9 @@
 | 🧭 | Native tray | Show the main window, choose the controlled display or decoder, and arrange one or two viewer windows |
 | 🛡️ | Linux integration | Autostart, sleep inhibition, resilient encrypted DNS, file transfer, safe updates, and Wake-on-LAN bridges |
 
+> [!NOTE]
+> After a UU update, the Wake-on-LAN layer derives a local profile from verified function boundaries and WOL semantics in the official `GameViewerServer.exe`, then deploys only after checking the original bytes and SHA-256 hashes. Ambiguous binaries are left untouched and safely fall back to Win32 adapter mapping.
+
 ## 🚀 Quick start
 
 1. Download the latest `.deb` from [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).

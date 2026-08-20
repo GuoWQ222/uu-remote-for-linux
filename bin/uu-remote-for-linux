@@ -51,6 +51,8 @@ readonly input_injector_source="$runtime_dir/uu-remote-input-injector.exe"
 readonly powershell_bridge_source="$runtime_dir/uu-remote-powershell-bridge.exe"
 readonly wol_bridge="$runtime_dir/uu-remote-wol-bridge"
 readonly wol_configure="$runtime_dir/uu-remote-wol-configure"
+readonly wol_compatibility_profiles="${UU_REMOTE_WOL_COMPATIBILITY_PROFILES:-$runtime_dir/wol-compatibility.tsv}"
+readonly wol_profiler="${UU_REMOTE_WOL_PROFILER_BIN:-$runtime_dir/uu-remote-wol-profiler}"
 readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
 readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
 readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
@@ -188,8 +190,7 @@ readonly client_log_dir="$install_dir/log/client/Log"
 readonly streamer_log_dir="$install_dir/log/server/log"
 readonly mobile_download_dir="$install_dir/Download"
 readonly wol_enabled_stamp="$data_dir/wol-enabled"
-readonly wol_server_original_sha="${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-c012039c0e9f5ffd33c5b5ac0da069dca68e7566e78124b7c799e5beac3b0034}"
-readonly wol_server_patched_sha="${UU_REMOTE_WOL_SERVER_PATCHED_SHA:-886c0638717d80cc567f1e9fe05b0072065a6fd67d6d114446e44953cde2822a}"
+readonly wol_generated_profiles="$data_dir/wol-generated.tsv"
 readonly decoder_selection_file="$data_dir/decoder-selection"
 readonly operation_lock_timeout="${UU_REMOTE_OPERATION_LOCK_TIMEOUT:-30}"
 readonly hwdecode_runtime_dir="$runtime_dir/hwdecode"
@@ -228,6 +229,13 @@ streamer_patch_after_1=""
 streamer_patch_after_2=""
 streamer_original_sha=""
 streamer_patched_sha=""
+wol_profile_version=""
+wol_profile_source=""
+wol_profile_original_sha=""
+wol_profile_patched_sha=""
+wol_profile_patch_offset=0
+wol_profile_patch_before=""
+wol_profile_patch_after=""
 
 readonly wine="${UU_REMOTE_WINE_BIN:-wine}"
 readonly wineboot="${UU_REMOTE_WINEBOOT_BIN:-wineboot}"
@@ -416,8 +424,8 @@ usage() {
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
   --enable-hwencode    强制启用 NVIDIA NVENC/HEVC 被控端编码桥
   --disable-hwencode   禁用自动 NVENC 并恢复 OpenH264 安全回退
-  --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 通用映射
-  --disable-wol        关闭 UU WOL 通用映射（保留 Linux 网卡设置）
+  --enable-wol         配置 Magic Packet 并启用 UU WOL 自适应兼容层
+  --disable-wol        关闭 UU WOL 兼容层（保留 Linux 网卡设置）
   --select-decoder     打开 CPU/GPU 解码设备选择窗口
   --select-decoder-and-restart
                        选择解码设备，保存后自动重启 UU
@@ -2661,44 +2669,198 @@ wol_enabled() {
     [[ -r $wol_enabled_stamp ]]
 }
 
-wol_patch_ready() {
-    [[ -x $wol_bridge ]] &&
-        "$wol_bridge" patched \
-            "$server" \
-            "$wol_server_original" \
-            "$wol_server_original_sha" \
-            "$wol_server_patched_sha"
-}
-
 wol_server_sha() {
     [[ -f $server ]] || return 1
     file_sha256 "$server"
 }
 
-wol_legacy_patch_applicable() {
-    local current_sha
-
-    current_sha=$(wol_server_sha) || return 1
-    [[ $current_sha == "$wol_server_original_sha" ||
-        $current_sha == "$wol_server_patched_sha" ]]
+clear_wol_profile() {
+    wol_profile_version=""
+    wol_profile_source=""
+    wol_profile_original_sha=""
+    wol_profile_patched_sha=""
+    wol_profile_patch_offset=0
+    wol_profile_patch_before=""
+    wol_profile_patch_after=""
 }
 
-wol_legacy_patch_ready_or_unused() {
+load_wol_profile() {
+    local requested_version=${1:-} requested_sha=${2:-}
+    local row_version original_sha patched_sha offset before after
+    local profile_file source override_version found=false
+
+    requested_sha=${requested_sha,,}
+    if [[ -n $wol_profile_version &&
+        (-z $requested_version || $wol_profile_version == "$requested_version") &&
+        (-z $requested_sha || $requested_sha == "$wol_profile_original_sha" ||
+            $requested_sha == "$wol_profile_patched_sha") ]]; then
+        return 0
+    fi
+    clear_wol_profile
+
+    override_version=${UU_REMOTE_WOL_SERVER_VERSION:-$requested_version}
+    if [[ -n $override_version &&
+        -n ${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-} &&
+        -n ${UU_REMOTE_WOL_SERVER_PATCHED_SHA:-} ]]; then
+        row_version=$override_version
+        original_sha=$UU_REMOTE_WOL_SERVER_ORIGINAL_SHA
+        patched_sha=$UU_REMOTE_WOL_SERVER_PATCHED_SHA
+        offset=${UU_REMOTE_WOL_PATCH_OFFSET:-0x40df20}
+        before=${UU_REMOTE_WOL_PATCH_BEFORE:-48895c}
+        after=${UU_REMOTE_WOL_PATCH_AFTER:-b001c3}
+        source=override
+        if [[ (-z $requested_version || $row_version == "$requested_version") &&
+            (-z $requested_sha || ${original_sha,,} == "$requested_sha" ||
+                ${patched_sha,,} == "$requested_sha") ]]; then
+            found=true
+        fi
+    fi
+
+    if ! $found; then
+        for profile_file in \
+            "$wol_compatibility_profiles" \
+            "$wol_generated_profiles"; do
+            [[ -r $profile_file ]] || continue
+            if [[ $profile_file == "$wol_generated_profiles" ]]; then
+                source=generated
+            else
+                source=builtin
+            fi
+            while IFS=$'\t' read -r \
+                row_version original_sha patched_sha offset before after; do
+                [[ -n $row_version && $row_version != \#* ]] || continue
+                [[ -z $requested_version || $row_version == "$requested_version" ]] ||
+                    continue
+                [[ -z $requested_sha || ${original_sha,,} == "$requested_sha" ||
+                    ${patched_sha,,} == "$requested_sha" ]] || continue
+                found=true
+                break
+            done <"$profile_file"
+            $found && break
+        done
+    fi
+    $found || return 1
+    [[ $row_version =~ ^[0-9]+([.][0-9]+){2,3}$ &&
+        $original_sha =~ ^[[:xdigit:]]{64}$ &&
+        $patched_sha =~ ^[[:xdigit:]]{64}$ &&
+        $offset =~ ^0[xX][[:xdigit:]]+$ &&
+        $before =~ ^[[:xdigit:]]{6}$ &&
+        ${after,,} == b001c3 ]] || return 1
+
+    wol_profile_version=$row_version
+    wol_profile_source=$source
+    wol_profile_original_sha=${original_sha,,}
+    wol_profile_patched_sha=${patched_sha,,}
+    wol_profile_patch_offset=$((offset))
+    wol_profile_patch_before=${before,,}
+    wol_profile_patch_after=${after,,}
+}
+
+load_wol_profile_for_server() {
+    local current_sha version
+
+    current_sha=$(wol_server_sha) || return 1
+    version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
+    load_wol_profile "$version" "$current_sha" ||
+        load_wol_profile "" "$current_sha"
+}
+
+generate_wol_profile() {
+    local version=$1 row row_version original_sha patched_sha offset before after
+    local current_sha temp existing_version existing_original existing_patched
+    local existing_offset existing_before existing_after
+
+    [[ -x $wol_profiler && -f $server ]] || return 1
+    current_sha=$(wol_server_sha) || return 1
+    row=$("$wol_profiler" --derive "$server" --version "$version" \
+        2>>"$setup_log") || return 1
+    IFS=$'\t' read -r \
+        row_version original_sha patched_sha offset before after <<<"$row"
+    [[ $row_version == "$version" &&
+        ${original_sha,,} == "$current_sha" &&
+        $patched_sha =~ ^[[:xdigit:]]{64}$ &&
+        $offset =~ ^0[xX][[:xdigit:]]+$ &&
+        $before =~ ^[[:xdigit:]]{6}$ &&
+        ${after,,} == b001c3 ]] || return 1
+
+    mkdir -p "$data_dir"
+    temp=$(mktemp "$data_dir/.wol-generated.XXXXXX")
+    printf '# Automatically derived, fail-closed WOL profiles.\n' >"$temp"
+    if [[ -r $wol_generated_profiles ]]; then
+        while IFS=$'\t' read -r \
+            existing_version existing_original existing_patched \
+            existing_offset existing_before existing_after; do
+            [[ -n $existing_version && $existing_version != \#* ]] || continue
+            if [[ $existing_version == "$version" &&
+                ${existing_original,,} == "$current_sha" ]]; then
+                continue
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$existing_version" "$existing_original" "$existing_patched" \
+                "$existing_offset" "$existing_before" "$existing_after" >>"$temp"
+        done <"$wol_generated_profiles"
+    fi
+    printf '%s\n' "$row" >>"$temp"
+    chmod 0600 "$temp"
+    mv -f "$temp" "$wol_generated_profiles"
+    clear_wol_profile
+    load_wol_profile "$version" "$current_sha" || return 1
+    printf '已为 UU %s 自动生成并校验 WOL 二进制档案。\n' "$version"
+}
+
+ensure_wol_profile() {
+    local version=${1:-}
+
+    load_wol_profile_for_server && return 0
+    if [[ -z $version ]]; then
+        version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
+    fi
+    [[ -n $version ]] || return 1
+    generate_wol_profile "$version"
+}
+
+wol_patch_ready() {
+    load_wol_profile_for_server || return 1
+    [[ -x $wol_bridge ]] &&
+        UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
+        UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
+        UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
+        "$wol_bridge" patched \
+            "$server" \
+            "$wol_server_original" \
+            "$wol_profile_original_sha" \
+            "$wol_profile_patched_sha"
+}
+
+wol_binary_patch_ready_or_unused() {
+    local current_sha
+
     [[ -f $server ]] || return 1
-    if wol_legacy_patch_applicable; then
-        wol_patch_ready
+    if load_wol_profile_for_server; then
+        current_sha=$(wol_server_sha) || return 1
+        [[ $current_sha == "$wol_profile_patched_sha" ]] && wol_patch_ready
     else
         return 0
     fi
 }
 
 deploy_optional_wol_server_patch() {
-    wol_legacy_patch_applicable || return 0
-    "$wol_bridge" patch \
-        "$server" \
-        "$wol_server_original" \
-        "$wol_server_original_sha" \
-        "$wol_server_patched_sha" || return 1
+    local version
+
+    version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
+    if ! ensure_wol_profile "$version"; then
+        printf '未能为 UU %s 唯一识别 WOL 函数；保留通用 Win32 网卡映射。\n' \
+            "${version:-unknown}" >>"$setup_log"
+        return 0
+    fi
+    UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
+    UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
+    UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
+        "$wol_bridge" patch \
+            "$server" \
+            "$wol_server_original" \
+            "$wol_profile_original_sha" \
+            "$wol_profile_patched_sha" || return 1
     wol_patch_ready
 }
 
@@ -2706,23 +2868,39 @@ restore_optional_wol_server_patch() {
     local current_sha
 
     current_sha=$(wol_server_sha) || return 0
-    [[ $current_sha == "$wol_server_patched_sha" ]] || return 0
-    "$wol_bridge" restore \
-        "$server" \
-        "$wol_server_original" \
-        "$wol_server_original_sha" \
-        "$wol_server_patched_sha"
+    load_wol_profile_for_server || return 0
+    [[ $current_sha == "$wol_profile_patched_sha" ]] || return 0
+    UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
+    UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
+    UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
+        "$wol_bridge" restore \
+            "$server" \
+            "$wol_server_original" \
+            "$wol_profile_original_sha" \
+            "$wol_profile_patched_sha"
 }
 
 wol_server_compat_label() {
+    local current_sha
+
     if [[ ! -f $server ]]; then
         printf '服务端不存在'
     elif wol_patch_ready; then
-        printf '旧版服务端补丁完整'
-    elif wol_legacy_patch_applicable; then
-        printf '旧版服务端补丁缺失/不匹配'
+        load_wol_profile_for_server || true
+        if [[ $wol_profile_source == generated ]]; then
+            printf '自适应档案补丁完整（UU %s）' "$wol_profile_version"
+        else
+            printf '版本档案补丁完整（UU %s）' "$wol_profile_version"
+        fi
+    elif load_wol_profile_for_server; then
+        current_sha=$(wol_server_sha) || true
+        if [[ $current_sha == "$wol_profile_original_sha" ]]; then
+            printf '已识别 UU %s，WOL 补丁待部署' "$wol_profile_version"
+        else
+            printf 'UU %s WOL 补丁/备份不匹配' "$wol_profile_version"
+        fi
     else
-        printf '通用 Win32 网卡映射（无需二进制补丁）'
+        printf '通用 Win32 网卡映射（自动档案未唯一识别）'
     fi
 }
 
@@ -2991,7 +3169,7 @@ powershell_bridge_runtime_label() {
 }
 
 wol_runtime_bridge_ready() {
-    wol_legacy_patch_ready_or_unused &&
+    wol_binary_patch_ready_or_unused &&
         wol_hook_config_ready &&
         powershell_bridge_ready
 }
@@ -3088,22 +3266,18 @@ deploy_wol_powershell_bridge() {
         die "UU WOL PowerShell 电源属性兼容桥部署后核验失败"
 }
 
-deploy_wol_bridge() {
+write_wol_enabled_stamp() {
     local interface connection mac gateway nm_wol power_wakeup
 
-    configure_native_wol
-    deploy_optional_wol_server_patch ||
-        die "UU WOL 旧版服务端补丁部署失败；Linux 网卡设置已保留"
-    write_wol_hook_config ||
-        die "无法生成 UU WOL 物理网卡映射；Linux 网卡设置已保留"
-    deploy_wol_powershell_bridge
     IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
-        < <(wol_detect_row)
+        < <(wol_detect_row) || return 1
     {
         printf 'version=2\n'
         printf 'package_version=%s\n' "$package_version"
         if wol_patch_ready; then
-            printf 'server_mode=legacy-binary-patch\n'
+            printf 'server_mode=adaptive-binary-patch\n'
+            printf 'server_profile=%s\n' "$wol_profile_version"
+            printf 'server_profile_source=%s\n' "$wol_profile_source"
         else
             printf 'server_mode=win32-adapter-mapping\n'
         fi
@@ -3114,6 +3288,17 @@ deploy_wol_bridge() {
     } >"${wol_enabled_stamp}.tmp"
     chmod 0600 "${wol_enabled_stamp}.tmp"
     mv -f "${wol_enabled_stamp}.tmp" "$wol_enabled_stamp"
+}
+
+deploy_wol_bridge() {
+    configure_native_wol
+    deploy_optional_wol_server_patch ||
+        die "UU WOL 自适应服务端补丁部署失败；Linux 网卡设置已保留"
+    write_wol_hook_config ||
+        die "无法生成 UU WOL 物理网卡映射；Linux 网卡设置已保留"
+    deploy_wol_powershell_bridge
+    write_wol_enabled_stamp ||
+        die "无法记录 UU WOL 自适应档案状态"
 }
 
 remove_wol_bridge() {
@@ -4364,6 +4549,7 @@ create_version_bridge_state_snapshot() {
         hwdecode-enabled \
         hwdecode-manifest \
         hwdecode-generated.tsv \
+        wol-generated.tsv \
         decoder-cache-before-hwdecode.json \
         hwencode-enabled \
         hwencode-disabled \
@@ -4392,6 +4578,7 @@ restore_version_bridge_state_snapshot() {
         "$hwdecode_enabled_stamp" \
         "$hwdecode_manifest" \
         "$hwdecode_generated_profiles" \
+        "$wol_generated_profiles" \
         "$decoder_cache_backup" \
         "$hwencode_enabled_stamp" \
         "$hwencode_disabled_stamp" \
@@ -4500,7 +4687,7 @@ run_update_transaction() {
         stop_prefix_for_setup
         if wol_enabled; then
             restore_optional_wol_server_patch ||
-                die "更新前无法安全恢复 WOL 旧版服务端补丁"
+                die "更新前无法安全恢复 WOL 服务端补丁"
         fi
         if ! $profile_supported; then
             if hwdecode_enabled || streamer_bridge_ready; then
@@ -4524,6 +4711,8 @@ run_update_transaction() {
             write_wol_hook_config ||
                 die "更新后 WOL 物理网卡映射无法生成"
             deploy_wol_powershell_bridge
+            write_wol_enabled_stamp ||
+                die "更新后 WOL 自适应档案状态无法刷新"
         fi
         apply_decoder_selection
 
@@ -4552,15 +4741,15 @@ run_update_transaction() {
                 "$latest"
         elif hwdecode_enabled; then
             write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证；已启用的 WOL 通用映射已重新部署"
+                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证；已启用的 WOL 自适应兼容层已重新生成并部署"
             notify_status "UU 已更新到 $latest，NVDEC 自动补丁验证通过"
-            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁已自动验证；已启用的 WOL 通用映射已重新部署。\n' \
+            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁已自动验证；已启用的 WOL 自适应兼容层已重新生成并部署。\n' \
                 "$latest"
         else
             write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；已启用的 WOL 通用映射已重新部署，版本绑定的 NVDEC 补丁已安全停用"
+                "已安装官方最新版；已启用的 WOL 自适应兼容层已重新生成并部署，版本绑定的 NVDEC 补丁已安全停用"
             notify_status "UU 已更新到 $latest，通用兼容层已重新部署"
-            printf 'UU 已更新到官方最新版 %s；已启用的 WOL 通用映射已重新部署，版本绑定的 NVDEC 补丁暂时停用。\n' \
+            printf 'UU 已更新到官方最新版 %s；已启用的 WOL 自适应兼容层已重新生成并部署，版本绑定的 NVDEC 补丁暂时停用。\n' \
                 "$latest"
         fi
         restart_client_after_update || true
@@ -4730,7 +4919,7 @@ if $enable_wol; then
     stop_prefix_for_setup
     deploy_wol_bridge
     notify_status "远程开机兼容桥已启用"
-    printf 'Linux Magic Packet 与 UU WOL 通用映射兼容桥已启用。\n'
+    printf 'Linux Magic Packet 与 UU WOL 自适应兼容层已启用。\n'
     printf '请重新启动 UU，在“允许通过远程开机启动”中继续配置辅助设备或路由器。\n'
     exit 0
 fi
@@ -4739,7 +4928,7 @@ if $disable_wol; then
     stop_prefix_for_setup
     remove_wol_bridge
     notify_status "远程开机兼容桥已关闭"
-    printf 'UU WOL 通用映射兼容桥已关闭；如曾使用旧版服务端补丁，也已安全恢复。\n'
+    printf 'UU WOL 自适应兼容层已关闭；服务端补丁已安全恢复。\n'
     printf 'Linux 网卡的 Magic Packet 设置予以保留，不会影响正常联网。\n'
     exit 0
 fi
@@ -4784,10 +4973,12 @@ fi
 
 if wol_enabled; then
     deploy_optional_wol_server_patch ||
-        die "远程开机兼容桥已启用，但旧版 UU 服务端补丁无法安全部署"
+        die "远程开机兼容桥已启用，但 UU 服务端补丁无法安全部署"
     write_wol_hook_config ||
         die "远程开机兼容桥已启用，但无法映射 Linux 物理网卡"
     deploy_wol_powershell_bridge
+    write_wol_enabled_stamp ||
+        die "远程开机兼容桥已启用，但自适应档案状态无法刷新"
     wol_runtime_bridge_ready ||
         die "远程开机兼容桥已启用，但运行时映射核验失败"
 fi

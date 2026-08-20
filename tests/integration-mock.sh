@@ -216,6 +216,38 @@ test "$(sha256sum "$wol_server" | cut -d' ' -f1)" = \
 test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
 test ! -e "$prefix/drive_c/uu-remote-wol-bridge.ini"
 test ! -e "$install_dir/bin/powershell.exe"
+
+# A future binary without a packaged row gets a local, hash-bound profile.
+# The fixture deliberately uses a different function prologue to verify that
+# the bridge consumes the generated before-bytes instead of a hardcoded value.
+truncate -s 8192 "$wol_server"
+printf '\125\110\211' |
+    dd of="$wol_server" bs=1 seek=4096 conv=notrunc status=none
+wol_adaptive_original_sha=$(sha256sum "$wol_server" | cut -d' ' -f1)
+empty_wol_profiles="$test_root/empty-wol-profiles.tsv"
+: >"$empty_wol_profiles"
+UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    "$launcher" --enable-wol
+test "$(od -An -tx1 -j 4096 -N 3 "$wol_server" | tr -d ' \n')" = b001c3
+test -s "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
+grep -q $'^4.34.0.8979\t.*\t.*\t0x1000\t554889\tb001c3$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
+grep -q '^server_mode=adaptive-binary-patch$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+"$launcher" --diagnose >"$test_root/wol-adaptive-diagnose.txt"
+grep -q 'UU WOL 服务端兼容.*自适应档案补丁完整' \
+    "$test_root/wol-adaptive-diagnose.txt"
+"$launcher" --disable-wol
+test "$(sha256sum "$wol_server" | cut -d' ' -f1)" = \
+    "$wol_adaptive_original_sha"
+test ! -e "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
+# Keep WOL enabled across the following failed and successful UU updates. The
+# transaction must restore this binary before install, preserve it on rollback,
+# then safely fall back when the next mock server has no unique PE profile.
+"$launcher" --enable-wol
+grep -q '^server_mode=adaptive-binary-patch$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
 unset UU_REMOTE_WOL_DETECT_ROW \
     UU_REMOTE_WOL_NATIVE_IP \
     UU_REMOTE_WOL_REFERENCE_IP
@@ -371,6 +403,8 @@ sha256sum \
     "$install_dir/bin/streamer.dll" \
     "$prefix/drive_c/windows/system32/nvcuda.dll" \
     "$prefix/drive_c/windows/system32/nvcuvid.dll" \
+    "$install_dir/bin/GameViewerServer.exe" \
+    "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe" \
     "$prefix/drive_c/uu-remote-input-hook.dll" >"$protected_before"
 if UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
     UU_REMOTE_FAKE_INSTALLER_VERSION=4.34.0.8979 \
@@ -386,6 +420,8 @@ sha256sum \
     "$install_dir/bin/streamer.dll" \
     "$prefix/drive_c/windows/system32/nvcuda.dll" \
     "$prefix/drive_c/windows/system32/nvcuvid.dll" \
+    "$install_dir/bin/GameViewerServer.exe" \
+    "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe" \
     "$prefix/drive_c/uu-remote-input-hook.dll" >"$protected_after"
 cmp -s "$protected_before" "$protected_after"
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-enabled"
@@ -396,6 +432,12 @@ UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \
     "$launcher" --check-update
 "$launcher" --diagnose | grep -q 'UU 版本.*4.35.0.9000'
 "$launcher" --diagnose | grep -q '安全更新状态.*已更新到 4.35.0.9000'
+grep -q '^server_mode=win32-adapter-mapping$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+test -s "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
+test ! -e "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
+"$launcher" --diagnose | grep -q \
+    'UU WOL 服务端兼容.*通用 Win32 网卡映射'
 test ! -e "$install_dir/bin/d3d11.dll"
 test ! -e "$install_dir/bin/dxgi.dll"
 test ! -e "$streamer_original"

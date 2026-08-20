@@ -49,6 +49,11 @@ check "system proxy bridge Python syntax" /usr/bin/python3 -c \
     "$project_root/lib/uu-remote-for-linux/uu-remote-system-proxy-bridge"
 check "WOL bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
+check "WOL profiler Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-profiler"
+check "WOL profiler self-test" \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-profiler" --self-test
 check "WOL root configurator syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure"
 check "update bridge syntax" bash -n \
@@ -65,6 +70,8 @@ check "keyboard gsettings fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/keyboard-gsettings"
 check "proxy gsettings fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/proxy-gsettings"
+check "WOL profiler fixture syntax" bash -n \
+    "$project_root/tests/fixtures/bin/wol-profiler"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "DXGI probe builder syntax" bash -n \
@@ -136,6 +143,8 @@ check "WOL bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-bridge"
 check "WOL root configurator exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-wol-configure"
+check "WOL automatic profiler exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-wol-profiler"
 check "update bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge"
 check "keyboard bridge exists" test -x \
@@ -144,6 +153,8 @@ check "input bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
 check "update compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
+check "WOL compatibility profiles exist" test -s \
+    "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv"
 check "NVDEC compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv"
 check "NVDEC automatic profiler exists" test -x \

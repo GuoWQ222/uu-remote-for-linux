@@ -27,6 +27,9 @@
 | 🧭 | 原生托盘 | 显示主界面、选择被控屏幕或解码器，并排列单个或两个远控窗口 |
 | 🛡️ | Linux 集成 | 自启动、防休眠、加密 DNS 容错、文件传输、安全更新与远程开机兼容桥 |
 
+> [!NOTE]
+> 远程开机兼容层会在 UU 更新后从官方 `GameViewerServer.exe` 的函数边界与 WOL 语义标记自动生成本机版本档案，再经原始字节和 SHA-256 双重校验后部署；无法唯一识别时不会修改二进制，并继续使用 Win32 网卡映射安全回退。
+
 ## 🚀 快速开始
 
 1. 从 [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest) 下载最新 `.deb`。

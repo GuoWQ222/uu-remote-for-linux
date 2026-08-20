@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${1:-} == --derive && -f ${2:-} && ${3:-} == --version && -n ${4:-} ]]
+
+readonly server=$2
+readonly version=$4
+readonly offset=4096
+temp="${server}.wol-profiler-test.$$"
+trap 'rm -f -- "$temp"' EXIT
+
+original_sha=$(sha256sum "$server")
+original_sha=${original_sha%% *}
+before=$(od -An -tx1 -j "$offset" -N 3 "$server" | tr -d ' \n')
+[[ $before =~ ^[[:xdigit:]]{6}$ ]]
+install -m 0644 "$server" "$temp"
+printf '\260\001\303' |
+    dd of="$temp" bs=1 seek="$offset" conv=notrunc status=none
+patched_sha=$(sha256sum "$temp")
+patched_sha=${patched_sha%% *}
+
+printf '%s\t%s\t%s\t0x%x\t%s\tb001c3\n' \
+    "$version" "$original_sha" "$patched_sha" "$offset" "$before"

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 readonly patch_offset="${UU_REMOTE_WOL_PATCH_OFFSET:-$((0x40df20))}"
-readonly original_bytes="48895c"
-readonly patched_bytes="b001c3"
+readonly original_bytes="${UU_REMOTE_WOL_PATCH_BEFORE:-48895c}"
+readonly patched_bytes="${UU_REMOTE_WOL_PATCH_AFTER:-b001c3}"
 
 usage() {
     cat <<'EOF'
@@ -26,6 +26,12 @@ file_sha256() {
 bytes_at_patch() {
     od -An -tx1 -j "$patch_offset" -N 3 "$1" 2>/dev/null |
         tr -d ' \n'
+}
+
+validate_patch_parameters() {
+    [[ $patch_offset =~ ^[0-9]+$ &&
+        $original_bytes =~ ^[[:xdigit:]]{6}$ &&
+        $patched_bytes == b001c3 ]]
 }
 
 detect_interface() {
@@ -66,6 +72,10 @@ patch_server() {
     local server=$1 backup=$2 original_sha=$3 patched_sha=$4
     local current_sha temp
 
+    validate_patch_parameters || {
+        printf 'WOL 补丁档案参数无效。\n' >&2
+        return 1
+    }
     if wol_patch_ready "$server" "$backup" "$original_sha" "$patched_sha"; then
         return
     fi
@@ -107,6 +117,10 @@ patch_server() {
 restore_server() {
     local server=$1 backup=$2 original_sha=$3 patched_sha=$4 current_sha
 
+    validate_patch_parameters || {
+        printf 'WOL 补丁档案参数无效。\n' >&2
+        return 1
+    }
     [[ -f $server ]] || return 0
     current_sha=$(file_sha256 "$server")
     if [[ $current_sha == "$original_sha" ]]; then
