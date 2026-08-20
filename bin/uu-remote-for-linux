@@ -212,6 +212,9 @@ readonly decoder_cache="$install_dir/config/streamer/decoder_codec_capability_ca
 readonly decoder_cache_backup="$data_dir/decoder-cache-before-hwdecode.json"
 readonly encoder_cache="$install_dir/config/streamer/encoder_codec_capability_cache.json"
 readonly encoder_cache_backup="$data_dir/encoder-cache-before-hwencode.json"
+readonly streamer_profile_dir="$data_dir/streamer-profiles"
+readonly streamer_active_profile="$data_dir/streamer-compatibility.json"
+readonly adaptive_patch_baseline_version="4.38.0.9292"
 readonly hwencode_enabled_stamp="$data_dir/hwencode-enabled"
 readonly hwencode_disabled_stamp="$data_dir/hwencode-disabled"
 readonly hwencode_failed_stamp="$data_dir/hwencode-failed"
@@ -1454,7 +1457,7 @@ hwencode_probe_current() {
     expected=$(hwencode_signature) || return 1
     recorded=$(sed -n 's/^signature=//p' "$hwencode_probe_status" | head -n1)
     [[ $recorded == "$expected" ]] &&
-        grep -q $'^NVENC_D3D11_OK\t.*\th264=1\thevc=1\ttexture_upload=1$' \
+        grep -q $'^NVENC_D3D11_OK\t.*\th264=1\thevc=1\ttexture_upload=1\tnv12_upload=1$' \
             "$hwencode_probe_status"
 }
 
@@ -1474,11 +1477,14 @@ hwencode_probe_ids() {
 }
 
 probe_hwencode_bridge() {
-    local output line signature temp
+    local output line signature temp installed_version
 
     [[ -f $hwencode_probe ]] || return 1
-    "$hwencode_policy" probe-streamer "$streamer_dll" >>"$setup_log" 2>&1 ||
-        return 1
+    installed_version=$(
+        registry_value "$installed_version_key" Version 2>/dev/null || true
+    )
+    [[ -n $installed_version ]] || return 1
+    ensure_streamer_compatibility_profile "$installed_version" || return 1
     configure_hwencode_environment
     output=$(mktemp "$cache_dir/.hwencode-probe.XXXXXX")
     if ! (
@@ -1498,7 +1504,8 @@ probe_hwencode_bridge() {
         rm -f -- "$output"
         return 1
     }
-    grep -q $'\th264=1\thevc=1\ttexture_upload=1$' <<<"$line" || {
+    grep -q $'\th264=1\thevc=1\ttexture_upload=1\tnv12_upload=1$' \
+        <<<"$line" || {
         rm -f -- "$output"
         return 1
     }
@@ -1597,6 +1604,91 @@ hwencode_failure_current() {
     [[ -r $hwencode_failed_stamp ]] || return 1
     signature=$(hwencode_signature 2>/dev/null || printf unknown)
     [[ $(<"$hwencode_failed_stamp") == "$signature" ]]
+}
+
+streamer_profile_requires_portrait() {
+    local version=$1
+
+    version_at_least "$version" "$adaptive_patch_baseline_version"
+}
+
+future_adaptive_patch_required() {
+    local version=$1
+
+    version_greater "$version" "$adaptive_patch_baseline_version"
+}
+
+streamer_profile_command() {
+    local command=$1 streamer=$2 version=$3 profile=$4
+    local -a arguments
+
+    arguments=(
+        "$hwencode_policy" "$command" "$streamer" "$version" "$profile"
+    )
+    if streamer_profile_requires_portrait "$version"; then
+        arguments+=(--require-portrait)
+    fi
+    "${arguments[@]}"
+}
+
+ensure_streamer_compatibility_profile() {
+    local version=$1 streamer_sha archive temp
+
+    [[ -x $hwencode_policy && -f $streamer_dll ]] || return 1
+    [[ $version =~ ^[0-9]+([.][0-9]+){2,3}$ ]] || return 1
+    streamer_sha=$(file_sha256 "$streamer_dll") || return 1
+    mkdir -p "$streamer_profile_dir"
+    archive="$streamer_profile_dir/${version}-${streamer_sha}.json"
+
+    if ! streamer_profile_command match-streamer-profile \
+        "$streamer_dll" "$version" "$archive" \
+        >>"$setup_log" 2>&1; then
+        rm -f -- "$archive"
+        streamer_profile_command derive-streamer-profile \
+            "$streamer_dll" "$version" "$archive" \
+            >>"$setup_log" 2>&1 || return 1
+        streamer_profile_command verify-streamer-profile \
+            "$streamer_dll" "$version" "$archive" \
+            >>"$setup_log" 2>&1 || {
+            rm -f -- "$archive"
+            return 1
+        }
+    fi
+
+    temp=$(mktemp "$data_dir/.streamer-compatibility.XXXXXX") || return 1
+    install -m0600 "$archive" "$temp" || {
+        rm -f -- "$temp"
+        return 1
+    }
+    mv -f "$temp" "$streamer_active_profile" || {
+        rm -f -- "$temp"
+        return 1
+    }
+    streamer_profile_command match-streamer-profile \
+        "$streamer_dll" "$version" "$streamer_active_profile" \
+        >>"$setup_log" 2>&1 || return 1
+    printf '已为 UU %s 自动生成并校验 NVENC/竖屏语义档案。\n' "$version"
+}
+
+streamer_compatibility_profile_ready() {
+    local version=$1
+
+    [[ -f $streamer_dll && -r $streamer_active_profile ]] || return 1
+    streamer_profile_command match-streamer-profile \
+        "$streamer_dll" "$version" "$streamer_active_profile" \
+        >/dev/null 2>&1
+}
+
+decoder_selection_wants_nvdec() {
+    local requested effective
+
+    requested=$(saved_decoder_selection || true)
+    [[ -n $requested ]] || return 1
+    effective=$requested
+    if [[ $requested == auto ]]; then
+        effective=$("$decoder_selector" --best-id 2>/dev/null || printf 'cpu')
+    fi
+    [[ $effective =~ ^nvidia:[0-9]+$ ]]
 }
 
 update_blocker_manifest_hash() {
@@ -3026,10 +3118,17 @@ wol_binary_patch_ready_or_unused() {
 }
 
 deploy_optional_wol_server_patch() {
-    local version
+    local mode=${1:-optional} version
+
+    [[ $mode == optional || $mode == required ]] || return 1
 
     version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
     if ! ensure_wol_profile "$version"; then
+        if [[ $mode == required ]]; then
+            printf '未能为 UU %s 唯一识别 WOL 函数；拒绝接受会丢失 WOL 补丁的新版本。\n' \
+                "${version:-unknown}" >>"$setup_log"
+            return 1
+        fi
         printf '未能为 UU %s 唯一识别 WOL 函数；保留通用 Win32 网卡映射。\n' \
             "${version:-unknown}" >>"$setup_log"
         return 0
@@ -3607,6 +3706,27 @@ hwencode_status_label() {
     fi
 }
 
+streamer_compatibility_profile_status_label() {
+    local version output
+
+    version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
+    [[ -n $version ]] || {
+        printf '未建立（UU 未安装）'
+        return
+    }
+    output=$(streamer_profile_command match-streamer-profile \
+        "$streamer_dll" "$version" "$streamer_active_profile" \
+        2>/dev/null) || {
+        printf '缺失或与当前二进制不匹配'
+        return
+    }
+    if [[ $output == *$'\tportrait=1' ]]; then
+        printf '完整（UU %s；NVENC/竖屏）' "$version"
+    else
+        printf '完整（UU %s；NVENC）' "$version"
+    fi
+}
+
 hwencode_last_session_label() {
     local latest line
 
@@ -3692,6 +3812,7 @@ print_diagnostics() {
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
         "竖屏原画缩放" "$(portrait_original_quality_status_label)" \
+        "自适应语义档案" "$(streamer_compatibility_profile_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
         "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
         "输入桥日志" "$input_bridge_log" \
@@ -4737,6 +4858,8 @@ create_version_bridge_state_snapshot() {
         hwdecode-manifest \
         hwdecode-generated.tsv \
         wol-generated.tsv \
+        streamer-compatibility.json \
+        streamer-profiles \
         decoder-cache-before-hwdecode.json \
         hwencode-enabled \
         hwencode-disabled \
@@ -4766,6 +4889,7 @@ restore_version_bridge_state_snapshot() {
         "$hwdecode_manifest" \
         "$hwdecode_generated_profiles" \
         "$wol_generated_profiles" \
+        "$streamer_active_profile" \
         "$decoder_cache_backup" \
         "$hwencode_enabled_stamp" \
         "$hwencode_disabled_stamp" \
@@ -4774,6 +4898,11 @@ restore_version_bridge_state_snapshot() {
         "$encoder_cache_backup" \
         "$hwencode_dxvk_config" \
         "$wol_enabled_stamp"
+    if [[ -d $streamer_profile_dir ]]; then
+        find "$streamer_profile_dir" -mindepth 1 -maxdepth 1 -type f -delete ||
+            return 1
+        rmdir "$streamer_profile_dir" || return 1
+    fi
     tar -C "$data_dir" -xf "$snapshot"
 }
 
@@ -4827,10 +4956,19 @@ restart_client_after_update() {
 }
 
 update_restart_ready() {
+    local installed_version
+
     app_files_present &&
         shim_ready &&
         input_hook_ready &&
         update_blocker_ready || return 1
+    installed_version=$(
+        registry_value "$installed_version_key" Version 2>/dev/null || true
+    )
+    if [[ -n $installed_version ]] &&
+        future_adaptive_patch_required "$installed_version"; then
+        streamer_compatibility_profile_ready "$installed_version" || return 1
+    fi
     if hwdecode_enabled; then
         hwdecode_files_deployed || return 1
     fi
@@ -4846,6 +4984,11 @@ run_update_transaction() {
     local latest=$1 expected_installer_sha actual_installer_sha
     local snapshot bridge_state_snapshot installed_after
     local profile_supported=false
+    local strict_adaptive_patch=false
+
+    if future_adaptive_patch_required "$latest"; then
+        strict_adaptive_patch=true
+    fi
 
     if update_version_supported "$latest"; then
         profile_supported=true
@@ -4890,10 +5033,23 @@ run_update_transaction() {
         [[ $installed_after == "$latest" ]] ||
             die "更新后版本核验失败：${installed_after:-unknown}"
 
+        ensure_streamer_compatibility_profile "$installed_after" ||
+            die "更新后无法自动生成 NVENC/竖屏语义档案"
+
         ensure_auto_hwencode
+        if $strict_adaptive_patch &&
+            [[ ${UU_REMOTE_DISABLE_AUTO_HWENCODE:-0} != 1 ]] &&
+            ! hwencode_disabled && hwencode_runtime_ready &&
+            hwencode_host_libraries_ready && ! hwencode_enabled; then
+            die "更新后 NVENC 自动补丁无法通过深层验证"
+        fi
 
         if wol_enabled; then
-            deploy_optional_wol_server_patch ||
+            if $strict_adaptive_patch; then
+                deploy_optional_wol_server_patch required
+            else
+                deploy_optional_wol_server_patch
+            fi ||
                 die "更新后 WOL 服务端兼容策略无法部署"
             write_wol_hook_config ||
                 die "更新后 WOL 物理网卡映射无法生成"
@@ -4902,6 +5058,12 @@ run_update_transaction() {
                 die "更新后 WOL 自适应档案状态无法刷新"
         fi
         apply_decoder_selection
+        if $strict_adaptive_patch && decoder_selection_wants_nvdec &&
+            { ! hwdecode_enabled || ! hwdecode_files_deployed; }; then
+            die "更新后 NVDEC 自动补丁无法通过官方解码探测"
+        fi
+        ensure_streamer_compatibility_profile "$installed_after" ||
+            die "更新后最终 streamer.dll 无法通过 NVENC/竖屏档案复核"
 
         shim_ready || die "更新后 Event Log 兼容 DLL 核验失败"
         update_blocker_ready ||
@@ -5173,6 +5335,17 @@ fi
 ensure_auto_hwencode
 
 apply_decoder_selection
+
+installed_profile_version=$(
+    registry_value "$installed_version_key" Version 2>/dev/null || true
+)
+if [[ -n $installed_profile_version ]] &&
+    ! ensure_streamer_compatibility_profile "$installed_profile_version"; then
+    if future_adaptive_patch_required "$installed_profile_version"; then
+        die "当前 UU 版本无法自动生成 NVENC/竖屏补丁档案；已阻止不兼容版本启动"
+    fi
+    printf '警告：当前旧版 UU 无法生成 NVENC/竖屏语义档案；继续使用安全回退。\n' >&2
+fi
 
 if ! sync_linux_system_proxy; then
     printf '警告：Linux 系统代理未能同步到 Wine，详见 %s\n' \

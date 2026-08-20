@@ -131,6 +131,13 @@ cmp -s \
 cmp -s \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
     "$prefix/drive_c/uu-remote-input-injector.exe"
+test -s "$XDG_DATA_HOME/uu-remote-for-linux/streamer-compatibility.json"
+"$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
+    match-streamer-profile \
+    "$install_dir/bin/streamer.dll" \
+    4.34.0.8979 \
+    "$XDG_DATA_HOME/uu-remote-for-linux/streamer-compatibility.json" \
+    >/dev/null
 test -f "$install_dir/bin/.webview-ready"
 test -f "$cache_dir/UURemote_Setup.exe"
 grep -q '^version=4.34.0.8979$' "$cache_dir/installer-metadata"
@@ -748,6 +755,66 @@ grep -q $'^4.36.0.9300\t' \
 grep -q 'NVDEC 自动补丁运行验证通过' "$state_dir/setup.log"
 grep -q '^HWDECODE_DXGI_PROBE$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^HWDECODE_CODEC_PROBE$' "$UU_REMOTE_FAKE_TRACE"
+
+# A post-4.38 release must rebuild all four version-bound features as one
+# transaction: NVENC/portrait semantic profile, NVDEC binary profile and WOL
+# capability profile. If any required semantic target disappears, the updater
+# must restore the last fully compatible client instead of accepting a partial
+# feature downgrade.
+UU_REMOTE_DISABLE_AUTO_HWENCODE=0 "$launcher" --enable-hwencode
+UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT=1 \
+UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+UU_REMOTE_FAKE_LATEST_VERSION=4.39.0.9400 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.39.0.9400 \
+    "$launcher" --check-update
+"$launcher" --diagnose >"$test_root/future-adaptive-diagnose.txt"
+grep -q 'UU 版本.*4.39.0.9400' "$test_root/future-adaptive-diagnose.txt"
+grep -q '自适应语义档案.*完整（UU 4.39.0.9400；NVENC/竖屏）' \
+    "$test_root/future-adaptive-diagnose.txt"
+grep -q 'NVENC 编码策略.*已启用（NVENC/HEVC 深层验证通过）' \
+    "$test_root/future-adaptive-diagnose.txt"
+grep -q '硬解桥注入.*完整' "$test_root/future-adaptive-diagnose.txt"
+grep -q 'UU WOL 服务端兼容.*自适应档案补丁完整' \
+    "$test_root/future-adaptive-diagnose.txt"
+awk -F '\t' '$1 == "4.39.0.9400" { found = 1 } END { exit !found }' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
+awk -F '\t' '$1 == "4.39.0.9400" { found = 1 } END { exit !found }' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
+"$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
+    verify-streamer-profile \
+    "$streamer" \
+    4.39.0.9400 \
+    "$XDG_DATA_HOME/uu-remote-for-linux/streamer-compatibility.json" \
+    --require-portrait \
+    >/dev/null
+
+if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+    UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+    UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+    UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+    UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    UU_REMOTE_FAKE_LATEST_VERSION=4.40.0.9500 \
+    UU_REMOTE_FAKE_INSTALLER_VERSION=4.40.0.9500 \
+        "$launcher" --check-update \
+        >"$test_root/future-incompatible.out" \
+        2>"$test_root/future-incompatible.err"; then
+    printf '缺少竖屏语义点的未来版本被意外接受。\n' >&2
+    exit 1
+fi
+if ! grep -q '无法自动生成 NVENC/竖屏语义档案' \
+    "$test_root/future-incompatible.err"; then
+    printf '未来版本的自动补丁失败原因不符合预期：\n' >&2
+    sed -n '1,20p' "$test_root/future-incompatible.err" >&2
+    exit 1
+fi
+"$launcher" --diagnose >"$test_root/future-rollback-diagnose.txt"
+grep -q 'UU 版本.*4.39.0.9400' "$test_root/future-rollback-diagnose.txt"
+grep -q '自适应语义档案.*完整（UU 4.39.0.9400；NVENC/竖屏）' \
+    "$test_root/future-rollback-diagnose.txt"
 
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"

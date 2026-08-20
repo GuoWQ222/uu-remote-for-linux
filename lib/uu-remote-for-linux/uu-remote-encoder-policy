@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -260,7 +261,7 @@ def parse_id(value: str, label: str) -> int:
     return result
 
 
-def probe_streamer(path: Path) -> None:
+def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
     """Find the GDI RawVideoFrame adapter-id vtable slot without fixed RVAs."""
     try:
         data = path.read_bytes()
@@ -941,7 +942,35 @@ def probe_streamer(path: Path) -> None:
         if portrait_scaler_offsets
         else 0
     )
-    print(
+    profile: dict[str, object] = {
+        "vtable_rva": vtable_rva,
+        "slot_rva": slot_rva,
+        "base_getter_rva": adapter_getter_rva,
+        "base_slots": base_slots,
+        "long_slots": long_slots,
+        "wrapper_vtable_rva": wrapper_vtable_rva,
+        "wrapper_slot_rva": wrapper_slot_rva,
+        "wrapper_ctor_refs": wrapper_ctor_refs,
+        "wrapper_rtti": wrapper_rtti or "none",
+        "rtti_named_slots": rtti_named_slots,
+        "encoder_accessor_rva": encoder_accessor_rva,
+        "encoder_path_candidates": len(encoder_accessor_offsets),
+        "implementation_profile": implementation_profile,
+        "nvenc_v8_impl": NVENC_V8_IMPL,
+        "nvenc_v11_impl": NVENC_V11_IMPL,
+        "software_impl": software_impl,
+        "impl_33": "software",
+        "impl_switch_candidates": len(impl_switch_candidates),
+        "portrait_scale_rva": portrait_scale_rva,
+        "portrait_scale_candidates": len(portrait_scale_offsets),
+        "portrait_capture_rva": portrait_capture_rva,
+        "portrait_capture_candidates": len(portrait_capture_offsets),
+        "portrait_update_rva": portrait_update_rva,
+        "portrait_update_candidates": len(portrait_update_offsets),
+        "portrait_scaler_rva": portrait_scaler_rva,
+        "portrait_scaler_candidates": len(portrait_scaler_offsets),
+    }
+    line = (
         f"STREAMER_GDI_ADAPTER_OK\tvtable_rva=0x{vtable_rva:x}"
         f"\tslot_rva=0x{slot_rva:x}"
         f"\tbase_getter_rva=0x{adapter_getter_rva:x}"
@@ -969,11 +998,213 @@ def probe_streamer(path: Path) -> None:
         f"\tportrait_scaler_rva=0x{portrait_scaler_rva:x}"
         f"\tportrait_scaler_candidates={len(portrait_scaler_offsets)}"
     )
+    if emit:
+        print(line)
+    return profile
+
+
+def portrait_profile_ready(profile: dict[str, object]) -> bool:
+    return all(
+        profile.get(f"portrait_{name}_candidates") == 1
+        and isinstance(profile.get(f"portrait_{name}_rva"), int)
+        and profile[f"portrait_{name}_rva"] > 0
+        for name in ("scale", "capture", "update", "scaler")
+    )
+
+
+def encoder_profile_ready(profile: dict[str, object]) -> bool:
+    positive_rvas = (
+        "vtable_rva",
+        "slot_rva",
+        "base_getter_rva",
+        "wrapper_vtable_rva",
+        "wrapper_slot_rva",
+        "encoder_accessor_rva",
+    )
+    return (
+        all(
+            isinstance(profile.get(name), int) and profile[name] > 0
+            for name in positive_rvas
+        )
+        and isinstance(profile.get("base_slots"), int)
+        and profile["base_slots"] >= 1
+        and isinstance(profile.get("long_slots"), int)
+        and profile["long_slots"] >= 1
+        and isinstance(profile.get("wrapper_ctor_refs"), int)
+        and profile["wrapper_ctor_refs"] >= 1
+        and profile.get("encoder_path_candidates") == 1
+        and profile.get("impl_switch_candidates") == 1
+        and profile.get("implementation_profile")
+        in {"nvenc-v8-v11", "unified-nvenc"}
+        and profile.get("software_impl") in {5, 6}
+        and profile.get("impl_33") == "software"
+    )
+
+
+def streamer_profile_payload(
+    streamer: Path,
+    version: str,
+    *,
+    require_portrait: bool,
+) -> dict[str, object]:
+    if not version or any(
+        not part.isdigit() for part in version.split(".")
+    ) or len(version.split(".")) not in {3, 4}:
+        fail("UU 版本号格式无效")
+    try:
+        data = streamer.read_bytes()
+    except OSError as error:
+        fail(f"无法读取 streamer.dll：{error}")
+    # Keep the established one-line semantic evidence in setup/update logs.
+    # Existing diagnostics and regressions use these exact target counts to
+    # distinguish a verified adapter path from a merely written profile file.
+    probe = probe_streamer(streamer, emit=True)
+    if not encoder_profile_ready(probe):
+        fail("编码器语义档案缺少必需的唯一候选点")
+    if require_portrait and not portrait_profile_ready(probe):
+        fail("无法为当前 UU 唯一生成四处竖屏原画补丁档案")
+    return {
+        "format": 1,
+        "uu_version": version,
+        "streamer_sha256": hashlib.sha256(data).hexdigest(),
+        "portrait_required": require_portrait,
+        "portrait_ready": portrait_profile_ready(probe),
+        "probe": probe,
+    }
+
+
+def write_streamer_profile(
+    streamer: Path,
+    version: str,
+    destination: Path,
+    *,
+    require_portrait: bool,
+) -> None:
+    payload = streamer_profile_payload(
+        streamer, version, require_portrait=require_portrait
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(
+        "STREAMER_PROFILE_OK"
+        f"\tversion={version}"
+        f"\tsha256={payload['streamer_sha256']}"
+        f"\tportrait={int(bool(payload['portrait_ready']))}"
+    )
+
+
+def verify_streamer_profile(
+    streamer: Path,
+    version: str,
+    profile_path: Path,
+    *,
+    require_portrait: bool,
+) -> None:
+    try:
+        saved = json.loads(profile_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        fail(f"streamer 自动兼容档案不存在：{profile_path}")
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"无法读取 streamer 自动兼容档案：{error}")
+    current = streamer_profile_payload(
+        streamer, version, require_portrait=require_portrait
+    )
+    if not isinstance(saved, dict) or saved.get("format") != 1:
+        fail("streamer 自动兼容档案格式无效")
+    if saved != current:
+        fail("streamer 自动兼容档案与当前 UU 二进制不匹配")
+    print(
+        "STREAMER_PROFILE_VERIFIED"
+        f"\tversion={version}"
+        f"\tsha256={current['streamer_sha256']}"
+        f"\tportrait={int(bool(current['portrait_ready']))}"
+    )
+
+
+def match_streamer_profile(
+    streamer: Path,
+    version: str,
+    profile_path: Path,
+    *,
+    require_portrait: bool,
+) -> None:
+    try:
+        saved = json.loads(profile_path.read_text(encoding="utf-8"))
+        streamer_sha256 = hashlib.sha256(streamer.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        fail(f"streamer 自动兼容档案不存在：{profile_path}")
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"无法快速核验 streamer 自动兼容档案：{error}")
+    probe = saved.get("probe") if isinstance(saved, dict) else None
+    if (
+        not isinstance(saved, dict)
+        or saved.get("format") != 1
+        or saved.get("uu_version") != version
+        or saved.get("streamer_sha256") != streamer_sha256
+        or not isinstance(probe, dict)
+        or not encoder_profile_ready(probe)
+        or saved.get("portrait_ready") != portrait_profile_ready(probe)
+        or saved.get("portrait_required") != require_portrait
+        or (require_portrait and not portrait_profile_ready(probe))
+    ):
+        fail("streamer 自动兼容档案与当前 UU 二进制不匹配")
+    print(
+        "STREAMER_PROFILE_MATCHED"
+        f"\tversion={version}"
+        f"\tsha256={streamer_sha256}"
+        f"\tportrait={int(bool(saved.get('portrait_ready')))}"
+    )
 
 
 def main(argv: list[str]) -> None:
     if len(argv) == 3 and argv[1] == "probe-streamer":
         probe_streamer(Path(argv[2]))
+        return
+    if len(argv) in {5, 6} and argv[1] in {
+        "derive-streamer-profile",
+        "verify-streamer-profile",
+        "match-streamer-profile",
+    }:
+        require_portrait = len(argv) == 6 and argv[5] == "--require-portrait"
+        if len(argv) == 6 and not require_portrait:
+            fail(f"未知参数：{argv[5]}")
+        streamer = Path(argv[2])
+        version = argv[3]
+        profile_path = Path(argv[4])
+        if argv[1] == "derive-streamer-profile":
+            write_streamer_profile(
+                streamer,
+                version,
+                profile_path,
+                require_portrait=require_portrait,
+            )
+        elif argv[1] == "verify-streamer-profile":
+            verify_streamer_profile(
+                streamer,
+                version,
+                profile_path,
+                require_portrait=require_portrait,
+            )
+        else:
+            match_streamer_profile(
+                streamer,
+                version,
+                profile_path,
+                require_portrait=require_portrait,
+            )
         return
     if len(argv) == 8 and argv[1] == "watch":
         watch(
@@ -990,6 +1221,9 @@ def main(argv: list[str]) -> None:
             "用法：uu-remote-encoder-policy "
             "enable|verify CACHE BACKUP DEVICE_ID ADAPTER_ID；"
             "或 disable CACHE BACKUP；或 probe-streamer STREAMER_DLL；"
+            "或 derive-streamer-profile|verify-streamer-profile|"
+            "match-streamer-profile "
+            "STREAMER_DLL UU_VERSION PROFILE [--require-portrait]；"
             "或 watch CACHE BACKUP DEVICE_ID ADAPTER_ID ENABLED_STAMP LOCK"
         )
     command = argv[1]

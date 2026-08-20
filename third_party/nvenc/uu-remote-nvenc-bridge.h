@@ -96,6 +96,7 @@ struct uu_nvenc_encoder
     void *native_encoder;
     uu_CUdevice cuda_device;
     uu_CUcontext cuda_context;
+    pthread_mutex_t mutex;
     struct uu_nvenc_resource *resources;
     struct uu_nvenc_encoder *next;
 };
@@ -221,16 +222,41 @@ static void uu_pop_encoder(void)
     uu_cuCtxPopCurrent(&previous);
 }
 
-static struct uu_nvenc_encoder *uu_enter_encoder(void *encoder_handle)
+static struct uu_nvenc_encoder *uu_lock_encoder(void *encoder_handle)
 {
     struct uu_nvenc_encoder *encoder;
 
     pthread_mutex_lock(&uu_bridge_mutex);
     encoder = uu_find_encoder(encoder_handle);
+    if (encoder)
+        pthread_mutex_lock(&encoder->mutex);
     pthread_mutex_unlock(&uu_bridge_mutex);
-    if (!encoder || !uu_push_encoder(encoder))
-        return NULL;
     return encoder;
+}
+
+static void uu_unlock_encoder(struct uu_nvenc_encoder *encoder)
+{
+    pthread_mutex_unlock(&encoder->mutex);
+}
+
+static struct uu_nvenc_encoder *uu_enter_encoder(void *encoder_handle)
+{
+    struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle);
+
+    if (!encoder)
+        return NULL;
+    if (!uu_push_encoder(encoder))
+    {
+        uu_unlock_encoder(encoder);
+        return NULL;
+    }
+    return encoder;
+}
+
+static void uu_leave_encoder(struct uu_nvenc_encoder *encoder)
+{
+    uu_pop_encoder();
+    uu_unlock_encoder(encoder);
 }
 
 static NVENCSTATUS uu_initialize_encoder(
@@ -242,7 +268,7 @@ static NVENCSTATUS uu_initialize_encoder(
     if (!encoder)
         return origFunctions.nvEncInitializeEncoder(encoder_handle, params);
     status = origFunctions.nvEncInitializeEncoder(encoder_handle, params);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -255,7 +281,7 @@ static NVENCSTATUS uu_create_bitstream_buffer(
     if (!encoder)
         return origFunctions.nvEncCreateBitstreamBuffer(encoder_handle, params);
     status = origFunctions.nvEncCreateBitstreamBuffer(encoder_handle, params);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -268,7 +294,7 @@ static NVENCSTATUS uu_destroy_bitstream_buffer(
     if (!encoder)
         return origFunctions.nvEncDestroyBitstreamBuffer(encoder_handle, buffer);
     status = origFunctions.nvEncDestroyBitstreamBuffer(encoder_handle, buffer);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -281,7 +307,7 @@ static NVENCSTATUS uu_encode_picture(
     if (!encoder)
         return origFunctions.nvEncEncodePicture(encoder_handle, params);
     status = origFunctions.nvEncEncodePicture(encoder_handle, params);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -294,7 +320,7 @@ static NVENCSTATUS uu_lock_bitstream(
     if (!encoder)
         return origFunctions.nvEncLockBitstream(encoder_handle, params);
     status = origFunctions.nvEncLockBitstream(encoder_handle, params);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -307,7 +333,7 @@ static NVENCSTATUS uu_unlock_bitstream(
     if (!encoder)
         return origFunctions.nvEncUnlockBitstream(encoder_handle, buffer);
     status = origFunctions.nvEncUnlockBitstream(encoder_handle, buffer);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -320,7 +346,7 @@ static NVENCSTATUS uu_unmap_input_resource(
     if (!encoder)
         return origFunctions.nvEncUnmapInputResource(encoder_handle, resource);
     status = origFunctions.nvEncUnmapInputResource(encoder_handle, resource);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -333,7 +359,7 @@ static NVENCSTATUS uu_reconfigure_encoder(
     if (!encoder)
         return origFunctions.nvEncReconfigureEncoder(encoder_handle, params);
     status = origFunctions.nvEncReconfigureEncoder(encoder_handle, params);
-    uu_pop_encoder();
+    uu_leave_encoder(encoder);
     return status;
 }
 
@@ -429,11 +455,23 @@ static NVENCSTATUS uu_open_d3d11_session(
     bridge = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*bridge));
     if (!bridge)
         return UU_NV_ENC_ERR_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&bridge->mutex, NULL))
+    {
+        HeapFree(GetProcessHeap(), 0, bridge);
+        return UU_NV_ENC_ERR_OUT_OF_MEMORY;
+    }
     if (!uu_selected_cuda_device(&bridge->cuda_device) ||
         uu_cuDevicePrimaryCtxRetain(&bridge->cuda_context,
-                                    bridge->cuda_device) != UU_CUDA_SUCCESS ||
-        !uu_push_encoder(bridge))
+                                    bridge->cuda_device) != UU_CUDA_SUCCESS)
     {
+        pthread_mutex_destroy(&bridge->mutex);
+        HeapFree(GetProcessHeap(), 0, bridge);
+        return UU_NV_ENC_ERR_NO_ENCODE_DEVICE;
+    }
+    if (!uu_push_encoder(bridge))
+    {
+        uu_cuDevicePrimaryCtxRelease(bridge->cuda_device);
+        pthread_mutex_destroy(&bridge->mutex);
         HeapFree(GetProcessHeap(), 0, bridge);
         return UU_NV_ENC_ERR_NO_ENCODE_DEVICE;
     }
@@ -447,6 +485,7 @@ static NVENCSTATUS uu_open_d3d11_session(
     if (status != NV_ENC_SUCCESS || !bridge->native_encoder)
     {
         uu_cuDevicePrimaryCtxRelease(bridge->cuda_device);
+        pthread_mutex_destroy(&bridge->mutex);
         HeapFree(GetProcessHeap(), 0, bridge);
         ERR("CUDA NvEncOpenEncodeSessionEx failed: %d\n", status);
         return status;
@@ -474,18 +513,26 @@ static NVENCSTATUS uu_register_d3d11_resource(
     NVENCSTATUS status;
     HRESULT hr;
 
-    pthread_mutex_lock(&uu_bridge_mutex);
-    encoder = uu_find_encoder(encoder_handle);
-    pthread_mutex_unlock(&uu_bridge_mutex);
+    encoder = uu_lock_encoder(encoder_handle);
     if (!encoder || !params ||
         params->resourceType != UU_NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX)
+    {
+        if (encoder)
+            uu_unlock_encoder(encoder);
         return origFunctions.nvEncRegisterResource(encoder_handle, params);
+    }
     if (!params->resourceToRegister || !params->width || !params->height)
+    {
+        uu_unlock_encoder(encoder);
         return UU_NV_ENC_ERR_INVALID_PARAM;
+    }
 
     resource = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*resource));
     if (!resource)
+    {
+        uu_unlock_encoder(encoder);
         return UU_NV_ENC_ERR_OUT_OF_MEMORY;
+    }
     resource->owner = encoder;
     resource->texture = (ID3D11Texture2D *)params->resourceToRegister;
     ID3D11Texture2D_AddRef(resource->texture);
@@ -550,22 +597,22 @@ static NVENCSTATUS uu_register_d3d11_resource(
 
     resource->native_resource = native_params.registeredResource;
     resource->magic = UU_NVENC_RESOURCE_MAGIC;
-    pthread_mutex_lock(&uu_bridge_mutex);
     resource->next = encoder->resources;
     encoder->resources = resource;
-    pthread_mutex_unlock(&uu_bridge_mutex);
     params->registeredResource = (NV_ENC_REGISTERED_PTR)resource;
     params->chromaOffset[0] = native_params.chromaOffset[0];
     params->chromaOffset[1] = native_params.chromaOffset[1];
     TRACE("registered D3D11 NVENC texture %ux%u format=%#x row=%u rows=%u cuda_pitch=%zu\n",
           params->width, params->height, params->bufferFormat,
           resource->row_bytes, resource->rows, resource->cuda_pitch);
+    uu_unlock_encoder(encoder);
     return NV_ENC_SUCCESS;
 
 failed_pop:
     uu_pop_encoder();
 failed:
     uu_free_resource(resource);
+    uu_unlock_encoder(encoder);
     return status;
 }
 
@@ -584,20 +631,28 @@ static NVENCSTATUS uu_upload_and_map_resource(
 
     if (!params)
         return NV_ENC_ERR_INVALID_PTR;
-    pthread_mutex_lock(&uu_bridge_mutex);
-    encoder = uu_find_encoder(encoder_handle);
+    encoder = uu_lock_encoder(encoder_handle);
     resource = uu_find_resource(encoder, params->registeredResource);
-    pthread_mutex_unlock(&uu_bridge_mutex);
     if (!resource)
+    {
+        if (encoder)
+            uu_unlock_encoder(encoder);
         return origFunctions.nvEncMapInputResource(encoder_handle, params);
+    }
 
     ID3D11Texture2D_GetDevice(resource->texture, &device);
     if (!device)
+    {
+        uu_unlock_encoder(encoder);
         return UU_NV_ENC_ERR_INVALID_DEVICE;
+    }
     ID3D11Device_GetImmediateContext(device, &context);
     ID3D11Device_Release(device);
     if (!context)
+    {
+        uu_unlock_encoder(encoder);
         return UU_NV_ENC_ERR_INVALID_DEVICE;
+    }
 
     ID3D11DeviceContext_CopySubresourceRegion(
         context, (ID3D11Resource *)resource->staging, 0, 0, 0, 0,
@@ -647,6 +702,7 @@ unmap:
                               (ID3D11Resource *)resource->staging, 0);
 done:
     ID3D11DeviceContext_Release(context);
+    uu_unlock_encoder(encoder);
     return status;
 }
 
@@ -658,8 +714,7 @@ static NVENCSTATUS uu_unregister_resource(
     struct uu_nvenc_resource **cursor;
     NVENCSTATUS status;
 
-    pthread_mutex_lock(&uu_bridge_mutex);
-    encoder = uu_find_encoder(encoder_handle);
+    encoder = uu_lock_encoder(encoder_handle);
     resource = uu_find_resource(encoder, handle);
     if (resource)
     {
@@ -670,9 +725,12 @@ static NVENCSTATUS uu_unregister_resource(
                 break;
             }
     }
-    pthread_mutex_unlock(&uu_bridge_mutex);
     if (!resource)
+    {
+        if (encoder)
+            uu_unlock_encoder(encoder);
         return origFunctions.nvEncUnregisterResource(encoder_handle, handle);
+    }
 
     if (!uu_push_encoder(encoder))
         status = UU_NV_ENC_ERR_INVALID_DEVICE;
@@ -683,6 +741,7 @@ static NVENCSTATUS uu_unregister_resource(
         uu_pop_encoder();
     }
     uu_free_resource(resource);
+    uu_unlock_encoder(encoder);
     return status;
 }
 
@@ -703,6 +762,7 @@ static NVENCSTATUS uu_destroy_encoder(void *encoder_handle)
                 *cursor = encoder->next;
                 break;
             }
+        pthread_mutex_lock(&encoder->mutex);
     }
     pthread_mutex_unlock(&uu_bridge_mutex);
     if (!encoder)
@@ -722,6 +782,8 @@ static NVENCSTATUS uu_destroy_encoder(void *encoder_handle)
         status = UU_NV_ENC_ERR_INVALID_DEVICE;
     encoder->magic = 0;
     uu_cuDevicePrimaryCtxRelease(encoder->cuda_device);
+    pthread_mutex_unlock(&encoder->mutex);
+    pthread_mutex_destroy(&encoder->mutex);
     HeapFree(GetProcessHeap(), 0, encoder);
     return status;
 }

@@ -6,6 +6,17 @@ All notable changes to this project are documented here.
 
 ## [1.1.27] - 2026-08-20
 
+- Add a hash-bound semantic compatibility profile for the NVENC encoder path
+  and all four portrait Original-quality scaling stages. After an official UU
+  update, the launcher now derives and fully re-probes that profile instead of
+  trusting offsets from the previous client binary.
+- Treat post-4.38 client updates as one fail-closed compatibility transaction:
+  regenerate and runtime-validate the enabled NVENC, NVDEC, portrait, and WOL
+  adaptations, persist their generated profiles, and restore the previous UU
+  client plus bridge state if any required semantic target cannot be proven.
+- Require a real NV12 D3D11 registration, mapping, and upload in the NVENC
+  deep probe, and serialize native NVENC/CUDA calls per encoder session so
+  concurrent UU worker threads cannot race resource registration or teardown.
 - Preserve the selected portrait monitor's native capture resolution instead
   of applying UU's landscape-oriented 2160-pixel height ceiling. The
   fail-closed runtime profile now repairs all four verified scaling stages,

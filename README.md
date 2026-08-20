@@ -36,7 +36,7 @@
 | 🧭 | Linux desktop | Native tray and all UU Remote settings |
 
 > [!NOTE]
-> Version-specific codec and WOL changes are applied only after unique fingerprint and hash validation. Ambiguous client updates keep the official files untouched and use a safe fallback.
+> Version-specific codec, portrait-quality, and WOL changes are applied only after unique semantic fingerprint, hash, and runtime validation. For releases newer than the verified 4.38 baseline, an update that cannot rebuild every enabled adaptation is rejected and rolled back to the last complete client; older releases retain the documented safe fallbacks.
 
 <a id="install"></a>
 ## 🚀 Install

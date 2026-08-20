@@ -118,6 +118,7 @@ case ${1:-} in
         install -Dm0644 /dev/null "$install_dir/bin/Upgrade.exe"
         truncate -s $((0x94e4ee + 3)) "$install_dir/bin/streamer.dll"
         python3 - "$install_dir/bin/streamer.dll" <<'PY'
+import os
 import struct
 import sys
 
@@ -129,7 +130,10 @@ section_offset = pe_offset + 24 + optional_size
 text_rva, text_raw, text_size = 0x1000, 0x400, 0x1000
 rdata_rva, rdata_raw, rdata_size = 0x3000, 0x1400, 0x1000
 
-with open(path, "r+b") as stream:
+# A Windows installer replaces streamer.dll instead of retaining bytes from an
+# older same-sized file. Recreate it here so future-version compatibility tests
+# cannot pass because semantic patterns leaked from the previous mock release.
+with open(path, "w+b") as stream:
     def put(offset, data):
         stream.seek(offset)
         stream.write(data)
@@ -306,7 +310,65 @@ with open(path, "r+b") as stream:
         text_raw + impl_table_rva - text_rva,
         struct.pack("<7I", *case_rvas),
     )
+
+    if os.environ.get("UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT") == "1":
+        portrait_patterns = (
+            (
+                0x1A00,
+                bytes.fromhex(
+                    "41 8b 56 04 85 d2 75 10 41 8b 46 30 "
+                    "89 83 c0 00 00 00 41 8b 46 34 eb 08 "
+                    "89 bb c0 00 00 00 8b c7 "
+                    "4c 8d ab c4 00 00 00 41 89 45 00 "
+                    "89 93 c8 00 00 00"
+                ),
+            ),
+            (
+                0x1B00,
+                bytes.fromhex(
+                    "41 8b 85 c0 00 00 00 89 86 24 01 00 00 "
+                    "41 8b 85 c4 00 00 00 89 86 28 01 00 00"
+                ),
+            ),
+            (
+                0x1C00,
+                bytes.fromhex(
+                    "8b 86 28 01 00 00 41 3b 86 c4 00 00 00 75 12 "
+                    "45 8b 86 c0 00 00 00 44 39 86 24 01 00 00 75 09 eb 32 "
+                    "45 8b 86 c0 00 00 00 44 89 86 24 01 00 00 "
+                    "41 8b 96 c4 00 00 00 89 96 28 01 00 00"
+                ),
+            ),
+            (
+                0x1D00,
+                bytes.fromhex(
+                    "8b 97 90 00 00 00 2b 97 88 00 00 00 "
+                    "44 8b 45 88 44 2b 45 80 44 8b 4d 8c 44 8b 55 84 "
+                    "44 3b c2 7f 50 8b 8f 94 00 00 00 2b 8f 8c 00 00 00 "
+                    "41 8b c1 41 2b c2 3b c1 7f 3a "
+                    "0f 28 75 80 66 0f 6f c6 66 0f 73 d8 0c 66 0f 7e c3 "
+                    "66 0f 6f ce 66 0f 73 d9 08 66 0f 7e ce 89 74 24 40 "
+                    "66 0f 6f c6 66 0f 73 d8 04 66 41 0f 7e c7 "
+                    "66 41 0f 7e f6 e9 8c 00 00 00 "
+                    "66 41 0f 6e c0 0f 5b c0 66 0f 6e ca 0f 5b c9 "
+                    "f3 0f 5e c8 45 2b ca 66 45 0f 6e c1 45 0f 5b c0 "
+                    "8b 87 94 00 00 00 2b 87 8c 00 00 00 "
+                    "66 0f 6e f8 0f 5b ff f3"
+                ),
+            ),
+        )
+        for pattern_rva, pattern in portrait_patterns:
+            put(text_raw + pattern_rva - text_rva, pattern)
 PY
+        if [[ ${UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT:-0} == 1 ]]; then
+            truncate -s 8192 "$install_dir/bin/GameViewerServer.exe"
+            printf '%s' "${UU_REMOTE_FAKE_INSTALLER_VERSION:-future}" |
+                dd of="$install_dir/bin/GameViewerServer.exe" bs=1 seek=32 \
+                    conv=notrunc status=none
+            printf '\125\110\211' |
+                dd of="$install_dir/bin/GameViewerServer.exe" bs=1 seek=4096 \
+                    conv=notrunc status=none
+        fi
         printf '\211\125\320' |
             dd of="$install_dir/bin/streamer.dll" bs=1 seek=$((0x94dc03)) \
                 conv=notrunc status=none
@@ -349,7 +411,7 @@ PY
             ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvencodeapi64=b"* &&
             -r ${DXVK_CONFIG_FILE:-} ]]; then
             printf '%s\n' \
-                $'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=1012\tapi=0x000000d0\th264=1\thevc=1\ttexture_upload=1'
+                $'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=1012\tapi=0x000000d0\th264=1\thevc=1\ttexture_upload=1\tnv12_upload=1'
             printf 'HWENCODE_PROBE\n' >>"$trace_file"
             exit 0
         fi

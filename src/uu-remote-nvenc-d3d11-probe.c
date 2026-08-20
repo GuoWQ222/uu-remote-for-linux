@@ -40,6 +40,7 @@ int main(void)
     ID3D11Device *device = NULL;
     ID3D11DeviceContext *context = NULL;
     ID3D11Texture2D *texture = NULL;
+    ID3D11Texture2D *nv12_texture = NULL;
     ID3D11RenderTargetView *render_target = NULL;
     HMODULE nvenc_module = NULL;
     get_max_version_fn get_max_version = NULL;
@@ -50,7 +51,11 @@ int main(void)
     NV_ENC_INITIALIZE_PARAMS initialize_params = {0};
     NV_ENC_REGISTER_RESOURCE register_params = {0};
     NV_ENC_MAP_INPUT_RESOURCE map_params = {0};
+    NV_ENC_REGISTER_RESOURCE nv12_register_params = {0};
+    NV_ENC_MAP_INPUT_RESOURCE nv12_map_params = {0};
     D3D11_TEXTURE2D_DESC texture_desc;
+    D3D11_TEXTURE2D_DESC nv12_texture_desc;
+    D3D11_SUBRESOURCE_DATA nv12_initial_data;
     DXGI_ADAPTER_DESC1 adapter_desc;
     GUID encode_guids[16];
     uint32_t max_version = 0;
@@ -62,6 +67,8 @@ int main(void)
     int h264 = 0;
     int hevc = 0;
     int texture_upload = 0;
+    int nv12_upload = 0;
+    BYTE *nv12_pixels = NULL;
     int result = 1;
 
     hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
@@ -235,12 +242,87 @@ int main(void)
         texture_upload = 0;
         goto done;
     }
+
+    nv12_texture_desc = texture_desc;
+    nv12_texture_desc.Format = DXGI_FORMAT_NV12;
+    nv12_texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    nv12_pixels = HeapAlloc(
+        GetProcessHeap(), 0,
+        (SIZE_T)nv12_texture_desc.Width *
+            (nv12_texture_desc.Height + nv12_texture_desc.Height / 2));
+    if (!nv12_pixels) {
+        fprintf(stderr, "allocating NV12 probe pixels failed\n");
+        goto done;
+    }
+    memset(nv12_pixels, 0x10,
+           (SIZE_T)nv12_texture_desc.Width * nv12_texture_desc.Height);
+    memset(nv12_pixels +
+               (SIZE_T)nv12_texture_desc.Width * nv12_texture_desc.Height,
+           0x80,
+           (SIZE_T)nv12_texture_desc.Width * nv12_texture_desc.Height / 2);
+    memset(&nv12_initial_data, 0, sizeof(nv12_initial_data));
+    nv12_initial_data.pSysMem = nv12_pixels;
+    nv12_initial_data.SysMemPitch = nv12_texture_desc.Width;
+    nv12_initial_data.SysMemSlicePitch =
+        nv12_texture_desc.Width *
+        (nv12_texture_desc.Height + nv12_texture_desc.Height / 2);
+    hr = ID3D11Device_CreateTexture2D(
+        device, &nv12_texture_desc, &nv12_initial_data, &nv12_texture);
+    if (FAILED(hr)) {
+        fprintf(stderr, "CreateTexture2D(NV12) failed: 0x%08lx\n",
+                (unsigned long)hr);
+        goto done;
+    }
+
+    memset(&nv12_register_params, 0, sizeof(nv12_register_params));
+    nv12_register_params.version = NV_ENC_REGISTER_RESOURCE_VER;
+    nv12_register_params.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+    nv12_register_params.width = nv12_texture_desc.Width;
+    nv12_register_params.height = nv12_texture_desc.Height;
+    nv12_register_params.resourceToRegister = nv12_texture;
+    nv12_register_params.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+    nv12_register_params.bufferUsage = NV_ENC_INPUT_IMAGE;
+    status = functions.nvEncRegisterResource(encoder, &nv12_register_params);
+    if (status != NV_ENC_SUCCESS ||
+        !nv12_register_params.registeredResource) {
+        fprintf(stderr, "NvEncRegisterResource(NV12 D3D11) failed: %d\n",
+                status);
+        goto done;
+    }
+
+    memset(&nv12_map_params, 0, sizeof(nv12_map_params));
+    nv12_map_params.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    nv12_map_params.registeredResource =
+        nv12_register_params.registeredResource;
+    status = functions.nvEncMapInputResource(encoder, &nv12_map_params);
+    if (status != NV_ENC_SUCCESS || !nv12_map_params.mappedResource) {
+        fprintf(stderr, "NvEncMapInputResource(NV12 D3D11) failed: %d\n",
+                status);
+        goto done;
+    }
+    nv12_upload = 1;
+    status = functions.nvEncUnmapInputResource(
+        encoder, nv12_map_params.mappedResource);
+    nv12_map_params.mappedResource = NULL;
+    if (status != NV_ENC_SUCCESS) {
+        fprintf(stderr, "NvEncUnmapInputResource(NV12) failed: %d\n", status);
+        nv12_upload = 0;
+        goto done;
+    }
+    status = functions.nvEncUnregisterResource(
+        encoder, nv12_register_params.registeredResource);
+    nv12_register_params.registeredResource = NULL;
+    if (status != NV_ENC_SUCCESS) {
+        fprintf(stderr, "NvEncUnregisterResource(NV12) failed: %d\n", status);
+        nv12_upload = 0;
+        goto done;
+    }
     printf("NVENC_D3D11_OK\tadapter=%u\tdevice=%u\tluid=%ld\tapi=0x%08x"
-           "\th264=%d\thevc=%d\ttexture_upload=%d\n",
+           "\th264=%d\thevc=%d\ttexture_upload=%d\tnv12_upload=%d\n",
            adapter_index, adapter_desc.DeviceId,
            (long)adapter_desc.AdapterLuid.LowPart, max_version, h264, hevc,
-           texture_upload);
-    result = h264 && hevc && texture_upload ? 0 : 1;
+           texture_upload, nv12_upload);
+    result = h264 && hevc && texture_upload && nv12_upload ? 0 : 1;
 
 done:
     if (encoder && map_params.mappedResource &&
@@ -251,6 +333,16 @@ done:
         functions.nvEncUnregisterResource) {
         functions.nvEncUnregisterResource(
             encoder, register_params.registeredResource);
+    }
+    if (encoder && nv12_map_params.mappedResource &&
+        functions.nvEncUnmapInputResource) {
+        functions.nvEncUnmapInputResource(
+            encoder, nv12_map_params.mappedResource);
+    }
+    if (encoder && nv12_register_params.registeredResource &&
+        functions.nvEncUnregisterResource) {
+        functions.nvEncUnregisterResource(
+            encoder, nv12_register_params.registeredResource);
     }
     if (encoder && functions.nvEncDestroyEncoder) {
         functions.nvEncDestroyEncoder(encoder);
@@ -266,6 +358,12 @@ done:
     }
     if (texture) {
         ID3D11Texture2D_Release(texture);
+    }
+    if (nv12_texture) {
+        ID3D11Texture2D_Release(nv12_texture);
+    }
+    if (nv12_pixels) {
+        HeapFree(GetProcessHeap(), 0, nv12_pixels);
     }
     if (device) {
         ID3D11Device_Release(device);
