@@ -248,9 +248,10 @@ test ! -e "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
 "$launcher" --enable-wol
 grep -q '^server_mode=adaptive-binary-patch$' \
     "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
-unset UU_REMOTE_WOL_DETECT_ROW \
-    UU_REMOTE_WOL_NATIVE_IP \
-    UU_REMOTE_WOL_REFERENCE_IP
+# Keep the deterministic physical-adapter fixture active while WOL remains
+# enabled. Later setup and update transactions intentionally regenerate the
+# mapping; falling through to the runner's real network would make this test
+# depend on whether CI happens to expose a Wake-on-LAN-capable Ethernet NIC.
 
 install_count=$(grep -c '^INSTALL$' "$UU_REMOTE_FAKE_TRACE")
 webview_count=$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")
