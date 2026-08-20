@@ -114,6 +114,7 @@ case ${1:-} in
         install -Dm0644 /dev/null "$install_dir/bin/GameViewer.exe"
         install -Dm0644 /dev/null "$install_dir/bin/GameViewerServer.exe"
         install -Dm0644 /dev/null "$install_dir/bin/GameViewerHealthd.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/StreamerCodecDetector.exe"
         install -Dm0644 /dev/null "$install_dir/bin/Upgrade.exe"
         truncate -s $((0x94e4ee + 3)) "$install_dir/bin/streamer.dll"
         python3 - "$install_dir/bin/streamer.dll" <<'PY'
@@ -350,6 +351,28 @@ PY
             printf '%s\n' \
                 $'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=1012\tapi=0x000000d0\th264=1\thevc=1\ttexture_upload=1'
             printf 'HWENCODE_PROBE\n' >>"$trace_file"
+            exit 0
+        fi
+        exit 1
+        ;;
+    *uu-remote-dxgi-probe.exe)
+        if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
+            ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
+            printf '8578\t1012\t4318\t0\n'
+            printf 'HWDECODE_DXGI_PROBE\n' >>"$trace_file"
+            exit 0
+        fi
+        exit 1
+        ;;
+    *StreamerCodecDetector.exe)
+        if [[ ${2:-} == --batch && ${3:-} == 33 &&
+            ${WINEDLLPATH:-} == *hwdecode/wine* &&
+            ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"* ]]; then
+            printf '%s\n' \
+                'RESULT,1,1,8,3840,2160,1' \
+                'RESULT,2,1,8,3840,2160,1' \
+                'BATCH_DONE'
+            printf 'HWDECODE_CODEC_PROBE\n' >>"$trace_file"
             exit 0
         fi
         exit 1

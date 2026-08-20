@@ -9,7 +9,10 @@ All notable changes to this project are documented here.
   profiler that locates the unique batch-probe function from its exception
   boundary and seven detector data-flow markers, then binds both patch sites
   through the same stack variable. This remains resilient to function moves,
-  frame-layout changes, and register-allocation changes after UU updates.
+  frame-layout changes, and register-allocation changes after UU updates. The
+  update transaction now has an end-to-end regression proving that a future
+  unlisted version is profiled, validated with UU's own H.264/H.265 detector,
+  persisted locally, and returned to the selected NVIDIA decoder automatically.
 - Derive fail-closed Wake-on-LAN patch profiles automatically from the
   official `GameViewerServer.exe` after UU updates. The profiler requires a
   unique PE exception-function boundary that references the WOL source path

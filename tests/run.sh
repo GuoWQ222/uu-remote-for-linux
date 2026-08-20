@@ -72,6 +72,8 @@ check "proxy gsettings fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/proxy-gsettings"
 check "WOL profiler fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/wol-profiler"
+check "NVDEC profiler fixture syntax" bash -n \
+    "$project_root/tests/fixtures/bin/hwdecode-profiler"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "DXGI probe builder syntax" bash -n \
@@ -316,6 +318,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/fixtures/bin/zenity" \
         "$project_root/tests/fixtures/bin/keyboard-gsettings" \
         "$project_root/tests/fixtures/bin/proxy-gsettings" \
+        "$project_root/tests/fixtures/bin/hwdecode-profiler" \
         "$project_root/tests/fixtures/bin/wine" \
         "$project_root/tests/fixtures/bin/wineboot" \
         "$project_root/tests/fixtures/bin/winecfg" \

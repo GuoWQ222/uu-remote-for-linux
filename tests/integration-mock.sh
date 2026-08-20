@@ -698,9 +698,8 @@ test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
     "$client_count_before_failed_startup_update"
 
 # A normal graphical launch checks the official version before starting. An
-# unknown newer version is installed with the generic bridges, while the
-# requested NVIDIA choice is retained for a future package with a matching
-# binary profile.
+# unrecognizable newer binary is installed with the generic bridges, while the
+# requested NVIDIA choice is retained for a future safe profile.
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
 client_count_before_startup_update=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
@@ -712,6 +711,28 @@ grep -q '^selection=nvidia:0$' \
     "$XDG_DATA_HOME/uu-remote-for-linux/decoder-selection"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
     "$client_count_before_startup_update"
+
+# A subsequent official version whose NVDEC data flow remains recognizable
+# must not wait for a package release. The update transaction derives a local
+# hash-bound profile, validates it with the DXGI and official codec probes,
+# persists it, and restores the requested NVIDIA bridge before returning.
+empty_hwdecode_profiles="$test_root/empty-hwdecode-profiles.tsv"
+: >"$empty_hwdecode_profiles"
+UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+UU_REMOTE_FAKE_LATEST_VERSION=4.36.0.9300 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.36.0.9300 \
+    "$launcher" --check-update
+"$launcher" --diagnose | grep -q 'UU 版本.*4.36.0.9300'
+"$launcher" --diagnose | grep -q '实际解码选择.*nvidia:0'
+"$launcher" --diagnose | grep -q '硬解桥注入.*完整'
+test -e "$install_dir/bin/d3d11.dll"
+test -e "$streamer_original"
+grep -q $'^4.36.0.9300\t' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
+grep -q 'NVDEC 自动补丁运行验证通过' "$state_dir/setup.log"
+grep -q '^HWDECODE_DXGI_PROBE$' "$UU_REMOTE_FAKE_TRACE"
+grep -q '^HWDECODE_CODEC_PROBE$' "$UU_REMOTE_FAKE_TRACE"
 
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"

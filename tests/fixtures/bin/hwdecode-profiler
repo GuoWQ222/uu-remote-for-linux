@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${1:-} == --derive && -f ${2:-} &&
+    ${3:-} == --version && -n ${4:-} ]]
+
+readonly streamer=$2
+readonly version=$4
+readonly offset_1=$((0x94dc03))
+readonly offset_2=$((0x94e4ee))
+temp="${streamer}.hwdecode-profiler-test.$$"
+trap 'rm -f -- "$temp"' EXIT
+
+original_sha=$(sha256sum "$streamer")
+original_sha=${original_sha%% *}
+before_1=$(od -An -tx1 -j "$offset_1" -N 3 "$streamer" | tr -d ' \n')
+before_2=$(od -An -tx1 -j "$offset_2" -N 3 "$streamer" | tr -d ' \n')
+[[ $before_1 =~ ^[[:xdigit:]]{6}$ &&
+    $before_2 =~ ^[[:xdigit:]]{6}$ ]]
+
+install -m 0644 "$streamer" "$temp"
+printf '\262\041\220' |
+    dd of="$temp" bs=1 seek="$offset_1" conv=notrunc status=none
+printf '\152\041\130' |
+    dd of="$temp" bs=1 seek="$offset_2" conv=notrunc status=none
+patched_sha=$(sha256sum "$temp")
+patched_sha=${patched_sha%% *}
+
+printf '%s\t%s\t%s\t0x%x\t%s\tb22190\t0x%x\t%s\t6a2158\n' \
+    "$version" "$original_sha" "$patched_sha" \
+    "$offset_1" "$before_1" "$offset_2" "$before_2"
