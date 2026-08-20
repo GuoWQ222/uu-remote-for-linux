@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Restore NVIDIA NVDEC capability negotiation for official UU 4.38.0.9292.
+  Replace the compiler-byte-blob profiler with a fail-closed PE semantic
+  profiler that locates the unique batch-probe function from its exception
+  boundary and seven detector data-flow markers, then binds both patch sites
+  through the same stack variable. This remains resilient to function moves,
+  frame-layout changes, and register-allocation changes after UU updates.
 - Derive fail-closed Wake-on-LAN patch profiles automatically from the
   official `GameViewerServer.exe` after UU updates. The profiler requires a
   unique PE exception-function boundary that references the WOL source path
