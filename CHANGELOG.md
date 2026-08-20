@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.27] - 2026-08-20
+
+- Preserve the selected portrait monitor's native capture resolution instead
+  of applying UU's landscape-oriented 2160-pixel height ceiling. The
+  fail-closed runtime profile now repairs all four verified scaling stages,
+  keeping a 1440x2560 source at 1440x2560 in Original quality.
+- Synchronize complete X11 cursor images and hotspots to the Windows
+  controller through an XFixes ARGB bridge and native Win64 `HCURSOR`
+  reconstruction. Text I-beams, diagonal resize arrows, and application
+  cursors no longer collapse to UU's hard-coded default arrow.
+- Add independent portrait-scaling and cursor-shape telemetry plus dynamic
+  Wine regression tests for cursor dimensions, pixels, and hotspot changes.
 - Restore NVIDIA NVDEC capability negotiation for official UU 4.38.0.9292.
   Replace the compiler-byte-blob profiler with a fail-closed PE semantic
   profiler that locates the unique batch-probe function from its exception

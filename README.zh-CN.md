@@ -22,7 +22,7 @@
 | | 能力 | 提供的功能 |
 |---|---|---|
 | 🖥️ | Ubuntu 桌面 | 独立 Wine 客户端、图形化首次设置，以及事务式官方客户端更新 |
-| 🖱️ | 原生远控 | X11/XTest 或 Wayland Portal 输入、被控屏幕选择，以及本地与远端光标对齐 |
+| 🖱️ | 原生远控 | X11/XTest 或 Wayland Portal 输入、被控屏幕选择、竖屏原生分辨率，以及完整 X11 光标形状同步 |
 | 🎬 | 硬件编解码 | CPU/OpenH264 回退、实验性 NVIDIA NVDEC 解码和经验证的 NVENC H.264/HEVC 编码 |
 | 🧭 | 原生托盘 | 显示主界面、选择被控屏幕或解码器，并排列单个或两个远控窗口 |
 | 🛡️ | Linux 集成 | 自启动、防休眠、加密 DNS 容错、文件传输、安全更新与远程开机兼容桥 |
@@ -36,7 +36,7 @@
 2. 安装软件包：
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.26_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.27_amd64.deb
    ```
 
 3. 从 Ubuntu 应用菜单打开 **UU 远程 Linux 版**，或运行：
@@ -138,13 +138,6 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
 
 </details>
-
-## ⚠️ 已知问题
-
-以下问题已确认，将在后续版本中修复：
-
-- Windows 控制双显示器 Ubuntu 时，切换到竖向显示器后，即使选择“原画”，画面仍可能明显模糊，文字难以辨认；横向显示器通常不受影响。
-- Ubuntu 本地光标在文本框、窗口边缘或角落会切换为 I 形、缩放箭头等形状，但 Windows 控制端目前仍显示普通箭头，未同步远端光标形状。
 
 ## 📄 许可证与署名
 

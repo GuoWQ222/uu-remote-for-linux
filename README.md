@@ -22,7 +22,7 @@
 | | Capability | What it provides |
 |---|---|---|
 | 🖥️ | Ubuntu desktop | Isolated Wine client, graphical first-run setup, and transactional official-client updates |
-| 🖱️ | Native remote control | X11/XTest or Wayland Portal input, controlled-display selection, and aligned local/remote cursors |
+| 🖱️ | Native remote control | X11/XTest or Wayland Portal input, controlled-display selection, native portrait resolution, and complete X11 cursor shapes |
 | 🎬 | Hardware video | CPU/OpenH264 fallback, experimental NVIDIA NVDEC decoding, and validated NVENC H.264/HEVC encoding |
 | 🧭 | Native tray | Show the main window, choose the controlled display or decoder, and arrange one or two viewer windows |
 | 🛡️ | Linux integration | Autostart, sleep inhibition, resilient encrypted DNS, file transfer, safe updates, and Wake-on-LAN bridges |
@@ -36,7 +36,7 @@
 2. Install it:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.26_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.27_amd64.deb
    ```
 
 3. Open **UU Remote for Linux** from the Ubuntu application menu, or run:
@@ -138,13 +138,6 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
 
 </details>
-
-## ⚠️ Known issues
-
-The following issues are confirmed and will be fixed in later releases:
-
-- When Windows controls a dual-monitor Ubuntu host, switching to a portrait monitor may remain visibly blurry even at Original quality, making text difficult to read; the landscape monitor is usually unaffected.
-- The Ubuntu cursor changes to an I-beam or resize cursor over text fields, window edges, and corners, but the Windows controller currently keeps the default arrow instead of receiving the remote cursor shape.
 
 ## 📄 License and attribution
 

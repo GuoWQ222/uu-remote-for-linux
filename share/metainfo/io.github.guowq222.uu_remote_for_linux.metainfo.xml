@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.27" date="2026-08-20">
+      <description>
+        <p>Preserve native portrait-monitor resolution and synchronize complete X11 cursor images and hotspots, including text I-beams, resize arrows, and application-defined shapes, to the Windows controller.</p>
+      </description>
+    </release>
     <release version="1.1.26" date="2026-08-19">
       <description>
         <p>Keep UU alive after its outer launcher exits, add persistent controlled-display selection and correct multi-monitor pointer geometry, and synchronize XKB lock state with UU so Caps Lock switches uppercase and Rime exactly once per press.</p>
