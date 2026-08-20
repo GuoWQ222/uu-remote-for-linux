@@ -4539,7 +4539,9 @@ perform_upstream_update_handoff() {
 
     # The handoff owns the single restart decision.  Supported update and
     # rollback paths must not launch a competing client from the subshell.
-    if UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check; then
+    if (
+        UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check
+    ); then
         check_status=0
     else
         check_status=$?
@@ -4587,7 +4589,9 @@ if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
     startup_update_requested=true
 fi
 if $startup_update_requested; then
-    if ! UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check; then
+    if ! (
+        UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check
+    ); then
         notify_status "启动时自动更新未完成，将继续打开当前版本"
         printf '警告：启动时自动更新未完成；继续打开当前已安装版本。\n' >&2
     fi

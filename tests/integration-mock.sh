@@ -380,6 +380,29 @@ done
 grep -q 'TRAY_PROXY --quiesce-controller .*--grace-seconds 0' \
     "$UU_REMOTE_FAKE_TRACE"
 
+# The built-in updater handoff also has to restore the existing client when
+# its isolated official-version check fails.  It still reports the failed
+# check to its caller after the restart succeeds.
+handoff_clients_before=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+if UU_REMOTE_UPDATE_NO_RESTART=0 \
+    UU_REMOTE_UPSTREAM_UPDATE_EXIT_GRACE=0 \
+    UU_REMOTE_FAKE_CURL_FAILURE=dns \
+    "$launcher" --upstream-update-handoff \
+    >"$test_root/handoff-update-dns.out" \
+    2>"$test_root/handoff-update-dns.err"; then
+    printf '模拟 DNS 失败的内置更新交接被意外报告为成功。\n' >&2
+    exit 1
+fi
+for _attempt in {1..50}; do
+    handoff_clients_after=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+    ((handoff_clients_after > handoff_clients_before)) && break
+    sleep 0.1
+done
+((handoff_clients_after > handoff_clients_before))
+grep -Fq \
+    'DNS 解析失败：无法解析网易官方域名 api.nrd.nie.163.com' \
+    "$test_root/handoff-update-dns.err"
+
 installer_sha=$(sed -n 's/^sha256=//p' "$cache_dir/installer-metadata")
 server_sha=$(sha256sum "$install_dir/bin/GameViewerServer.exe")
 server_sha=${server_sha%% *}
@@ -573,6 +596,21 @@ grep -q '^CUDA_DEVICE=0$' "$UU_REMOTE_FAKE_TRACE"
 grep -q \
     'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client .*--property=ExitType=cgroup.*--restart-selected-decoder' \
     "$UU_REMOTE_FAKE_TRACE"
+
+# A failed startup update check must not abort the graphical launcher.  The
+# update checker uses die() for command-line failures, so it has to remain
+# isolated from the shell that continues into the current client launch.
+client_count_before_failed_startup_update=$(grep -c '^CLIENT$' \
+    "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_FAKE_CURL_FAILURE=dns \
+    "$launcher" \
+    >"$test_root/startup-update-dns.out" \
+    2>"$test_root/startup-update-dns.err"
+grep -Fq \
+    '启动时自动更新未完成；继续打开当前已安装版本' \
+    "$test_root/startup-update-dns.err"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
+    "$client_count_before_failed_startup_update"
 
 # A normal graphical launch checks the official version before starting. An
 # unknown newer version is installed with the generic bridges, while the
