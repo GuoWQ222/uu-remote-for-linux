@@ -139,6 +139,13 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 
 </details>
 
+## ⚠️ Known issues
+
+The following issues are confirmed and will be fixed in later releases:
+
+- When Windows controls a dual-monitor Ubuntu host, switching to a portrait monitor may remain visibly blurry even at Original quality, making text difficult to read; the landscape monitor is usually unaffected.
+- The Ubuntu cursor changes to an I-beam or resize cursor over text fields, window edges, and corners, but the Windows controller currently keeps the default arrow instead of receiving the remote cursor shape.
+
 ## 📄 License and attribution
 
 Original project code uses the [Zero-Clause BSD license](LICENSE). Optional hardware-codec components retain their zlib or LGPL licenses; exact revisions, source links, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).

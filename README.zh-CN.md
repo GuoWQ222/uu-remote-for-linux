@@ -139,6 +139,13 @@ UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 
 </details>
 
+## ⚠️ 已知问题
+
+以下问题已确认，将在后续版本中修复：
+
+- Windows 控制双显示器 Ubuntu 时，切换到竖向显示器后，即使选择“原画”，画面仍可能明显模糊，文字难以辨认；横向显示器通常不受影响。
+- Ubuntu 本地光标在文本框、窗口边缘或角落会切换为 I 形、缩放箭头等形状，但 Windows 控制端目前仍显示普通箭头，未同步远端光标形状。
+
 ## 📄 许可证与署名
 
 本项目原创代码采用[零条款 BSD 许可证](LICENSE)。可选硬件编解码组件继续使用各自的 zlib 或 LGPL 许可证；准确的修订版本、源代码链接与校验和记录在 [NOTICE.md](NOTICE.md) 和 [third_party/HWDECODE.md](third_party/HWDECODE.md) 中。
