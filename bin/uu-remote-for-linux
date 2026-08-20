@@ -416,8 +416,8 @@ usage() {
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
   --enable-hwencode    强制启用 NVIDIA NVENC/HEVC 被控端编码桥
   --disable-hwencode   禁用自动 NVENC 并恢复 OpenH264 安全回退
-  --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 识别桥
-  --disable-wol        关闭 UU WOL 识别桥（保留 Linux 网卡设置）
+  --enable-wol         配置 Linux Magic Packet 并启用 UU WOL 通用映射
+  --disable-wol        关闭 UU WOL 通用映射（保留 Linux 网卡设置）
   --select-decoder     打开 CPU/GPU 解码设备选择窗口
   --select-decoder-and-restart
                        选择解码设备，保存后自动重启 UU
@@ -2670,6 +2670,62 @@ wol_patch_ready() {
             "$wol_server_patched_sha"
 }
 
+wol_server_sha() {
+    [[ -f $server ]] || return 1
+    file_sha256 "$server"
+}
+
+wol_legacy_patch_applicable() {
+    local current_sha
+
+    current_sha=$(wol_server_sha) || return 1
+    [[ $current_sha == "$wol_server_original_sha" ||
+        $current_sha == "$wol_server_patched_sha" ]]
+}
+
+wol_legacy_patch_ready_or_unused() {
+    [[ -f $server ]] || return 1
+    if wol_legacy_patch_applicable; then
+        wol_patch_ready
+    else
+        return 0
+    fi
+}
+
+deploy_optional_wol_server_patch() {
+    wol_legacy_patch_applicable || return 0
+    "$wol_bridge" patch \
+        "$server" \
+        "$wol_server_original" \
+        "$wol_server_original_sha" \
+        "$wol_server_patched_sha" || return 1
+    wol_patch_ready
+}
+
+restore_optional_wol_server_patch() {
+    local current_sha
+
+    current_sha=$(wol_server_sha) || return 0
+    [[ $current_sha == "$wol_server_patched_sha" ]] || return 0
+    "$wol_bridge" restore \
+        "$server" \
+        "$wol_server_original" \
+        "$wol_server_original_sha" \
+        "$wol_server_patched_sha"
+}
+
+wol_server_compat_label() {
+    if [[ ! -f $server ]]; then
+        printf '服务端不存在'
+    elif wol_patch_ready; then
+        printf '旧版服务端补丁完整'
+    elif wol_legacy_patch_applicable; then
+        printf '旧版服务端补丁缺失/不匹配'
+    else
+        printf '通用 Win32 网卡映射（无需二进制补丁）'
+    fi
+}
+
 powershell_bridge_ready() {
     [[ -r $powershell_bridge_source &&
         -f $powershell_bridge &&
@@ -2679,12 +2735,21 @@ powershell_bridge_ready() {
 }
 
 wol_detect_row() {
+    if [[ -n ${UU_REMOTE_WOL_DETECT_ROW:-} ]]; then
+        printf '%s\n' "$UU_REMOTE_WOL_DETECT_ROW"
+        return
+    fi
     [[ -x $wol_bridge ]] || return 1
     "$wol_bridge" detect 2>/dev/null
 }
 
 wol_native_ipv4() {
     local interface=$1 address
+
+    if [[ -n ${UU_REMOTE_WOL_NATIVE_IP:-} ]]; then
+        printf '%s\n' "$UU_REMOTE_WOL_NATIVE_IP"
+        return
+    fi
 
     while IFS= read -r address; do
         address=${address%%/*}
@@ -2700,6 +2765,11 @@ wol_native_ipv4() {
 
 wol_reference_ipv4() {
     local route_line
+
+    if [[ -n ${UU_REMOTE_WOL_REFERENCE_IP:-} ]]; then
+        printf '%s\n' "$UU_REMOTE_WOL_REFERENCE_IP"
+        return
+    fi
 
     route_line=$(ip -4 route get 223.5.5.5 2>/dev/null | head -n1) ||
         return 1
@@ -2920,6 +2990,12 @@ powershell_bridge_runtime_label() {
     printf 'v%s，最近 %s=%s' "$version" "$query" "$result"
 }
 
+wol_runtime_bridge_ready() {
+    wol_legacy_patch_ready_or_unused &&
+        wol_hook_config_ready &&
+        powershell_bridge_ready
+}
+
 wol_interface_label() {
     local interface connection mac gateway nm_wol power_wakeup
 
@@ -2987,6 +3063,9 @@ configure_native_wol() {
     IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
         < <(wol_detect_row) ||
         die "未检测到使用默认路由的有线物理网卡"
+    if [[ $nm_wol == magic && $power_wakeup == enabled ]]; then
+        return
+    fi
     if ((EUID == 0)); then
         "$wol_configure" enable "$interface" "$connection"
     else
@@ -3013,21 +3092,21 @@ deploy_wol_bridge() {
     local interface connection mac gateway nm_wol power_wakeup
 
     configure_native_wol
-    "$wol_bridge" patch \
-        "$server" \
-        "$wol_server_original" \
-        "$wol_server_original_sha" \
-        "$wol_server_patched_sha" ||
-        die "UU WOL 识别补丁部署失败；Linux 网卡设置已保留"
-    wol_patch_ready || die "UU WOL 识别补丁写入后核验失败"
+    deploy_optional_wol_server_patch ||
+        die "UU WOL 旧版服务端补丁部署失败；Linux 网卡设置已保留"
     write_wol_hook_config ||
-        die "无法生成 UU WOL 物理网卡映射；识别补丁已保留"
+        die "无法生成 UU WOL 物理网卡映射；Linux 网卡设置已保留"
     deploy_wol_powershell_bridge
     IFS=$'\t' read -r interface connection mac gateway nm_wol power_wakeup \
         < <(wol_detect_row)
     {
-        printf 'version=1\n'
+        printf 'version=2\n'
         printf 'package_version=%s\n' "$package_version"
+        if wol_patch_ready; then
+            printf 'server_mode=legacy-binary-patch\n'
+        else
+            printf 'server_mode=win32-adapter-mapping\n'
+        fi
         printf 'interface=%s\n' "$interface"
         printf 'connection=%s\n' "$connection"
         printf 'mac=%s\n' "$mac"
@@ -3038,11 +3117,7 @@ deploy_wol_bridge() {
 }
 
 remove_wol_bridge() {
-    "$wol_bridge" restore \
-        "$server" \
-        "$wol_server_original" \
-        "$wol_server_original_sha" \
-        "$wol_server_patched_sha" ||
+    restore_optional_wol_server_patch ||
         die "UU WOL 原版文件恢复失败"
     local installed_bridge
 
@@ -3278,7 +3353,7 @@ print_diagnostics() {
         "WOL 默认网关" "$(wol_gateway_label)" \
         "UU 远程开机开关" "$(wol_cloud_label)" \
         "UU WOL 兼容桥" "$(wol_enabled && printf '已启用' || printf '未启用')" \
-        "UU WOL 识别补丁" "$(wol_patch_ready && printf '完整' || printf '未安装/不匹配')" \
+        "UU WOL 服务端兼容" "$(wol_server_compat_label)" \
         "WOL Win32 网卡映射" "$(wol_hook_config_ready && printf '完整' || printf '未生成/不匹配')" \
         "WOL 电源属性桥" "$(powershell_bridge_runtime_label)" \
         "WOL 进程实测" "$(wol_hook_runtime_label)" \
@@ -4240,9 +4315,7 @@ prefix_needs_configuration() {
     controller_xim_disabled || return 0
     controller_take_focus_enabled || return 0
     if wol_enabled; then
-        wol_patch_ready || return 0
-        wol_hook_config_ready || return 0
-        powershell_bridge_ready || return 0
+        wol_runtime_bridge_ready || return 0
     fi
     [[ -d $mobile_download_dir && -w $mobile_download_dir ]] || return 0
     [[ -r $package_stamp && $(<"$package_stamp") == "$package_version" ]] || return 0
@@ -4361,9 +4434,7 @@ restore_update_snapshot() {
         hwencode_files_deployed && hwencode_probe_current || return 1
     fi
     if wol_enabled; then
-        wol_patch_ready &&
-            wol_hook_config_ready &&
-            powershell_bridge_ready || return 1
+        wol_runtime_bridge_ready || return 1
     fi
     printf '失败版本已保留用于排错：%s\n' "$failed_dir" >&2
 }
@@ -4393,9 +4464,7 @@ update_restart_ready() {
         hwencode_files_deployed && hwencode_probe_current || return 1
     fi
     if wol_enabled; then
-        wol_patch_ready &&
-            wol_hook_config_ready &&
-            powershell_bridge_ready || return 1
+        wol_runtime_bridge_ready || return 1
     fi
 }
 
@@ -4429,14 +4498,14 @@ run_update_transaction() {
     bridge_state_snapshot=$(create_version_bridge_state_snapshot)
     if (
         stop_prefix_for_setup
+        if wol_enabled; then
+            restore_optional_wol_server_patch ||
+                die "更新前无法安全恢复 WOL 旧版服务端补丁"
+        fi
         if ! $profile_supported; then
             if hwdecode_enabled || streamer_bridge_ready; then
                 remove_hwdecode_bridge
                 printf '正在为最新版准备自动 NVDEC 档案，已先安全恢复官方解码文件。\n'
-            fi
-            if wol_enabled; then
-                remove_wol_bridge
-                printf '最新版尚无 WOL 二进制补丁，已在更新前安全恢复官方服务文件。\n'
             fi
         fi
         prepare_prefix
@@ -4449,13 +4518,9 @@ run_update_transaction() {
 
         ensure_auto_hwencode
 
-        if $profile_supported && wol_enabled; then
-            "$wol_bridge" patch \
-                "$server" \
-                "$wol_server_original" \
-                "$wol_server_original_sha" \
-                "$wol_server_patched_sha" ||
-                die "更新后 WOL 兼容补丁无法部署"
+        if wol_enabled; then
+            deploy_optional_wol_server_patch ||
+                die "更新后 WOL 服务端兼容策略无法部署"
             write_wol_hook_config ||
                 die "更新后 WOL 物理网卡映射无法生成"
             deploy_wol_powershell_bridge
@@ -4473,12 +4538,9 @@ run_update_transaction() {
             hwencode_files_deployed && hwencode_probe_current ||
                 die "更新后 NVENC/HEVC 编码桥深层核验失败"
         fi
-        if $profile_supported && wol_enabled; then
-            wol_patch_ready || die "更新后 WOL 兼容补丁核验失败"
-            wol_hook_config_ready ||
-                die "更新后 WOL 物理网卡映射核验失败"
-            powershell_bridge_ready ||
-                die "更新后 WOL 电源属性兼容桥核验失败"
+        if wol_enabled; then
+            wol_runtime_bridge_ready ||
+                die "更新后 WOL 通用兼容桥核验失败"
         fi
     ); then
         rm -f -- "$snapshot" "$bridge_state_snapshot"
@@ -4490,15 +4552,15 @@ run_update_transaction() {
                 "$latest"
         elif hwdecode_enabled; then
             write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证，WOL 版本补丁已安全停用"
+                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证；已启用的 WOL 通用映射已重新部署"
             notify_status "UU 已更新到 $latest，NVDEC 自动补丁验证通过"
-            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁和硬件解码桥已自动生成、部署并通过真实解码验证，WOL 版本补丁暂时停用。\n' \
+            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁已自动验证；已启用的 WOL 通用映射已重新部署。\n' \
                 "$latest"
         else
             write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；版本绑定的 NVDEC/WOL 补丁已安全停用"
-            notify_status "UU 已更新到 $latest，版本绑定补丁已安全降级"
-            printf 'UU 已更新到官方最新版 %s；通用兼容层已部署，版本绑定的 NVDEC/WOL 补丁暂时停用。\n' \
+                "已安装官方最新版；已启用的 WOL 通用映射已重新部署，版本绑定的 NVDEC 补丁已安全停用"
+            notify_status "UU 已更新到 $latest，通用兼容层已重新部署"
+            printf 'UU 已更新到官方最新版 %s；已启用的 WOL 通用映射已重新部署，版本绑定的 NVDEC 补丁暂时停用。\n' \
                 "$latest"
         fi
         restart_client_after_update || true
@@ -4668,7 +4730,7 @@ if $enable_wol; then
     stop_prefix_for_setup
     deploy_wol_bridge
     notify_status "远程开机兼容桥已启用"
-    printf 'Linux Magic Packet 与 UU WOL 识别兼容桥已启用。\n'
+    printf 'Linux Magic Packet 与 UU WOL 通用映射兼容桥已启用。\n'
     printf '请重新启动 UU，在“允许通过远程开机启动”中继续配置辅助设备或路由器。\n'
     exit 0
 fi
@@ -4677,7 +4739,7 @@ if $disable_wol; then
     stop_prefix_for_setup
     remove_wol_bridge
     notify_status "远程开机兼容桥已关闭"
-    printf 'UU WOL 识别兼容桥已关闭并恢复原版服务端文件。\n'
+    printf 'UU WOL 通用映射兼容桥已关闭；如曾使用旧版服务端补丁，也已安全恢复。\n'
     printf 'Linux 网卡的 Magic Packet 设置予以保留，不会影响正常联网。\n'
     exit 0
 fi
@@ -4721,17 +4783,13 @@ if app_files_present && ! input_hook_ready; then
 fi
 
 if wol_enabled; then
-    "$wol_bridge" patch \
-        "$server" \
-        "$wol_server_original" \
-        "$wol_server_original_sha" \
-        "$wol_server_patched_sha" ||
-        die "远程开机兼容桥已启用，但 UU 服务端文件版本不受支持"
-    wol_patch_ready ||
-        die "远程开机兼容桥已启用，但识别补丁缺失或不匹配"
+    deploy_optional_wol_server_patch ||
+        die "远程开机兼容桥已启用，但旧版 UU 服务端补丁无法安全部署"
     write_wol_hook_config ||
         die "远程开机兼容桥已启用，但无法映射 Linux 物理网卡"
     deploy_wol_powershell_bridge
+    wol_runtime_bridge_ready ||
+        die "远程开机兼容桥已启用，但运行时映射核验失败"
 fi
 
 ensure_auto_hwencode

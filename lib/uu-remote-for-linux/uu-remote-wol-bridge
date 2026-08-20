@@ -135,7 +135,8 @@ latest_client_log() {
         latest=${entry#* }
         break
     done < <(
-        find "$log_dir" -maxdepth 1 -type f -name 'log_*.txt' \
+        find "$log_dir" -maxdepth 1 -type f \
+            \( -name 'log_*.txt' -o -name 'log_*.slog' \) \
             -printf '%T@ %p\n' 2>/dev/null | sort -nr
     )
     [[ -n $latest ]] || return 1
@@ -146,6 +147,12 @@ cloud_wol_state() {
     local log_dir=$1 latest line
 
     latest=$(latest_client_log "$log_dir") || {
+        printf 'unknown\n'
+        return
+    }
+    # UU 4.38+ writes the current session as an encrypted SLOG container.
+    # Never report a stale value from an older plaintext session as current.
+    [[ $latest == *.txt ]] || {
         printf 'unknown\n'
         return
     }

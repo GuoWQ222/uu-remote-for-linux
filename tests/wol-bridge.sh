@@ -57,5 +57,8 @@ test "$("$bridge" cloud-state "$log_dir")" = enabled
 sleep 0.02
 printf 'new session\n' >"$log_dir/log_2.txt"
 test "$("$bridge" cloud-state "$log_dir")" = unknown
+sleep 0.02
+printf 'SLOG\r\n' >"$log_dir/log_3.slog"
+test "$("$bridge" cloud-state "$log_dir")" = unknown
 
 printf '远程开机识别桥检查通过。\n'

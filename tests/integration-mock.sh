@@ -183,6 +183,43 @@ printf '%s\r\n' \
 "$launcher" --diagnose |
     grep -q 'WOL 进程实测.*v8，地址 1/2，旧接口 0/0，网卡表 1/1'
 
+# New UU releases must retain WOL through the generic Win32 adapter and
+# PowerShell bridges even when their GameViewerServer.exe hash has no legacy
+# binary-patch profile.  The unknown server fixture must never be modified.
+export UU_REMOTE_WOL_DETECT_ROW=$'eth-test\tMock Wired\t58:11:22:76:19:64\t10.6.15.254\tmagic\tenabled'
+export UU_REMOTE_WOL_NATIVE_IP=10.6.12.133
+export UU_REMOTE_WOL_REFERENCE_IP=10.6.12.133
+wol_server="$install_dir/bin/GameViewerServer.exe"
+wol_server_sha_before=$(sha256sum "$wol_server" | cut -d' ' -f1)
+"$launcher" --enable-wol
+test "$(sha256sum "$wol_server" | cut -d' ' -f1)" = \
+    "$wol_server_sha_before"
+test -f "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+grep -q '^version=2$' "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+grep -q '^server_mode=win32-adapter-mapping$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+grep -q '^enabled=1$' "$prefix/drive_c/uu-remote-wol-bridge.ini"
+grep -q '^gateway=10.6.15.254$' \
+    "$prefix/drive_c/uu-remote-wol-bridge.ini"
+cmp -s \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" \
+    "$install_dir/bin/powershell.exe"
+"$launcher" --diagnose >"$test_root/wol-generic-diagnose.txt"
+grep -q 'UU WOL 兼容桥.*已启用' "$test_root/wol-generic-diagnose.txt"
+grep -q 'UU WOL 服务端兼容.*通用 Win32 网卡映射' \
+    "$test_root/wol-generic-diagnose.txt"
+grep -q 'WOL Win32 网卡映射.*完整' \
+    "$test_root/wol-generic-diagnose.txt"
+"$launcher" --disable-wol
+test "$(sha256sum "$wol_server" | cut -d' ' -f1)" = \
+    "$wol_server_sha_before"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/wol-enabled"
+test ! -e "$prefix/drive_c/uu-remote-wol-bridge.ini"
+test ! -e "$install_dir/bin/powershell.exe"
+unset UU_REMOTE_WOL_DETECT_ROW \
+    UU_REMOTE_WOL_NATIVE_IP \
+    UU_REMOTE_WOL_REFERENCE_IP
+
 install_count=$(grep -c '^INSTALL$' "$UU_REMOTE_FAKE_TRACE")
 webview_count=$(grep -c '^WEBVIEW$' "$UU_REMOTE_FAKE_TRACE")
 
