@@ -31,8 +31,14 @@ LEGACY_SCAN_INTERVAL_MS = 750
 WINDOW_LAYOUT_SINGLE = "single-primary"
 WINDOW_LAYOUT_DUAL = "dual-monitor"
 WINDOW_LAYOUT_REFLOW_ATTEMPTS = 3
+WINDOW_LAYOUT_SETTLED = -1
 WINDOW_LAYOUT_REFLOW_INTERVAL_SECONDS = 2.0
 WINDOW_LAYOUT_RESTORE_DELAY_MS = 80
+WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH = 16
+WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT = 9
+WINDOW_LAYOUT_DEFAULT_NONCLIENT_HEIGHT = 40
+WINDOW_LAYOUT_MIN_NONCLIENT_HEIGHT = 24
+WINDOW_LAYOUT_MAX_NONCLIENT_HEIGHT = 96
 HOME_REPAINT_DELAY_MS = 2500
 HOME_REPAINT_RETRY_MS = 100
 HOME_REPAINT_RESTORE_DELAY_MS = 80
@@ -544,6 +550,45 @@ def gdk_monitor_workareas(gdk) -> list[tuple[int, int, int, int]]:
         )
     monitors.sort(key=lambda row: (not row[0], row[1], row[2]))
     return [row[1:] for row in monitors]
+
+
+def fit_video_window_to_workarea(
+    area: tuple[int, int, int, int],
+    current_rect: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int]:
+    """Fit an exact 16:9 client surface inside a monitor work area."""
+
+    area_x, area_y, area_width, area_height = area
+    nonclient_height = WINDOW_LAYOUT_DEFAULT_NONCLIENT_HEIGHT
+    if current_rect is not None:
+        inferred = current_rect[3] - round(
+            current_rect[2]
+            * WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT
+            / WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH
+        )
+        if (
+            WINDOW_LAYOUT_MIN_NONCLIENT_HEIGHT
+            <= inferred
+            <= WINDOW_LAYOUT_MAX_NONCLIENT_HEIGHT
+        ):
+            nonclient_height = inferred
+
+    available_client_height = area_height - nonclient_height
+    aspect_units = min(
+        area_width // WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH,
+        available_client_height // WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT,
+    )
+    if aspect_units <= 0:
+        return area
+    client_width = aspect_units * WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH
+    client_height = aspect_units * WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT
+    outer_height = client_height + nonclient_height
+    return (
+        area_x + (area_width - client_width) // 2,
+        area_y + (area_height - outer_height) // 2,
+        client_width,
+        outer_height,
+    )
 
 
 def mapped_home_window(
@@ -1442,23 +1487,39 @@ class TrayProxy:
         return False
 
     def reflow_remote_window(
-        self, window: int, area: tuple[int, int, int, int]
+        self,
+        window: int,
+        area: tuple[int, int, int, int],
+        current_rect: tuple[int, int, int, int] | None,
     ) -> None:
         if self.x11 is None:
             return
         x, y, width, height = area
-        pulse_width = width - 1 if width > 1 else width
-        self.x11.move_resize(window, x, y, pulse_width, height)
-        self.GLib.timeout_add(
-            WINDOW_LAYOUT_RESTORE_DELAY_MS,
-            self.restore_window_layout,
-            window,
-            area,
-        )
+        if current_rect == area:
+            # A mapped Qt viewer can already have the requested outer geometry
+            # while its mixed-orientation canvas still has the stale size.  In
+            # that one case, emit one real resize transition to wake the Qt and
+            # DXGI layout paths.  When the geometry differs, moving directly to
+            # the target already supplies that transition and avoids rebuilding
+            # the swapchain twice.
+            pulse_width = width - 1 if width > 1 else width
+            self.x11.move_resize(window, x, y, pulse_width, height)
+            self.GLib.timeout_add(
+                WINDOW_LAYOUT_RESTORE_DELAY_MS,
+                self.restore_window_layout,
+                window,
+                area,
+            )
+            method = "pulse"
+        else:
+            self.x11.move_resize(window, *area)
+            method = "direct"
         logging.info(
-            "重排远控窗口：window=0x%x layout=%s target=%d,%d %dx%d",
+            "重排远控窗口：window=0x%x layout=%s method=%s "
+            "target=%d,%d %dx%d",
             window,
             self.window_layout,
+            method,
             x,
             y,
             width,
@@ -1480,42 +1541,122 @@ class TrayProxy:
             force = True
 
         windows = mapped_remote_windows(self.x11, self.prefix)
-        window_ids = {window[0] for window in windows}
-        self.window_layout_state = {
-            window: state
-            for window, state in self.window_layout_state.items()
-            if window in window_ids
-        }
+        # A Qt viewer is briefly unmapped during fullscreen, minimize, and
+        # swapchain transitions.  Keep its settled state across that gap; X11
+        # window IDs remain unique for the lifetime of this tray process, and
+        # stale entries are harmless because planning only considers mapped
+        # windows.  Pruning here made a remapped viewer look new and stretched
+        # it back to the full work area a minute after initial convergence.
         if not windows:
             return 0
 
         if self.window_layout == WINDOW_LAYOUT_DUAL:
-            plans = [
-                (window[0], monitor_areas[index])
-                for index, window in enumerate(windows[: len(monitor_areas)])
+            # Preserve an established window-to-monitor assignment.  Sorting
+            # candidates by their current area is useful only for the initial
+            # assignment: after a portrait window is expanded it can become
+            # larger than the landscape window, and recomputing by area would
+            # swap both windows on every periodic check.
+            plans = []
+            planned_windows: set[int] = set()
+            used_areas: set[tuple[int, int, int, int]] = set()
+            for window in windows:
+                state = self.window_layout_state.get(window[0])
+                if state is None:
+                    continue
+                established_area = next(
+                    (
+                        area
+                        for area in monitor_areas
+                        if area not in used_areas
+                        and self.rect_center_in_area(state[0], area)
+                    ),
+                    None,
+                )
+                if established_area is None:
+                    continue
+                plans.append((window[0], established_area))
+                planned_windows.add(window[0])
+                used_areas.add(established_area)
+            remaining_areas = [
+                area for area in monitor_areas if area not in used_areas
             ]
+            for window in windows:
+                if window[0] in planned_windows or not remaining_areas:
+                    continue
+                area = remaining_areas.pop(0)
+                plans.append((window[0], area))
+                planned_windows.add(window[0])
         else:
-            plans = [(windows[0][0], monitor_areas[0])]
+            primary_area = monitor_areas[0]
+            established = next(
+                (
+                    window[0]
+                    for window in windows
+                    if self.window_layout_state.get(window[0]) is not None
+                    and self.rect_center_in_area(
+                        self.window_layout_state[window[0]][0], primary_area
+                    )
+                ),
+                None,
+            )
+            plans = [
+                (
+                    established if established is not None else windows[0][0],
+                    primary_area,
+                )
+            ]
 
         now = time.monotonic()
         applied = 0
-        for window, area in plans:
+        for window, monitor_area in plans:
             state = self.window_layout_state.get(window)
             rect = self.x11.window_rect(window)
+            target_area = fit_video_window_to_workarea(monitor_area, rect)
             outside_target = (
-                rect is not None and not self.rect_center_in_area(rect, area)
+                rect is not None
+                and not self.rect_center_in_area(rect, monitor_area)
             )
-            if force or state is None or state[0] != area or outside_target:
-                state = (area, 0, 0.0)
+            reset_state = (
+                force
+                or state is None
+                or state[0] != target_area
+                or (
+                    outside_target
+                    and state[1] == WINDOW_LAYOUT_SETTLED
+                )
+            )
+            if reset_state:
+                state = (target_area, 0, 0.0)
             target, attempts, next_attempt = state
             if (
-                attempts >= WINDOW_LAYOUT_REFLOW_ATTEMPTS
+                not reset_state
+                and 0 < attempts < WINDOW_LAYOUT_REFLOW_ATTEMPTS
+                and rect == target
+            ):
+                # The previous move was accepted.  Mark the window settled
+                # instead of blindly performing the remaining safety retries;
+                # those retries forced DXVK to recreate an already-correct
+                # swapchain and caused two visible white flashes.
+                self.window_layout_state[window] = (
+                    target,
+                    WINDOW_LAYOUT_SETTLED,
+                    0.0,
+                )
+                logging.info(
+                    "远控窗口布局已稳定：window=0x%x attempts=%d",
+                    window,
+                    attempts,
+                )
+                continue
+            if (
+                attempts == WINDOW_LAYOUT_SETTLED
+                or attempts >= WINDOW_LAYOUT_REFLOW_ATTEMPTS
                 or now < next_attempt
             ):
                 self.window_layout_state[window] = state
                 continue
             try:
-                self.reflow_remote_window(window, target)
+                self.reflow_remote_window(window, target, rect)
             except Exception:
                 logging.exception(
                     "远控窗口布局应用失败：window=0x%x", window

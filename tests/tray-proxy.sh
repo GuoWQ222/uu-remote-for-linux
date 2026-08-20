@@ -104,6 +104,18 @@ assert namespace["gdk_monitor_workareas"](LayoutGdk) == [
     (1506, 32, 2494, 1408),
     (0, 0, 1440, 2560),
 ]
+assert namespace["fit_video_window_to_workarea"](
+    (1506, 32, 2494, 1408),
+    (1537, 32, 2432, 1408),
+) == (1537, 32, 2432, 1408)
+assert namespace["fit_video_window_to_workarea"](
+    (1506, 32, 2494, 1408),
+    (1506, 32, 2494, 1408),
+) == (1537, 32, 2432, 1408)
+assert namespace["fit_video_window_to_workarea"](
+    (0, 0, 1440, 2560),
+    (0, 0, 1000, 700),
+) == (0, 855, 1440, 850)
 
 monitor_descriptors = namespace["gdk_monitor_descriptors"](LayoutGdk)
 assert [row["id"] for row in monitor_descriptors] == [
@@ -132,10 +144,16 @@ class LayoutX11:
 
     def __init__(self):
         self.moves = []
+        self.accept_moves = True
+        self.visible_windows = [0x300, 0x301, 0x302]
+        self.rects = {
+            0x300: (0, 0, 1200, 800),
+            0x301: (0, 0, 1000, 700),
+            0x302: (100, 100, 920, 680),
+        }
 
-    @staticmethod
-    def windows():
-        return [0x300, 0x301, 0x302]
+    def windows(self):
+        return self.visible_windows
 
     @staticmethod
     def window_class(window):
@@ -157,16 +175,13 @@ class LayoutX11:
             0x302: "网易UU远程",
         }[window]
 
-    @staticmethod
-    def window_rect(window):
-        return {
-            0x300: (0, 0, 1200, 800),
-            0x301: (0, 0, 1000, 700),
-            0x302: (100, 100, 920, 680),
-        }[window]
+    def window_rect(self, window):
+        return self.rects[window]
 
     def move_resize(self, window, x, y, width, height):
         self.moves.append((window, x, y, width, height))
+        if self.accept_moves:
+            self.rects[window] = (x, y, width, height)
 
 
 class ImmediateGLib:
@@ -191,19 +206,88 @@ layout_globals["controller_processes"] = lambda *_args: {4242}
 try:
     assert layout_proxy.apply_window_layout(force=True) == 1
     assert layout_x11.moves == [
-        (0x300, 1506, 32, 2493, 1408),
-        (0x300, 1506, 32, 2494, 1408),
+        (0x300, 1537, 32, 2432, 1408),
     ]
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
+    assert layout_proxy.window_layout_state[0x300][1] == (
+        namespace["WINDOW_LAYOUT_SETTLED"]
+    )
+
+    # A temporary unmap/remap keeps the settled identity and must not trigger
+    # another resize when the same X11 window returns.
+    settled_state = layout_proxy.window_layout_state[0x300]
+    layout_x11.visible_windows = []
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_proxy.window_layout_state[0x300] == settled_state
+    layout_x11.visible_windows = [0x300, 0x301, 0x302]
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
+
+    # If UU restores its startup geometry before verification, retry once and
+    # stop as soon as the target geometry is observed.
+    layout_proxy.window_layout_state[0x300] = (
+        layout_proxy.window_layout_state[0x300][0],
+        1,
+        0.0,
+    )
+    layout_x11.rects[0x300] = (0, 0, 1200, 800)
+    assert layout_proxy.apply_window_layout() == 1
+    assert layout_x11.moves == [
+        (0x300, 1537, 32, 2432, 1408),
+    ]
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
+
+    # An already-correct outer window receives exactly one pulse to refresh a
+    # stale mixed-orientation Qt canvas, then converges without another pulse.
+    layout_proxy.window_layout_state.clear()
+    assert layout_proxy.apply_window_layout(force=True) == 1
+    assert layout_x11.moves == [
+        (0x300, 1537, 32, 2431, 1408),
+        (0x300, 1537, 32, 2432, 1408),
+    ]
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
+
     layout_proxy.window_layout = namespace["WINDOW_LAYOUT_DUAL"]
     layout_proxy.window_layout_state.clear()
     layout_x11.moves.clear()
     assert layout_proxy.apply_window_layout(force=True) == 2
     assert layout_x11.moves == [
-        (0x300, 1506, 32, 2493, 1408),
-        (0x300, 1506, 32, 2494, 1408),
-        (0x301, 0, 0, 1439, 2560),
-        (0x301, 0, 0, 1440, 2560),
+        # The primary window is already at its target and needs one pulse.
+        (0x300, 1537, 32, 2431, 1408),
+        (0x300, 1537, 32, 2432, 1408),
+        # The secondary window differs, so one direct resize is sufficient.
+        (0x301, 0, 855, 1440, 850),
     ]
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
+
+    # Failed moves retain the finite three-attempt ceiling.
+    layout_proxy.window_layout = namespace["WINDOW_LAYOUT_SINGLE"]
+    layout_proxy.window_layout_state.clear()
+    layout_x11.rects[0x300] = (0, 0, 1200, 800)
+    layout_x11.rects[0x301] = (0, 0, 1000, 700)
+    layout_x11.accept_moves = False
+    for attempt in range(namespace["WINDOW_LAYOUT_REFLOW_ATTEMPTS"]):
+        if attempt:
+            target, attempts, _next_attempt = (
+                layout_proxy.window_layout_state[0x300]
+            )
+            layout_proxy.window_layout_state[0x300] = (
+                target,
+                attempts,
+                0.0,
+            )
+        assert layout_proxy.apply_window_layout() == 1
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout() == 0
+    assert layout_x11.moves == []
 finally:
     layout_globals["controller_processes"] = (
         original_layout_controller_processes
