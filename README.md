@@ -1,7 +1,7 @@
 <h1 align="center">UU Remote for Linux</h1>
 
 <p align="center">
-  Run the official UU Remote client on Ubuntu with native Linux input, display, tray, update, and hardware-codec integration.
+  Run the official UU Remote client on Ubuntu with native Linux input, display, tray, updates, and hardware video integration.
 </p>
 
 <p align="center">
@@ -14,44 +14,50 @@
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
 > [!IMPORTANT]
-> This is an unofficial compatibility wrapper for NetEase UU Remote. The repository does not distribute the proprietary installer or client binaries.
-> UU and wrapper-managed downloads use direct connections by default; desktop proxy settings are not copied into the Wine client.
+> This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries. Downloads use direct connections by default, and desktop proxy settings are not copied into Wine.
 
+## 🗺️ Contents
+
+- [✨ Highlights](#highlights)
+- [🚀 Install](#install)
+- [🧭 Daily use](#daily-use)
+- [🎛️ Compatibility](#compatibility)
+- [🧰 Commands](#commands)
+- [📄 License](#license)
+
+<a id="highlights"></a>
 ## ✨ Highlights
 
-| | Capability | What it provides |
+| | Capability | What you get |
 |---|---|---|
-| 🖥️ | Ubuntu desktop | Isolated Wine client, graphical first-run setup, and transactional official-client updates |
-| 🖱️ | Native remote control | X11/XTest or Wayland Portal input, controlled-display selection, native portrait resolution, and complete X11 cursor shapes |
-| 🎬 | Hardware video | CPU/OpenH264 fallback, experimental NVIDIA NVDEC decoding, and validated NVENC H.264/HEVC encoding |
-| 🧭 | Native tray | Show the main window, choose the controlled display or decoder, and arrange one or two viewer windows |
-| 🛡️ | Linux integration | Autostart, sleep inhibition, resilient encrypted DNS, file transfer, safe updates, and Wake-on-LAN bridges |
+| 🖥️ | Official client | Isolated Wine environment, graphical first-run setup, and safe client updates |
+| 🖱️ | Native control | X11/XTest or Wayland Portal input, monitor selection, native portrait resolution, and complete cursor shapes |
+| 🎬 | Hardware video | CPU/OpenH264 fallback, experimental NVIDIA NVDEC, and validated NVENC H.264/HEVC |
+| 🧭 | Linux desktop | Native tray, multi-monitor layout, autostart, sleep inhibition, file transfer, and Wake-on-LAN |
 
 > [!NOTE]
-> After a UU update, the Wake-on-LAN layer derives a local profile from verified function boundaries and WOL semantics in the official `GameViewerServer.exe`, then deploys only after checking the original bytes and SHA-256 hashes. Ambiguous binaries are left untouched and safely fall back to Win32 adapter mapping.
+> Version-specific codec and WOL changes are applied only after unique fingerprint and hash validation. Ambiguous client updates keep the official files untouched and use a safe fallback.
 
-## 🚀 Quick start
+<a id="install"></a>
+## 🚀 Install
+
+**Tested environment:** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 or GNOME Wayland
 
 1. Download the latest `.deb` from [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
-2. Install it:
+2. Install and launch:
 
    ```bash
    sudo apt install ./uu-remote-for-linux_1.1.27_amd64.deb
-   ```
-
-3. Open **UU Remote for Linux** from the Ubuntu application menu, or run:
-
-   ```bash
    uu-remote-for-linux
    ```
 
-On first launch, accept NetEase's official UU Remote agreement to install the isolated Windows client and WebView2 automatically. Rejecting the agreement leaves the client uninstalled.
+On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the isolated client and WebView2. Rejecting it leaves the client uninstalled.
 
 > [!TIP]
-> For terminal-only setup, read the [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html), then run `uu-remote-for-linux --accept-eula --setup-only`.
+> Terminal-only setup: `uu-remote-for-linux --accept-eula --setup-only`
 
 <details>
-<summary><strong>Install from source</strong></summary>
+<summary><strong>🧱 Install from source</strong></summary>
 
 ```bash
 sudo apt install python3-gi zenity gir1.2-gstreamer-1.0 \
@@ -64,81 +70,63 @@ cd uu-remote-for-linux
 
 </details>
 
-## ✅ Requirements
+<a id="daily-use"></a>
+## 🧭 Daily use
 
-| Item | Requirement |
-|---|---|
-| Operating system | Ubuntu 24.04 (tested) |
-| Wine | 11.1 or newer |
-| Desktop | X11, or GNOME Wayland with XWayland and XDG Desktop Portal |
-| NVIDIA acceleration | Proprietary driver with usable `libcuda.so.1` and `libnvidia-encode.so.1` |
-
-The launcher detects the session and probes optional NVIDIA libraries automatically. Wayland asks for screen-sharing and remote-interaction permission the first time this machine is controlled.
-
-## 🧭 Tray at a glance
-
-Right-click the native UU icon in the Ubuntu top bar or system tray:
+Right-click the native tray icon:
 
 | Action | Purpose |
 |---|---|
-| **显示主界面 · Show main window** | Restore the hidden or minimized UU window |
-| **被控屏幕 · Controlled display** | Choose the Ubuntu monitor that matches the video track selected on Windows |
-| **远控窗口布局 · Viewer layout** | Keep one viewer on the primary display or place existing viewers across two displays |
-| **选择解码器… · Select decoder…** | Choose CPU/NVIDIA decoding and restart UU automatically |
-| **退出 · Exit** | Stop this project's dedicated Wine client and remove the tray icon |
+| **Show main window** | Restore the hidden or minimized UU window |
+| **Controlled display** | Select the Ubuntu monitor matching the Windows video track |
+| **Viewer layout** | Keep one viewer on the primary display or arrange two existing viewers |
+| **Select decoder** | Choose CPU/NVIDIA decoding and restart UU |
+| **Exit** | Stop the dedicated Wine client |
 
-The display menu follows hot-plug, rotation, and layout changes. The dual-view option arranges existing windows; it does not create another remote session.
+Display choices follow hot-plug, rotation, and layout changes automatically.
 
+<a id="compatibility"></a>
 ## 🎛️ Compatibility
 
-### Video
-
-| Role | Backend | Status | Notes |
+| Area | Backend | Status | Notes |
 |---|---|---:|---|
-| Decode | CPU / OpenH264 | ✅ Supported | Upstream path, up to 1080p/60 fps |
-| Decode | NVIDIA NVDEC | 🧪 Experimental | UU menu up to 4K/144 fps; verify on the actual stream |
-| Encode | NVIDIA NVENC | ✅ Auto-probed | H.264 and HEVC; preferred only after validation |
-| Encode | CPU / OpenH264 | ✅ Safe fallback | H.264 |
-| Decode/encode | Intel/AMD hardware | ❌ Not implemented | CPU fallback remains available |
+| Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
+| Desktop | GNOME Wayland Portal | ✅ | XWayland UI; Portal input and PipeWire capture |
+| Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |
+| Decode | NVIDIA NVDEC | 🧪 | Experimental; UU menu up to 4K/144 fps |
+| Encode | NVIDIA NVENC | ✅ | H.264/HEVC, enabled only after validation |
+| Intel/AMD hardware | — | ❌ | CPU fallback remains available |
 
-### Desktop
+> [!WARNING]
+> Wayland requires Portal permission. Login-manager and lock-screen capture are outside the logged-in Portal session; use X11 for unattended access before login.
 
-| Session | UI | Controlled-host input | Capture |
-|---|---|---|---|
-| X11 | Wine X11 driver | XTest | Existing UU capture path |
-| Wayland | XWayland | XDG RemoteDesktop Portal | ScreenCast/PipeWire shared frames → Win64 GDI hook |
-
-> [!NOTE]
-> Portal permission is mandatory on Wayland. Login-manager and lock-screen capture remain outside the logged-in Portal session, so X11 is safer for unattended control before login.
+<a id="commands"></a>
+## 🧰 Commands
 
 <details>
-<summary><strong>Useful commands</strong></summary>
+<summary><strong>Show common commands</strong></summary>
 
 ```bash
-# Start, inspect, repair, or stop
+# Start and maintenance
 uu-remote-for-linux
 uu-remote-for-linux --diagnose
 uu-remote-for-linux --repair
 uu-remote-for-linux --stop
-
-# Update the official client
 uu-remote-for-linux --check-update
 
-# Decoder selection
+# Decoder
 uu-remote-for-linux --select-decoder
 uu-remote-for-linux --list-decoders
-uu-remote-for-linux --decoder auto   # or cpu / nvidia:0
+uu-remote-for-linux --decoder auto   # cpu / nvidia:0
 
-# Controlled-host NVENC policy
+# Controlled-host encoder
 uu-remote-for-linux --enable-hwencode
 uu-remote-for-linux --disable-hwencode
-
-# Emergency focus fallback
-UU_REMOTE_DISABLE_FOCUS_STABILIZER=1 uu-remote-for-linux
 ```
 
 </details>
 
-## 📄 License and attribution
+<a id="license"></a>
+## 📄 License
 
-Original project code uses the [Zero-Clause BSD license](LICENSE). Optional hardware-codec components retain their zlib or LGPL licenses; exact revisions, source links, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).
+Original project code uses the [Zero-Clause BSD license](LICENSE). Optional components retain their own licenses; revisions, source links, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).
