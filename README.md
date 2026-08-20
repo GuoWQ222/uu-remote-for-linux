@@ -30,10 +30,10 @@
 
 | | Capability | What you get |
 |---|---|---|
-| 🖥️ | Official client | Isolated Wine environment, graphical first-run setup, and safe client updates |
-| 🖱️ | Native control | X11/XTest or Wayland Portal input, monitor selection, native portrait resolution, and complete cursor shapes |
-| 🎬 | Hardware video | CPU/OpenH264 fallback, experimental NVIDIA NVDEC, and validated NVENC H.264/HEVC |
-| 🧭 | Linux desktop | Native tray, multi-monitor layout, autostart, sleep inhibition, file transfer, and Wake-on-LAN |
+| 🖥️ | Official client | Wine-based environment, graphical interface, and automatic updates |
+| 🖱️ | Native control | Supports X11/Wayland, dual monitors, and primary-display switching |
+| 🎬 | Hardware video | Supports CPU/OpenH264, NVIDIA NVDEC, and NVENC H.264/HEVC |
+| 🧭 | Linux desktop | Native tray and all UU Remote settings |
 
 > [!NOTE]
 > Version-specific codec and WOL changes are applied only after unique fingerprint and hash validation. Ambiguous client updates keep the official files untouched and use a safe fallback.
