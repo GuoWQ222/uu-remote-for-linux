@@ -295,6 +295,20 @@ rows = json.load(open(sys.argv[1], encoding="utf-8"))["encoder_capabilities"]
 assert not any(row.get("codec_impl") == 6 for row in rows)
 assert not any(row.get("codec_impl") in {1, 33} for row in rows)
 assert {row.get("video_codec") for row in rows if row.get("codec_impl") == 0} >= {1, 2}
+assert {
+    row.get("video_codec")
+    for row in rows
+    if row.get("codec_impl") == 0
+    and row.get("width", 0) >= 1080
+    and row.get("height", 0) >= 1920
+} >= {1, 2}
+assert {
+    row.get("video_codec")
+    for row in rows
+    if row.get("codec_impl") == 0
+    and row.get("width", 0) >= 1920
+    and row.get("width") == row.get("height")
+} >= {1, 2}
 assert all(
     row.get("adapter_id") == 1012 and row.get("device_id") == 8578
     for row in rows

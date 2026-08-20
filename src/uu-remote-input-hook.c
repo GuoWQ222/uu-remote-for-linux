@@ -38,7 +38,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 28u
+#define HOOK_VERSION 30u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -197,6 +197,9 @@ static volatile LONG frame_adapter_wrapper_candidates;
 static volatile LONG frame_adapter_rtti_named_candidates;
 static volatile LONG frame_adapter_encoder_path_candidates;
 static BOOL streamer_wrapper_frame_adapter_hooked;
+static BOOL streamer_portrait_scale_limit_hooked;
+static volatile LONG frame_portrait_scale_limit_candidates;
+static volatile LONG frame_portrait_scale_limit_patches;
 static BOOL adapters_addresses_hooked;
 static BOOL adapters_info_hooked;
 static BOOL if_table2_hooked;
@@ -221,6 +224,18 @@ static ULONGLONG frame_sequence_changed_at;
 static volatile LONG frame_hook_calls;
 static volatile LONG frame_hook_rendered;
 static volatile LONG frame_hook_fallbacks;
+static volatile LONG frame_destination_x;
+static volatile LONG frame_destination_y;
+static volatile LONG frame_destination_width;
+static volatile LONG frame_destination_height;
+static volatile LONG frame_source_x;
+static volatile LONG frame_source_y;
+static volatile LONG frame_source_width;
+static volatile LONG frame_source_height;
+static volatile LONG frame_monitor_left;
+static volatile LONG frame_monitor_top;
+static volatile LONG frame_monitor_width;
+static volatile LONG frame_monitor_height;
 static BOOL controller_dispatch_hooked;
 static BOOL qt_dispatch_hooked;
 static BOOL controller_set_hook_hooked;
@@ -1246,6 +1261,98 @@ static void write_frame_hook_status(void) {
     wsprintfA(value, "%lu", (unsigned long)frame_last_sequence);
     WritePrivateProfileStringA("capture", "sequence", value, frame_status_path);
     wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_x, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_x", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_y, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_y", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_width, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_width", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_height, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_height", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_source_x, 0, 0)
+    );
+    WritePrivateProfileStringA("capture", "source_x", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_source_y, 0, 0)
+    );
+    WritePrivateProfileStringA("capture", "source_y", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_source_width, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "source_width", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_source_height, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "source_height", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_monitor_left, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "monitor_left", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_monitor_top, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "monitor_top", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_monitor_width, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "monitor_width", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_monitor_height, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "monitor_height", value, frame_status_path
+    );
+    wsprintfA(
         value, "%lu", (unsigned long)configured_frame_adapter_luid
     );
     WritePrivateProfileStringA(
@@ -1323,6 +1430,32 @@ static void write_frame_hook_status(void) {
     WritePrivateProfileStringA(
         "encoder", "encoder_path_candidates", value, frame_status_path
     );
+    WritePrivateProfileStringA(
+        "encoder",
+        "portrait_scale_limit_hooked",
+        streamer_portrait_scale_limit_hooked ? "1" : "0",
+        frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &frame_portrait_scale_limit_candidates, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "encoder", "portrait_scale_limit_candidates", value,
+        frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_portrait_scale_limit_patches, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "encoder", "portrait_scale_limit_patches", value,
+        frame_status_path
+    );
 }
 
 static BOOL refresh_frame_mapping(void) {
@@ -1374,8 +1507,36 @@ static BOOL render_wayland_frame(
     uint32_t active;
     int result;
     LONG calls;
+    POINT source_point;
+    HMONITOR source_monitor;
+    MONITORINFO monitor_info;
 
     calls = InterlockedIncrement(&frame_hook_calls);
+    InterlockedExchange(&frame_destination_x, destination_x);
+    InterlockedExchange(&frame_destination_y, destination_y);
+    InterlockedExchange(&frame_destination_width, destination_width);
+    InterlockedExchange(&frame_destination_height, destination_height);
+    InterlockedExchange(&frame_source_x, source_x);
+    InterlockedExchange(&frame_source_y, source_y);
+    InterlockedExchange(&frame_source_width, source_width);
+    InterlockedExchange(&frame_source_height, source_height);
+    source_point.x = source_x;
+    source_point.y = source_y;
+    source_monitor = MonitorFromPoint(source_point, MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&monitor_info, sizeof(monitor_info));
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (source_monitor && GetMonitorInfoW(source_monitor, &monitor_info)) {
+        InterlockedExchange(&frame_monitor_left, monitor_info.rcMonitor.left);
+        InterlockedExchange(&frame_monitor_top, monitor_info.rcMonitor.top);
+        InterlockedExchange(
+            &frame_monitor_width,
+            monitor_info.rcMonitor.right - monitor_info.rcMonitor.left
+        );
+        InterlockedExchange(
+            &frame_monitor_height,
+            monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top
+        );
+    }
     if (
         !destination ||
         !source ||
@@ -2102,6 +2263,121 @@ static BOOL patch_frame_adapter_accessor(void *function) {
         function, sizeof(jump), old_protection, &old_protection
     );
     FlushInstructionCache(GetCurrentProcess(), function, sizeof(jump));
+    return TRUE;
+}
+
+/*
+ * UU's "Original" quality request currently carries a landscape-oriented
+ * max-scale rectangle (3840x2160).  The controlled host copies those values
+ * into its capture configuration without accounting for monitor rotation, so
+ * a 1440x2560 portrait display is reduced to 1216x2160 before encoding.  Find
+ * the unique request-to-capture copy by semantics and make its height use the
+ * same direction-neutral maximum as its width.  This changes only the upper
+ * bound: the capture path still keeps the monitor's real aspect ratio.
+ */
+static BOOL patch_streamer_portrait_scale_limit(HMODULE module) {
+    static const unsigned char scale_copy_pattern[] = {
+        0x41, 0x8b, 0x56, 0x04, 0x85, 0xd2, 0x75, 0x10,
+        0x41, 0x8b, 0x46, 0x30,
+        0x89, 0x83, 0xc0, 0x00, 0x00, 0x00,
+        0x41, 0x8b, 0x46, 0x34,
+        0xeb, 0x08,
+        0x89, 0xbb, 0xc0, 0x00, 0x00, 0x00,
+        0x8b, 0xc7,
+        0x4c, 0x8d, 0xab, 0xc4, 0x00, 0x00, 0x00,
+        0x41, 0x89, 0x45, 0x00,
+        0x89, 0x93, 0xc8, 0x00, 0x00, 0x00
+    };
+    const SIZE_T height_source_offset = 21u;
+    unsigned char *base = (unsigned char *)module;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *sections;
+    IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *candidate = NULL;
+    unsigned int candidate_count = 0;
+    unsigned int section_index;
+    SIZE_T index;
+    DWORD old_protection;
+
+    if (streamer_portrait_scale_limit_hooked) {
+        return TRUE;
+    }
+    if (!base) {
+        return FALSE;
+    }
+    dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return FALSE;
+    }
+    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    if (
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    ) {
+        return FALSE;
+    }
+    sections = IMAGE_FIRST_SECTION(nt);
+    for (section_index = 0;
+         section_index < nt->FileHeader.NumberOfSections;
+         ++section_index) {
+        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
+            text = &sections[section_index];
+            break;
+        }
+    }
+    if (!text || text->Misc.VirtualSize < sizeof(scale_copy_pattern)) {
+        return FALSE;
+    }
+    for (index = 0;
+         index + sizeof(scale_copy_pattern) <= text->Misc.VirtualSize;
+         ++index) {
+        unsigned char *current = base + text->VirtualAddress + index;
+        if (
+            !bytes_equal(
+                current, scale_copy_pattern, height_source_offset
+            ) ||
+            !bytes_equal(
+                current + height_source_offset + 1u,
+                scale_copy_pattern + height_source_offset + 1u,
+                sizeof(scale_copy_pattern) - height_source_offset - 1u
+            ) ||
+            (current[height_source_offset] != 0x34u &&
+             current[height_source_offset] != 0x30u)
+        ) {
+            continue;
+        }
+        candidate = current;
+        ++candidate_count;
+    }
+    InterlockedExchange(
+        &frame_portrait_scale_limit_candidates, (LONG)candidate_count
+    );
+    if (candidate_count != 1u || !candidate) {
+        return FALSE;
+    }
+    if (candidate[height_source_offset] == 0x34u) {
+        if (!VirtualProtect(
+                candidate + height_source_offset,
+                1u,
+                PAGE_EXECUTE_READWRITE,
+                &old_protection
+            )) {
+            return FALSE;
+        }
+        candidate[height_source_offset] = 0x30u;
+        VirtualProtect(
+            candidate + height_source_offset,
+            1u,
+            old_protection,
+            &old_protection
+        );
+        FlushInstructionCache(
+            GetCurrentProcess(), candidate + height_source_offset, 1u
+        );
+        InterlockedIncrement(&frame_portrait_scale_limit_patches);
+    }
+    streamer_portrait_scale_limit_hooked = TRUE;
     return TRUE;
 }
 
@@ -5631,6 +5907,7 @@ static BOOL patch_streamer_imports(void) {
         streamer_stretch_blt_hooked = FALSE;
         streamer_frame_adapter_hooked = FALSE;
         streamer_wrapper_frame_adapter_hooked = FALSE;
+        streamer_portrait_scale_limit_hooked = FALSE;
         original_frame_adapter_id = NULL;
         InterlockedExchange(&frame_adapter_hook_calls, 0);
         InterlockedExchange(&frame_adapter_wrapper_hook_calls, 0);
@@ -5639,8 +5916,11 @@ static BOOL patch_streamer_imports(void) {
         InterlockedExchange(&frame_adapter_wrapper_candidates, 0);
         InterlockedExchange(&frame_adapter_rtti_named_candidates, 0);
         InterlockedExchange(&frame_adapter_encoder_path_candidates, 0);
+        InterlockedExchange(&frame_portrait_scale_limit_candidates, 0);
+        InterlockedExchange(&frame_portrait_scale_limit_patches, 0);
     }
     adapter_ready = patch_streamer_gdi_frame_adapter(module);
+    patch_streamer_portrait_scale_limit(module);
     if (!streamer_send_input_hooked) {
         streamer_send_input_hooked = patch_import(
             module,

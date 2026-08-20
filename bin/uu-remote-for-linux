@@ -217,6 +217,8 @@ readonly hwencode_disabled_stamp="$data_dir/hwencode-disabled"
 readonly hwencode_failed_stamp="$data_dir/hwencode-failed"
 readonly hwencode_manifest="$data_dir/hwencode-manifest"
 readonly hwencode_probe_status="$state_dir/hwencode-probe-status"
+readonly hwencode_policy_log="$state_dir/hwencode-policy.log"
+readonly hwencode_policy_lock="$state_dir/hwencode-policy.lock"
 readonly hwencode_dxvk_config="$data_dir/dxvk-hwencode.conf"
 readonly hwencode_nvencode="$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
 readonly hwencode_probe="$install_dir/bin/uu-remote-nvenc-d3d11-probe.exe"
@@ -249,6 +251,7 @@ readonly keyboard_runtime_unit="${app_id}-keyboard"
 readonly input_runtime_unit="${app_id}-input"
 readonly input_injector_runtime_unit="${app_id}-input-injector"
 readonly focus_injector_runtime_unit="${app_id}-focus-injector"
+readonly hwencode_policy_runtime_unit="${app_id}-hwencode-policy"
 readonly tray_runtime_unit="${app_id}-tray"
 readonly tray_exit_runtime_unit="${app_id}-tray-exit"
 
@@ -1538,6 +1541,48 @@ hwencode_policy_ready() {
         "$device_id" "$adapter_id" >/dev/null 2>&1
 }
 
+start_hwencode_policy_watcher() {
+    local ids device_id adapter_id
+    local -a watcher_command systemd_command
+
+    hwencode_enabled || return 0
+    ids=$(hwencode_probe_ids) || return 1
+    IFS=$'\t' read -r device_id adapter_id <<<"$ids"
+    watcher_command=(
+        "$hwencode_policy"
+        watch
+        "$encoder_cache"
+        "$encoder_cache_backup"
+        "$device_id"
+        "$adapter_id"
+        "$hwencode_enabled_stamp"
+        "$hwencode_policy_lock"
+    )
+    if systemd_user_available; then
+        if runtime_unit_active "$hwencode_policy_runtime_unit"; then
+            return 0
+        fi
+        systemctl --user reset-failed \
+            "$hwencode_policy_runtime_unit.service" >/dev/null 2>&1 || true
+        systemd_command=(
+            systemd-run
+            --user
+            "--unit=$hwencode_policy_runtime_unit"
+            --collect
+            --quiet
+            --property=Restart=on-failure
+            --property=RestartSec=1s
+            "--property=StandardOutput=append:$hwencode_policy_log"
+            "--property=StandardError=append:$hwencode_policy_log"
+            "${watcher_command[@]}"
+        )
+        "${systemd_command[@]}" 9>&- && return 0
+        printf '警告：无法创建 NVENC 档案监视服务，改用兼容后台进程。\n' >&2
+    fi
+    nohup "${watcher_command[@]}" 9>&- </dev/null \
+        >>"$hwencode_policy_log" 2>&1 &
+}
+
 mark_hwencode_failure() {
     local signature
 
@@ -1926,6 +1971,43 @@ wayland_frame_hook_status_label() {
             "$version" "${rendered:-0}" "${calls:-0}"
     else
         printf '未安装/不完整'
+    fi
+}
+
+portrait_original_quality_status_label() {
+    local version="" hooked="" candidates="" patches=""
+    local source_width="" source_height=""
+    local destination_width="" destination_height=""
+
+    [[ -r $wayland_frame_hook_status ]] || {
+        printf '就绪（待被控端启动）'
+        return
+    }
+    version=$(ini_section_value "$wayland_frame_hook_status" hook version)
+    hooked=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scale_limit_hooked)
+    candidates=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scale_limit_candidates)
+    patches=$(ini_section_value \
+        "$wayland_frame_hook_status" encoder portrait_scale_limit_patches)
+    source_width=$(ini_section_value \
+        "$wayland_frame_hook_status" capture source_width)
+    source_height=$(ini_section_value \
+        "$wayland_frame_hook_status" capture source_height)
+    destination_width=$(ini_section_value \
+        "$wayland_frame_hook_status" capture destination_width)
+    destination_height=$(ini_section_value \
+        "$wayland_frame_hook_status" capture destination_height)
+    if [[ $version =~ ^[0-9]+$ && $version -ge 30 && $hooked == 1 &&
+        $candidates == 1 ]]; then
+        printf '已修复（运行时补丁 %s；采集 %sx%s ← %sx%s）' \
+            "${patches:-0}" \
+            "${destination_width:-0}" "${destination_height:-0}" \
+            "${source_width:-0}" "${source_height:-0}"
+    elif [[ $version =~ ^[0-9]+$ && $version -ge 30 ]]; then
+        printf '未生效（唯一候选 %s）' "${candidates:-0}"
+    else
+        printf '旧版钩子，尚未修复'
     fi
 }
 
@@ -2481,6 +2563,14 @@ stop_update_bridge_runtime() {
         "$update_runtime_unit.service" >/dev/null 2>&1 || true
 }
 
+stop_hwencode_policy_runtime() {
+    systemd_user_available || return 0
+    systemctl --user stop \
+        "$hwencode_policy_runtime_unit.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed \
+        "$hwencode_policy_runtime_unit.service" >/dev/null 2>&1 || true
+}
+
 stop_tray_proxy_runtime() {
     local pid="" key value cmdline=""
     local -a tray_units=("$tray_runtime_unit.service")
@@ -2514,6 +2604,7 @@ stop_managed_runtime_services() {
     local pid="" cmdline=""
 
     stop_input_bridge_runtime
+    stop_hwencode_policy_runtime
     if systemd_user_available; then
         systemctl --user stop \
             "$client_runtime_unit.service" \
@@ -3509,6 +3600,7 @@ print_diagnostics() {
         "被控端鼠标屏幕" "$(input_bridge_target_label)" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
+        "竖屏原画缩放" "$(portrait_original_quality_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
         "Win64 输入钩子" "$(input_hook_ready && printf '完整' || printf '未安装/不匹配')" \
         "输入桥日志" "$input_bridge_log" \
@@ -4107,6 +4199,10 @@ remove_hwencode_bridge() {
     local name source target i
     local -a names sources targets
 
+    stop_hwencode_policy_runtime
+    # Make the compatibility watcher exit before restoring the original cache.
+    # The systemd unit is stopped above; this also covers the nohup fallback.
+    rm -f -- "$hwencode_enabled_stamp"
     "$hwencode_policy" disable \
         "$encoder_cache" "$encoder_cache_backup" \
         >>"$setup_log" 2>&1 || true
@@ -5219,6 +5315,8 @@ ensure_wine_image_running "$server_runtime_unit" "$server" ||
     die "GameViewerServer.exe 未能启动"
 if ! finalize_hwencode_policy; then
     printf '当前被控会话将使用 UU 的安全软件编码回退。\n' >&2
+elif ! start_hwencode_policy_watcher; then
+    printf '警告：NVENC 档案监视器未启动，UU 重新探测后可能恢复软件编码。\n' >&2
 fi
 wait_input_hook_active ||
     printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \

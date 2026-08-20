@@ -3,18 +3,20 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
 NVENC_V8_IMPL = 0
 NVENC_V11_IMPL = 1
-OPENH264_IMPL = 6
+SOFTWARE_IMPLS = {5, 6}
 PATCHED_NVDEC_IMPL = 33
 
 
@@ -79,11 +81,42 @@ def capability_is_nvenc_source(row: object) -> bool:
 
 
 def capability_is_openh264(row: object) -> bool:
-    return isinstance(row, dict) and row.get("codec_impl") == OPENH264_IMPL
+    return (
+        isinstance(row, dict)
+        and row.get("video_codec") == 1
+        and row.get("adapter_id") == 0
+        and row.get("device_id") == 0
+        and row.get("codec_impl") in SOFTWARE_IMPLS
+    )
+
+
+def nvenc_codecs_for_extent(
+    rows: list,
+    device_id: int,
+    adapter_id: int,
+    minimum_width: int,
+    minimum_height: int,
+) -> set:
+    return {
+        row.get("video_codec")
+        for row in rows
+        if capability_is_nvenc(row)
+        and row.get("device_id") == device_id
+        and row.get("adapter_id") == adapter_id
+        and row.get("bit_depth") == 8
+        and row.get("width", 0) >= minimum_width
+        and row.get("height", 0) >= minimum_height
+    }
 
 
 def validate_nvenc_rows(rows: list, device_id: int, adapter_id: int) -> None:
-    codecs = {
+    landscape_codecs = nvenc_codecs_for_extent(
+        rows, device_id, adapter_id, 1920, 1080
+    )
+    portrait_codecs = nvenc_codecs_for_extent(
+        rows, device_id, adapter_id, 1080, 1920
+    )
+    orientation_neutral_codecs = {
         row.get("video_codec")
         for row in rows
         if capability_is_nvenc(row)
@@ -91,10 +124,41 @@ def validate_nvenc_rows(rows: list, device_id: int, adapter_id: int) -> None:
         and row.get("adapter_id") == adapter_id
         and row.get("bit_depth") == 8
         and row.get("width", 0) >= 1920
-        and row.get("height", 0) >= 1080
+        and row.get("width") == row.get("height")
     }
-    if not {1, 2}.issubset(codecs):
+    if not {1, 2}.issubset(landscape_codecs):
         fail("能力缓存没有同时包含可用的 H.264 与 HEVC NVENC 档案")
+    if not {1, 2}.issubset(portrait_codecs):
+        fail("能力缓存没有同时包含可用的 H.264 与 HEVC 竖屏 NVENC 档案")
+    if not {1, 2}.issubset(orientation_neutral_codecs):
+        fail("能力缓存的 H.264 与 HEVC NVENC 档案仍受固定屏幕方向限制")
+
+
+def normalize_orientation_capabilities(rows: list, hardware_rows: list) -> int:
+    expanded = 0
+    for row in hardware_rows:
+        width = row.get("width", 0)
+        height = row.get("height", 0)
+        if not isinstance(width, int) or not isinstance(height, int):
+            continue
+        if width <= 0 or height <= 0 or width == height:
+            continue
+        maximum = max(width, height)
+        row["width"] = maximum
+        row["height"] = maximum
+        expanded += 1
+
+    unique_rows = []
+    seen = set()
+    for row in rows:
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    rows[:] = unique_rows
+    hardware_rows[:] = [row for row in rows if capability_is_nvenc_source(row)]
+    return expanded
 
 
 def enable(cache: Path, backup: Path, device_id: int, adapter_id: int) -> None:
@@ -111,6 +175,9 @@ def enable(cache: Path, backup: Path, device_id: int, adapter_id: int) -> None:
         row["codec_impl"] = NVENC_V8_IMPL
         row["device_id"] = device_id
         row["adapter_id"] = adapter_id
+    orientation_expanded = normalize_orientation_capabilities(
+        rows, hardware_rows
+    )
     validate_nvenc_rows(hardware_rows, device_id, adapter_id)
 
     if not backup.is_file() and (
@@ -129,6 +196,7 @@ def enable(cache: Path, backup: Path, device_id: int, adapter_id: int) -> None:
     print(
         f"NVENC_POLICY_OK\tdevice={device_id}\tadapter={adapter_id}"
         f"\timpl={NVENC_V8_IMPL}\tmigrated={migrated}"
+        f"\torientation_expanded={orientation_expanded}"
         f"\tentries={len(data['encoder_capabilities'])}"
     )
 
@@ -143,6 +211,31 @@ def verify(cache: Path, device_id: int, adapter_id: int) -> None:
     ):
         fail("活动能力缓存仍包含未迁移的 NVENC V11/NVDEC 实现编号")
     validate_nvenc_rows(rows, device_id, adapter_id)
+
+
+def watch(
+    cache: Path,
+    backup: Path,
+    device_id: int,
+    adapter_id: int,
+    enabled_stamp: Path,
+    lock_path: Path,
+) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        while enabled_stamp.is_file():
+            try:
+                verify(cache, device_id, adapter_id)
+            except SystemExit:
+                try:
+                    enable(cache, backup, device_id, adapter_id)
+                except SystemExit:
+                    pass
+            time.sleep(0.5)
 
 
 def disable(cache: Path, backup: Path) -> None:
@@ -350,13 +443,6 @@ def probe_streamer(path: Path) -> None:
             )
         return offset_to_rva(offsets[0], len(needle))
 
-    try:
-        nvenc_v8_name_rva = unique_ascii_rva(b"Nvenc V8")
-        nvenc_v11_name_rva = unique_ascii_rva(b"Nvenc V11")
-        software_name_rva = unique_ascii_rva(b"SoftWare")
-    except ValueError as error:
-        fail(f"无法验证编码器实现编号字符串：{error}")
-
     def has_rip_lea(
         start: int, end: int, opcode: bytes, target_rva: int
     ) -> bool:
@@ -374,63 +460,159 @@ def probe_streamer(path: Path) -> None:
         return matches == 1
 
     impl_switch_candidates: list[int] = []
-    switch_prefix = bytes.fromhex("0fb6432083f806")
-    offset = text_offset
-    while True:
-        offset = data.find(switch_prefix, offset, text_end)
-        if offset < 0:
-            break
-        if (
-            offset + 22 > text_end
-            or data[offset + 7] != 0x77
-            or data[offset + 9 : offset + 13] != bytes.fromhex("418b8c87")
-            or data[offset + 17 : offset + 22]
-            != bytes.fromhex("4903cfffe1")
-        ):
-            offset += 1
-            continue
-        switch_rva = text_rva + offset - text_offset
-        default_rva = switch_rva + 9 + struct.unpack_from(
-            "<b", data, offset + 8
-        )[0]
-        table_rva = read_u32(data, offset + 13)
+    if (
+        data.count(b"Nvenc V8\0") == 1
+        and data.count(b"Nvenc V11\0") == 1
+        and data.count(b"SoftWare\0") == 1
+    ):
+        implementation_profile = "nvenc-v8-v11"
+        software_impl = 6
         try:
-            table_offset = rva_to_offset(table_rva, 7 * 4)
-            targets = struct.unpack_from("<7I", data, table_offset)
-            target_offsets = [rva_to_offset(target, 7) for target in targets]
-        except (ValueError, struct.error):
+            nvenc_v8_name_rva = unique_ascii_rva(b"Nvenc V8")
+            nvenc_v11_name_rva = unique_ascii_rva(b"Nvenc V11")
+            software_name_rva = unique_ascii_rva(b"SoftWare")
+        except ValueError as error:
+            fail(f"无法验证编码器实现编号字符串：{error}")
+        switch_prefix = bytes.fromhex("0fb6432083f806")
+        offset = text_offset
+        while True:
+            offset = data.find(switch_prefix, offset, text_end)
+            if offset < 0:
+                break
+            if (
+                offset + 22 > text_end
+                or data[offset + 7] != 0x77
+                or data[offset + 9 : offset + 13]
+                != bytes.fromhex("418b8c87")
+                or data[offset + 17 : offset + 22]
+                != bytes.fromhex("4903cfffe1")
+            ):
+                offset += 1
+                continue
+            switch_rva = text_rva + offset - text_offset
+            default_rva = switch_rva + 9 + struct.unpack_from(
+                "<b", data, offset + 8
+            )[0]
+            table_rva = read_u32(data, offset + 13)
+            try:
+                table_offset = rva_to_offset(table_rva, 7 * 4)
+                targets = struct.unpack_from("<7I", data, table_offset)
+                target_offsets = [rva_to_offset(target, 7) for target in targets]
+            except (ValueError, struct.error):
+                offset += 1
+                continue
+            expected_cases = (
+                bytes.fromhex("488955c7"),
+                bytes.fromhex("4c8945c7"),
+                bytes.fromhex("4c894dc7"),
+                bytes.fromhex("4c8955c7"),
+                bytes.fromhex("4c895dc7"),
+                bytes.fromhex("488d05"),
+                bytes.fromhex("4c8965c7"),
+            )
+            if any(
+                data[target_offset : target_offset + len(pattern)] != pattern
+                for target_offset, pattern in zip(target_offsets, expected_cases)
+            ):
+                offset += 1
+                continue
+            load_start = max(text_offset, offset - 512)
+            if (
+                default_rva == targets[6]
+                and has_rip_lea(
+                    load_start,
+                    offset,
+                    bytes.fromhex("488d15"),
+                    nvenc_v8_name_rva,
+                )
+                and has_rip_lea(
+                    load_start,
+                    offset,
+                    bytes.fromhex("4c8d05"),
+                    nvenc_v11_name_rva,
+                )
+                and has_rip_lea(
+                    load_start,
+                    offset,
+                    bytes.fromhex("4c8d25"),
+                    software_name_rva,
+                )
+            ):
+                impl_switch_candidates.append(switch_rva)
             offset += 1
-            continue
-        expected_cases = (
-            bytes.fromhex("488955c7"),
-            bytes.fromhex("4c8945c7"),
-            bytes.fromhex("4c894dc7"),
-            bytes.fromhex("4c8955c7"),
-            bytes.fromhex("4c895dc7"),
-            bytes.fromhex("488d05"),
-            bytes.fromhex("4c8965c7"),
-        )
-        if any(
-            data[target_offset : target_offset + len(pattern)] != pattern
-            for target_offset, pattern in zip(target_offsets, expected_cases)
-        ):
+    elif (
+        data.count(b"Nvenc\0") == 1
+        and data.count(b"SoftWare\0") == 1
+    ):
+        implementation_profile = "unified-nvenc"
+        software_impl = 5
+        try:
+            nvenc_name_rva = unique_ascii_rva(b"Nvenc")
+            software_name_rva = unique_ascii_rva(b"SoftWare")
+        except ValueError as error:
+            fail(f"无法验证编码器实现编号字符串：{error}")
+        switch_prefix = bytes.fromhex("0fb6472083f805")
+        offset = text_offset
+        while True:
+            offset = data.find(switch_prefix, offset, text_end)
+            if offset < 0:
+                break
+            if (
+                offset + 22 > text_end
+                or data[offset + 7] != 0x77
+                or data[offset + 9 : offset + 13]
+                != bytes.fromhex("418b8c84")
+                or data[offset + 17 : offset + 22]
+                != bytes.fromhex("4903ccffe1")
+            ):
+                offset += 1
+                continue
+            switch_rva = text_rva + offset - text_offset
+            default_rva = switch_rva + 9 + struct.unpack_from(
+                "<b", data, offset + 8
+            )[0]
+            table_rva = read_u32(data, offset + 13)
+            try:
+                table_offset = rva_to_offset(table_rva, 6 * 4)
+                targets = struct.unpack_from("<6I", data, table_offset)
+                target_offsets = [rva_to_offset(target, 7) for target in targets]
+            except (ValueError, struct.error):
+                offset += 1
+                continue
+            expected_cases = (
+                bytes.fromhex("4c894597"),
+                bytes.fromhex("4c894d97"),
+                bytes.fromhex("4c895597"),
+                bytes.fromhex("4c895d97"),
+                bytes.fromhex("488d05"),
+                bytes.fromhex("48895597"),
+            )
+            if any(
+                data[target_offset : target_offset + len(pattern)] != pattern
+                for target_offset, pattern in zip(target_offsets, expected_cases)
+            ):
+                offset += 1
+                continue
+            load_start = max(text_offset, offset - 512)
+            if (
+                default_rva == targets[5]
+                and has_rip_lea(
+                    load_start,
+                    offset,
+                    bytes.fromhex("4c8d05"),
+                    nvenc_name_rva,
+                )
+                and has_rip_lea(
+                    load_start,
+                    offset,
+                    bytes.fromhex("488d15"),
+                    software_name_rva,
+                )
+            ):
+                impl_switch_candidates.append(switch_rva)
             offset += 1
-            continue
-        load_start = max(text_offset, offset - 512)
-        if (
-            default_rva == targets[6]
-            and has_rip_lea(
-                load_start, offset, bytes.fromhex("488d15"), nvenc_v8_name_rva
-            )
-            and has_rip_lea(
-                load_start, offset, bytes.fromhex("4c8d05"), nvenc_v11_name_rva
-            )
-            and has_rip_lea(
-                load_start, offset, bytes.fromhex("4c8d25"), software_name_rva
-            )
-        ):
-            impl_switch_candidates.append(switch_rva)
-        offset += 1
+    else:
+        fail("无法识别当前 streamer.dll 的编码器实现编号档案")
     if len(impl_switch_candidates) != 1:
         fail(
             "无法唯一验证编码器实现编号分发表；"
@@ -576,6 +758,42 @@ def probe_streamer(path: Path) -> None:
     wrapper_slot_rva, wrapper_vtable_rva, wrapper_ctor_refs, wrapper_rtti = (
         wrapper_candidates[0]
     )
+    portrait_scale_pattern = bytes.fromhex(
+        "41 8b 56 04 85 d2 75 10 41 8b 46 30 "
+        "89 83 c0 00 00 00 41 8b 46 34 eb 08 "
+        "89 bb c0 00 00 00 8b c7 "
+        "4c 8d ab c4 00 00 00 41 89 45 00 "
+        "89 93 c8 00 00 00"
+    )
+    portrait_height_source_offset = 21
+    portrait_scale_offsets = []
+    for offset in range(
+        text_offset,
+        text_end - len(portrait_scale_pattern) + 1,
+    ):
+        if (
+            data[offset : offset + portrait_height_source_offset]
+            == portrait_scale_pattern[:portrait_height_source_offset]
+            and data[
+                offset + portrait_height_source_offset + 1 :
+                offset + len(portrait_scale_pattern)
+            ]
+            == portrait_scale_pattern[portrait_height_source_offset + 1 :]
+            and data[offset + portrait_height_source_offset] == 0x34
+        ):
+            portrait_scale_offsets.append(offset)
+    if implementation_profile == "unified-nvenc" and len(
+        portrait_scale_offsets
+    ) != 1:
+        fail(
+            "无法唯一验证原画画质的竖屏缩放上限复制点；"
+            f"候选数={len(portrait_scale_offsets)}"
+        )
+    portrait_scale_rva = (
+        offset_to_rva(portrait_scale_offsets[0], len(portrait_scale_pattern))
+        if portrait_scale_offsets
+        else 0
+    )
     print(
         f"STREAMER_GDI_ADAPTER_OK\tvtable_rva=0x{vtable_rva:x}"
         f"\tslot_rva=0x{slot_rva:x}"
@@ -589,10 +807,14 @@ def probe_streamer(path: Path) -> None:
         f"\trtti_named_slots={rtti_named_slots}"
         f"\tencoder_accessor_rva=0x{encoder_accessor_rva:x}"
         f"\tencoder_path_candidates={len(encoder_accessor_offsets)}"
+        f"\timplementation_profile={implementation_profile}"
         f"\tnvenc_v8_impl={NVENC_V8_IMPL}"
         f"\tnvenc_v11_impl={NVENC_V11_IMPL}"
+        f"\tsoftware_impl={software_impl}"
         f"\timpl_33=software"
         f"\timpl_switch_candidates={len(impl_switch_candidates)}"
+        f"\tportrait_scale_rva=0x{portrait_scale_rva:x}"
+        f"\tportrait_scale_candidates={len(portrait_scale_offsets)}"
     )
 
 
@@ -600,11 +822,22 @@ def main(argv: list[str]) -> None:
     if len(argv) == 3 and argv[1] == "probe-streamer":
         probe_streamer(Path(argv[2]))
         return
+    if len(argv) == 8 and argv[1] == "watch":
+        watch(
+            Path(argv[2]),
+            Path(argv[3]),
+            parse_id(argv[4], "DEVICE_ID"),
+            parse_id(argv[5], "ADAPTER_ID"),
+            Path(argv[6]),
+            Path(argv[7]),
+        )
+        return
     if len(argv) < 4 or argv[1] not in {"enable", "disable", "verify"}:
         fail(
             "用法：uu-remote-encoder-policy "
             "enable|verify CACHE BACKUP DEVICE_ID ADAPTER_ID；"
-            "或 disable CACHE BACKUP；或 probe-streamer STREAMER_DLL"
+            "或 disable CACHE BACKUP；或 probe-streamer STREAMER_DLL；"
+            "或 watch CACHE BACKUP DEVICE_ID ADAPTER_ID ENABLED_STAMP LOCK"
         )
     command = argv[1]
     cache = Path(argv[2])

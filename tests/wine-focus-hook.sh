@@ -95,7 +95,7 @@ for attempt in 1 2; do
         wineserver -w >/dev/null 2>&1 || true
 done
 (( probe_status == 0 )) || exit "$probe_status"
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=28'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=30'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=1023'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'
