@@ -40,6 +40,8 @@ check "NVDEC profiler self-test" \
 check "NVENC encoder policy Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
+check "NVENC encoder policy cache schema and watcher" \
+    "$project_root/tests/encoder-policy.sh"
 check "autostart bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
@@ -203,6 +205,10 @@ check "shim preloads input hook" bash -c \
     'objdump -p "$1" | grep -q "uu-remote-input-hook.dll"' _ \
     "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 # shellcheck disable=SC2016
+check "shim DllMain only marks input hook as preloaded" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteInputHookMarkPreloaded" && ! objdump -p "$1" | grep -q "UURemoteInputHookInitialize"' _ \
+    "$project_root/lib/uu-remote-for-linux/wevtapi.dll"
+# shellcheck disable=SC2016
 check "update blocker is Win64 GUI PE" bash -c \
     'file "$1" | grep -q "PE32+ executable (GUI).*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe"
@@ -238,6 +244,10 @@ check "input hook exports sticky-null self-test" bash -c \
 # shellcheck disable=SC2016
 check "input hook exports UI-health evidence self-test" bash -c \
     'objdump -p "$1" | grep -q "UURemoteUIHealthEvidenceSelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
+check "input hook exports executable-patch self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteExecutablePatchSelfTest"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
 check "input hook exports WOL status" bash -c \

@@ -102,6 +102,7 @@ struct uu_nvenc_encoder
 };
 
 static void *uu_cuda_handle;
+static pthread_mutex_t uu_cuda_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t uu_bridge_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct uu_nvenc_encoder *uu_encoders;
 
@@ -117,9 +118,9 @@ static uu_CUresult (*uu_cuMemAllocPitch)(uu_CUdeviceptr *, size_t *, size_t,
 static uu_CUresult (*uu_cuMemFree)(uu_CUdeviceptr);
 static uu_CUresult (*uu_cuMemcpyHtoD)(uu_CUdeviceptr, const void *, size_t);
 
-static BOOL uu_load_cuda_symbol(void **target, const char *name)
+static BOOL uu_load_cuda_symbol(void *handle, void **target, const char *name)
 {
-    *target = dlsym(uu_cuda_handle, name);
+    *target = dlsym(handle, name);
     if (!*target)
     {
         ERR("missing CUDA symbol %s: %s\n", name, dlerror());
@@ -130,32 +131,65 @@ static BOOL uu_load_cuda_symbol(void **target, const char *name)
 
 static BOOL uu_remote_load_cuda(void)
 {
-    if (uu_cuda_handle)
-        return TRUE;
+    void *handle;
+    BOOL loaded = FALSE;
 
-    uu_cuda_handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!uu_cuda_handle)
+    pthread_mutex_lock(&uu_cuda_mutex);
+    if (uu_cuda_handle)
     {
-        ERR("cannot load libcuda.so.1: %s\n", dlerror());
-        return FALSE;
+        loaded = TRUE;
+        goto done;
     }
 
-    return uu_load_cuda_symbol((void **)&uu_cuInit, "cuInit") &&
-           uu_load_cuda_symbol((void **)&uu_cuDeviceGetCount, "cuDeviceGetCount") &&
-           uu_load_cuda_symbol((void **)&uu_cuDeviceGet, "cuDeviceGet") &&
-           uu_load_cuda_symbol((void **)&uu_cuDevicePrimaryCtxRetain,
-                               "cuDevicePrimaryCtxRetain") &&
-           uu_load_cuda_symbol((void **)&uu_cuDevicePrimaryCtxRelease,
-                               "cuDevicePrimaryCtxRelease_v2") &&
-           uu_load_cuda_symbol((void **)&uu_cuCtxPushCurrent,
-                               "cuCtxPushCurrent_v2") &&
-           uu_load_cuda_symbol((void **)&uu_cuCtxPopCurrent,
-                               "cuCtxPopCurrent_v2") &&
-           uu_load_cuda_symbol((void **)&uu_cuMemAllocPitch,
-                               "cuMemAllocPitch_v2") &&
-           uu_load_cuda_symbol((void **)&uu_cuMemFree, "cuMemFree_v2") &&
-           uu_load_cuda_symbol((void **)&uu_cuMemcpyHtoD,
-                               "cuMemcpyHtoD_v2");
+    handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+    {
+        ERR("cannot load libcuda.so.1: %s\n", dlerror());
+        goto done;
+    }
+
+    loaded = uu_load_cuda_symbol(handle, (void **)&uu_cuInit, "cuInit") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuDeviceGetCount,
+                                 "cuDeviceGetCount") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuDeviceGet,
+                                 "cuDeviceGet") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuDevicePrimaryCtxRetain,
+                                 "cuDevicePrimaryCtxRetain") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuDevicePrimaryCtxRelease,
+                                 "cuDevicePrimaryCtxRelease_v2") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuCtxPushCurrent,
+                                 "cuCtxPushCurrent_v2") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuCtxPopCurrent,
+                                 "cuCtxPopCurrent_v2") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuMemAllocPitch,
+                                 "cuMemAllocPitch_v2") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuMemFree,
+                                 "cuMemFree_v2") &&
+             uu_load_cuda_symbol(handle, (void **)&uu_cuMemcpyHtoD,
+                                 "cuMemcpyHtoD_v2");
+    if (loaded)
+    {
+        /* Publish the handle only after every function pointer is valid. */
+        uu_cuda_handle = handle;
+    }
+    else
+    {
+        uu_cuInit = NULL;
+        uu_cuDeviceGetCount = NULL;
+        uu_cuDeviceGet = NULL;
+        uu_cuDevicePrimaryCtxRetain = NULL;
+        uu_cuDevicePrimaryCtxRelease = NULL;
+        uu_cuCtxPushCurrent = NULL;
+        uu_cuCtxPopCurrent = NULL;
+        uu_cuMemAllocPitch = NULL;
+        uu_cuMemFree = NULL;
+        uu_cuMemcpyHtoD = NULL;
+        dlclose(handle);
+    }
+
+done:
+    pthread_mutex_unlock(&uu_cuda_mutex);
+    return loaded;
 }
 
 static BOOL uu_selected_cuda_device(uu_CUdevice *device)
@@ -575,10 +609,14 @@ static NVENCSTATUS uu_register_d3d11_resource(
         status = UU_NV_ENC_ERR_OUT_OF_MEMORY;
         goto failed;
     }
-    if (!uu_push_encoder(encoder) ||
-        uu_cuMemAllocPitch(&resource->cuda_memory, &resource->cuda_pitch,
+    if (!uu_push_encoder(encoder))
+    {
+        status = UU_NV_ENC_ERR_INVALID_DEVICE;
+        goto failed;
+    }
+    if (uu_cuMemAllocPitch(&resource->cuda_memory, &resource->cuda_pitch,
                            resource->row_bytes, resource->rows, 16) !=
-            UU_CUDA_SUCCESS)
+        UU_CUDA_SUCCESS)
     {
         status = UU_NV_ENC_ERR_OUT_OF_MEMORY;
         goto failed_pop;

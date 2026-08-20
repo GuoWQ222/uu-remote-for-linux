@@ -397,6 +397,10 @@ PY
         install -Dm0644 /dev/null "$install_dir/bin/.app-installed"
         printf '%s\n' "${UU_REMOTE_FAKE_INSTALLER_VERSION:-4.34.0.8979}" \
             >"$install_dir/bin/.installed-version"
+        if [[ ${UU_REMOTE_FAKE_CORRUPT_ROLLBACK_SNAPSHOT:-0} == 1 ]]; then
+            printf 'corrupt rollback archive\n' \
+                >"${XDG_CACHE_HOME:?}/uu-remote-for-linux/update-rollback/pre-update.tar"
+        fi
         printf 'INSTALL\n' >>"$trace_file"
         exit 0
         ;;

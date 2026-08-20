@@ -1,3 +1,3 @@
 LIBRARY uu-remote-input-hook.dll
 EXPORTS
-    UURemoteInputHookInitialize
+    UURemoteInputHookMarkPreloaded

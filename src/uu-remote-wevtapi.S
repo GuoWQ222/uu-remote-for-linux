@@ -18,7 +18,7 @@ DllMain:
     jne 1f
     subq $40, %rsp
     movl $1, %ecx
-    call UURemoteInputHookInitialize
+    call UURemoteInputHookMarkPreloaded
     addq $40, %rsp
 1:
     movl $1, %eax

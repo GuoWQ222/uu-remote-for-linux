@@ -4847,99 +4847,281 @@ create_update_snapshot() {
     printf '%s\n' "$snapshot"
 }
 
-create_version_bridge_state_snapshot() {
-    local snapshot="$update_rollback_dir/pre-update-bridge-state.tar"
+version_bridge_state_names() {
+    local -n result=$1
+
+    result=(
+        hwdecode-enabled
+        hwdecode-manifest
+        hwdecode-generated.tsv
+        wol-generated.tsv
+        streamer-compatibility.json
+        streamer-profiles
+        decoder-cache-before-hwdecode.json
+        hwencode-enabled
+        hwencode-disabled
+        hwencode-failed
+        hwencode-manifest
+        encoder-cache-before-hwencode.json
+        dxvk-hwencode.conf
+        wol-enabled
+    )
+}
+
+write_version_bridge_state_snapshot() {
+    local snapshot=$1
     local name
+    local -a names
     local -a paths=()
 
-    mkdir -p "$update_rollback_dir"
-    for name in \
-        hwdecode-enabled \
-        hwdecode-manifest \
-        hwdecode-generated.tsv \
-        wol-generated.tsv \
-        streamer-compatibility.json \
-        streamer-profiles \
-        decoder-cache-before-hwdecode.json \
-        hwencode-enabled \
-        hwencode-disabled \
-        hwencode-failed \
-        hwencode-manifest \
-        encoder-cache-before-hwencode.json \
-        dxvk-hwencode.conf \
-        wol-enabled; do
-        [[ -e $data_dir/$name ]] && paths+=("$name")
+    version_bridge_state_names names
+    for name in "${names[@]}"; do
+        [[ -e $data_dir/$name || -L $data_dir/$name ]] && paths+=("$name")
     done
     if ((${#paths[@]} > 0)); then
-        tar --format=pax -C "$data_dir" -cf "$snapshot" "${paths[@]}" ||
-            die "无法保存版本绑定兼容桥状态；现有客户端未作修改"
+        tar --format=pax -C "$data_dir" -cf "$snapshot" "${paths[@]}"
     else
-        tar --format=pax -cf "$snapshot" --files-from /dev/null ||
-            die "无法创建空的兼容桥状态快照"
+        tar --format=pax -cf "$snapshot" --files-from /dev/null
     fi
+}
+
+create_version_bridge_state_snapshot() {
+    local snapshot="$update_rollback_dir/pre-update-bridge-state.tar"
+    local temp
+
+    mkdir -p "$update_rollback_dir"
+    temp=$(mktemp "$update_rollback_dir/.bridge-snapshot.XXXXXX")
+    if ! write_version_bridge_state_snapshot "$temp"; then
+        rm -f -- "$temp"
+        die "无法保存版本绑定兼容桥状态；现有客户端未作修改"
+    fi
+    mv -f "$temp" "$snapshot"
     printf '%s\n' "$snapshot"
 }
 
 restore_version_bridge_state_snapshot() {
     local snapshot=$1
+    local staging backup name source target
+    local commit_failed=0 rollback_failed=0
+    local -a names backed_up=() restored=()
+    local index
 
     [[ -f $snapshot ]] || return 1
-    rm -f -- \
-        "$hwdecode_enabled_stamp" \
-        "$hwdecode_manifest" \
-        "$hwdecode_generated_profiles" \
-        "$wol_generated_profiles" \
-        "$streamer_active_profile" \
-        "$decoder_cache_backup" \
-        "$hwencode_enabled_stamp" \
-        "$hwencode_disabled_stamp" \
-        "$hwencode_failed_stamp" \
-        "$hwencode_manifest" \
-        "$encoder_cache_backup" \
-        "$hwencode_dxvk_config" \
-        "$wol_enabled_stamp"
-    if [[ -d $streamer_profile_dir ]]; then
-        find "$streamer_profile_dir" -mindepth 1 -maxdepth 1 -type f -delete ||
-            return 1
-        rmdir "$streamer_profile_dir" || return 1
+    mkdir -p "$data_dir"
+    staging=$(mktemp -d "$data_dir/.bridge-restore-stage.XXXXXX") || return 1
+    backup=$(mktemp -d "$data_dir/.bridge-restore-backup.XXXXXX") || {
+        rm -rf -- "$staging"
+        return 1
+    }
+    if ! tar -C "$staging" -xf "$snapshot"; then
+        rm -rf -- "$staging" "$backup"
+        return 1
     fi
-    tar -C "$data_dir" -xf "$snapshot"
+
+    version_bridge_state_names names
+    for name in "${names[@]}"; do
+        source="$staging/$name"
+        target="$data_dir/$name"
+        if [[ -e $target || -L $target ]]; then
+            if ! mv -- "$target" "$backup/$name"; then
+                commit_failed=1
+                break
+            fi
+            backed_up+=("$name")
+        fi
+        if [[ -e $source || -L $source ]]; then
+            if ! mv -- "$source" "$target"; then
+                commit_failed=1
+                break
+            fi
+            restored+=("$name")
+        fi
+    done
+    if ((commit_failed)); then
+        for ((index=${#restored[@]} - 1; index >= 0; --index)); do
+            rm -rf -- "${data_dir:?}/${restored[index]}" || rollback_failed=1
+        done
+        for ((index=${#backed_up[@]} - 1; index >= 0; --index)); do
+            mv -- "$backup/${backed_up[index]}" \
+                "$data_dir/${backed_up[index]}" || rollback_failed=1
+        done
+        if ((rollback_failed)); then
+            printf '兼容桥状态提交失败，恢复备份也未完成：%s\n' \
+                "$backup" >&2
+            return 1
+        fi
+        rm -rf -- "$staging" "$backup"
+        return 1
+    fi
+    rm -rf -- "$staging" "$backup"
 }
 
 restore_update_snapshot() {
-    local snapshot=$1 bridge_state_snapshot=${2:-} failed_dir
+    local snapshot=$1 bridge_state_snapshot=${2:-}
+    local relative_install='drive_c/Program Files/Netease/GameViewer'
+    local staging backup current_bridge_snapshot="" failed_dir=""
+    local source target relative
+    local commit_failed=0 rollback_failed=0 bridge_restored=0
+    local preserve_backup=0 index
+    local -a paths=(
+        "$relative_install"
+        system.reg
+        user.reg
+        userdef.reg
+        "drive_c/users/$current_user/AppData/Local/GameViewer/setting.ini"
+        "drive_c/users/$current_user/AppData/Local/GameViewer/upgrade"
+        drive_c/windows/system32/nvcuda.dll
+        drive_c/windows/system32/nvcuvid.dll
+        drive_c/windows/system32/nvEncodeAPI64.dll
+    )
+    local -a backed_up=() restored=()
 
     [[ -f $snapshot ]] || {
         printf '回滚快照不存在：%s\n' "$snapshot" >&2
         return 1
     }
+    mkdir -p "$prefix" "$update_rollback_dir"
+    staging=$(mktemp -d "$prefix/.uu-remote-restore-stage.XXXXXX") || return 1
+    if ! tar -C "$staging" -xf "$snapshot"; then
+        printf '更新回滚快照无法完整解压；当前安装保持不变。\n' >&2
+        rm -rf -- "$staging"
+        return 1
+    fi
+    for relative in \
+        "$relative_install/GameViewer.exe" \
+        "$relative_install/bin/GameViewer.exe" \
+        "$relative_install/bin/GameViewerServer.exe" \
+        "$relative_install/bin/GameViewerHealthd.exe" \
+        "$relative_install/bin/wevtapi.dll" \
+        "$relative_install/bin/Upgrade.exe"; do
+        if [[ ! -f $staging/$relative ]]; then
+            printf '更新回滚快照缺少必需文件：%s；当前安装保持不变。\n' \
+                "$relative" >&2
+            rm -rf -- "$staging"
+            return 1
+        fi
+    done
+    if [[ -n $bridge_state_snapshot ]]; then
+        if [[ ! -f $bridge_state_snapshot ]] ||
+            ! tar -tf "$bridge_state_snapshot" >/dev/null; then
+            printf '版本绑定兼容桥快照损坏；当前安装保持不变。\n' >&2
+            rm -rf -- "$staging"
+            return 1
+        fi
+        current_bridge_snapshot=$(
+            mktemp "$update_rollback_dir/.failed-bridge-state.XXXXXX"
+        ) || {
+            rm -rf -- "$staging"
+            return 1
+        }
+        if ! write_version_bridge_state_snapshot \
+            "$current_bridge_snapshot"; then
+            printf '无法保存回滚前的兼容桥状态；当前安装保持不变。\n' >&2
+            rm -rf -- "$staging"
+            rm -f -- "$current_bridge_snapshot"
+            return 1
+        fi
+    fi
+
     stop_prefix_for_setup
-    failed_dir="$update_rollback_dir/failed-install-$(date +%Y%m%d%H%M%S)"
-    if [[ -e $install_dir ]]; then
-        mv "$install_dir" "$failed_dir" || return 1
+    backup=$(mktemp -d "$prefix/.uu-remote-restore-backup.XXXXXX") || {
+        rm -rf -- "$staging"
+        [[ -z $current_bridge_snapshot ]] ||
+            rm -f -- "$current_bridge_snapshot"
+        return 1
+    }
+    for relative in "${paths[@]}"; do
+        source="$staging/$relative"
+        [[ -e $source || -L $source ]] || continue
+        target="$prefix/$relative"
+        if [[ -e $target || -L $target ]]; then
+            if ! mkdir -p -- "$(dirname -- "$backup/$relative")" ||
+                ! mv -- "$target" "$backup/$relative"; then
+                commit_failed=1
+                break
+            fi
+            backed_up+=("$relative")
+        fi
+        if ! mkdir -p -- "$(dirname -- "$target")" ||
+            ! mv -- "$source" "$target"; then
+            commit_failed=1
+            break
+        fi
+        restored+=("$relative")
+    done
+    if ((!commit_failed)) && [[ -n $bridge_state_snapshot ]]; then
+        if restore_version_bridge_state_snapshot "$bridge_state_snapshot"; then
+            bridge_restored=1
+        else
+            printf '无法恢复更新前的版本绑定兼容桥状态。\n' >&2
+            commit_failed=1
+        fi
     fi
-    if ! tar -C "$prefix" -xf "$snapshot"; then
-        printf '无法从更新快照恢复旧版 UU 文件。\n' >&2
+    if ((!commit_failed)) &&
+        ! { app_files_present && shim_ready && update_blocker_ready; }; then
+        printf '恢复后的旧版 UU 基础文件核验失败。\n' >&2
+        commit_failed=1
+    fi
+    if ((!commit_failed)) && hwdecode_enabled &&
+        ! hwdecode_files_deployed; then
+        printf '恢复后的 NVDEC 兼容桥核验失败。\n' >&2
+        commit_failed=1
+    fi
+    if ((!commit_failed)) && hwencode_enabled &&
+        ! { hwencode_files_deployed && hwencode_probe_current; }; then
+        printf '恢复后的 NVENC 兼容桥核验失败。\n' >&2
+        commit_failed=1
+    fi
+    if ((!commit_failed)) && wol_enabled &&
+        ! wol_runtime_bridge_ready; then
+        printf '恢复后的 WOL 兼容桥核验失败。\n' >&2
+        commit_failed=1
+    fi
+
+    if ((commit_failed)); then
+        if ((bridge_restored)) &&
+            ! restore_version_bridge_state_snapshot \
+                "$current_bridge_snapshot"; then
+            printf '无法恢复回滚开始前的兼容桥状态：%s\n' \
+                "$current_bridge_snapshot" >&2
+            rollback_failed=1
+        fi
+        for ((index=${#restored[@]} - 1; index >= 0; --index)); do
+            rm -rf -- "${prefix:?}/${restored[index]}" || rollback_failed=1
+        done
+        for ((index=${#backed_up[@]} - 1; index >= 0; --index)); do
+            mkdir -p -- "$(dirname -- "$prefix/${backed_up[index]}")" ||
+                rollback_failed=1
+            mv -- "$backup/${backed_up[index]}" \
+                "$prefix/${backed_up[index]}" || rollback_failed=1
+        done
+        if ((rollback_failed)); then
+            printf '回滚提交失败，但事务备份已保留：%s\n' "$backup" >&2
+            return 1
+        fi
+        rm -rf -- "$staging" "$backup"
+        [[ -z $current_bridge_snapshot ]] ||
+            rm -f -- "$current_bridge_snapshot"
+        printf '旧版恢复未能完成，已原样恢复回滚前的安装。\n' >&2
         return 1
     fi
-    if [[ -n $bridge_state_snapshot ]] &&
-        ! restore_version_bridge_state_snapshot "$bridge_state_snapshot"; then
-        printf '无法恢复更新前的版本绑定兼容桥状态。\n' >&2
-        return 1
+
+    if [[ -e $backup/$relative_install ]]; then
+        failed_dir="$prefix/.uu-remote-failed-install-$(date +%Y%m%d%H%M%S)"
+        if ! mv -- "$backup/$relative_install" "$failed_dir"; then
+            failed_dir="$backup/$relative_install"
+            preserve_backup=1
+        fi
     fi
-    app_files_present &&
-        shim_ready &&
-        update_blocker_ready || return 1
-    if hwdecode_enabled; then
-        hwdecode_files_deployed || return 1
+    rm -rf -- "$staging"
+    if ((!preserve_backup)); then
+        rm -rf -- "$backup"
     fi
-    if hwencode_enabled; then
-        hwencode_files_deployed && hwencode_probe_current || return 1
+    [[ -z $current_bridge_snapshot ]] ||
+        rm -f -- "$current_bridge_snapshot"
+    if [[ -n $failed_dir ]]; then
+        printf '失败版本已保留用于排错：%s\n' "$failed_dir" >&2
     fi
-    if wol_enabled; then
-        wol_runtime_bridge_ready || return 1
-    fi
-    printf '失败版本已保留用于排错：%s\n' "$failed_dir" >&2
 }
 
 restart_client_after_update() {

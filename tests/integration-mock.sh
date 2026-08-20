@@ -816,6 +816,29 @@ grep -q 'UU 版本.*4.39.0.9400' "$test_root/future-rollback-diagnose.txt"
 grep -q '自适应语义档案.*完整（UU 4.39.0.9400；NVENC/竖屏）' \
     "$test_root/future-rollback-diagnose.txt"
 
+# A damaged rollback archive must be rejected before the updater moves or
+# deletes the currently installed client. The failed new install remains
+# intact for diagnosis instead of leaving an empty GameViewer directory.
+if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+    UU_REMOTE_FAKE_CORRUPT_ROLLBACK_SNAPSHOT=1 \
+    UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+    UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+    UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+    UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    UU_REMOTE_FAKE_LATEST_VERSION=4.41.0.9600 \
+    UU_REMOTE_FAKE_INSTALLER_VERSION=4.41.0.9600 \
+        "$launcher" --check-update \
+        >"$test_root/corrupt-rollback.out" \
+        2>"$test_root/corrupt-rollback.err"; then
+    printf '损坏回滚归档的更新事务被意外接受。\n' >&2
+    exit 1
+fi
+grep -q '更新回滚快照无法完整解压；当前安装保持不变' \
+    "$test_root/corrupt-rollback.err"
+test -f "$install_dir/GameViewer.exe"
+test -f "$install_dir/bin/GameViewer.exe"
+test "$(<"$install_dir/bin/.installed-version")" = 4.41.0.9600
+
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"
 

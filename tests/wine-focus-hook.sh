@@ -54,6 +54,31 @@ readonly bin_dir="$prefix/drive_c/probe/bin"
 readonly status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
 mkdir -p "$bin_dir"
 
+prepare_wine_prefix() {
+    local attempt
+    local boot_status=0
+
+    for attempt in 1 2; do
+        if WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all \
+            timeout 30s wineboot -u >/dev/null 2>&1; then
+            return 0
+        else
+            boot_status=$?
+        fi
+        WINEPREFIX="$prefix" WINEDEBUG=-all wineserver -k \
+            >/dev/null 2>&1 || true
+        WINEPREFIX="$prefix" WINEDEBUG=-all timeout 10s \
+            wineserver -w >/dev/null 2>&1 || true
+        if (( attempt == 1 )); then
+            printf '%s\n' \
+                'Wine 前缀初始化失败或超时；清理 wineserver 后重试一次。' \
+                >&2
+        fi
+    done
+    printf 'Wine 前缀初始化失败：exit=%s\n' "$boot_status" >&2
+    return "$boot_status"
+}
+
 "$compiler" \
     -std=c11 -Os -Wall -Wextra -Werror -shared \
     -Wl,--no-insert-timestamp \
@@ -72,8 +97,7 @@ install -Dm0644 "$hook" "$bin_dir/uu-remote-input-hook.dll"
 
 probe_status=0
 for attempt in 1 2; do
-    WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
-        >/dev/null 2>&1
+    prepare_wine_prefix
     if (
         cd "$bin_dir"
         WINEPREFIX="$prefix" WINEDEBUG=-all timeout 60s \
@@ -85,6 +109,7 @@ for attempt in 1 2; do
         probe_status=$?
     fi
     if (( probe_status != 124 || attempt == 2 )); then
+        printf 'Wine 焦点探针失败：exit=%s\n' "$probe_status" >&2
         exit "$probe_status"
     fi
     printf '%s\n' \
@@ -95,7 +120,7 @@ for attempt in 1 2; do
         wineserver -w >/dev/null 2>&1 || true
 done
 (( probe_status == 0 )) || exit "$probe_status"
-grep -A3 -F '[hook]' "$status" | grep -Fq 'version=34'
+grep -A3 -F '[hook]' "$status" | grep -Fq 'version=35'
 grep -A3 -F '[hook]' "$status" | grep -Fq 'status_bits=1023'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate=[1-9]'
 grep -A4 -F '[focus]' "$status" | grep -Eq 'suppressed_activate_app=[1-9]'

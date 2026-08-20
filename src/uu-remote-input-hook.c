@@ -38,7 +38,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 34u
+#define HOOK_VERSION 35u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 1u
 #define UUWF_HEADER_SIZE 64u
@@ -50,6 +50,9 @@
 #define UUCI_MAX_DIMENSION 512u
 #define UUCI_CHECK_INTERVAL_MS 8u
 #define UUCI_CACHE_CAPACITY 64u
+#define EXECUTABLE_PATCH_SIZE 12u
+#define EXECUTABLE_PATCH_MAX_THREADS 1024u
+#define EXECUTABLE_PATCH_MAX_ATTEMPTS 32u
 #define FOCUS_UNHOOK_GRACE_MS 350u
 #define FOCUS_INTERNAL_GRACE_MS 700u
 #define FOCUS_STORM_WINDOW_MS 250u
@@ -188,6 +191,7 @@ static BOOL cursor_info_hooked;
 static BOOL cursor_pos_hooked;
 static BOOL bit_blt_hooked;
 static BOOL stretch_blt_hooked;
+static SRWLOCK streamer_patch_lock = SRWLOCK_INIT;
 static HMODULE patched_streamer_module;
 static BOOL streamer_send_input_hooked;
 static BOOL streamer_cursor_info_hooked;
@@ -506,7 +510,6 @@ struct native_cursor_cache_entry {
     uint32_t hotspot_x;
     uint32_t hotspot_y;
     HCURSOR cursor;
-    ULONGLONG last_used;
 };
 
 static struct native_cursor_cache_entry
@@ -1193,12 +1196,10 @@ cleanup:
 static HCURSOR cached_native_cursor(
     const struct native_cursor_header *header,
     const unsigned char *pixels,
-    uint64_t hash,
-    ULONGLONG now
+    uint64_t hash
 ) {
     SIZE_T index;
-    SIZE_T target = 0;
-    ULONGLONG oldest = UINT64_MAX;
+    SIZE_T target = UUCI_CACHE_CAPACITY;
     HCURSOR cursor;
 
     for (index = 0; index < UUCI_CACHE_CAPACITY; ++index) {
@@ -1211,26 +1212,28 @@ static HCURSOR cached_native_cursor(
             entry->hotspot_x == header->hotspot_x &&
             entry->hotspot_y == header->hotspot_y
         ) {
-            entry->last_used = now;
             return entry->cursor;
         }
         if (!entry->cursor) {
             target = index;
-            oldest = 0;
             break;
         }
-        if (entry->last_used < oldest) {
-            oldest = entry->last_used;
-            target = index;
-        }
+    }
+    if (target == UUCI_CACHE_CAPACITY) {
+        /*
+         * GetCursorInfo returns a borrowed handle with no release callback.
+         * Keep created cursors valid for the process lifetime; once the
+         * bounded cache is full, retain the last valid native cursor rather
+         * than invalidating a handle another thread may still hold.
+         */
+        return native_cursor_handle
+            ? native_cursor_handle
+            : native_cursor_cache[0].cursor;
     }
 
     cursor = create_native_cursor(header, pixels);
     if (!cursor) {
         return NULL;
-    }
-    if (native_cursor_cache[target].cursor) {
-        DestroyCursor(native_cursor_cache[target].cursor);
     }
     native_cursor_cache[target].hash = hash;
     native_cursor_cache[target].width = header->width;
@@ -1238,7 +1241,6 @@ static HCURSOR cached_native_cursor(
     native_cursor_cache[target].hotspot_x = header->hotspot_x;
     native_cursor_cache[target].hotspot_y = header->hotspot_y;
     native_cursor_cache[target].cursor = cursor;
-    native_cursor_cache[target].last_used = now;
     return cursor;
 }
 
@@ -1313,7 +1315,7 @@ static HCURSOR refresh_native_cursor(void) {
         goto cleanup;
     }
     hash = hash_native_cursor(&header, pixels);
-    cursor = cached_native_cursor(&header, pixels, hash, now);
+    cursor = cached_native_cursor(&header, pixels, hash);
     if (!cursor) {
         goto cleanup;
     }
@@ -2696,10 +2698,173 @@ static BOOL patch_frame_adapter_slot(
     return TRUE;
 }
 
-static BOOL patch_frame_adapter_accessor(void *function) {
-    unsigned char jump[12];
+struct executable_patch_thread {
+    HANDLE handle;
+    DWORD id;
+};
+
+static BOOL executable_patch_thread_recorded(
+    const struct executable_patch_thread *threads,
+    SIZE_T count,
+    DWORD id
+) {
+    SIZE_T index;
+
+    for (index = 0u; index < count; ++index) {
+        if (threads[index].id == id) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void resume_executable_patch_threads(
+    struct executable_patch_thread *threads,
+    SIZE_T count
+) {
+    while (count) {
+        --count;
+        ResumeThread(threads[count].handle);
+        CloseHandle(threads[count].handle);
+        threads[count].handle = NULL;
+    }
+}
+
+static BOOL suspend_executable_patch_threads(
+    struct executable_patch_thread *threads,
+    SIZE_T *count
+) {
+    const DWORD process_id = GetCurrentProcessId();
+    const DWORD current_thread_id = GetCurrentThreadId();
+    unsigned int pass;
+
+    *count = 0u;
+    for (pass = 0u; pass < 4u; ++pass) {
+        THREADENTRY32 entry;
+        HANDLE snapshot;
+        BOOL added = FALSE;
+        BOOL have_entry;
+
+        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            goto failed;
+        }
+        ZeroMemory(&entry, sizeof(entry));
+        entry.dwSize = sizeof(entry);
+        have_entry = Thread32First(snapshot, &entry);
+        if (!have_entry) {
+            DWORD error = GetLastError();
+            CloseHandle(snapshot);
+            SetLastError(error);
+            goto failed;
+        }
+        while (have_entry) {
+            HANDLE thread;
+            DWORD suspend_count;
+
+            if (
+                entry.th32OwnerProcessID != process_id ||
+                entry.th32ThreadID == current_thread_id ||
+                executable_patch_thread_recorded(
+                    threads, *count, entry.th32ThreadID
+                )
+            ) {
+                have_entry = Thread32Next(snapshot, &entry);
+                continue;
+            }
+            if (*count >= EXECUTABLE_PATCH_MAX_THREADS) {
+                CloseHandle(snapshot);
+                SetLastError(ERROR_TOO_MANY_TCBS);
+                goto failed;
+            }
+            thread = OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                    THREAD_QUERY_INFORMATION | SYNCHRONIZE,
+                FALSE,
+                entry.th32ThreadID
+            );
+            if (!thread) {
+                DWORD error = GetLastError();
+                if (error == ERROR_INVALID_PARAMETER) {
+                    have_entry = Thread32Next(snapshot, &entry);
+                    continue;
+                }
+                CloseHandle(snapshot);
+                SetLastError(error);
+                goto failed;
+            }
+            suspend_count = SuspendThread(thread);
+            if (suspend_count == (DWORD)-1) {
+                DWORD error = GetLastError();
+                if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) {
+                    CloseHandle(thread);
+                    have_entry = Thread32Next(snapshot, &entry);
+                    continue;
+                }
+                CloseHandle(thread);
+                CloseHandle(snapshot);
+                SetLastError(error);
+                goto failed;
+            }
+            threads[*count].handle = thread;
+            threads[*count].id = entry.th32ThreadID;
+            ++*count;
+            added = TRUE;
+            have_entry = Thread32Next(snapshot, &entry);
+        }
+        if (GetLastError() != ERROR_NO_MORE_FILES) {
+            DWORD error = GetLastError();
+            CloseHandle(snapshot);
+            SetLastError(error);
+            goto failed;
+        }
+        CloseHandle(snapshot);
+        if (!added) {
+            return TRUE;
+        }
+    }
+    SetLastError(ERROR_BUSY);
+
+failed:
+    resume_executable_patch_threads(threads, *count);
+    *count = 0u;
+    return FALSE;
+}
+
+static BOOL executable_patch_range_is_idle(
+    const struct executable_patch_thread *threads,
+    SIZE_T count,
+    const void *function
+) {
+    const uintptr_t start = (uintptr_t)function;
+    const uintptr_t end = start + EXECUTABLE_PATCH_SIZE;
+    SIZE_T index;
+
+    for (index = 0u; index < count; ++index) {
+        CONTEXT context;
+
+        ZeroMemory(&context, sizeof(context));
+        context.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(threads[index].handle, &context)) {
+            if (WaitForSingleObject(threads[index].handle, 0) == WAIT_OBJECT_0) {
+                continue;
+            }
+            return FALSE;
+        }
+        if ((uintptr_t)context.Rip >= start && (uintptr_t)context.Rip < end) {
+            SetLastError(ERROR_BUSY);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL patch_executable_entry(void *function, void *replacement) {
+    unsigned char jump[EXECUTABLE_PATCH_SIZE];
     DWORD old_protection;
-    void *replacement = (void *)hooked_wrapper_frame_adapter_id;
+    struct executable_patch_thread threads[EXECUTABLE_PATCH_MAX_THREADS];
+    SIZE_T thread_count;
+    unsigned int attempt;
 
     if (!function || !replacement) {
         return FALSE;
@@ -2709,17 +2874,42 @@ static BOOL patch_frame_adapter_accessor(void *function) {
     CopyMemory(jump + 2, &replacement, sizeof(replacement));
     jump[10] = 0xff;
     jump[11] = 0xe0;
-    if (!VirtualProtect(
-            function, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protection
-        )) {
-        return FALSE;
+    for (attempt = 0u; attempt < EXECUTABLE_PATCH_MAX_ATTEMPTS; ++attempt) {
+        if (!suspend_executable_patch_threads(threads, &thread_count)) {
+            return FALSE;
+        }
+        if (!executable_patch_range_is_idle(
+                threads, thread_count, function
+            )) {
+            resume_executable_patch_threads(threads, thread_count);
+            Sleep(1);
+            continue;
+        }
+        if (!VirtualProtect(
+                function,
+                sizeof(jump),
+                PAGE_EXECUTE_READWRITE,
+                &old_protection
+            )) {
+            resume_executable_patch_threads(threads, thread_count);
+            return FALSE;
+        }
+        CopyMemory(function, jump, sizeof(jump));
+        FlushInstructionCache(GetCurrentProcess(), function, sizeof(jump));
+        VirtualProtect(
+            function, sizeof(jump), old_protection, &old_protection
+        );
+        resume_executable_patch_threads(threads, thread_count);
+        return TRUE;
     }
-    CopyMemory(function, jump, sizeof(jump));
-    VirtualProtect(
-        function, sizeof(jump), old_protection, &old_protection
+    SetLastError(ERROR_BUSY);
+    return FALSE;
+}
+
+static BOOL patch_frame_adapter_accessor(void *function) {
+    return patch_executable_entry(
+        function, (void *)hooked_wrapper_frame_adapter_id
     );
-    FlushInstructionCache(GetCurrentProcess(), function, sizeof(jump));
-    return TRUE;
 }
 
 /*
@@ -6775,8 +6965,11 @@ static BOOL initialize_controller_focus_hook(void) {
 static BOOL patch_streamer_imports(void) {
     HMODULE module = GetModuleHandleW(L"streamer.dll");
     BOOL adapter_ready;
+    BOOL ready;
 
+    AcquireSRWLockExclusive(&streamer_patch_lock);
     if (!module) {
+        ReleaseSRWLockExclusive(&streamer_patch_lock);
         return FALSE;
     }
     if (module != patched_streamer_module) {
@@ -6849,10 +7042,12 @@ static BOOL patch_streamer_imports(void) {
             (void **)&original_stretch_blt
         );
     }
-    return streamer_send_input_hooked &&
+    ready = streamer_send_input_hooked &&
         streamer_cursor_info_hooked &&
         streamer_bit_blt_hooked &&
         streamer_stretch_blt_hooked && adapter_ready;
+    ReleaseSRWLockExclusive(&streamer_patch_lock);
+    return ready;
 }
 
 static enum hook_process_kind identify_process(void) {
@@ -7217,16 +7412,121 @@ __declspec(dllexport) DWORD WINAPI UURemoteUIHealthEvidenceSelfTest(void) {
     ) ? 1u : 0u;
 }
 
+struct executable_patch_test_state {
+    void *function;
+    volatile LONG stop;
+    volatile LONG invalid_results;
+};
+
+static DWORD WINAPI executable_patch_test_replacement(void *unused) {
+    (void)unused;
+    return 42u;
+}
+
+static DWORD WINAPI executable_patch_test_worker(void *parameter) {
+    typedef DWORD(WINAPI *test_function_fn)(void);
+    struct executable_patch_test_state *state =
+        (struct executable_patch_test_state *)parameter;
+    test_function_fn function;
+
+    CopyMemory(&function, &state->function, sizeof(function));
+    while (!InterlockedCompareExchange(&state->stop, 0, 0)) {
+        DWORD value = function();
+        if (value != 7u && value != 42u) {
+            InterlockedIncrement(&state->invalid_results);
+        }
+    }
+    return 0u;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteExecutablePatchSelfTest(void) {
+    static const unsigned char original_code[EXECUTABLE_PATCH_SIZE] = {
+        0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+    typedef DWORD(WINAPI *test_function_fn)(void);
+    struct executable_patch_test_state state;
+    HANDLE workers[4] = {NULL, NULL, NULL, NULL};
+    DWORD old_protection;
+    test_function_fn function;
+    SIZE_T index;
+    BOOL patched = FALSE;
+    BOOL workers_ready = TRUE;
+    DWORD result = 0u;
+
+    ZeroMemory(&state, sizeof(state));
+    state.function = VirtualAlloc(
+        NULL,
+        EXECUTABLE_PATCH_SIZE,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+    if (!state.function) {
+        return 0u;
+    }
+    CopyMemory(state.function, original_code, sizeof(original_code));
+    if (!VirtualProtect(
+            state.function,
+            EXECUTABLE_PATCH_SIZE,
+            PAGE_EXECUTE_READ,
+            &old_protection
+        )) {
+        goto cleanup;
+    }
+    FlushInstructionCache(
+        GetCurrentProcess(), state.function, EXECUTABLE_PATCH_SIZE
+    );
+    CopyMemory(&function, &state.function, sizeof(function));
+    if (function() != 7u) {
+        goto cleanup;
+    }
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        workers[index] = CreateThread(
+            NULL, 0, executable_patch_test_worker, &state, 0, NULL
+        );
+        if (!workers[index]) {
+            workers_ready = FALSE;
+            break;
+        }
+    }
+    if (!workers_ready) {
+        goto cleanup;
+    }
+    Sleep(10);
+    patched = patch_executable_entry(
+        state.function, (void *)executable_patch_test_replacement
+    );
+    Sleep(10);
+    if (
+        patched && function() == 42u &&
+        InterlockedCompareExchange(&state.invalid_results, 0, 0) == 0
+    ) {
+        result = 1u;
+    }
+
+cleanup:
+    InterlockedExchange(&state.stop, 1);
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        if (workers[index]) {
+            WaitForSingleObject(workers[index], 5000);
+            CloseHandle(workers[index]);
+        }
+    }
+    VirtualFree(state.function, 0, MEM_RELEASE);
+    return result;
+}
+
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(
     LPVOID unused
 ) {
     (void)unused;
     hook_preloaded = TRUE;
-    return wol_hook_status();
+    return 1u;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     BOOL ready;
+    BOOL streamer_ready = TRUE;
 
     if (process_kind == HOOK_PROCESS_CONTROLLER) {
         return initialize_controller_focus_hook() ? 1u : 0u;
@@ -7237,8 +7537,11 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     if (unused) {
         hook_preloaded = TRUE;
     }
-    patch_streamer_imports();
+    if (GetModuleHandleW(L"streamer.dll")) {
+        streamer_ready = patch_streamer_imports();
+    }
     ready = (
+        streamer_ready &&
         send_input_hooked &&
         get_key_state_hooked &&
         cursor_pos_hooked &&

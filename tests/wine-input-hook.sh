@@ -98,6 +98,31 @@ readonly frame_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 mkdir -p "$state_dir"
 export WINEDLLOVERRIDES='wevtapi=n'
 
+prepare_wine_prefix() {
+    local attempt
+    local boot_status=0
+
+    for attempt in 1 2; do
+        if WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all \
+            timeout 30s wineboot -u >/dev/null 2>&1; then
+            return 0
+        else
+            boot_status=$?
+        fi
+        WINEPREFIX="$prefix" WINEDEBUG=-all wineserver -k \
+            >/dev/null 2>&1 || true
+        WINEPREFIX="$prefix" WINEDEBUG=-all timeout 10s \
+            wineserver -w >/dev/null 2>&1 || true
+        if (( attempt == 1 )); then
+            printf '%s\n' \
+                'Wine 前缀初始化失败或超时；清理 wineserver 后重试一次。' \
+                >&2
+        fi
+    done
+    printf 'Wine 前缀初始化失败：exit=%s\n' "$boot_status" >&2
+    return "$boot_status"
+}
+
 "$compiler" \
     -std=c11 \
     -Os \
@@ -130,8 +155,7 @@ if objdump -p "$compiled_probe" | grep -Fq 'GetCursorInfo'; then
 fi
 objdump -p "$compiled_streamer_probe" | grep -Fq 'GetCursorInfo'
 
-WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
-    >/dev/null 2>&1
+prepare_wine_prefix
 install -Dm0644 "$hook" "$prefix/drive_c/uu-remote-input-hook.dll"
 install -Dm0644 "$shim" "$prefix/drive_c/wevtapi.dll"
 install -Dm0644 "$injector" \
@@ -199,20 +223,18 @@ WINEPREFIX="$prefix" WINEDEBUG=-all timeout 30s \
     wine 'C:\GameViewerServer.exe' \
     >"$test_root/server.log" 2>&1 &
 server_pid=$!
-for _ in {1..500}; do
-    grep -Fq 'preloaded=1' "$wol_status" 2>/dev/null &&
-        grep -Fq 'status_bits=15' "$wol_status" 2>/dev/null &&
-        break
-    sleep 0.02
-done
-grep -Fq 'preloaded=1' "$wol_status"
-grep -Fq 'status_bits=15' "$wol_status"
 WINEPREFIX="$prefix" WINEDEBUG=-all \
     wine 'C:\uu-remote-input-injector.exe' \
     --watch GameViewerServer.exe 'C:\uu-remote-input-hook.dll' \
     >"$test_root/injector.log" 2>&1 &
 injector_pid=$!
-wait "$server_pid"
+if wait "$server_pid"; then
+    :
+else
+    probe_status=$?
+    printf 'Wine 输入钩子探针失败：exit=%s\n' "$probe_status" >&2
+    exit "$probe_status"
+fi
 server_pid=
 for _ in {1..100}; do
     grep -q '"hook_pid": [1-9]' \
@@ -235,6 +257,7 @@ if [[ $(grep -c '^keycode 66 1$' "$trace" || true) -ne 2 ]] ||
     exit 1
 fi
 grep -q 'GameViewerServer 输入钩子已连接' "$log"
+grep -Eq '^streamer-initialized pid=[1-9][0-9]*' "$test_root/injector.log"
 grep -q '绝对鼠标坐标域：virtual-desktop（flags=0xc001）' "$log"
 grep -q '绝对鼠标坐标域：selected-monitor（flags=0x8001）' "$log"
 grep -Fq 'preloaded=1' "$wol_status"
@@ -245,16 +268,16 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=34'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=35'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'active=1'
 grep -A9 -F '[cursor]' "$frame_status" | grep -Eq 'updates=[2-9][0-9]*'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'sequence=2'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'width=6'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'height=8'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_x=3'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=4'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'sequence=165'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'width=2'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'height=2'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_x=0'
+grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=0'
 
 kill "$bridge_pid" 2>/dev/null || true
 wait "$bridge_pid" 2>/dev/null || true

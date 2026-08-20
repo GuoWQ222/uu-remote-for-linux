@@ -1,6 +1,21 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#pragma pack(push, 1)
+struct test_cursor_header {
+    DWORD magic;
+    DWORD version;
+    DWORD header_size;
+    DWORD sequence;
+    DWORD width;
+    DWORD height;
+    DWORD hotspot_x;
+    DWORD hotspot_y;
+    DWORD pixel_size;
+    BYTE reserved[28];
+};
+#pragma pack(pop)
+
 static int close_enough(LONG actual, LONG expected) {
     LONG difference = actual - expected;
     return difference >= -1 && difference <= 1;
@@ -124,6 +139,83 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursor(
         (DWORD)bitmap.bmHeight != expected_height
     ) {
         return 13;
+    }
+    if (icon.hbmMask) {
+        DeleteObject(icon.hbmMask);
+    }
+    if (icon.hbmColor) {
+        DeleteObject(icon.hbmColor);
+    }
+    return 0;
+}
+
+static int write_lifetime_cursor(DWORD sequence) {
+    struct test_cursor_header header;
+    DWORD pixels[4];
+    HANDLE file;
+    DWORD written;
+    DWORD index;
+    int result = 1;
+
+    ZeroMemory(&header, sizeof(header));
+    header.magic = 0x49435555u;
+    header.version = 1u;
+    header.header_size = sizeof(header);
+    header.sequence = sequence;
+    header.width = 2u;
+    header.height = 2u;
+    header.pixel_size = sizeof(pixels);
+    for (index = 0u; index < 4u; ++index) {
+        pixels[index] = 0xff000000u |
+            ((sequence * 17u + index * 31u) & 0x00ffffffu);
+    }
+    file = CreateFileW(
+        L"C:\\uu-remote-native-cursor.bin",
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    if (
+        WriteFile(file, &header, sizeof(header), &written, NULL) &&
+        written == sizeof(header) &&
+        WriteFile(file, pixels, sizeof(pixels), &written, NULL) &&
+        written == sizeof(pixels)
+    ) {
+        result = 0;
+    }
+    CloseHandle(file);
+    return result;
+}
+
+__declspec(dllexport) int WINAPI ProbeStreamerCursorCacheLifetime(void) {
+    HCURSOR retained = NULL;
+    CURSORINFO cursor;
+    ICONINFO icon;
+    DWORD index;
+
+    for (index = 0u; index < 66u; ++index) {
+        if (write_lifetime_cursor(100u + index)) {
+            return 30;
+        }
+        Sleep(12);
+        ZeroMemory(&cursor, sizeof(cursor));
+        cursor.cbSize = sizeof(cursor);
+        if (!GetCursorInfo(&cursor) || !cursor.hCursor) {
+            return 31;
+        }
+        if (index == 0u) {
+            retained = cursor.hCursor;
+        }
+    }
+    ZeroMemory(&icon, sizeof(icon));
+    if (!retained || !GetIconInfo(retained, &icon)) {
+        return 32;
     }
     if (icon.hbmMask) {
         DeleteObject(icon.hbmMask);

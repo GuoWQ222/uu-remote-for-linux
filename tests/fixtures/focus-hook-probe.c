@@ -7,13 +7,17 @@ typedef DWORD(WINAPI *focus_hook_status_fn)(void);
 typedef DWORD(WINAPI *event_loop_guard_self_test_fn)(void);
 typedef DWORD(WINAPI *sticky_null_guard_self_test_fn)(void);
 typedef DWORD(WINAPI *ui_health_evidence_self_test_fn)(void);
+typedef DWORD(WINAPI *executable_patch_self_test_fn)(void);
 
 static volatile LONG app_deactivate_messages;
 static volatile LONG window_deactivate_messages;
 static volatile LONG nonclient_deactivate_messages;
+static volatile LONG explicit_nonclient_deactivate_messages;
 static volatile LONG nonclient_right_button_down_messages;
 static volatile LONG home_size_messages;
 static volatile LONG outer_window_proc_calls;
+static volatile LONG explicit_probe_active;
+static HWND explicit_probe_window;
 static WNDPROC outer_window_proc_next;
 
 static LRESULT CALLBACK outer_window_proc(
@@ -44,6 +48,12 @@ static LRESULT CALLBACK probe_window_proc(
         InterlockedIncrement(&window_deactivate_messages);
     } else if (message == WM_NCACTIVATE && !wparam) {
         InterlockedIncrement(&nonclient_deactivate_messages);
+        if (
+            InterlockedCompareExchange(&explicit_probe_active, 0, 0) &&
+            window == explicit_probe_window
+        ) {
+            InterlockedIncrement(&explicit_nonclient_deactivate_messages);
+        }
     } else if (message == WM_NCRBUTTONDOWN) {
         InterlockedIncrement(&nonclient_right_button_down_messages);
     } else if (message == WM_SIZE) {
@@ -67,13 +77,23 @@ static void dispatch_probe_message(
     LPARAM lparam
 ) {
     MSG probe;
+    BOOL track_nonclient = message == WM_NCACTIVATE && !wparam;
 
     ZeroMemory(&probe, sizeof(probe));
     probe.hwnd = window;
     probe.message = message;
     probe.wParam = wparam;
     probe.lParam = lparam;
+    if (track_nonclient) {
+        explicit_probe_window = window;
+        InterlockedExchange(&explicit_nonclient_deactivate_messages, 0);
+        InterlockedExchange(&explicit_probe_active, 1);
+    }
     DispatchMessageW(&probe);
+    if (track_nonclient) {
+        InterlockedExchange(&explicit_probe_active, 0);
+        explicit_probe_window = NULL;
+    }
 }
 
 static BOOL create_home_show_request(void) {
@@ -157,6 +177,7 @@ int WINAPI WinMain(
     event_loop_guard_self_test_fn event_loop_guard_self_test;
     sticky_null_guard_self_test_fn sticky_null_guard_self_test;
     ui_health_evidence_self_test_fn ui_health_evidence_self_test;
+    executable_patch_self_test_fn executable_patch_self_test;
     HHOOK first_hook;
     HHOOK reused_hook;
     DWORD external_pid = 0;
@@ -297,6 +318,14 @@ int WINAPI WinMain(
         &procedure,
         sizeof(ui_health_evidence_self_test)
     );
+    procedure = GetProcAddress(
+        hook_module, "UURemoteExecutablePatchSelfTest"
+    );
+    CopyMemory(
+        &executable_patch_self_test,
+        &procedure,
+        sizeof(executable_patch_self_test)
+    );
     if (
         !initialize_hook ||
         !focus_hook_status ||
@@ -306,6 +335,8 @@ int WINAPI WinMain(
         !sticky_null_guard_self_test() ||
         !ui_health_evidence_self_test ||
         !ui_health_evidence_self_test() ||
+        !executable_patch_self_test ||
+        !executable_patch_self_test() ||
         !initialize_hook(NULL) ||
         (focus_hook_status() & 1023u) != 1023u
     ) {
@@ -590,8 +621,8 @@ int WINAPI WinMain(
     Sleep(50);
     InterlockedExchange(&nonclient_deactivate_messages, 0);
     dispatch_probe_message(main_window, WM_NCACTIVATE, FALSE, 0);
-    if (nonclient_deactivate_messages != 1) {
-        return 9;
+    if (explicit_nonclient_deactivate_messages != 1) {
+        return 33;
     }
     for (index = 0; index < 12; ++index) {
         SendMessageW(
@@ -610,8 +641,8 @@ int WINAPI WinMain(
     pump_messages_for(200);
     InterlockedExchange(&nonclient_deactivate_messages, 0);
     dispatch_probe_message(video_window, WM_NCACTIVATE, FALSE, 0);
-    if (nonclient_deactivate_messages != 0) {
-        return 9;
+    if (explicit_nonclient_deactivate_messages != 0) {
+        return 34;
     }
     if (!UnhookWindowsHookEx(reused_hook)) {
         return 10;

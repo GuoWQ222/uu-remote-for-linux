@@ -93,6 +93,7 @@ grep -Eq '^reg delete .* /v ProxyServer /f$' "$trace"
 grep -Fq '"mode": "none"' "$status"
 
 unset UU_REMOTE_SYSTEM_PROXY_SOURCE
+unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY ftp_proxy all_proxy
 export XDG_CURRENT_DESKTOP=unknown
 export DESKTOP_SESSION=unknown
 export http_proxy=http://user:secret@proxy.example.test:3128

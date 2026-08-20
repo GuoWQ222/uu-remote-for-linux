@@ -11,6 +11,7 @@ typedef int(WINAPI *probe_streamer_cursor_fn)(
     LONG, LONG, LONG, LONG, DWORD, DWORD, DWORD, DWORD, DWORD
 );
 typedef int(WINAPI *probe_streamer_frame_fn)(void);
+typedef int(WINAPI *probe_streamer_cursor_cache_lifetime_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
 typedef DWORD(WINAPI *frame_hook_status_fn)(void);
 typedef HANDLE EVT_HANDLE;
@@ -360,6 +361,8 @@ int WINAPI WinMain(
     HMODULE streamer;
     probe_streamer_cursor_fn probe_streamer_cursor;
     probe_streamer_frame_fn probe_streamer_frame;
+    probe_streamer_cursor_cache_lifetime_fn
+        probe_streamer_cursor_cache_lifetime;
     wol_hook_status_fn wol_hook_status;
     frame_hook_status_fn frame_hook_status;
     HMODULE hook;
@@ -408,7 +411,7 @@ int WINAPI WinMain(
 
     streamer = LoadLibraryW(L"streamer.dll");
     if (!streamer) {
-        return 1;
+        return 21;
     }
     probe_streamer_cursor = (probe_streamer_cursor_fn)GetProcAddress(
         streamer, "ProbeStreamerCursor"
@@ -416,8 +419,15 @@ int WINAPI WinMain(
     probe_streamer_frame = (probe_streamer_frame_fn)GetProcAddress(
         streamer, "ProbeStreamerFrame"
     );
-    if (!probe_streamer_cursor || !probe_streamer_frame) {
-        return 1;
+    probe_streamer_cursor_cache_lifetime =
+        (probe_streamer_cursor_cache_lifetime_fn)GetProcAddress(
+            streamer, "ProbeStreamerCursorCacheLifetime"
+        );
+    if (
+        !probe_streamer_cursor || !probe_streamer_frame ||
+        !probe_streamer_cursor_cache_lifetime
+    ) {
+        return 22;
     }
 
     /* Give the explicit watchdog time to initialize and patch streamer.dll. */
@@ -506,6 +516,10 @@ int WINAPI WinMain(
         !close_enough(position.y, expected_y)
     ) {
         return 4;
+    }
+    streamer_result = probe_streamer_cursor_cache_lifetime();
+    if (streamer_result != 0) {
+        return streamer_result;
     }
     Sleep(200);
     return 0;

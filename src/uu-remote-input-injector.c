@@ -181,7 +181,10 @@ static BOOL inject_library(
     LPTHREAD_START_ROUTINE remote_load_library;
     SIZE_T path_size;
     SIZE_T written = 0;
+    DWORD wait_result;
     DWORD thread_exit = 0;
+    DWORD failure_error = ERROR_SUCCESS;
+    BOOL remote_thread_finished = FALSE;
     BOOL success = FALSE;
 
     if (remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)) {
@@ -245,10 +248,15 @@ static BOOL inject_library(
     if (!thread) {
         goto cleanup;
     }
-    if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
-        SetLastError(ERROR_TIMEOUT);
+    wait_result = WaitForSingleObject(thread, 10000);
+    if (wait_result != WAIT_OBJECT_0) {
+        failure_error = wait_result == WAIT_TIMEOUT
+            ? ERROR_TIMEOUT
+            : (wait_result == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE);
+        SetLastError(failure_error);
         goto cleanup;
     }
+    remote_thread_finished = TRUE;
     if (!GetExitCodeThread(thread, &thread_exit) || thread_exit == 0) {
         SetLastError(ERROR_DLL_INIT_FAILED);
         goto cleanup;
@@ -260,14 +268,20 @@ static BOOL inject_library(
     }
 
 cleanup:
+    if (!success && failure_error == ERROR_SUCCESS) {
+        failure_error = GetLastError();
+    }
     if (thread) {
         CloseHandle(thread);
     }
-    if (remote_path) {
+    if (remote_path && (!thread || remote_thread_finished)) {
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
     }
     if (process) {
         CloseHandle(process);
+    }
+    if (!success) {
+        SetLastError(failure_error);
     }
     return success;
 }
@@ -294,21 +308,21 @@ static int inject_once(const WCHAR *image_name, const WCHAR *dll_path) {
 static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     DWORD last_pid = 0;
     BOOL last_injected = FALSE;
-    BOOL streamer_initialized = FALSE;
+    uintptr_t initialized_streamer = 0;
 
     for (;;) {
         DWORD pid = find_process(image_name);
         if (!pid) {
             last_pid = 0;
             last_injected = FALSE;
-            streamer_initialized = FALSE;
+            initialized_streamer = 0;
             Sleep(WATCH_INTERVAL_MS);
             continue;
         }
         if (pid != last_pid) {
             last_pid = pid;
             last_injected = FALSE;
-            streamer_initialized = FALSE;
+            initialized_streamer = 0;
         }
         if (
             !last_injected ||
@@ -316,9 +330,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
         ) {
             last_injected = inject_library(pid, dll_path, FALSE);
             if (last_injected) {
-                streamer_initialized = remote_module_info(
-                    pid, L"streamer.dll", NULL
-                );
+                initialized_streamer = 0;
                 wprintf(L"injected pid=%lu\n", (unsigned long)pid);
                 fflush(stdout);
             } else {
@@ -331,15 +343,18 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                 fflush(stderr);
             }
         }
-        if (
-            last_injected &&
-            !streamer_initialized &&
-            remote_module_info(pid, L"streamer.dll", NULL)
-        ) {
-            streamer_initialized = initialize_remote_hook(
-                pid, dll_path, FALSE
-            );
-            if (streamer_initialized) {
+        if (last_injected) {
+            uintptr_t streamer_module = 0;
+
+            if (!remote_module_info(
+                    pid, L"streamer.dll", &streamer_module
+                )) {
+                initialized_streamer = 0;
+            } else if (
+                streamer_module != initialized_streamer &&
+                initialize_remote_hook(pid, dll_path, FALSE)
+            ) {
+                initialized_streamer = streamer_module;
                 wprintf(
                     L"streamer-initialized pid=%lu\n",
                     (unsigned long)pid

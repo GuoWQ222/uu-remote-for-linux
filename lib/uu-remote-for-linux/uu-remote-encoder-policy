@@ -19,6 +19,17 @@ NVENC_V8_IMPL = 0
 NVENC_V11_IMPL = 1
 SOFTWARE_IMPLS = {5, 6}
 PATCHED_NVDEC_IMPL = 33
+CAPABILITY_INTEGER_FIELDS = {
+    "video_codec",
+    "adapter_id",
+    "device_id",
+    "width",
+    "height",
+    "frame_rate",
+    "codec_impl",
+    "chroma_sampling",
+    "bit_depth",
+}
 
 
 def read_u16(data: bytes, offset: int) -> int:
@@ -49,6 +60,18 @@ def load_cache(path: Path) -> dict:
         data.get("encoder_capabilities"), list
     ):
         fail("编码器能力缓存结构无效")
+    for index, row in enumerate(data["encoder_capabilities"]):
+        if not isinstance(row, dict):
+            fail(f"编码器能力缓存第 {index} 项不是对象")
+        for field in CAPABILITY_INTEGER_FIELDS:
+            if field not in row:
+                continue
+            value = row[field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                fail(
+                    f"编码器能力缓存第 {index} 项的 {field} 字段"
+                    "不是整数"
+                )
     return data
 
 
@@ -222,20 +245,54 @@ def watch(
     enabled_stamp: Path,
     lock_path: Path,
 ) -> None:
+    def cache_signature() -> tuple[int, int, int] | None:
+        try:
+            status = cache.stat()
+        except OSError:
+            return None
+        return (status.st_ino, status.st_size, status.st_mtime_ns)
+
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        failed_signature: tuple[int, int, int] | None = None
+        failure_recorded = False
         while enabled_stamp.is_file():
+            current_signature = cache_signature()
+            if failure_recorded and current_signature == failed_signature:
+                time.sleep(0.5)
+                continue
             try:
                 verify(cache, device_id, adapter_id)
             except SystemExit:
                 try:
                     enable(cache, backup, device_id, adapter_id)
                 except SystemExit:
-                    pass
+                    failed_signature = cache_signature()
+                    failure_recorded = True
+                except Exception as error:
+                    print(
+                        "错误：NVENC 能力缓存修复发生未预期错误："
+                        f"{type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
+                    failed_signature = cache_signature()
+                    failure_recorded = True
+                else:
+                    failure_recorded = False
+            except Exception as error:
+                print(
+                    "错误：NVENC 能力缓存核验发生未预期错误："
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                failed_signature = cache_signature()
+                failure_recorded = True
+            else:
+                failure_recorded = False
             time.sleep(0.5)
 
 

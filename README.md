@@ -47,7 +47,7 @@
 2. Install and launch:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.27_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.28_amd64.deb
    uu-remote-for-linux
    ```
 

@@ -4,6 +4,32 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.1.28] - 2026-08-20
+
+- Serialize lazy CUDA symbol initialization and publish the completed API table
+  atomically, so concurrent encoder creation cannot observe partially resolved
+  driver entry points.
+- Balance every CUDA primary-context push with a matching pop across normal and
+  failure paths, preventing context-stack growth during repeated NVENC resource
+  registration and teardown.
+- Keep remote-injection argument memory alive when the injected thread exceeds
+  its wait deadline, eliminating a use-after-free while preserving bounded
+  launcher waits.
+- Suspend and inspect peer threads before applying the 12-byte streamer
+  hotpatch, reject any thread whose instruction pointer overlaps the patch
+  window, serialize concurrent patch attempts, and track streamer module
+  generations so the injector retries initialization after each load or reload.
+- Stage UU update rollback data transactionally, restore both client and bridge
+  state after partial failures, and reject corrupt rollback archives before they
+  can replace a verified installation.
+- Validate every encoder-policy JSON field by type and value, and rate-limit
+  watcher retries by input signature so malformed or partially written state
+  cannot trigger a CPU-intensive retry loop.
+- Defer Wine compatibility initialization until execution is outside
+  `DllMain`'s loader lock while retaining the earliest safe preload marker.
+- Retain cached native cursor handles for the process lifetime so callers never
+  receive an `HCURSOR` that another cache rotation has already destroyed.
+
 ## [1.1.27] - 2026-08-20
 
 - Add a hash-bound semantic compatibility profile for the NVENC encoder path
