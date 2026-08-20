@@ -15,6 +15,7 @@
 
 > [!IMPORTANT]
 > This is an unofficial compatibility wrapper for NetEase UU Remote. The repository does not distribute the proprietary installer or client binaries.
+> UU and wrapper-managed downloads use direct connections by default; desktop proxy settings are not copied into the Wine client.
 
 ## ✨ Highlights
 
@@ -24,7 +25,7 @@
 | 🖱️ | Native remote control | X11/XTest or Wayland Portal input, controlled-display selection, and aligned local/remote cursors |
 | 🎬 | Hardware video | CPU/OpenH264 fallback, experimental NVIDIA NVDEC decoding, and validated NVENC H.264/HEVC encoding |
 | 🧭 | Native tray | Show the main window, choose the controlled display or decoder, and arrange one or two viewer windows |
-| 🛡️ | Linux integration | Autostart, sleep inhibition, system proxy, file transfer, safe updates, and Wake-on-LAN bridges |
+| 🛡️ | Linux integration | Autostart, sleep inhibition, resilient encrypted DNS, file transfer, safe updates, and Wake-on-LAN bridges |
 
 ## 🚀 Quick start
 

@@ -6,6 +6,8 @@ readonly app_name="UU 远程（Linux 版本）"
 readonly min_wine_version="11.1"
 readonly official_installer_url_default="https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd"
 readonly eula_url="https://uuyc.163.com/contact/20240402/40294_1146065.html"
+readonly direct_doh_url="https://dns.alidns.com/dns-query"
+readonly direct_doh_bootstrap="223.5.5.5"
 readonly zenity_bin="${UU_REMOTE_ZENITY_BIN:-zenity}"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -254,6 +256,23 @@ die() {
     exit 1
 }
 
+network_curl() {
+    if [[ ${UU_REMOTE_SYSTEM_PROXY_SOURCE:-none} != none ]]; then
+        curl "$@"
+        return
+    fi
+
+    # UU uses direct networking by default. Bootstrap encrypted DNS with a
+    # validated hostname so broken local resolvers cannot prevent access to
+    # the official NetEase endpoints.
+    env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy -u no_proxy \
+        -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY -u NO_PROXY \
+        curl \
+        --doh-url "$direct_doh_url" \
+        --resolve "dns.alidns.com:443:$direct_doh_bootstrap" \
+        "$@"
+}
+
 eula_gui_prompt_allowed() {
     [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || return 1
     command -v "$zenity_bin" >/dev/null 2>&1 || return 1
@@ -278,7 +297,7 @@ prompt_eula_acceptance() {
         rm -f -- "$html_file"
         return 2
     }
-    if ! curl --fail --location --silent --show-error --retry 2 \
+    if ! network_curl --fail --location --silent --show-error --retry 2 \
         --connect-timeout 10 --max-time 30 \
         --output "$html_file" "$eula_url"; then
         rm -f -- "$html_file" "$text_file"
@@ -785,7 +804,7 @@ official_latest_version() {
             '无法创建官方版本检查的临时错误文件'
         return 1
     }
-    if effective_url=$(curl --silent --show-error --fail --head --location \
+    if effective_url=$(network_curl --silent --show-error --fail --head --location \
         --retry 2 --connect-timeout 15 --max-time 45 \
         --output /dev/null --write-out '%{url_effective}' "$source_url" \
         2>"$curl_error_file" 9>&-); then
@@ -3082,7 +3101,9 @@ system_proxy_bridge_label() {
         printf '缺失'
         return
     fi
-    "$system_proxy_bridge" describe "$system_proxy_bridge_status" 2>/dev/null ||
+    UU_REMOTE_SYSTEM_PROXY_SOURCE="${UU_REMOTE_SYSTEM_PROXY_SOURCE:-none}" \
+        "$system_proxy_bridge" describe \
+        "$system_proxy_bridge_status" 2>/dev/null ||
         printf '检测失败（详见日志）'
 }
 
@@ -3092,7 +3113,8 @@ sync_linux_system_proxy() {
     # The bridge intentionally appends its structured result to this log while
     # stderr from the same invocation is captured alongside it.
     # shellcheck disable=SC2094
-    "$system_proxy_bridge" sync \
+    UU_REMOTE_SYSTEM_PROXY_SOURCE="${UU_REMOTE_SYSTEM_PROXY_SOURCE:-none}" \
+        "$system_proxy_bridge" sync \
         "$prefix" \
         "$wine" \
         "$system_proxy_bridge_status" \
@@ -3428,7 +3450,7 @@ download_installer() {
     temp_file=$(mktemp "$cache_dir/.UURemote_Setup.XXXXXX")
     notify_status "正在从网易官方下载客户端"
     printf '正在从网易官方下载 Windows 客户端……\n'
-    if ! effective_url=$(curl --fail --location --retry 3 --connect-timeout 15 \
+    if ! effective_url=$(network_curl --fail --location --retry 3 --connect-timeout 15 \
         --output "$temp_file" --write-out '%{url_effective}' "$source_url" 9>&-); then
         rm -f -- "$temp_file"
         die "官方安装包下载失败"

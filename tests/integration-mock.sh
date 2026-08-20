@@ -26,7 +26,6 @@ export UU_REMOTE_DISABLE_INPUT_BRIDGE=1
 export UU_REMOTE_DISABLE_FOCUS_STABILIZER=1
 export UU_REMOTE_TRAY_PROXY_BIN="$fixture_bin/uu-remote-tray-proxy"
 export UU_REMOTE_UPDATE_NO_RESTART=1
-export UU_REMOTE_SYSTEM_PROXY_SOURCE=none
 export HTTP_PROXY=http://should-not-reach-wine.invalid:8888
 export HTTPS_PROXY=http://should-not-reach-wine.invalid:8888
 export DISPLAY=:99
@@ -75,6 +74,9 @@ fi
 
 "$launcher"
 grep -q '^EULA_FETCH$' "$UU_REMOTE_FAKE_TRACE"
+grep -q \
+    'CURL .*--doh-url https://dns.alidns.com/dns-query .*--resolve dns.alidns.com:443:223.5.5.5' \
+    "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--text-info' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--checkbox=' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--ok-label=接受并继续' "$UU_REMOTE_FAKE_TRACE"
@@ -84,6 +86,10 @@ prefix="$XDG_DATA_HOME/uu-remote-for-linux/wineprefix"
 install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 cache_dir="$XDG_CACHE_HOME/uu-remote-for-linux"
 state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
+grep -Fq '"mode": "none"' \
+    "$state_dir/system-proxy-bridge-status.json"
+grep -Fq '"source": "forced"' \
+    "$state_dir/system-proxy-bridge-status.json"
 
 # Package upgrades can inherit a live update bridge created before versioned
 # status files existed.  The launcher must replace that bridge and continue to
