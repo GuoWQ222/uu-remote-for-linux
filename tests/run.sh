@@ -247,6 +247,18 @@ check "input hook exports Wayland frame status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteFrameHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
+check "input hook exports Wayland frame bounds self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteFrameBoundsSelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
+check "input hook exports Wayland stable-frame self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteFrameSnapshotSelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
+check "input hook exports Wayland frame identity self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteFrameMappingIdentitySelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports controller focus status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteFocusHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"

@@ -15,6 +15,9 @@ typedef int(WINAPI *probe_streamer_cursor_cache_lifetime_fn)(void);
 typedef int(WINAPI *probe_streamer_embedded_cursor_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
 typedef DWORD(WINAPI *frame_hook_status_fn)(void);
+typedef DWORD(WINAPI *frame_bounds_self_test_fn)(void);
+typedef DWORD(WINAPI *frame_snapshot_self_test_fn)(void);
+typedef DWORD(WINAPI *frame_mapping_identity_self_test_fn)(void);
 typedef DWORD(WINAPI *dxgi_cursor_self_test_fn)(
     DWORD, DWORD, DWORD, DWORD
 );
@@ -372,6 +375,9 @@ int WINAPI WinMain(
     probe_streamer_embedded_cursor_fn probe_streamer_embedded_cursor;
     wol_hook_status_fn wol_hook_status;
     frame_hook_status_fn frame_hook_status;
+    frame_bounds_self_test_fn frame_bounds_self_test;
+    frame_snapshot_self_test_fn frame_snapshot_self_test;
+    frame_mapping_identity_self_test_fn frame_mapping_identity_self_test;
     dxgi_cursor_self_test_fn dxgi_cursor_self_test;
     HMODULE hook;
     int streamer_result;
@@ -398,11 +404,25 @@ int WINAPI WinMain(
     frame_hook_status = (frame_hook_status_fn)GetProcAddress(
         hook, "UURemoteFrameHookStatus"
     );
+    frame_bounds_self_test = (frame_bounds_self_test_fn)GetProcAddress(
+        hook, "UURemoteFrameBoundsSelfTest"
+    );
+    frame_snapshot_self_test = (frame_snapshot_self_test_fn)GetProcAddress(
+        hook, "UURemoteFrameSnapshotSelfTest"
+    );
+    frame_mapping_identity_self_test =
+        (frame_mapping_identity_self_test_fn)GetProcAddress(
+            hook, "UURemoteFrameMappingIdentitySelfTest"
+        );
     dxgi_cursor_self_test = (dxgi_cursor_self_test_fn)GetProcAddress(
         hook, "UURemoteDXGICursorSelfTest"
     );
     if (
         !wol_hook_status || wol_hook_status() != 15u ||
+        !frame_bounds_self_test || frame_bounds_self_test() != 1u ||
+        !frame_snapshot_self_test || frame_snapshot_self_test() != 1u ||
+        !frame_mapping_identity_self_test ||
+        frame_mapping_identity_self_test() != 1u ||
         !dxgi_cursor_self_test
     ) {
         return 8;

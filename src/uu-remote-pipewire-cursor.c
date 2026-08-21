@@ -95,12 +95,14 @@ struct application {
     struct pw_main_loop *loop;
     struct pw_context *context;
     struct pw_core *core;
+    struct spa_hook core_listener;
     struct stream_data streams[UUCI_MAX_STREAMS];
     uint32_t n_streams;
     const char *output_path;
     uint32_t sequence;
     uint64_t last_hash;
     uint32_t updates;
+    uint32_t diagnostics;
     bool failed;
 };
 
@@ -320,10 +322,27 @@ static int write_all(int descriptor, const void *data, size_t size)
             }
             return -errno;
         }
+        if (written == 0) {
+            return -EIO;
+        }
         bytes += written;
         size -= (size_t)written;
     }
     return 0;
+}
+
+static bool should_log_cursor_event(uint32_t count)
+{
+    return count <= 5u || count % 300u == 0u;
+}
+
+static bool should_log_cursor_diagnostic(struct application *application)
+{
+    application->diagnostics += 1u;
+    if (application->diagnostics == 0u) {
+        application->diagnostics = 1u;
+    }
+    return should_log_cursor_event(application->diagnostics);
 }
 
 static int publish_snapshot(
@@ -394,22 +413,26 @@ static int publish_snapshot(
     }
     application->last_hash = hash;
     application->updates += 1u;
-    fprintf(
-        stderr,
-        "cursor-update sequence=%" PRIu32 " size=%" PRIu32 "x%" PRIu32
-        " hotspot=%" PRIu32 ",%" PRIu32 " node=%" PRIu32
-        " cursor-id=%" PRIu32 " position=%" PRId32 ",%" PRId32 "\n",
-        header.sequence,
-        header.width,
-        header.height,
-        header.hotspot_x,
-        header.hotspot_y,
-        stream_data->node,
-        event->id,
-        event->position_x,
-        event->position_y
-    );
-    fflush(stderr);
+    if (should_log_cursor_event(application->updates)) {
+        fprintf(
+            stderr,
+            "cursor-update count=%" PRIu32 " sequence=%" PRIu32
+            " size=%" PRIu32 "x%" PRIu32
+            " hotspot=%" PRIu32 ",%" PRIu32 " node=%" PRIu32
+            " cursor-id=%" PRIu32 " position=%" PRId32 ",%" PRId32 "\n",
+            application->updates,
+            header.sequence,
+            header.width,
+            header.height,
+            header.hotspot_x,
+            header.hotspot_y,
+            stream_data->node,
+            event->id,
+            event->position_x,
+            event->position_y
+        );
+        fflush(stderr);
+    }
     return 1;
 }
 
@@ -425,8 +448,16 @@ static void process_cursor_meta(
     meta = spa_buffer_find_meta(buffer, SPA_META_Cursor);
     result = extract_cursor(meta, &event);
     if (result <= 0) {
-        if (result < 0 && result != -ENOTSUP) {
-            fprintf(stderr, "invalid cursor metadata: %s\n", strerror(-result));
+        if (
+            result < 0 && result != -ENOTSUP &&
+            should_log_cursor_diagnostic(stream_data->application)
+        ) {
+            fprintf(
+                stderr,
+                "invalid cursor metadata count=%" PRIu32 ": %s\n",
+                stream_data->application->diagnostics,
+                strerror(-result)
+            );
         }
         return;
     }
@@ -450,8 +481,16 @@ static void process_cursor_meta(
         &event
     );
     free(event.snapshot.pixels);
-    if (result < 0) {
-        fprintf(stderr, "cursor publication failed: %s\n", strerror(-result));
+    if (
+        result < 0 &&
+        should_log_cursor_diagnostic(stream_data->application)
+    ) {
+        fprintf(
+            stderr,
+            "cursor publication failed count=%" PRIu32 ": %s\n",
+            stream_data->application->diagnostics,
+            strerror(-result)
+        );
     }
 }
 
@@ -474,6 +513,16 @@ static void on_process(void *userdata)
     pw_stream_queue_buffer(stream_data->stream, latest);
 }
 
+static bool stream_state_is_terminal(
+    enum pw_stream_state old,
+    enum pw_stream_state state
+)
+{
+    return state == PW_STREAM_STATE_ERROR ||
+        (state == PW_STREAM_STATE_UNCONNECTED &&
+         old != PW_STREAM_STATE_UNCONNECTED);
+}
+
 static void on_state_changed(
     void *userdata,
     enum pw_stream_state old,
@@ -483,7 +532,9 @@ static void on_state_changed(
 {
     struct stream_data *stream_data = userdata;
 
-    (void)old;
+    if (!stream_state_is_terminal(old, state)) {
+        return;
+    }
     if (state == PW_STREAM_STATE_ERROR) {
         fprintf(
             stderr,
@@ -491,9 +542,16 @@ static void on_state_changed(
             stream_data->node,
             error ? error : "unknown error"
         );
-        stream_data->application->failed = true;
-        pw_main_loop_quit(stream_data->application->loop);
+    } else {
+        fprintf(
+            stderr,
+            "PipeWire node %" PRIu32 " disconnected from state %s\n",
+            stream_data->node,
+            pw_stream_state_as_string(old)
+        );
     }
+    stream_data->application->failed = true;
+    pw_main_loop_quit(stream_data->application->loop);
 }
 
 static void on_param_changed(
@@ -514,6 +572,7 @@ static void on_param_changed(
     uint32_t width;
     uint32_t height;
     uint64_t image_size;
+    int result;
 
     if (!param || id != SPA_PARAM_Format) {
         return;
@@ -564,7 +623,15 @@ static void on_param_changed(
             UUCI_META_SIZE(UUCI_MAX_DIMENSION, UUCI_MAX_DIMENSION)
         )
     );
-    pw_stream_update_params(stream_data->stream, params, 2);
+    result = pw_stream_update_params(stream_data->stream, params, 2);
+    if (result < 0) {
+        pw_stream_set_error(
+            stream_data->stream,
+            result,
+            "unable to negotiate cursor metadata: %s",
+            spa_strerror(result)
+        );
+    }
 }
 
 static const struct pw_stream_events stream_events = {
@@ -572,6 +639,33 @@ static const struct pw_stream_events stream_events = {
     .state_changed = on_state_changed,
     .param_changed = on_param_changed,
     .process = on_process,
+};
+
+static void on_core_error(
+    void *userdata,
+    uint32_t id,
+    int sequence,
+    int result,
+    const char *message
+)
+{
+    struct application *application = userdata;
+
+    fprintf(
+        stderr,
+        "Portal PipeWire core failed: id=%" PRIu32 " seq=%d result=%d %s\n",
+        id,
+        sequence,
+        result,
+        message ? message : "unknown error"
+    );
+    application->failed = true;
+    pw_main_loop_quit(application->loop);
+}
+
+static const struct pw_core_events core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .error = on_core_error,
 };
 
 static int connect_stream(struct stream_data *stream_data)
@@ -605,7 +699,7 @@ static int connect_stream(struct stream_data *stream_data)
         properties
     );
     if (!stream_data->stream) {
-        return -errno;
+        return errno ? -errno : -ENOMEM;
     }
     pw_stream_add_listener(
         stream_data->stream,
@@ -723,6 +817,33 @@ static int self_test(void)
         fprintf(stderr, "PipeWire inactive cursor stream self-test failed\n");
         return 1;
     }
+    if (
+        stream_state_is_terminal(
+            PW_STREAM_STATE_UNCONNECTED,
+            PW_STREAM_STATE_UNCONNECTED
+        ) ||
+        !stream_state_is_terminal(
+            PW_STREAM_STATE_STREAMING,
+            PW_STREAM_STATE_UNCONNECTED
+        ) ||
+        !stream_state_is_terminal(
+            PW_STREAM_STATE_CONNECTING,
+            PW_STREAM_STATE_ERROR
+        )
+    ) {
+        fprintf(stderr, "PipeWire terminal state self-test failed\n");
+        return 1;
+    }
+    if (
+        !should_log_cursor_event(1u) ||
+        !should_log_cursor_event(5u) ||
+        should_log_cursor_event(6u) ||
+        !should_log_cursor_event(300u) ||
+        should_log_cursor_event(301u)
+    ) {
+        fprintf(stderr, "PipeWire cursor log throttle self-test failed\n");
+        return 1;
+    }
     printf("PipeWire cursor metadata self-test passed\n");
     return 0;
 }
@@ -820,6 +941,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "unable to connect Portal PipeWire remote: %m\n");
         goto cleanup;
     }
+    pw_core_add_listener(
+        application.core,
+        &application.core_listener,
+        &core_events,
+        &application
+    );
     pw_loop_add_signal(
         pw_main_loop_get_loop(application.loop),
         SIGINT,

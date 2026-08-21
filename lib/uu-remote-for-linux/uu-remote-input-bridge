@@ -90,7 +90,7 @@ PORTAL_CURSOR_METADATA = 4
 PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
 CAPTURE_START_TIMEOUT_SECONDS = 10
-CAPTURE_STREAM_STALE_SECONDS = 2.0
+CAPTURE_MAX_STREAMS = 16
 FRAME_MAGIC = 0x46575555  # "UUWF" in little-endian byte order
 FRAME_VERSION = 2
 # The final two signed fields are the Win32 virtual-desktop origin.  Keeping
@@ -98,6 +98,10 @@ FRAME_VERSION = 2
 # protocol used by the injected capture hook.
 FRAME_HEADER = struct.Struct("<10I2i16x")
 FRAME_BUFFERS = 2
+FRAME_MAX_DIMENSION = 16384
+FRAME_MAX_PIXELS = 32 * 1024 * 1024
+SIGNED_INT32_MIN = -(2**31)
+SIGNED_INT32_MAX = 2**31 - 1
 CURSOR_MAGIC = 0x49435555  # "UUCI" in little-endian byte order
 CURSOR_VERSION = 1
 CURSOR_HEADER = struct.Struct("<9I28x")
@@ -148,6 +152,18 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         os.chmod(path, 0o600)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def read_last_log_line(path: Path, limit: int = 8192) -> str:
+    if limit <= 0:
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(size - limit, 0), os.SEEK_SET)
+        tail = handle.read(limit)
+    lines = tail.decode("utf-8", errors="replace").splitlines()
+    return lines[-1] if lines else ""
 
 
 class XFixesCursorImage(ctypes.Structure):
@@ -713,6 +729,10 @@ class PortalRequestError(RuntimeError):
     """A denied, cancelled, or failed desktop-portal request."""
 
 
+class WaylandCaptureStartupError(RuntimeError):
+    """Portal authorization succeeded, but its capture transport did not."""
+
+
 class WaylandPortalBackend:
     """Wayland keyboard and pointer injection through XDG RemoteDesktop."""
 
@@ -753,11 +773,13 @@ class WaylandPortalBackend:
         self.capture_frames = 0
         self.capture_output_hash = 0
         self.capture_output_hash_changes = 0
+        self.capture_callback_error = ""
         self.capture_stream_stats: list[dict[str, int]] = []
         self.capture_lock = threading.Lock()
         self.capture_map = None
         self.capture_frame_size = 0
         self.capture_backing_path = None
+        self.cleanup_errors: list[str] = []
         self.fake_trace = os.environ.get(
             "UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", ""
         )
@@ -782,7 +804,7 @@ class WaylandPortalBackend:
             )
             if self.fake_video:
                 self._load_gio()
-                self._start_capture_bridge()
+                self._start_capture_or_raise()
             else:
                 self.capture_state = "active"
                 self.capture_frames = 120
@@ -795,11 +817,22 @@ class WaylandPortalBackend:
         )
         self._configure_x11_keymap()
         self._authorize()
+        self._start_capture_or_raise()
+
+    def _start_capture_or_raise(self) -> None:
         try:
             self._start_capture_bridge()
-        except Exception:
+        except Exception as error:
             self.close()
-            raise
+            cleanup_detail = (
+                "；清理警告：" + "; ".join(self.cleanup_errors)
+                if self.cleanup_errors
+                else ""
+            )
+            raise WaylandCaptureStartupError(
+                "Wayland Portal 已授权，但画面捕获启动失败："
+                f"{error}{cleanup_detail}"
+            ) from error
 
     def _fake_stream_descriptors(self) -> list[dict[str, Any]]:
         configured = os.environ.get(
@@ -826,8 +859,8 @@ class WaylandPortalBackend:
             descriptors.append(
                 {
                     "node": int(node_text),
-                    "width": max(int(width_text), 1),
-                    "height": max(int(height_text), 1),
+                    "width": int(width_text),
+                    "height": int(height_text),
                     "position": (int(x_text), int(y_text)),
                     "primary": index == 0,
                 }
@@ -845,14 +878,66 @@ class WaylandPortalBackend:
         """Align Portal streams with Wine's primary-relative screen space."""
         if not streams:
             raise PortalRequestError("桌面门户未返回屏幕坐标流")
+        if len(streams) > CAPTURE_MAX_STREAMS:
+            raise PortalRequestError(
+                "桌面门户返回的屏幕流过多："
+                f"{len(streams)}（上限 {CAPTURE_MAX_STREAMS}）"
+            )
+        normalized: list[dict[str, Any]] = []
+        nodes: set[int] = set()
+        for stream in streams:
+            try:
+                node = int(stream["node"])
+                width = int(stream["width"])
+                height = int(stream["height"])
+                position = stream.get("position", (0, 0))
+                if not isinstance(position, (tuple, list)) or len(position) != 2:
+                    raise ValueError
+                position_x = int(position[0])
+                position_y = int(position[1])
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                raise PortalRequestError(
+                    "桌面门户返回了无效的屏幕流描述"
+                ) from error
+            if node <= 0 or node > 0xFFFFFFFF or node in nodes:
+                raise PortalRequestError(
+                    f"桌面门户返回了无效或重复的 PipeWire 节点：{node}"
+                )
+            if (
+                not 1 <= width <= FRAME_MAX_DIMENSION
+                or not 1 <= height <= FRAME_MAX_DIMENSION
+                or width * height > FRAME_MAX_PIXELS
+            ):
+                raise PortalRequestError(
+                    "桌面门户返回了超出安全范围的屏幕尺寸："
+                    f"{width}x{height}"
+                )
+            if not (
+                SIGNED_INT32_MIN <= position_x <= SIGNED_INT32_MAX
+                and SIGNED_INT32_MIN <= position_y <= SIGNED_INT32_MAX
+            ):
+                raise PortalRequestError(
+                    "桌面门户返回了超出安全范围的屏幕坐标"
+                )
+            nodes.add(node)
+            record = dict(stream)
+            record.update(
+                {
+                    "node": node,
+                    "width": width,
+                    "height": height,
+                    "position": (position_x, position_y),
+                }
+            )
+            normalized.append(record)
+
         descriptors = x11_monitor_descriptors() if use_x11 else []
         unused = list(descriptors)
         matched: list[dict[str, Any]] = []
-        for stream in streams:
-            width = max(int(stream.get("width", 1)), 1)
-            height = max(int(stream.get("height", 1)), 1)
-            position = stream.get("position", (0, 0))
-            position = (int(position[0]), int(position[1]))
+        for stream in normalized:
+            width = int(stream["width"])
+            height = int(stream["height"])
+            position = stream["position"]
             candidates = [
                 descriptor
                 for descriptor in unused
@@ -895,10 +980,30 @@ class WaylandPortalBackend:
             stream["root_geometry"][1] + stream["root_geometry"][3]
             for stream in matched
         )
-        self.canvas_width = max(max_x - min_x, 1)
-        self.canvas_height = max(max_y - min_y, 1)
-        self.frame_origin_x = min_x - primary_x
-        self.frame_origin_y = min_y - primary_y
+        canvas_width = max_x - min_x
+        canvas_height = max_y - min_y
+        frame_origin_x = min_x - primary_x
+        frame_origin_y = min_y - primary_y
+        if (
+            not 1 <= canvas_width <= FRAME_MAX_DIMENSION
+            or not 1 <= canvas_height <= FRAME_MAX_DIMENSION
+            or canvas_width * canvas_height > FRAME_MAX_PIXELS
+        ):
+            raise PortalRequestError(
+                "桌面门户返回的多屏画布超出安全范围："
+                f"{canvas_width}x{canvas_height}"
+            )
+        if not (
+            SIGNED_INT32_MIN <= frame_origin_x <= SIGNED_INT32_MAX
+            and SIGNED_INT32_MIN <= frame_origin_y <= SIGNED_INT32_MAX
+        ):
+            raise PortalRequestError(
+                "桌面门户返回的多屏原点超出安全范围"
+            )
+        self.canvas_width = canvas_width
+        self.canvas_height = canvas_height
+        self.frame_origin_x = frame_origin_x
+        self.frame_origin_y = frame_origin_y
         for stream in matched:
             root_x, root_y, width, height = stream["root_geometry"]
             stream["x"] = root_x - min_x
@@ -1221,8 +1326,8 @@ class WaylandPortalBackend:
             stream_descriptors.append(
                 {
                     "node": int(node),
-                    "width": max(int(size[0]), 1),
-                    "height": max(int(size[1]), 1),
+                    "width": int(size[0]),
+                    "height": int(size[1]),
                     "position": (int(position[0]), int(position[1])),
                 }
             )
@@ -1361,7 +1466,7 @@ class WaylandPortalBackend:
                 value = ((value ^ data[offset]) * 16777619) & 0xFFFFFFFF
             return value
 
-        def write_stream(appsink, stream_index: int, stream) -> int:
+        def write_stream_frame(appsink, stream_index: int, stream) -> int:
             sample = appsink.emit("pull-sample")
             if sample is None or self.capture_map is None:
                 return self.Gst.FlowReturn.ERROR
@@ -1437,6 +1542,15 @@ class WaylandPortalBackend:
             finally:
                 buffer.unmap(info)
             return self.Gst.FlowReturn.OK
+
+        def write_stream(appsink, stream_index: int, stream) -> int:
+            try:
+                return write_stream_frame(appsink, stream_index, stream)
+            except Exception as error:
+                self.capture_callback_error = (
+                    f"node={stream['node']} {type(error).__name__}: {error}"
+                )
+                return self.Gst.FlowReturn.ERROR
 
         for index, stream in enumerate(self.streams):
             if self.fake_video:
@@ -1552,17 +1666,18 @@ class WaylandPortalBackend:
             return
         if self.capture_pipeline is None:
             raise RuntimeError("Wayland PipeWire 画面转发未启动")
+        if self.capture_callback_error:
+            raise RuntimeError(
+                "Wayland 共享帧回调失败：" + self.capture_callback_error
+            )
         if (
             self.cursor_helper_process is None or
             self.cursor_helper_process.poll() is not None
         ):
             detail = ""
             try:
-                detail = self.cursor_helper_log_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                ).splitlines()[-1]
-            except (OSError, IndexError):
+                detail = read_last_log_line(self.cursor_helper_log_path)
+            except OSError:
                 pass
             raise RuntimeError(
                 "Wayland PipeWire 动态光标桥已停止"
@@ -1584,21 +1699,6 @@ class WaylandPortalBackend:
             self.Gst.State.PLAYING,
         ):
             raise RuntimeError("Wayland PipeWire 画面转发已停止")
-        now_ns = time.monotonic_ns()
-        stale_ns = int(CAPTURE_STREAM_STALE_SECONDS * 1_000_000_000)
-        stalled = [
-            stats
-            for stats in self.capture_stream_stats
-            if int(stats.get("frames", 0)) > 0
-            and int(stats.get("last_ns", 0)) > 0
-            and now_ns - int(stats["last_ns"]) > stale_ns
-        ]
-        if stalled:
-            nodes = ",".join(str(stats["node"]) for stats in stalled)
-            raise RuntimeError(
-                "Wayland PipeWire 屏幕流停止交付新缓冲："
-                f"nodes={nodes}"
-            )
 
     def _configure_x11_keymap(self) -> None:
         self.x11 = ctypes.CDLL("libX11.so.6")
@@ -1635,42 +1735,78 @@ class WaylandPortalBackend:
         )
 
     def close(self) -> None:
+        errors: list[str] = []
+
+        def cleanup(label: str, action) -> None:
+            try:
+                action()
+            except Exception as error:
+                errors.append(f"{label}: {error}")
+
         if self.fake_trace:
-            self._fake_write("close")
+            cleanup("测试轨迹", lambda: self._fake_write("close"))
         self.capture_state = "stopped"
         if self.cursor_helper_process is not None:
             process = self.cursor_helper_process
             self.cursor_helper_process = None
             if process.poll() is None:
-                process.terminate()
+                cleanup("终止光标桥", process.terminate)
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+                    cleanup("强制终止光标桥", process.kill)
+                    cleanup(
+                        "等待光标桥退出",
+                        lambda: process.wait(timeout=2),
+                    )
+                except Exception as error:
+                    errors.append(f"等待光标桥退出: {error}")
         if self.capture_pipeline is not None:
-            self.capture_pipeline.set_state(self.Gst.State.NULL)
-            self.capture_pipeline.get_state(5 * self.Gst.SECOND)
+            pipeline = self.capture_pipeline
             self.capture_pipeline = None
-        for descriptor in self.capture_pipewire_fds:
-            os.close(descriptor)
+            cleanup(
+                "停止画面管线",
+                lambda: pipeline.set_state(self.Gst.State.NULL),
+            )
+            cleanup(
+                "等待画面管线停止",
+                lambda: pipeline.get_state(5 * self.Gst.SECOND),
+            )
+        descriptors = list(self.capture_pipewire_fds)
         self.capture_pipewire_fds.clear()
+        for descriptor in descriptors:
+            cleanup(
+                f"关闭 PipeWire FD {descriptor}",
+                lambda descriptor=descriptor: os.close(descriptor),
+            )
         if self.capture_map is not None:
-            self.capture_map.close()
+            capture_map = self.capture_map
             self.capture_map = None
-        self.frame_path.unlink(missing_ok=True)
+            try:
+                capture_map.close()
+            except Exception as error:
+                errors.append(f"关闭共享帧映射: {error}")
+                self.capture_map = capture_map
+        cleanup("移除共享帧入口", lambda: self.frame_path.unlink(missing_ok=True))
         if self.capture_backing_path is not None:
-            self.capture_backing_path.unlink(missing_ok=True)
+            backing_path = self.capture_backing_path
             self.capture_backing_path = None
+            cleanup(
+                "移除共享帧文件",
+                lambda: backing_path.unlink(missing_ok=True),
+            )
         if (
             not self.fake_trace
             and self.session_handle
             and self.connection is not None
         ):
-            try:
-                self.connection.call_sync(
+            session_handle = self.session_handle
+            self.session_handle = ""
+            cleanup(
+                "关闭 Portal 会话",
+                lambda: self.connection.call_sync(
                     PORTAL_BUS_NAME,
-                    self.session_handle,
+                    session_handle,
                     PORTAL_SESSION,
                     "Close",
                     None,
@@ -1678,12 +1814,16 @@ class WaylandPortalBackend:
                     self.Gio.DBusCallFlags.NONE,
                     2000,
                     None,
-                )
-            except Exception:
-                pass
+                ),
+            )
         if self.display and self.x11:
-            self.x11.XCloseDisplay(self.display)
+            display = self.display
             self.display = None
+            cleanup(
+                "关闭 XWayland 显示",
+                lambda: self.x11.XCloseDisplay(display),
+            )
+        self.cleanup_errors = errors
 
     def flush(self) -> None:
         return
@@ -2643,13 +2783,15 @@ def watch(
                 last_status = now
         return 0
     except Exception as error:
-        # A completed Wayland backend has already passed Portal authorization
-        # and delivered frames.  Runtime PipeWire failures must therefore
-        # exit non-zero so the launcher's Restart=on-failure unit can rebuild
-        # the Portal session and shared-frame inode.  Initial authorization
-        # failures (backend is still None) exit cleanly, preventing a denied
-        # share dialog from reopening in a loop.
-        restartable = selected_backend() != "wayland" or backend is not None
+        # Runtime failures and capture-start failures after authorization must
+        # exit non-zero so Restart=on-failure can rebuild the Portal session
+        # and shared-frame inode.  Initial authorization failures still exit
+        # cleanly, preventing a denied share dialog from reopening in a loop.
+        restartable = (
+            selected_backend() != "wayland"
+            or backend is not None
+            or isinstance(error, WaylandCaptureStartupError)
+        )
         logger.write(f"原生输入桥异常：{error}")
         publish_status("error", str(error))
         return 1 if restartable else 0
@@ -2663,6 +2805,12 @@ def watch(
             listener.close()
         if backend is not None:
             backend.close()
+            cleanup_errors = getattr(backend, "cleanup_errors", [])
+            if cleanup_errors:
+                logger.write(
+                    "Wayland 输入桥退出清理警告："
+                    + "; ".join(str(error) for error in cleanup_errors)
+                )
         remove_owned_endpoint(endpoint, token)
         cursor_path.unlink(missing_ok=True)
         cursor_snapshot = None

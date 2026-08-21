@@ -39,18 +39,22 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 43u
+#define HOOK_VERSION 48u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 2u
 #define UUWF_HEADER_SIZE 64u
 #define UUWF_BUFFER_COUNT 2u
-#define UUWF_STALE_TIMEOUT_MS 2000u
+#define UUWF_PATH_CHECK_INTERVAL_MS 1000u
+#define UUWF_MAX_DIMENSION 16384u
+#define UUWF_MAX_PIXELS (32u * 1024u * 1024u)
+#define UUWF_SNAPSHOT_ATTEMPTS 3u
 #define UUCI_MAGIC 0x49435555u
 #define UUCI_VERSION 1u
 #define UUCI_HEADER_SIZE 64u
 #define UUCI_MAX_DIMENSION 512u
 #define UUCI_CHECK_INTERVAL_MS 8u
 #define UUCI_CACHE_CAPACITY 64u
+#define UUCI_CACHE_HARD_LIMIT 128u
 #define UUCI_TRANSPARENT_SIZE 32u
 #define EXECUTABLE_PATCH_SIZE 12u
 #define EXECUTABLE_PATCH_MAX_THREADS 1024u
@@ -302,8 +306,12 @@ static HANDLE frame_file = INVALID_HANDLE_VALUE;
 static HANDLE frame_mapping;
 static unsigned char *frame_view;
 static SIZE_T frame_view_size;
+static unsigned char *frame_snapshot;
+static SIZE_T frame_snapshot_capacity;
+static volatile LONG frame_snapshot_retries;
+static volatile LONG frame_snapshot_failures;
 static uint32_t frame_last_sequence;
-static ULONGLONG frame_sequence_changed_at;
+static ULONGLONG frame_path_checked_at;
 static volatile LONG frame_hook_calls;
 static volatile LONG frame_hook_rendered;
 static volatile LONG frame_hook_fallbacks;
@@ -576,6 +584,7 @@ static struct native_cursor_cache_entry
 static struct native_cursor_cache_entry *native_cursor_cache_overflow;
 static volatile LONG native_cursor_cache_entries;
 static volatile LONG native_cursor_cache_overflows;
+static volatile LONG native_cursor_cache_drops;
 
 static BOOL CALLBACK initialize_winsock(
     PINIT_ONCE once,
@@ -1332,7 +1341,8 @@ cleanup:
 static HCURSOR cached_native_cursor(
     const struct native_cursor_header *header,
     const unsigned char *pixels,
-    uint64_t hash
+    uint64_t hash,
+    BOOL *capacity_exhausted
 ) {
     SIZE_T index;
     SIZE_T target = UUCI_CACHE_CAPACITY;
@@ -1340,6 +1350,7 @@ static HCURSOR cached_native_cursor(
     struct native_cursor_cache_entry *allocated = NULL;
     HCURSOR cursor;
 
+    *capacity_exhausted = FALSE;
     for (index = 0; index < UUCI_CACHE_CAPACITY; ++index) {
         entry = &native_cursor_cache[index];
         if (
@@ -1359,13 +1370,12 @@ static HCURSOR cached_native_cursor(
     }
     if (target == UUCI_CACHE_CAPACITY) {
         /*
-         * GetCursorInfo returns a borrowed handle with no release callback.
-         * GameViewerServer also survives controller reconnects.  Reusing the
-         * last cached handle once this fixed table fills makes every later
-         * Wayland shape look identical to the new controller session.  Keep
-         * overflow entries for the process lifetime instead: Windows owns
-         * the handles until process exit, while repeated shapes still reuse
-         * their existing entry.
+         * GetCursorInfo returns a borrowed handle with no release callback,
+         * so destroying an entry that GameViewerServer may still retain is
+         * unsafe.  Keep a bounded process-lifetime overflow list: this still
+         * survives normal reconnect churn without reusing invalid handles,
+         * while malformed or animated metadata cannot exhaust GDI objects
+         * and heap memory indefinitely.
          */
         for (
             entry = native_cursor_cache_overflow;
@@ -1382,6 +1392,15 @@ static HCURSOR cached_native_cursor(
             ) {
                 return entry->cursor;
             }
+        }
+        if (
+            InterlockedCompareExchange(
+                &native_cursor_cache_entries, 0, 0
+            ) >= (LONG)UUCI_CACHE_HARD_LIMIT
+        ) {
+            InterlockedIncrement(&native_cursor_cache_drops);
+            *capacity_exhausted = TRUE;
+            return NULL;
         }
         allocated = HeapAlloc(
             GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*allocated)
@@ -1422,6 +1441,9 @@ static HCURSOR refresh_native_cursor(void) {
     HCURSOR cursor = NULL;
     uint64_t hash;
     ULONGLONG now = GetTickCount64();
+    BOOL capacity_exhausted = FALSE;
+    BOOL had_active;
+    BOOL status_changed = FALSE;
     BOOL updated = FALSE;
 
     AcquireSRWLockExclusive(&native_cursor_lock);
@@ -1440,8 +1462,15 @@ static HCURSOR refresh_native_cursor(void) {
         return NULL;
     }
     hash = hash_native_cursor(&header, pixels);
-    cursor = cached_native_cursor(&header, pixels, hash);
+    had_active = InterlockedCompareExchange(&native_cursor_active, 0, 0) != 0;
+    cursor = cached_native_cursor(
+        &header, pixels, hash, &capacity_exhausted
+    );
     if (!cursor) {
+        if (capacity_exhausted && had_active && native_cursor_handle) {
+            cursor = native_cursor_handle;
+            status_changed = TRUE;
+        }
         goto cleanup;
     }
     updated = !InterlockedCompareExchange(&native_cursor_active, 0, 0) ||
@@ -1467,7 +1496,7 @@ cleanup:
         InterlockedExchange(&native_cursor_active, 0);
     }
     ReleaseSRWLockExclusive(&native_cursor_lock);
-    if (updated) {
+    if (updated || status_changed) {
         write_frame_hook_status();
     }
     return cursor;
@@ -1670,7 +1699,7 @@ static void close_frame_mapping(void) {
     }
     frame_view_size = 0;
     frame_last_sequence = 0;
-    frame_sequence_changed_at = 0;
+    frame_path_checked_at = 0;
 }
 
 static BOOL frame_header_valid(
@@ -1686,9 +1715,10 @@ static BOOL frame_header_valid(
         header->header_size != UUWF_HEADER_SIZE ||
         header->width == 0 ||
         header->height == 0 ||
-        header->width > 16384 ||
-        header->height > 16384 ||
-        header->stride < header->width * 4u ||
+        header->width > UUWF_MAX_DIMENSION ||
+        header->height > UUWF_MAX_DIMENSION ||
+        (ULONGLONG)header->width * header->height > UUWF_MAX_PIXELS ||
+        header->stride != header->width * 4u ||
         header->buffer_count != UUWF_BUFFER_COUNT
     ) {
         return FALSE;
@@ -1723,7 +1753,9 @@ static BOOL open_frame_mapping(void) {
     if (
         !GetFileSizeEx(file, &size) ||
         size.QuadPart < (LONGLONG)UUWF_HEADER_SIZE ||
-        size.QuadPart > (LONGLONG)(2u * 16384u * 16384u * 4u + 4096u)
+        size.QuadPart >
+            (LONGLONG)UUWF_HEADER_SIZE +
+                (LONGLONG)UUWF_BUFFER_COUNT * UUWF_MAX_PIXELS * 4
     ) {
         CloseHandle(file);
         return FALSE;
@@ -1757,8 +1789,40 @@ static BOOL open_frame_mapping(void) {
     frame_view = view;
     frame_view_size = (SIZE_T)size.QuadPart;
     frame_last_sequence = 0;
-    frame_sequence_changed_at = GetTickCount64();
+    frame_path_checked_at = GetTickCount64();
     return TRUE;
+}
+
+static BOOL frame_mapping_matches_path(void) {
+    BY_HANDLE_FILE_INFORMATION mapped_info;
+    BY_HANDLE_FILE_INFORMATION current_info;
+    HANDLE current;
+    BOOL matches;
+
+    if (frame_file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    current = CreateFileW(
+        frame_path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (current == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    ZeroMemory(&mapped_info, sizeof(mapped_info));
+    ZeroMemory(&current_info, sizeof(current_info));
+    matches = GetFileInformationByHandle(frame_file, &mapped_info) &&
+        GetFileInformationByHandle(current, &current_info) &&
+        mapped_info.dwVolumeSerialNumber == current_info.dwVolumeSerialNumber &&
+        mapped_info.nFileIndexHigh == current_info.nFileIndexHigh &&
+        mapped_info.nFileIndexLow == current_info.nFileIndexLow;
+    CloseHandle(current);
+    return matches;
 }
 
 static void write_frame_hook_status(void) {
@@ -1865,6 +1929,14 @@ static void write_frame_hook_status(void) {
     );
     WritePrivateProfileStringA(
         "cursor", "cache_overflows", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&native_cursor_cache_drops, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "cache_drops", value, frame_status_path
     );
     WritePrivateProfileStringA(
         "cursor",
@@ -2341,21 +2413,21 @@ static BOOL refresh_frame_mapping(void) {
         close_frame_mapping();
         return FALSE;
     }
+    if (
+        now - frame_path_checked_at >= UUWF_PATH_CHECK_INTERVAL_MS
+    ) {
+        frame_path_checked_at = now;
+        if (!frame_mapping_matches_path()) {
+            close_frame_mapping();
+            return FALSE;
+        }
+    }
     MemoryBarrier();
     sequence = header->sequence;
     if (sequence && sequence != frame_last_sequence) {
         frame_last_sequence = sequence;
-        frame_sequence_changed_at = now;
-        return TRUE;
     }
-    if (
-        sequence &&
-        now - frame_sequence_changed_at <= UUWF_STALE_TIMEOUT_MS
-    ) {
-        return TRUE;
-    }
-    close_frame_mapping();
-    return FALSE;
+    return sequence != 0;
 }
 
 static DWORD sample_destination_bitmap(const BITMAP *bitmap) {
@@ -2428,7 +2500,30 @@ static BOOL CALLBACK match_frame_source_monitor(
  * frames are a single virtual-desktop canvas, so translate the former into the
  * latter when the source DC uniquely identifies one physical monitor.
  */
-static void normalize_frame_source_coordinates(
+static BOOL offset_frame_source_coordinates(
+    int source_x,
+    int source_y,
+    LONG offset_x,
+    LONG offset_y,
+    int *translated_x,
+    int *translated_y
+) {
+    LONGLONG wide_x = (LONGLONG)source_x + offset_x;
+    LONGLONG wide_y = (LONGLONG)source_y + offset_y;
+
+    if (
+        !translated_x || !translated_y ||
+        wide_x < INT_MIN || wide_x > INT_MAX ||
+        wide_y < INT_MIN || wide_y > INT_MAX
+    ) {
+        return FALSE;
+    }
+    *translated_x = (int)wide_x;
+    *translated_y = (int)wide_y;
+    return TRUE;
+}
+
+static BOOL normalize_frame_source_coordinates(
     HDC source,
     int *source_x,
     int *source_y
@@ -2437,21 +2532,132 @@ static void normalize_frame_source_coordinates(
     LONG dc_width;
     LONG dc_height;
     if (!source || !source_x || !source_y || *source_x < 0 || *source_y < 0) {
-        return;
+        return TRUE;
     }
     dc_width = GetDeviceCaps(source, HORZRES);
     dc_height = GetDeviceCaps(source, VERTRES);
     if (dc_width <= 0 || dc_height <= 0) {
-        return;
+        return TRUE;
     }
     ZeroMemory(&match, sizeof(match));
     match.width = dc_width;
     match.height = dc_height;
     EnumDisplayMonitors(NULL, NULL, match_frame_source_monitor, (LPARAM)&match);
     if (match.count == 1u) {
-        *source_x += match.rectangle.left;
-        *source_y += match.rectangle.top;
+        return offset_frame_source_coordinates(
+            *source_x,
+            *source_y,
+            match.rectangle.left,
+            match.rectangle.top,
+            source_x,
+            source_y
+        );
     }
+    return TRUE;
+}
+
+static BOOL clamp_frame_source_rectangle(
+    uint32_t frame_width,
+    uint32_t frame_height,
+    int source_x,
+    int source_y,
+    int *source_width,
+    int *source_height
+) {
+    int available_width;
+    int available_height;
+
+    if (
+        !source_width || !source_height ||
+        frame_width == 0 || frame_width > INT_MAX ||
+        frame_height == 0 || frame_height > INT_MAX ||
+        source_x < 0 || source_y < 0 ||
+        source_x >= (int)frame_width || source_y >= (int)frame_height ||
+        *source_width <= 0 || *source_height <= 0
+    ) {
+        return FALSE;
+    }
+    available_width = (int)frame_width - source_x;
+    available_height = (int)frame_height - source_y;
+    if (*source_width > available_width) {
+        *source_width = available_width;
+    }
+    if (*source_height > available_height) {
+        *source_height = available_height;
+    }
+    return *source_width > 0 && *source_height > 0;
+}
+
+static BOOL ensure_frame_snapshot(SIZE_T required) {
+    unsigned char *snapshot;
+
+    if (frame_snapshot && frame_snapshot_capacity >= required) {
+        return TRUE;
+    }
+    snapshot = VirtualAlloc(
+        NULL,
+        required,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+    if (!snapshot) {
+        return FALSE;
+    }
+    if (frame_snapshot) {
+        VirtualFree(frame_snapshot, 0, MEM_RELEASE);
+    }
+    frame_snapshot = snapshot;
+    frame_snapshot_capacity = required;
+    return TRUE;
+}
+
+static BOOL snapshot_wayland_frame(
+    const struct wayland_frame_header *header,
+    const unsigned char *view,
+    const unsigned char **pixels_out
+) {
+    const unsigned char *source;
+    uint32_t attempt;
+    uint32_t sequence_before;
+    uint32_t sequence_after;
+    uint32_t active_before;
+    uint32_t active_after;
+
+    if (
+        !header || !view || !pixels_out || header->sequence == 0 ||
+        !ensure_frame_snapshot((SIZE_T)header->frame_size)
+    ) {
+        InterlockedIncrement(&frame_snapshot_failures);
+        return FALSE;
+    }
+    for (attempt = 0; attempt < UUWF_SNAPSHOT_ATTEMPTS; ++attempt) {
+        sequence_before = header->sequence;
+        MemoryBarrier();
+        active_before = header->active_buffer;
+        if (
+            sequence_before == 0 ||
+            active_before >= header->buffer_count
+        ) {
+            InterlockedIncrement(&frame_snapshot_failures);
+            return FALSE;
+        }
+        source = view + header->header_size +
+            (SIZE_T)active_before * header->frame_size;
+        CopyMemory(frame_snapshot, source, header->frame_size);
+        MemoryBarrier();
+        active_after = header->active_buffer;
+        sequence_after = header->sequence;
+        if (
+            sequence_before == sequence_after &&
+            active_before == active_after
+        ) {
+            *pixels_out = frame_snapshot;
+            return TRUE;
+        }
+        InterlockedIncrement(&frame_snapshot_retries);
+    }
+    InterlockedIncrement(&frame_snapshot_failures);
+    return FALSE;
 }
 
 static BOOL render_wayland_frame(
@@ -2470,7 +2676,6 @@ static BOOL render_wayland_frame(
     const struct wayland_frame_header *header;
     const unsigned char *pixels;
     BITMAPINFO bitmap;
-    uint32_t active;
     int result;
     LONG calls;
     POINT source_point;
@@ -2557,12 +2762,14 @@ static BOOL render_wayland_frame(
     }
     header = (const struct wayland_frame_header *)frame_view;
     MemoryBarrier();
-    active = header->active_buffer;
-    normalize_frame_source_coordinates(source, &source_x, &source_y);
+    if (!normalize_frame_source_coordinates(source, &source_x, &source_y)) {
+        ReleaseSRWLockExclusive(&frame_lock);
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
+    }
     translated_source_x = (int64_t)source_x - (int64_t)header->origin_x;
     translated_source_y = (int64_t)source_y - (int64_t)header->origin_y;
     if (
-        active >= header->buffer_count ||
         translated_source_x < 0 ||
         translated_source_y < 0 ||
         translated_source_x >= (int64_t)header->width ||
@@ -2574,11 +2781,17 @@ static BOOL render_wayland_frame(
     }
     source_x = (int)translated_source_x;
     source_y = (int)translated_source_y;
-    if (source_x + source_width > (int)header->width) {
-        source_width = (int)header->width - source_x;
-    }
-    if (source_y + source_height > (int)header->height) {
-        source_height = (int)header->height - source_y;
+    if (!clamp_frame_source_rectangle(
+            header->width,
+            header->height,
+            source_x,
+            source_y,
+            &source_width,
+            &source_height
+        )) {
+        ReleaseSRWLockExclusive(&frame_lock);
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
     }
     /*
      * StretchDIBits addresses the source rectangle from the DIB's lower edge,
@@ -2590,8 +2803,11 @@ static BOOL render_wayland_frame(
      */
     dib_source_y = (int)header->height - source_y - source_height;
     InterlockedExchange(&frame_dib_source_y, dib_source_y);
-    pixels = frame_view + header->header_size +
-        (SIZE_T)active * header->frame_size;
+    if (!snapshot_wayland_frame(header, frame_view, &pixels)) {
+        ReleaseSRWLockExclusive(&frame_lock);
+        InterlockedIncrement(&frame_hook_fallbacks);
+        return FALSE;
+    }
     ZeroMemory(&bitmap, sizeof(bitmap));
     bitmap.bmiHeader.biSize = sizeof(bitmap.bmiHeader);
     bitmap.bmiHeader.biWidth = (LONG)header->width;
@@ -8451,6 +8667,103 @@ __declspec(dllexport) DWORD WINAPI UURemoteFocusHookStatus(void) {
     return controller_focus_hook_status();
 }
 
+__declspec(dllexport) DWORD WINAPI UURemoteFrameBoundsSelfTest(void) {
+    int width = INT_MAX;
+    int height = INT_MAX;
+    int translated_x;
+    int translated_y;
+
+    if (
+        !clamp_frame_source_rectangle(
+            128u, 72u, 127, 71, &width, &height
+        ) ||
+        width != 1 || height != 1
+    ) {
+        return 0u;
+    }
+    width = INT_MAX;
+    height = INT_MAX;
+    if (
+        !clamp_frame_source_rectangle(
+            128u, 72u, 0, 0, &width, &height
+        ) ||
+        width != 128 || height != 72
+    ) {
+        return 0u;
+    }
+    width = 1;
+    height = 1;
+    if (
+        clamp_frame_source_rectangle(
+            128u, 72u, -1, 0, &width, &height
+        ) ||
+        clamp_frame_source_rectangle(
+            128u, 72u, 128, 0, &width, &height
+        )
+    ) {
+        return 0u;
+    }
+    if (
+        !offset_frame_source_coordinates(
+            64, 32, -128, 16, &translated_x, &translated_y
+        ) ||
+        translated_x != -64 || translated_y != 48 ||
+        offset_frame_source_coordinates(
+            INT_MAX, 0, 1, 0, &translated_x, &translated_y
+        ) ||
+        offset_frame_source_coordinates(
+            0, INT_MIN, 0, -1, &translated_x, &translated_y
+        )
+    ) {
+        return 0u;
+    }
+    return 1u;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteFrameSnapshotSelfTest(void) {
+    unsigned char storage[UUWF_HEADER_SIZE + UUWF_BUFFER_COUNT * 16u];
+    struct wayland_frame_header *header =
+        (struct wayland_frame_header *)storage;
+    const unsigned char *pixels = NULL;
+    SIZE_T index;
+
+    ZeroMemory(storage, sizeof(storage));
+    header->magic = UUWF_MAGIC;
+    header->version = UUWF_VERSION;
+    header->header_size = UUWF_HEADER_SIZE;
+    header->width = 2u;
+    header->height = 2u;
+    header->stride = 8u;
+    header->frame_size = 16u;
+    header->buffer_count = UUWF_BUFFER_COUNT;
+    header->active_buffer = 1u;
+    header->sequence = 7u;
+    memset(storage + UUWF_HEADER_SIZE, 0x11, 16u);
+    memset(storage + UUWF_HEADER_SIZE + 16u, 0x22, 16u);
+    if (!snapshot_wayland_frame(header, storage, &pixels) || !pixels) {
+        return 0u;
+    }
+    for (index = 0; index < 16u; ++index) {
+        if (pixels[index] != 0x22) {
+            return 0u;
+        }
+    }
+    return 1u;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteFrameMappingIdentitySelfTest(void) {
+    BOOL ready;
+
+    AcquireSRWLockExclusive(&frame_lock);
+    ready = refresh_frame_mapping();
+    if (ready) {
+        Sleep(UUWF_PATH_CHECK_INTERVAL_MS + 100u);
+        ready = refresh_frame_mapping();
+    }
+    ReleaseSRWLockExclusive(&frame_lock);
+    return ready ? 1u : 0u;
+}
+
 __declspec(dllexport) DWORD WINAPI UURemoteEventLoopGuardSelfTest(void) {
     struct event_loop_thread_state state;
     unsigned int index;
@@ -8851,6 +9164,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         executable_patch_exception_handler_handle = NULL;
         if (handler) {
             RemoveVectoredExceptionHandler(handler);
+        }
+        if (frame_snapshot) {
+            VirtualFree(frame_snapshot, 0, MEM_RELEASE);
+            frame_snapshot = NULL;
+            frame_snapshot_capacity = 0;
         }
         return TRUE;
     }

@@ -34,6 +34,196 @@ export UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE="$trace"
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO=1
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
 
+/usr/bin/python3 - "$bridge" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+import tempfile
+
+path = sys.argv[1]
+loader = importlib.machinery.SourceFileLoader("uu_remote_input_bridge", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+def configure(streams):
+    backend = module.WaylandPortalBackend.__new__(
+        module.WaylandPortalBackend
+    )
+    backend._configure_stream_layout(streams, use_x11=False)
+    return backend
+
+def rejected(streams):
+    try:
+        configure(streams)
+    except module.PortalRequestError:
+        return
+    raise AssertionError(f"unsafe Portal layout accepted: {streams!r}")
+
+valid = configure([
+    {"node": 1, "width": 3840, "height": 2160, "position": (0, 0)},
+    {"node": 2, "width": 3840, "height": 2160, "position": (3840, 0)},
+    {"node": 3, "width": 3840, "height": 2160, "position": (0, 2160)},
+    {"node": 4, "width": 3840, "height": 2160, "position": (3840, 2160)},
+])
+assert (valid.canvas_width, valid.canvas_height) == (7680, 4320)
+with tempfile.TemporaryDirectory() as directory:
+    log_path = module.Path(directory) / "large.log"
+    log_path.write_bytes(b"x" * (1024 * 1024) + b"\nfinal-error\n")
+    assert module.read_last_log_line(log_path) == "final-error"
+rejected([
+    {"node": index + 1, "width": 1, "height": 1, "position": (index, 0)}
+    for index in range(17)
+])
+rejected([
+    {"node": 1, "width": 16385, "height": 1, "position": (0, 0)}
+])
+rejected([
+    {"node": 1, "width": 8192, "height": 4097, "position": (0, 0)}
+])
+rejected([
+    {"node": 1, "width": 1, "height": 1, "position": (-(2**31), 0)},
+    {"node": 2, "width": 1, "height": 1, "position": (2**31 - 1, 0)},
+])
+rejected([
+    {"node": 7, "width": 1, "height": 1, "position": (0, 0)},
+    {"node": 7, "width": 1, "height": 1, "position": (1, 0)},
+])
+
+original_load = module.WaylandPortalBackend._load_gio
+original_start = module.WaylandPortalBackend._start_capture_bridge
+original_trace = module.os.environ.get("UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE")
+original_video = module.os.environ.get(
+    "UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO"
+)
+try:
+    with tempfile.TemporaryDirectory() as directory:
+        root = module.Path(directory)
+        module.os.environ["UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE"] = str(
+            root / "trace"
+        )
+        module.os.environ["UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO"] = "1"
+        module.WaylandPortalBackend._load_gio = lambda self: None
+        module.WaylandPortalBackend._start_capture_bridge = (
+            lambda self: (_ for _ in ()).throw(
+                RuntimeError("fixture failure")
+            )
+        )
+        try:
+            module.WaylandPortalBackend(root, root / "frame")
+        except module.WaylandCaptureStartupError as error:
+            assert "fixture failure" in str(error)
+        else:
+            raise AssertionError("capture startup failure was not classified")
+finally:
+    module.WaylandPortalBackend._load_gio = original_load
+    module.WaylandPortalBackend._start_capture_bridge = original_start
+    if original_trace is None:
+        module.os.environ.pop("UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", None)
+    else:
+        module.os.environ["UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE"] = original_trace
+    if original_video is None:
+        module.os.environ.pop("UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO", None)
+    else:
+        module.os.environ["UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO"] = original_video
+
+events = []
+
+class FailingProcess:
+    def poll(self):
+        events.append("process-poll")
+        return None
+
+    def terminate(self):
+        events.append("process-terminate")
+        raise RuntimeError("terminate failed")
+
+    def wait(self, timeout):
+        events.append(f"process-wait-{timeout}")
+        return 0
+
+class FailingPipeline:
+    def set_state(self, state):
+        events.append("pipeline-stop")
+        raise RuntimeError("pipeline stop failed")
+
+    def get_state(self, timeout):
+        events.append("pipeline-wait")
+
+class FailingMap:
+    def close(self):
+        events.append("map-close")
+        raise BufferError("exported view")
+
+class FixturePath:
+    def __init__(self, label, fail=False):
+        self.label = label
+        self.fail = fail
+
+    def unlink(self, missing_ok=False):
+        events.append(self.label)
+        if self.fail:
+            raise OSError(f"{self.label} failed")
+
+class FailingConnection:
+    def call_sync(self, *args):
+        events.append("portal-close")
+        raise RuntimeError("portal close failed")
+
+class FailingX11:
+    def XCloseDisplay(self, display):
+        events.append("x11-close")
+        raise RuntimeError("x11 close failed")
+
+backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
+backend.fake_trace = ""
+backend.capture_state = "active"
+backend.cursor_helper_process = FailingProcess()
+backend.capture_pipeline = FailingPipeline()
+backend.Gst = type(
+    "Gst", (), {"State": type("State", (), {"NULL": 0}), "SECOND": 1}
+)
+backend.capture_pipewire_fds = []
+backend.capture_map = FailingMap()
+backend.frame_path = FixturePath("frame-unlink", fail=True)
+backend.capture_backing_path = FixturePath("backing-unlink")
+backend.session_handle = "/fixture/session"
+backend.connection = FailingConnection()
+backend.Gio = type(
+    "Gio",
+    (),
+    {"DBusCallFlags": type("Flags", (), {"NONE": 0})},
+)
+backend.display = object()
+backend.x11 = FailingX11()
+backend.cleanup_errors = []
+backend.close()
+assert {
+    "process-terminate",
+    "process-wait-2",
+    "pipeline-stop",
+    "pipeline-wait",
+    "map-close",
+    "frame-unlink",
+    "backing-unlink",
+    "portal-close",
+    "x11-close",
+}.issubset(events)
+assert len(backend.cleanup_errors) == 6, backend.cleanup_errors
+assert backend.capture_map is not None
+
+backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
+backend.fake_trace = ""
+backend.capture_pipeline = object()
+backend.capture_callback_error = "node=7 fixture callback failure"
+try:
+    backend.ensure_healthy()
+except RuntimeError as error:
+    assert "fixture callback failure" in str(error)
+else:
+    raise AssertionError("capture callback failure was not detected")
+PY
+
 [[ $("$bridge" check) == wayland-portal ]]
 "$bridge" watch \
     "$state_dir" "$endpoint" "$log" "$lock" 0.2 &

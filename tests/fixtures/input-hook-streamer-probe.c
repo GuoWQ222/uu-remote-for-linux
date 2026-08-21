@@ -199,25 +199,40 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursorCacheLifetime(void) {
     CURSORINFO cursor;
     ICONINFO icon;
     DWORD index;
+    DWORD distinct = 0u;
+    BOOL saturated = FALSE;
 
-    for (index = 0u; index < 66u; ++index) {
+    for (index = 0u; index < 160u; ++index) {
         if (write_lifetime_cursor(100u + index)) {
             return 30;
         }
-        Sleep(12);
+        Sleep(20);
         ZeroMemory(&cursor, sizeof(cursor));
         cursor.cbSize = sizeof(cursor);
         if (!GetCursorInfo(&cursor) || !cursor.hCursor) {
             return 31;
         }
         if (previous && cursor.hCursor == previous) {
-            /* Every fixture image is unique, including entries 65 and 66. */
-            return 33;
+            saturated = TRUE;
+        } else {
+            if (saturated) {
+                return 33;
+            }
+            ++distinct;
         }
         if (index == 0u) {
             retained = cursor.hCursor;
         }
         previous = cursor.hCursor;
+    }
+    if (!saturated) {
+        return 34;
+    }
+    if (distinct < 64u) {
+        return 35;
+    }
+    if (distinct > 128u) {
+        return 36;
     }
     ZeroMemory(&icon, sizeof(icon));
     if (!retained || !GetIconInfo(retained, &icon)) {
