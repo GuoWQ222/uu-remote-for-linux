@@ -12,8 +12,12 @@ typedef int(WINAPI *probe_streamer_cursor_fn)(
 );
 typedef int(WINAPI *probe_streamer_frame_fn)(void);
 typedef int(WINAPI *probe_streamer_cursor_cache_lifetime_fn)(void);
+typedef int(WINAPI *probe_streamer_embedded_cursor_fn)(void);
 typedef DWORD(WINAPI *wol_hook_status_fn)(void);
 typedef DWORD(WINAPI *frame_hook_status_fn)(void);
+typedef DWORD(WINAPI *dxgi_cursor_self_test_fn)(
+    DWORD, DWORD, DWORD, DWORD
+);
 typedef HANDLE EVT_HANDLE;
 __declspec(dllimport) BOOL WINAPI EvtClose(EVT_HANDLE object);
 
@@ -289,7 +293,7 @@ static int probe_caps_lock_state(void) {
     return ((initial ^ restored) & 1) == 0 ? 0 : 10;
 }
 
-static int probe_frame_capture(BOOL stretch) {
+static int probe_frame_capture(BOOL stretch, int source_x) {
     const int width = 128;
     const int height = 72;
     BITMAPINFO info;
@@ -320,14 +324,16 @@ static int probe_frame_capture(BOOL stretch) {
     copied = stretch
         ? StretchBlt(
             memory, 0, 0, width, height,
-            screen, 0, 0, width, height, SRCCOPY
+            screen, source_x, 0, width, height, SRCCOPY
         )
         : BitBlt(
             memory, 0, 0, width, height,
-            screen, 0, 0, SRCCOPY | CAPTUREBLT
+            screen, source_x, 0, SRCCOPY | CAPTUREBLT
         );
     if (
         copied &&
+        (pixels[0] & 0x00ffffffu) != 0u &&
+        (pixels[width * height - 1] & 0x00ffffffu) != 0u &&
         (pixels[0] & 0x00ffffffu) !=
             (pixels[width * height - 1] & 0x00ffffffu)
     ) {
@@ -363,8 +369,10 @@ int WINAPI WinMain(
     probe_streamer_frame_fn probe_streamer_frame;
     probe_streamer_cursor_cache_lifetime_fn
         probe_streamer_cursor_cache_lifetime;
+    probe_streamer_embedded_cursor_fn probe_streamer_embedded_cursor;
     wol_hook_status_fn wol_hook_status;
     frame_hook_status_fn frame_hook_status;
+    dxgi_cursor_self_test_fn dxgi_cursor_self_test;
     HMODULE hook;
     int streamer_result;
     int wol_result;
@@ -390,7 +398,13 @@ int WINAPI WinMain(
     frame_hook_status = (frame_hook_status_fn)GetProcAddress(
         hook, "UURemoteFrameHookStatus"
     );
-    if (!wol_hook_status || wol_hook_status() != 15u) {
+    dxgi_cursor_self_test = (dxgi_cursor_self_test_fn)GetProcAddress(
+        hook, "UURemoteDXGICursorSelfTest"
+    );
+    if (
+        !wol_hook_status || wol_hook_status() != 15u ||
+        !dxgi_cursor_self_test
+    ) {
         return 8;
     }
     if (!frame_hook_status || (frame_hook_status() & 3u) != 3u) {
@@ -423,9 +437,14 @@ int WINAPI WinMain(
         (probe_streamer_cursor_cache_lifetime_fn)GetProcAddress(
             streamer, "ProbeStreamerCursorCacheLifetime"
         );
+    probe_streamer_embedded_cursor =
+        (probe_streamer_embedded_cursor_fn)GetProcAddress(
+            streamer, "ProbeStreamerEmbeddedCursor"
+        );
     if (
         !probe_streamer_cursor || !probe_streamer_frame ||
-        !probe_streamer_cursor_cache_lifetime
+        !probe_streamer_cursor_cache_lifetime ||
+        !probe_streamer_embedded_cursor
     ) {
         return 22;
     }
@@ -434,8 +453,9 @@ int WINAPI WinMain(
     Sleep(5000);
 
     if (
-        probe_frame_capture(FALSE) ||
-        probe_frame_capture(TRUE) ||
+        probe_frame_capture(FALSE, 0) ||
+        probe_frame_capture(TRUE, 0) ||
+        probe_frame_capture(FALSE, -64) ||
         probe_streamer_frame() ||
         (frame_hook_status() & 31u) != 31u
     ) {
@@ -497,6 +517,9 @@ int WINAPI WinMain(
     if (write_test_cursor(2, 6, 8, 3, 4)) {
         return 14;
     }
+    if (!dxgi_cursor_self_test(6, 8, 3, 4)) {
+        return 15;
+    }
     Sleep(30);
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     if (SendInput(1, &input, sizeof(input)) != 1) {
@@ -518,6 +541,10 @@ int WINAPI WinMain(
         return 4;
     }
     streamer_result = probe_streamer_cursor_cache_lifetime();
+    if (streamer_result != 0) {
+        return streamer_result;
+    }
+    streamer_result = probe_streamer_embedded_cursor();
     if (streamer_result != 0) {
         return streamer_result;
     }

@@ -31,6 +31,9 @@ check "keyboard bridge Python syntax" /usr/bin/python3 -c \
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "PipeWire cursor bridge self-test" \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
+    --self-test
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
@@ -42,6 +45,10 @@ check "NVENC encoder policy Python syntax" /usr/bin/python3 -c \
     "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
 check "NVENC encoder policy cache schema and watcher" \
     "$project_root/tests/encoder-policy.sh"
+check "NVENC encoder lifecycle concurrency" \
+    "$project_root/tests/nvenc-lifecycle.sh"
+check "NVENC D3D11 texture validation" \
+    "$project_root/tests/nvenc-texture-validation.sh"
 check "autostart bridge syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-autostart-bridge"
 check "sleep bridge syntax" bash -n \
@@ -64,6 +71,8 @@ check "systemctl fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/systemctl"
 check "systemd-run fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/systemd-run"
+check "install fixture syntax" bash -n \
+    "$project_root/tests/fixtures/bin/install"
 check "tray proxy fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/uu-remote-tray-proxy"
 check "zenity fixture syntax" bash -n \
@@ -88,6 +97,10 @@ check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \
     "$project_root/scripts/build-input-hook.sh"
+check "PipeWire cursor builder syntax" bash -n \
+    "$project_root/scripts/build-pipewire-cursor.sh"
+check "input injector concurrency policy" \
+    "$project_root/tests/input-injector-concurrency.sh"
 check "PowerShell bridge builder syntax" bash -n \
     "$project_root/scripts/build-powershell-bridge.sh"
 check "user installer syntax" bash -n "$project_root/scripts/install-user.sh"
@@ -191,6 +204,10 @@ check "NVDEC probe exists" test -x \
 check "NVDEC probe is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB.*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-nvdec-probe"
+# shellcheck disable=SC2016
+check "PipeWire cursor bridge is ELF" bash -c \
+    'file "$1" | grep -q "ELF 64-bit LSB.*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor"
 # The snippets intentionally defer "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "shim is PE DLL" bash -c \
@@ -302,6 +319,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/build-nvencode-bridge.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
+        "$project_root/scripts/build-pipewire-cursor.sh" \
         "$project_root/scripts/build-powershell-bridge.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
@@ -317,6 +335,9 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/keyboard-bridge.sh" \
         "$project_root/tests/input-bridge.sh" \
         "$project_root/tests/wayland-input-bridge.sh" \
+        "$project_root/tests/input-injector-concurrency.sh" \
+        "$project_root/tests/nvenc-lifecycle.sh" \
+        "$project_root/tests/nvenc-texture-validation.sh" \
         "$project_root/tests/wine-input-hook.sh" \
         "$project_root/tests/wine-focus-hook.sh" \
         "$project_root/tests/powershell-bridge.sh" \
@@ -334,7 +355,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/fixtures/bin/winecfg" \
         "$project_root/tests/fixtures/bin/wineserver" \
         "$project_root/tests/fixtures/bin/systemctl" \
-        "$project_root/tests/fixtures/bin/systemd-run"
+        "$project_root/tests/fixtures/bin/systemd-run" \
+        "$project_root/tests/fixtures/bin/install"
 else
     printf 'SKIP shellcheck（未安装）\n'
 fi

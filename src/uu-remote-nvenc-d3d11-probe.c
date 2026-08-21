@@ -317,10 +317,11 @@ int main(void)
         nv12_upload = 0;
         goto done;
     }
-    printf("NVENC_D3D11_OK\tadapter=%u\tdevice=%u\tluid=%ld\tapi=0x%08x"
+    printf("NVENC_D3D11_OK\tadapter=%u\tdevice=%u\tluid=%lu\tapi=0x%08x"
            "\th264=%d\thevc=%d\ttexture_upload=%d\tnv12_upload=%d\n",
            adapter_index, adapter_desc.DeviceId,
-           (long)adapter_desc.AdapterLuid.LowPart, max_version, h264, hevc,
+           (unsigned long)adapter_desc.AdapterLuid.LowPart,
+           max_version, h264, hevc,
            texture_upload, nv12_upload);
     result = h264 && hevc && texture_upload && nv12_upload ? 0 : 1;
 

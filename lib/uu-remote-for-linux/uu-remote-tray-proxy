@@ -28,6 +28,7 @@ import uuid
 APP_ID = "uu-remote-for-linux"
 TITLE = "网易 UU 远程"
 LEGACY_SCAN_INTERVAL_MS = 750
+WINDOW_LAYOUT_MANUAL = "manual"
 WINDOW_LAYOUT_SINGLE = "single-primary"
 WINDOW_LAYOUT_DUAL = "dual-monitor"
 WINDOW_LAYOUT_REFLOW_ATTEMPTS = 3
@@ -379,16 +380,18 @@ class X11:
 
 
 def normalize_window_layout(value: str) -> str:
+    if value == WINDOW_LAYOUT_SINGLE:
+        return WINDOW_LAYOUT_SINGLE
     if value == WINDOW_LAYOUT_DUAL:
         return WINDOW_LAYOUT_DUAL
-    return WINDOW_LAYOUT_SINGLE
+    return WINDOW_LAYOUT_MANUAL
 
 
 def read_window_layout(path: Path) -> str:
     try:
         return normalize_window_layout(path.read_text().strip())
-    except OSError:
-        return WINDOW_LAYOUT_SINGLE
+    except (OSError, UnicodeError):
+        return WINDOW_LAYOUT_MANUAL
 
 
 def write_window_layout(path: Path, value: str) -> None:
@@ -677,9 +680,10 @@ def process_environment(pid: int) -> dict[str, str] | None:
 
 def process_name(pid: int) -> str:
     try:
-        return Path(f"/proc/{pid}/comm").read_text().strip()
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        payload = Path(f"/proc/{pid}/comm").read_bytes()
+    except OSError:
         return ""
+    return payload.decode(errors="replace").strip()
 
 
 def process_arguments(pid: int) -> list[str]:
@@ -849,6 +853,7 @@ class TrayProxy:
         self.x11: X11 | None = None
         self.indicator = None
         self.decoder_item = None
+        self.manual_layout_item = None
         self.single_layout_item = None
         self.dual_layout_item = None
         self.controlled_monitor_menu = None
@@ -1217,11 +1222,13 @@ class TrayProxy:
         deadline = time.monotonic() + CONTROLLER_TERMINATE_GRACE_SECONDS
         remaining = set(controller_pids)
         while remaining and time.monotonic() < deadline:
-            remaining = {
-                pid for pid in remaining if Path(f"/proc/{pid}").exists()
-            }
+            remaining = controller_processes(self.prefix) & controller_pids
             if remaining:
                 time.sleep(0.05)
+        # A controller may exit and its PID may be reused during the grace
+        # period.  Revalidate both the Wine prefix and controller identity
+        # immediately before SIGKILL instead of trusting PID existence alone.
+        remaining = controller_processes(self.prefix) & controller_pids
         for pid in remaining:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -1335,13 +1342,21 @@ class TrayProxy:
 
         layout_item = self.Gtk.MenuItem.new_with_label("远控窗口布局")
         layout_menu = self.Gtk.Menu()
-        self.single_layout_item = self.Gtk.RadioMenuItem.new_with_label(
-            None, "单窗口（主屏）"
+        self.manual_layout_item = self.Gtk.RadioMenuItem.new_with_label(
+            None, "手动（不自动移动）"
+        )
+        self.single_layout_item = (
+            self.Gtk.RadioMenuItem.new_with_label_from_widget(
+                self.manual_layout_item, "单窗口（主屏）"
+            )
         )
         self.dual_layout_item = (
             self.Gtk.RadioMenuItem.new_with_label_from_widget(
-                self.single_layout_item, "双窗口（每屏一个）"
+                self.manual_layout_item, "双窗口（每屏一个）"
             )
+        )
+        self.manual_layout_item.set_active(
+            self.window_layout == WINDOW_LAYOUT_MANUAL
         )
         self.single_layout_item.set_active(
             self.window_layout == WINDOW_LAYOUT_SINGLE
@@ -1349,12 +1364,16 @@ class TrayProxy:
         self.dual_layout_item.set_active(
             self.window_layout == WINDOW_LAYOUT_DUAL
         )
+        self.manual_layout_item.connect(
+            "toggled", self.select_window_layout, WINDOW_LAYOUT_MANUAL
+        )
         self.single_layout_item.connect(
             "toggled", self.select_window_layout, WINDOW_LAYOUT_SINGLE
         )
         self.dual_layout_item.connect(
             "toggled", self.select_window_layout, WINDOW_LAYOUT_DUAL
         )
+        layout_menu.append(self.manual_layout_item)
         layout_menu.append(self.single_layout_item)
         layout_menu.append(self.dual_layout_item)
         layout_item.set_submenu(layout_menu)
@@ -1453,9 +1472,12 @@ class TrayProxy:
         write_window_layout(self.window_layout_file, layout)
         self.window_layout_state.clear()
         self.apply_window_layout(force=True)
-        label = "单窗口（主屏）" if layout == WINDOW_LAYOUT_SINGLE else (
-            "双窗口（每屏一个）"
-        )
+        labels = {
+            WINDOW_LAYOUT_MANUAL: "手动（不自动移动）",
+            WINDOW_LAYOUT_SINGLE: "单窗口（主屏）",
+            WINDOW_LAYOUT_DUAL: "双窗口（每屏一个）",
+        }
+        label = labels[layout]
         logging.info("远控窗口布局已切换：%s", label)
         self.write_status("active", f"远控窗口布局：{label}")
 
@@ -1527,6 +1549,18 @@ class TrayProxy:
         )
 
     def apply_window_layout(self, force: bool = False) -> int:
+        # Window placement belongs to the compositor and the user by default.
+        # In particular, GNOME Wayland exposes Wine through XWayland; forcing
+        # an X11 move after the user maximizes on another monitor restores the
+        # old primary-monitor assignment and visibly snaps the viewer away.
+        # Keep automatic reflow available only through the two opt-in modes.
+        if getattr(self, "window_layout", WINDOW_LAYOUT_MANUAL) == (
+            WINDOW_LAYOUT_MANUAL
+        ):
+            state = getattr(self, "window_layout_state", None)
+            if state is not None:
+                state.clear()
+            return 0
         if getattr(self, "x11", None) is None or getattr(
             self, "Gdk", None
         ) is None:

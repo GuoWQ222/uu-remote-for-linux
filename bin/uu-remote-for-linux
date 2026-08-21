@@ -2032,7 +2032,9 @@ native_cursor_status_label() {
         fallbacks=$(ini_section_value \
             "$wayland_frame_hook_status" cursor fallbacks)
     fi
-    if [[ $bridge_state != active ]]; then
+    if [[ $bridge_state == embedded ]]; then
+        printf '生效中（Wayland Portal 嵌入帧；UU 固定指针已抑制）'
+    elif [[ $bridge_state != active ]]; then
         printf 'X11 光标图像未建立'
     elif [[ $hook_active == 1 ]]; then
         printf '生效中（XFixes → HCURSOR；%sx%s；序列 %s；调用/更新/回退 %s/%s/%s）' \
@@ -2369,7 +2371,6 @@ start_input_bridge() {
     rm -f -- "$input_bridge_endpoint"
 
     if systemd_user_available; then
-        [[ $desktop_backend != wayland-xwayland ]] || restart_policy="no"
         systemctl --user stop \
             "$input_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
@@ -4209,7 +4210,39 @@ remove_streamer_patch() {
     fi
 }
 
-deploy_hwdecode_bridge() {
+snapshot_exact_file_set() {
+    local snapshot=$1 paths_name=$2 index path
+    local -n snapshot_paths=$paths_name
+
+    mkdir -p "$snapshot/files" || return 1
+    for ((index = 0; index < ${#snapshot_paths[@]}; ++index)); do
+        path=${snapshot_paths[index]}
+        if [[ -e $path || -L $path ]]; then
+            cp -a -- "$path" "$snapshot/files/$index" || return 1
+        fi
+    done
+}
+
+restore_exact_file_set() {
+    local snapshot=$1 paths_name=$2 index path saved
+    local status=0
+    local -n snapshot_paths=$paths_name
+
+    for ((index = 0; index < ${#snapshot_paths[@]}; ++index)); do
+        path=${snapshot_paths[index]}
+        saved="$snapshot/files/$index"
+        if [[ -e $path || -L $path ]]; then
+            rm -f -- "$path" || status=1
+        fi
+        if [[ -e $saved || -L $saved ]]; then
+            mkdir -p -- "$(dirname -- "$path")" || status=1
+            mv -- "$saved" "$path" || status=1
+        fi
+    done
+    return "$status"
+}
+
+deploy_hwdecode_bridge_impl() {
     local name source target temp_manifest hash i generated_version
     local -a names sources targets
 
@@ -4281,6 +4314,52 @@ deploy_hwdecode_bridge() {
     fi
 }
 
+deploy_hwdecode_bridge() {
+    local snapshot status
+    local -a paths=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwdecode_nvcuda"
+        "$hwdecode_nvcuvid"
+        "$hwdecode_dxgi_probe"
+        "${hwdecode_d3d11}.uu-remote-new"
+        "${hwdecode_dxgi}.uu-remote-new"
+        "${hwdecode_nvcuda}.uu-remote-new"
+        "${hwdecode_nvcuvid}.uu-remote-new"
+        "${hwdecode_dxgi_probe}.uu-remote-new"
+        "$streamer_dll"
+        "$streamer_original"
+        "${streamer_dll}.uu-remote-new"
+        "$decoder_cache"
+        "$decoder_cache_backup"
+        "$hwdecode_manifest"
+        "$hwdecode_enabled_stamp"
+        "${hwdecode_enabled_stamp}.tmp"
+    )
+
+    mkdir -p "$data_dir"
+    snapshot=$(mktemp -d "$data_dir/.hwdecode-deploy-snapshot.XXXXXX") ||
+        die "无法创建 NVDEC 部署事务快照；客户端未作修改"
+    if ! snapshot_exact_file_set "$snapshot" paths; then
+        rm -rf -- "$snapshot"
+        die "无法保存 NVDEC 部署前状态；客户端未作修改"
+    fi
+    if (deploy_hwdecode_bridge_impl); then
+        rm -rf -- "$snapshot"
+        return 0
+    else
+        status=$?
+    fi
+    if restore_exact_file_set "$snapshot" paths; then
+        rm -rf -- "$snapshot"
+        printf 'NVDEC 部署失败，已精确恢复部署前文件。\n' >&2
+    else
+        printf 'NVDEC 部署失败且未能完整恢复；事务快照已保留：%s\n' \
+            "$snapshot" >&2
+    fi
+    return "$status"
+}
+
 remove_hwdecode_bridge() {
     local name source target i
     local -a names sources targets
@@ -4320,7 +4399,7 @@ remove_hwdecode_bridge() {
     rm -f -- "$hwdecode_enabled_stamp" "$hwdecode_manifest"
 }
 
-deploy_hwencode_bridge() {
+deploy_hwencode_bridge_impl() {
     local name source target temp_manifest hash i status=0
     local -a names sources targets
 
@@ -4405,6 +4484,55 @@ deploy_hwencode_bridge() {
         printf 'NVENC 已通过深层探测，但编码能力缓存尚未能切换。\n' >&2
         return 1
     fi
+}
+
+deploy_hwencode_bridge() {
+    local snapshot status
+    local -a paths=(
+        "$hwdecode_d3d11"
+        "$hwdecode_dxgi"
+        "$hwencode_nvencode"
+        "$hwencode_probe"
+        "${hwdecode_d3d11}.uu-remote-new"
+        "${hwdecode_dxgi}.uu-remote-new"
+        "${hwencode_nvencode}.uu-remote-new"
+        "${hwencode_probe}.uu-remote-new"
+        "$hwencode_dxvk_config"
+        "${hwencode_dxvk_config}.tmp"
+        "$hwencode_manifest"
+        "$hwencode_probe_status"
+        "$hwencode_enabled_stamp"
+        "${hwencode_enabled_stamp}.tmp"
+        "$hwencode_disabled_stamp"
+        "$hwencode_failed_stamp"
+        "$encoder_cache"
+        "$encoder_cache_backup"
+    )
+
+    mkdir -p "$data_dir" "$state_dir"
+    snapshot=$(mktemp -d "$data_dir/.hwencode-deploy-snapshot.XXXXXX") || {
+        printf '无法创建 NVENC 部署事务快照；客户端未作修改。\n' >&2
+        return 1
+    }
+    if ! snapshot_exact_file_set "$snapshot" paths; then
+        rm -rf -- "$snapshot"
+        printf '无法保存 NVENC 部署前状态；客户端未作修改。\n' >&2
+        return 1
+    fi
+    if (deploy_hwencode_bridge_impl); then
+        rm -rf -- "$snapshot"
+        return 0
+    else
+        status=$?
+    fi
+    if restore_exact_file_set "$snapshot" paths; then
+        rm -rf -- "$snapshot"
+        printf 'NVENC 部署失败，已精确恢复部署前文件。\n' >&2
+    else
+        printf 'NVENC 部署失败且未能完整恢复；事务快照已保留：%s\n' \
+            "$snapshot" >&2
+    fi
+    return "$status"
 }
 
 remove_hwencode_bridge() {
@@ -5032,7 +5160,6 @@ restore_update_snapshot() {
     }
     for relative in "${paths[@]}"; do
         source="$staging/$relative"
-        [[ -e $source || -L $source ]] || continue
         target="$prefix/$relative"
         if [[ -e $target || -L $target ]]; then
             if ! mkdir -p -- "$(dirname -- "$backup/$relative")" ||
@@ -5042,12 +5169,14 @@ restore_update_snapshot() {
             fi
             backed_up+=("$relative")
         fi
-        if ! mkdir -p -- "$(dirname -- "$target")" ||
-            ! mv -- "$source" "$target"; then
-            commit_failed=1
-            break
+        if [[ -e $source || -L $source ]]; then
+            if ! mkdir -p -- "$(dirname -- "$target")" ||
+                ! mv -- "$source" "$target"; then
+                commit_failed=1
+                break
+            fi
+            restored+=("$relative")
         fi
-        restored+=("$relative")
     done
     if ((!commit_failed)) && [[ -n $bridge_state_snapshot ]]; then
         if restore_version_bridge_state_snapshot "$bridge_state_snapshot"; then
@@ -5425,7 +5554,6 @@ fi
 
 if $enable_hwencode; then
     stop_prefix_for_setup
-    rm -f -- "$hwencode_disabled_stamp" "$hwencode_failed_stamp"
     deploy_hwencode_bridge ||
         die "NVENC/HEVC 编码桥未通过 D3D11→CUDA 纹理上传验证；已保留 OpenH264"
     notify_status "NVIDIA NVENC/HEVC 编码桥已启用"

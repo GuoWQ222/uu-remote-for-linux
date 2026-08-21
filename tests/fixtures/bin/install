@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target=${!#}
+if [[ -n ${UU_REMOTE_FAKE_INSTALL_FAILURE_SUFFIX:-} &&
+    $target == *"$UU_REMOTE_FAKE_INSTALL_FAILURE_SUFFIX" ]]; then
+    printf '模拟 install 失败：%s\n' "$target" >&2
+    exit 1
+fi
+exec /usr/bin/install "$@"

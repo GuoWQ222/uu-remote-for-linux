@@ -333,10 +333,16 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         section_count = read_u16(data, pe_offset + 6)
         optional_size = read_u16(data, pe_offset + 20)
         optional_offset = pe_offset + 24
+        if not 1 <= section_count <= 96:
+            raise ValueError(f"PE 节数量无效：{section_count}")
+        if optional_size < 32 or optional_offset + optional_size > len(data):
+            raise ValueError("PE 可选头越界")
         if read_u16(data, optional_offset) != 0x20B:
             raise ValueError("不是 Win64 PE32+ 文件")
         image_base = read_u64(data, optional_offset + 24)
         section_offset = optional_offset + optional_size
+        if section_count > (len(data) - section_offset) // 40:
+            raise ValueError("PE 节表越界")
         sections: dict[str, tuple[int, int, int, int]] = {}
         for index in range(section_count):
             offset = section_offset + index * 40
@@ -347,6 +353,10 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
             virtual_address = read_u32(data, offset + 12)
             raw_size = read_u32(data, offset + 16)
             raw_offset = read_u32(data, offset + 20)
+            if name in sections:
+                raise ValueError(f"PE 节名称重复：{name}")
+            if raw_offset > len(data) or raw_size > len(data) - raw_offset:
+                raise ValueError(f"PE 节范围越界：{name}")
             sections[name] = (
                 virtual_address,
                 virtual_size,
@@ -360,15 +370,12 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
 
     def rva_to_offset(rva: int, size: int) -> int:
         for virtual_address, virtual_size, raw_offset, raw_size in sections.values():
-            span = max(virtual_size, raw_size)
             if (
                 virtual_address <= rva
-                and size <= span
-                and rva - virtual_address <= span - size
+                and size <= raw_size
+                and rva - virtual_address <= raw_size - size
             ):
                 result = raw_offset + rva - virtual_address
-                if result < 0 or result + size > len(data):
-                    break
                 return result
         raise ValueError(f"RVA 0x{rva:x} 不在有效节内")
 

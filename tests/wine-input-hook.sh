@@ -179,13 +179,13 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-width, height = 128, 72
+width, height = 192, 128
 stride = width * 4
 size = stride * height
 header = struct.pack(
-    "<10I24x",
+    "<10I2i16x",
     0x46575555,
-    1,
+    2,
     64,
     width,
     height,
@@ -194,9 +194,12 @@ header = struct.pack(
     2,
     1,
     1,
+    -64,
+    0,
 )
 frame = bytearray(size)
-for y in range(height):
+display_height = 72
+for y in range(display_height):
     for x in range(width):
         offset = y * stride + x * 4
         blue = x * 255 // (width - 1)
@@ -268,16 +271,19 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=35'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=43'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'active=1'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Eq 'updates=[2-9][0-9]*'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'sequence=165'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'width=2'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'height=2'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_x=0'
-grep -A9 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=0'
+grep -A20 -F '[capture]' "$frame_status" | grep -Fq 'dib_source_y=56'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'active=1'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Eq 'updates=[2-9][0-9]*'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'sequence=165'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'width=2'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'height=2'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_x=0'
+grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=0'
+grep -A14 -F '[cursor]' "$frame_status" | grep -Eq 'cache_entries=6[6-9]|cache_entries=[7-9][0-9]'
+grep -A14 -F '[cursor]' "$frame_status" | grep -Eq 'cache_overflows=[2-9][0-9]*'
 
 kill "$bridge_pid" 2>/dev/null || true
 wait "$bridge_pid" 2>/dev/null || true

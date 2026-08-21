@@ -47,7 +47,7 @@
 2. Install and launch:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.28_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.29_amd64.deb
    uu-remote-for-linux
    ```
 
@@ -79,11 +79,11 @@ Right-click the native tray icon:
 |---|---|
 | **Show main window** | Restore the hidden or minimized UU window |
 | **Controlled display** | Select the Ubuntu monitor matching the Windows video track |
-| **Viewer layout** | Keep one viewer on the primary display or arrange two existing viewers |
+| **Viewer layout** | Leave windows under manual control (default), keep one on the primary display, or arrange two existing viewers |
 | **Select decoder** | Choose CPU/NVIDIA decoding and restart UU |
 | **Exit** | Stop the dedicated Wine client |
 
-Display choices follow hot-plug, rotation, and layout changes automatically.
+Controlled-display choices follow hot-plug, rotation, and layout changes automatically. Viewer windows move automatically only after selecting a managed layout.
 
 <a id="compatibility"></a>
 ## 🎛️ Compatibility
@@ -98,7 +98,7 @@ Display choices follow hot-plug, rotation, and layout changes automatically.
 | Intel/AMD hardware | — | ❌ | CPU fallback remains available |
 
 > [!WARNING]
-> Wayland requires Portal permission. Login-manager and lock-screen capture are outside the logged-in Portal session; use X11 for unattended access before login.
+> Wayland requires Portal permission. On a multi-monitor desktop, select all displays in the sharing dialog; the permission is then restored for later sessions. Login-manager and lock-screen capture are outside the logged-in Portal session; use X11 for unattended access before login.
 
 <a id="commands"></a>
 ## 🧰 Commands

@@ -5,6 +5,8 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 readonly archive="$project_root/third_party/sources/nvenc-nvcuvid-v0.5.tar.xz"
 readonly overlay="$project_root/third_party/nvenc/uu-remote-nvenc-bridge.h"
+readonly lifecycle="$project_root/third_party/nvenc/uu-remote-nvenc-lifecycle.h"
+readonly texture="$project_root/third_party/nvenc/uu-remote-nvenc-texture.h"
 readonly bridge_patch="$project_root/third_party/nvenc/nvencodeapi-uu-remote.patch"
 readonly destination="$project_root/lib/uu-remote-for-linux/hwdecode/wine"
 
@@ -13,6 +15,10 @@ trap 'rm -rf -- "$build_root"' EXIT
 tar -xf "$archive" -C "$build_root"
 source_root="$build_root/nvenc-nvcuvid-v0.5"
 install -m 0644 "$overlay" "$source_root/dlls/nvencodeapi/uu-remote-nvenc-bridge.h"
+install -m 0644 "$lifecycle" \
+    "$source_root/dlls/nvencodeapi/uu-remote-nvenc-lifecycle.h"
+install -m 0644 "$texture" \
+    "$source_root/dlls/nvencodeapi/uu-remote-nvenc-texture.h"
 patch -d "$source_root" -p1 --forward --batch <"$bridge_patch"
 
 meson setup \

@@ -2,7 +2,46 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [1.1.29] - 2026-08-21
+
+- Request and consume every Wayland Portal monitor stream, composite them in
+  Wine's primary-relative virtual-desktop coordinates, and route absolute
+  pointer events to the matching PipeWire stream. This restores secondary
+  portrait-screen capture that was lost when the Wayland shared-frame bridge
+  previously kept only `streams[0]`.
+- Default remote viewer placement to manual control and make the primary/dual
+  monitor reflow policies opt-in, preventing GNOME Wayland/XWayland from
+  snapping a user-moved or maximized viewer back to the portrait primary
+  monitor during the tray proxy's periodic scan.
+- Add a native PipeWire cursor-metadata sidecar for Wayland, publish the real
+  GNOME cursor image and hotspot to the Wine capture hook, suppress UU's fixed
+  duplicate cursor, and keep the controller pointer releasable outside the
+  viewer while preserving text, resize, and application-specific shapes.
+- Extend the shared-frame protocol with the virtual-desktop origin and correct
+  the top-left Portal to bottom-up DIB crop conversion, eliminating the large
+  black region and vertically shifted partial image on mixed-orientation
+  monitor layouts.
+- Supervise the Wayland Portal bridge and fail fast when any PipeWire stream or
+  cursor helper stalls, so systemd recreates the capture session instead of
+  leaving a frozen frame or permanent black screen after reconnecting.
+- Keep dynamically reconstructed native cursor handles stable beyond the
+  fixed cache capacity and expose cursor/capture sequence telemetry for live
+  verification without allowing handle reuse to corrupt later cursor shapes.
+- Move potentially blocking Wine hook injection and streamer initialization to
+  independently polled workers, preventing one hung remote thread from
+  freezing monitoring or delaying reinjection after a module reload.
+- Make NVDEC and NVENC deployment exact-file transactions, restoring both
+  pre-existing and previously absent files after a partial install or failed
+  deep probe instead of leaving a mixed bridge state.
+- Harden PE profile parsing against truncated headers, invalid section counts,
+  duplicate names, and virtual-only ranges before calculating patch offsets.
+- Separate NVENC registration ownership from per-frame D3D11 texture upload,
+  serialize lifecycle transitions, validate resource identity and dimensions,
+  and propagate the selected adapter LUID into the client service to prevent
+  stale frames, cross-thread teardown races, and adapter mismatches.
+- Make controller recovery resistant to PID reuse and `/proc` names with
+  non-UTF-8 bytes, and isolate integration-test configuration state from the
+  user's real desktop settings.
 
 ## [1.1.28] - 2026-08-20
 

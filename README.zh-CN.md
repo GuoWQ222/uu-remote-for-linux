@@ -47,7 +47,7 @@
 2. 安装并启动：
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.28_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.29_amd64.deb
    uu-remote-for-linux
    ```
 
@@ -79,11 +79,11 @@ cd uu-remote-for-linux
 |---|---|
 | **显示主界面** | 恢复隐藏或最小化的 UU 窗口 |
 | **被控屏幕** | 选择与 Windows 视频轨道对应的 Ubuntu 显示器 |
-| **远控窗口布局** | 在主屏保留单窗口，或排列两个已有窗口 |
+| **远控窗口布局** | 默认由用户手动移动；也可在主屏保留单窗口，或排列两个已有窗口 |
 | **选择解码器** | 选择 CPU/NVIDIA 解码并重启 UU |
 | **退出** | 停止独立 Wine 客户端 |
 
-显示器热插拔、旋转和布局变化会自动同步。
+被控屏幕选择会自动同步热插拔、旋转和布局变化；只有主动选择自动布局后，远控窗口才会被自动移动。
 
 <a id="compatibility"></a>
 ## 🎛️ 兼容性
@@ -98,7 +98,7 @@ cd uu-remote-for-linux
 | Intel/AMD 硬件 | — | ❌ | 仍可使用 CPU 回退 |
 
 > [!WARNING]
-> Wayland 必须授权 Portal。登录管理器和锁屏不属于已登录用户的 Portal 会话；登录前无人值守控制请使用 X11。
+> Wayland 必须授权 Portal。多屏环境首次弹出共享对话框时请选择全部显示器，后续会复用该授权。登录管理器和锁屏不属于已登录用户的 Portal 会话；登录前无人值守控制请使用 X11。
 
 <a id="commands"></a>
 ## 🧰 常用命令

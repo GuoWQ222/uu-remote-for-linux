@@ -39,6 +39,7 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -r "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" ]] || {
@@ -80,6 +81,9 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge
     "$runtime_target/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$runtime_target/uu-remote-input-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
+    "$runtime_target/uu-remote-pipewire-cursor"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" \
     "$runtime_target/uu-remote-input-hook.dll"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \

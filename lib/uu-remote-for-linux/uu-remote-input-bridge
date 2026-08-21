@@ -20,7 +20,9 @@ import secrets
 import signal
 import socket
 import struct
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -84,13 +86,17 @@ PORTAL_SESSION = "org.freedesktop.portal.Session"
 PORTAL_DEVICE_KEYBOARD = 1
 PORTAL_DEVICE_POINTER = 2
 PORTAL_SOURCE_MONITOR = 1
-PORTAL_CURSOR_HIDDEN = 1
+PORTAL_CURSOR_METADATA = 4
 PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
 CAPTURE_START_TIMEOUT_SECONDS = 10
+CAPTURE_STREAM_STALE_SECONDS = 2.0
 FRAME_MAGIC = 0x46575555  # "UUWF" in little-endian byte order
-FRAME_VERSION = 1
-FRAME_HEADER = struct.Struct("<10I24x")
+FRAME_VERSION = 2
+# The final two signed fields are the Win32 virtual-desktop origin.  Keeping
+# active_buffer and sequence at offsets 32/36 preserves the lock-free publish
+# protocol used by the injected capture hook.
+FRAME_HEADER = struct.Struct("<10I2i16x")
 FRAME_BUFFERS = 2
 CURSOR_MAGIC = 0x49435555  # "UUCI" in little-endian byte order
 CURSOR_VERSION = 1
@@ -203,44 +209,61 @@ def x11_monitor_descriptors() -> list[dict[str, Any]]:
     except (ImportError, ValueError):
         return []
 
-    display = Gdk.Display.get_default()
+    # The bridge runs in a Wayland session, so Gdk.Display.get_default() opens
+    # the Wayland backend.  Mutter does not expose a primary monitor through
+    # GDK3 there, which made a portrait monitor returned first by the Portal
+    # look like Wine's primary screen.  Wine is running through XWayland, so
+    # open its DISPLAY explicitly and use XRandR's real primary monitor.
+    display_name = os.environ.get("DISPLAY", "").strip()
+    display = (
+        Gdk.Display.open(display_name)
+        if display_name
+        else Gdk.Display.get_default()
+    )
     if display is None:
         return []
-    primary = display.get_primary_monitor()
-    descriptors: list[dict[str, Any]] = []
-    duplicate_counts: dict[str, int] = {}
-    for index in range(display.get_n_monitors()):
-        monitor = display.get_monitor(index)
-        if monitor is None:
-            continue
-        rectangle = monitor.get_geometry()
-        geometry = (
-            int(rectangle.x),
-            int(rectangle.y),
-            int(rectangle.width),
-            int(rectangle.height),
-        )
-        if geometry[2] <= 0 or geometry[3] <= 0:
-            continue
-        manufacturer = (monitor.get_manufacturer() or "").strip()
-        model = (monitor.get_model() or "").strip()
-        base_id = f"{manufacturer}|{model}" if manufacturer or model else (
-            f"monitor-{index + 1}"
-        )
-        duplicate_counts[base_id] = duplicate_counts.get(base_id, 0) + 1
-        occurrence = duplicate_counts[base_id]
-        monitor_id = base_id if occurrence == 1 else f"{base_id}#{occurrence}"
-        descriptors.append(
-            {
-                "id": monitor_id,
-                "index": index,
-                "manufacturer": manufacturer,
-                "model": model,
-                "geometry": geometry,
-                "primary": monitor == primary,
-            }
-        )
-    return descriptors
+    close_display = bool(display_name)
+    try:
+        primary = display.get_primary_monitor()
+        descriptors: list[dict[str, Any]] = []
+        duplicate_counts: dict[str, int] = {}
+        for index in range(display.get_n_monitors()):
+            monitor = display.get_monitor(index)
+            if monitor is None:
+                continue
+            rectangle = monitor.get_geometry()
+            geometry = (
+                int(rectangle.x),
+                int(rectangle.y),
+                int(rectangle.width),
+                int(rectangle.height),
+            )
+            if geometry[2] <= 0 or geometry[3] <= 0:
+                continue
+            manufacturer = (monitor.get_manufacturer() or "").strip()
+            model = (monitor.get_model() or "").strip()
+            base_id = f"{manufacturer}|{model}" if manufacturer or model else (
+                f"monitor-{index + 1}"
+            )
+            duplicate_counts[base_id] = duplicate_counts.get(base_id, 0) + 1
+            occurrence = duplicate_counts[base_id]
+            monitor_id = (
+                base_id if occurrence == 1 else f"{base_id}#{occurrence}"
+            )
+            descriptors.append(
+                {
+                    "id": monitor_id,
+                    "index": index,
+                    "manufacturer": manufacturer,
+                    "model": model,
+                    "geometry": geometry,
+                    "primary": monitor == primary,
+                }
+            )
+        return descriptors
+    finally:
+        if close_display:
+            display.close()
 
 
 def read_monitor_selection(path: Path | None) -> str:
@@ -694,19 +717,44 @@ class WaylandPortalBackend:
     """Wayland keyboard and pointer injection through XDG RemoteDesktop."""
 
     name = "wayland-portal"
-
     def __init__(self, state_dir: Path, frame_path: Path) -> None:
         self.state_dir = state_dir
         self.frame_path = frame_path
-        self.restore_token_path = state_dir / "wayland-portal-restore-token"
+        self.cursor_path = frame_path.with_name("uu-remote-native-cursor.bin")
+        helper_override = os.environ.get(
+            "UU_REMOTE_PIPEWIRE_CURSOR_HELPER", ""
+        ).strip()
+        self.cursor_helper_path = (
+            Path(helper_override)
+            if helper_override
+            else Path(__file__).resolve().with_name(
+                "uu-remote-pipewire-cursor"
+            )
+        )
+        self.cursor_helper_log_path = (
+            state_dir / "pipewire-cursor.log"
+        )
+        self.cursor_helper_process: subprocess.Popen | None = None
+        # v2 asks the portal for every monitor.  Do not reuse a v1 grant that
+        # permanently restored only the first selected monitor.
+        self.restore_token_path = state_dir / "wayland-portal-restore-token-v2"
         self.session_handle = ""
+        self.streams: list[dict[str, Any]] = []
         self.stream_node = 0
         self.stream_width = 1
         self.stream_height = 1
+        self.canvas_width = 1
+        self.canvas_height = 1
+        self.frame_origin_x = 0
+        self.frame_origin_y = 0
         self.capture_state = "inactive"
         self.capture_pipeline = None
-        self.capture_pipewire_fd = -1
+        self.capture_pipewire_fds: list[int] = []
         self.capture_frames = 0
+        self.capture_output_hash = 0
+        self.capture_output_hash_changes = 0
+        self.capture_stream_stats: list[dict[str, int]] = []
+        self.capture_lock = threading.Lock()
         self.capture_map = None
         self.capture_frame_size = 0
         self.capture_backing_path = None
@@ -721,12 +769,16 @@ class WaylandPortalBackend:
         self.display = None
         if self.fake_trace:
             self.session_handle = "/org/freedesktop/portal/desktop/session/fake"
-            self.stream_node = 77
-            self.stream_width = 128 if self.fake_video else 1920
-            self.stream_height = 72 if self.fake_video else 1080
+            fake_streams = self._fake_stream_descriptors()
+            self._configure_stream_layout(fake_streams, use_x11=False)
+            stream_summary = ",".join(
+                f"{stream['node']}:{stream['width']}x{stream['height']}"
+                for stream in self.streams
+            )
             self._fake_write(
-                "session authorized devices=3 stream=77 "
-                f"{self.stream_width}x{self.stream_height}"
+                "session authorized devices=3 "
+                f"streams={stream_summary} canvas="
+                f"{self.canvas_width}x{self.canvas_height}"
             )
             if self.fake_video:
                 self._load_gio()
@@ -748,6 +800,131 @@ class WaylandPortalBackend:
         except Exception:
             self.close()
             raise
+
+    def _fake_stream_descriptors(self) -> list[dict[str, Any]]:
+        configured = os.environ.get(
+            "UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS", ""
+        ).strip()
+        if not configured:
+            width = 128 if self.fake_video else 1920
+            height = 72 if self.fake_video else 1080
+            return [
+                {
+                    "node": 77,
+                    "width": width,
+                    "height": height,
+                    "position": (0, 0),
+                    "primary": True,
+                }
+            ]
+        descriptors: list[dict[str, Any]] = []
+        for index, text in enumerate(configured.split(";")):
+            node_text, geometry_text = text.strip().split(":", 1)
+            size_text, position_text = geometry_text.split("@", 1)
+            width_text, height_text = size_text.lower().split("x", 1)
+            x_text, y_text = position_text.split(",", 1)
+            descriptors.append(
+                {
+                    "node": int(node_text),
+                    "width": max(int(width_text), 1),
+                    "height": max(int(height_text), 1),
+                    "position": (int(x_text), int(y_text)),
+                    "primary": index == 0,
+                }
+            )
+        if not descriptors:
+            raise ValueError("测试 Portal 屏幕流不能为空")
+        return descriptors
+
+    def _configure_stream_layout(
+        self,
+        streams: list[dict[str, Any]],
+        *,
+        use_x11: bool = True,
+    ) -> None:
+        """Align Portal streams with Wine's primary-relative screen space."""
+        if not streams:
+            raise PortalRequestError("桌面门户未返回屏幕坐标流")
+        descriptors = x11_monitor_descriptors() if use_x11 else []
+        unused = list(descriptors)
+        matched: list[dict[str, Any]] = []
+        for stream in streams:
+            width = max(int(stream.get("width", 1)), 1)
+            height = max(int(stream.get("height", 1)), 1)
+            position = stream.get("position", (0, 0))
+            position = (int(position[0]), int(position[1]))
+            candidates = [
+                descriptor
+                for descriptor in unused
+                if descriptor["geometry"][2:] == (width, height)
+            ]
+            exact = [
+                descriptor
+                for descriptor in candidates
+                if descriptor["geometry"][:2] == position
+            ]
+            descriptor = exact[0] if len(exact) == 1 else (
+                candidates[0] if len(candidates) == 1 else None
+            )
+            record = dict(stream)
+            if descriptor is not None:
+                unused.remove(descriptor)
+                record["root_geometry"] = descriptor["geometry"]
+                record["primary"] = bool(descriptor["primary"])
+                matched.append(record)
+            else:
+                record["root_geometry"] = (
+                    position[0], position[1], width, height
+                )
+                matched.append(record)
+
+        primary = next(
+            (stream for stream in matched if stream.get("primary")),
+            matched[0],
+        )
+        primary_x, primary_y, _primary_width, _primary_height = (
+            primary["root_geometry"]
+        )
+        min_x = min(stream["root_geometry"][0] for stream in matched)
+        min_y = min(stream["root_geometry"][1] for stream in matched)
+        max_x = max(
+            stream["root_geometry"][0] + stream["root_geometry"][2]
+            for stream in matched
+        )
+        max_y = max(
+            stream["root_geometry"][1] + stream["root_geometry"][3]
+            for stream in matched
+        )
+        self.canvas_width = max(max_x - min_x, 1)
+        self.canvas_height = max(max_y - min_y, 1)
+        self.frame_origin_x = min_x - primary_x
+        self.frame_origin_y = min_y - primary_y
+        for stream in matched:
+            root_x, root_y, width, height = stream["root_geometry"]
+            stream["x"] = root_x - min_x
+            stream["y"] = root_y - min_y
+            stream["width"] = width
+            stream["height"] = height
+            stream["win_x"] = root_x - primary_x
+            stream["win_y"] = root_y - primary_y
+        self.streams = matched
+        self.stream_node = int(primary["node"])
+        self.stream_width = int(primary["root_geometry"][2])
+        self.stream_height = int(primary["root_geometry"][3])
+        self.absolute_geometry = (
+            0,
+            0,
+            self.stream_width,
+            self.stream_height,
+        )
+        self.virtual_geometry = (
+            self.frame_origin_x,
+            self.frame_origin_y,
+            self.canvas_width,
+            self.canvas_height,
+        )
+        self.absolute_geometry_source = "portal-primary"
+        self.cursor_feedback_geometry = self.virtual_geometry
 
     @staticmethod
     def _load_gio_modules():
@@ -790,6 +967,20 @@ class WaylandPortalBackend:
             raise RuntimeError(
                 "Wayland 画面桥缺少 GStreamer 元件：" + ", ".join(missing)
             )
+        helper_override = os.environ.get(
+            "UU_REMOTE_PIPEWIRE_CURSOR_HELPER", ""
+        ).strip()
+        helper = (
+            Path(helper_override)
+            if helper_override
+            else Path(__file__).resolve().with_name(
+                "uu-remote-pipewire-cursor"
+            )
+        )
+        if not helper.is_file() or not os.access(helper, os.X_OK):
+            raise RuntimeError(
+                f"Wayland 动态光标桥缺失或不可执行：{helper}"
+            )
         connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         value = connection.call_sync(
             PORTAL_BUS_NAME,
@@ -805,6 +996,38 @@ class WaylandPortalBackend:
         version = int(value.unpack()[0])
         if version < 1:
             raise RuntimeError("RemoteDesktop Portal 版本无效")
+        value = connection.call_sync(
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant(
+                "(ss)",
+                (PORTAL_SCREENCAST, "AvailableCursorModes"),
+            ),
+            GLib.VariantType.new("(v)"),
+            Gio.DBusCallFlags.NONE,
+            3000,
+            None,
+        )
+        cursor_modes = int(value.unpack()[0])
+        if cursor_modes & PORTAL_CURSOR_METADATA == 0:
+            raise RuntimeError(
+                "当前 ScreenCast Portal 不支持动态光标元数据"
+            )
+
+    @property
+    def cursor_state(self) -> str:
+        if self.fake_trace:
+            return "metadata"
+        process = self.cursor_helper_process
+        if process is None:
+            return "metadata-inactive"
+        if process.poll() is not None:
+            return "metadata-error"
+        if self.cursor_path.is_file():
+            return "active"
+        return "metadata-waiting"
 
     def _fake_write(self, event: str) -> None:
         path = Path(self.fake_trace)
@@ -929,8 +1152,11 @@ class WaylandPortalBackend:
         source_options = {
             "handle_token": self.GLib.Variant("s", self._token("sources")),
             "types": self.GLib.Variant("u", PORTAL_SOURCE_MONITOR),
-            "multiple": self.GLib.Variant("b", False),
-            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_HIDDEN),
+            "multiple": self.GLib.Variant("b", True),
+            # Keep the cursor out of the video and request its authoritative
+            # compositor bitmap separately.  pipewiresrc 1.0.5 discards that
+            # bitmap, so the native sidecar publishes it to the Wine hook.
+            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_METADATA),
         }
         if restore_token:
             device_options["restore_token"] = self.GLib.Variant(
@@ -986,12 +1212,21 @@ class WaylandPortalBackend:
         streams = result.get("streams", [])
         if not streams:
             raise PortalRequestError("桌面门户未返回屏幕坐标流")
-        self.stream_node = int(streams[0][0])
-        properties = streams[0][1]
-        size = properties.get("size", (1, 1))
-        if len(size) == 2:
-            self.stream_width = max(int(size[0]), 1)
-            self.stream_height = max(int(size[1]), 1)
+        stream_descriptors: list[dict[str, Any]] = []
+        for node, properties in streams:
+            size = properties.get("size", (1, 1))
+            position = properties.get("position", (0, 0))
+            if len(size) != 2 or len(position) != 2:
+                raise PortalRequestError("桌面门户返回了无效的屏幕坐标")
+            stream_descriptors.append(
+                {
+                    "node": int(node),
+                    "width": max(int(size[0]), 1),
+                    "height": max(int(size[1]), 1),
+                    "position": (int(position[0]), int(position[1])),
+                }
+            )
+        self._configure_stream_layout(stream_descriptors)
         self._save_restore_token(str(result.get("restore_token", "")))
 
     def _open_pipewire_remote(self) -> int:
@@ -1013,10 +1248,50 @@ class WaylandPortalBackend:
             raise RuntimeError("桌面门户未返回有效的 PipeWire 描述符")
         return descriptor
 
+    def _start_cursor_bridge(self) -> None:
+        if self.fake_trace:
+            return
+        self.cursor_path.unlink(missing_ok=True)
+        descriptor = self._open_pipewire_remote()
+        command = [
+            str(self.cursor_helper_path),
+            str(self.cursor_path),
+            str(descriptor),
+        ]
+        for stream in self.streams:
+            command.extend(
+                (
+                    str(stream["node"]),
+                    str(stream["width"]),
+                    str(stream["height"]),
+                )
+            )
+        self.cursor_helper_log_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        log_descriptor = os.open(
+            self.cursor_helper_log_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            self.cursor_helper_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_descriptor,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            os.close(log_descriptor)
+            os.close(descriptor)
+
     def _start_capture_bridge(self) -> None:
         self.capture_state = "starting"
-        stride = self.stream_width * 4
-        self.capture_frame_size = stride * self.stream_height
+        stride = self.canvas_width * 4
+        self.capture_frame_size = stride * self.canvas_height
         mapped_size = (
             FRAME_HEADER.size + FRAME_BUFFERS * self.capture_frame_size
         )
@@ -1050,62 +1325,43 @@ class WaylandPortalBackend:
             FRAME_MAGIC,
             FRAME_VERSION,
             FRAME_HEADER.size,
-            self.stream_width,
-            self.stream_height,
+            self.canvas_width,
+            self.canvas_height,
             stride,
             self.capture_frame_size,
             FRAME_BUFFERS,
             0,
             0,
+            self.frame_origin_x,
+            self.frame_origin_y,
         )
-        if self.fake_video:
-            source = self.Gst.ElementFactory.make(
-                "videotestsrc", "portal-source"
-            )
-            source.set_property("is-live", True)
-            source.set_property("pattern", 0)
-        else:
-            self.capture_pipewire_fd = self._open_pipewire_remote()
-            source = self.Gst.ElementFactory.make(
-                "pipewiresrc", "portal-source"
-            )
-        queue = self.Gst.ElementFactory.make("queue", "frame-queue")
-        convert = self.Gst.ElementFactory.make("videoconvert", "frame-convert")
-        scale = self.Gst.ElementFactory.make("videoscale", "frame-scale")
-        caps_filter = self.Gst.ElementFactory.make("capsfilter", "frame-caps")
-        sink = self.Gst.ElementFactory.make("appsink", "capture-sink")
-        elements = (source, queue, convert, scale, caps_filter, sink)
-        if any(element is None for element in elements):
-            raise RuntimeError("无法创建 Wayland 画面桥 GStreamer 管线")
-        if not self.fake_video:
-            source.set_property("fd", self.capture_pipewire_fd)
-            source.set_property("path", str(self.stream_node))
-            source.set_property("do-timestamp", True)
-        queue.set_property("max-size-buffers", 2)
-        queue.set_property("leaky", 2)
-        scale.set_property("add-borders", False)
-        caps_filter.set_property(
-            "caps",
-            self.Gst.Caps.from_string(
-                "video/x-raw,format=BGRx,"
-                f"width={self.stream_width},height={self.stream_height},"
-                "pixel-aspect-ratio=1/1"
-            ),
-        )
-        sink.set_property("sync", False)
-        sink.set_property("emit-signals", True)
-        sink.set_property("max-buffers", 2)
-        sink.set_property("drop", True)
         self.capture_pipeline = self.Gst.Pipeline.new("wayland-capture")
-        for element in elements:
-            self.capture_pipeline.add(element)
-        for first, second in zip(elements, elements[1:]):
-            if not first.link(second):
-                raise RuntimeError(
-                    f"无法连接 GStreamer 元件 {first.name} → {second.name}"
-                )
+        if self.capture_pipeline is None:
+            raise RuntimeError("无法创建 Wayland 画面桥 GStreamer 管线")
 
-        def write_frame(appsink) -> int:
+        self.capture_stream_stats = [
+            {
+                "node": int(stream["node"]),
+                "frames": 0,
+                "hash": 0,
+                "hash_changes": 0,
+                "pts": 0,
+                "last_ns": 0,
+            }
+            for stream in self.streams
+        ]
+
+        def sampled_hash(data) -> int:
+            length = len(data)
+            if length <= 0:
+                return 0
+            step = max(length // 4096, 1)
+            value = 2166136261
+            for offset in range(0, length, step):
+                value = ((value ^ data[offset]) * 16777619) & 0xFFFFFFFF
+            return value
+
+        def write_stream(appsink, stream_index: int, stream) -> int:
             sample = appsink.emit("pull-sample")
             if sample is None or self.capture_map is None:
                 return self.Gst.FlowReturn.ERROR
@@ -1114,28 +1370,159 @@ class WaylandPortalBackend:
             if not mapped:
                 return self.Gst.FlowReturn.ERROR
             try:
-                if len(info.data) < self.capture_frame_size:
+                width = int(stream["width"])
+                height = int(stream["height"])
+                row_bytes = width * 4
+                source_stride = len(info.data) // height
+                if source_stride < row_bytes:
                     return self.Gst.FlowReturn.ERROR
-                sequence = self.capture_frames + 1
-                active = sequence % FRAME_BUFFERS
-                offset = FRAME_HEADER.size + active * self.capture_frame_size
-                self.capture_map[offset : offset + self.capture_frame_size] = \
-                    memoryview(info.data)[: self.capture_frame_size]
-                struct.pack_into("<I", self.capture_map, 32, active)
-                struct.pack_into("<I", self.capture_map, 36, sequence)
-                self.capture_frames = sequence
+                value = sampled_hash(info.data)
+                with self.capture_lock:
+                    stats = self.capture_stream_stats[stream_index]
+                    previous_hash = int(stats["hash"])
+                    stats["frames"] += 1
+                    stats["hash"] = value
+                    stats["pts"] = int(buffer.pts)
+                    stats["last_ns"] = time.monotonic_ns()
+                    if previous_hash and previous_hash != value:
+                        stats["hash_changes"] += 1
+
+                    previous_active = struct.unpack_from(
+                        "<I", self.capture_map, 32
+                    )[0]
+                    sequence = self.capture_frames + 1
+                    active = sequence % FRAME_BUFFERS
+                    destination = (
+                        FRAME_HEADER.size
+                        + active * self.capture_frame_size
+                    )
+                    previous = (
+                        FRAME_HEADER.size
+                        + previous_active * self.capture_frame_size
+                    )
+                    if active != previous_active:
+                        self.capture_map.move(
+                            destination,
+                            previous,
+                            self.capture_frame_size,
+                        )
+                    source_view = memoryview(info.data)
+                    destination_x = int(stream["x"]) * 4
+                    destination_y = int(stream["y"])
+                    for row in range(height):
+                        source_offset = row * source_stride
+                        destination_offset = (
+                            destination
+                            + (destination_y + row) * stride
+                            + destination_x
+                        )
+                        self.capture_map[
+                            destination_offset : destination_offset + row_bytes
+                        ] = source_view[
+                            source_offset : source_offset + row_bytes
+                        ]
+                    output = memoryview(self.capture_map)[
+                        destination : destination + self.capture_frame_size
+                    ]
+                    output_hash = sampled_hash(output)
+                    if (
+                        self.capture_output_hash
+                        and self.capture_output_hash != output_hash
+                    ):
+                        self.capture_output_hash_changes += 1
+                    self.capture_output_hash = output_hash
+                    struct.pack_into("<I", self.capture_map, 32, active)
+                    struct.pack_into("<I", self.capture_map, 36, sequence)
+                    self.capture_frames = sequence
             finally:
                 buffer.unmap(info)
             return self.Gst.FlowReturn.OK
 
-        sink.connect("new-sample", write_frame)
+        for index, stream in enumerate(self.streams):
+            if self.fake_video:
+                source = self.Gst.ElementFactory.make(
+                    "videotestsrc", f"portal-source-{index}"
+                )
+                if source is not None:
+                    source.set_property("is-live", True)
+                    source.set_property("pattern", index % 24)
+            else:
+                descriptor = self._open_pipewire_remote()
+                self.capture_pipewire_fds.append(descriptor)
+                source = self.Gst.ElementFactory.make(
+                    "pipewiresrc", f"portal-source-{index}"
+                )
+                if source is not None:
+                    source.set_property("fd", descriptor)
+                    source.set_property("path", str(stream["node"]))
+                    source.set_property("do-timestamp", True)
+                    # Each Portal node feeds an independent appsink.  Copy at
+                    # the PipeWire boundary so the Python shared-canvas writer
+                    # never keeps a compositor-owned or Portal-owned buffer
+                    # alive after the callback returns.
+                    source.set_property("always-copy", True)
+            queue = self.Gst.ElementFactory.make(
+                "queue", f"frame-queue-{index}"
+            )
+            convert = self.Gst.ElementFactory.make(
+                "videoconvert", f"stream-convert-{index}"
+            )
+            scale = self.Gst.ElementFactory.make(
+                "videoscale", f"frame-scale-{index}"
+            )
+            stream_caps = self.Gst.ElementFactory.make(
+                "capsfilter", f"stream-caps-{index}"
+            )
+            sink = self.Gst.ElementFactory.make(
+                "appsink", f"capture-sink-{index}"
+            )
+            stream_elements = (
+                source,
+                queue,
+                convert,
+                scale,
+                stream_caps,
+                sink,
+            )
+            if any(element is None for element in stream_elements):
+                raise RuntimeError("无法创建 Wayland 多屏画面源管线")
+            queue.set_property("max-size-buffers", 2)
+            queue.set_property("leaky", 2)
+            scale.set_property("add-borders", False)
+            stream_caps.set_property(
+                "caps",
+                self.Gst.Caps.from_string(
+                    "video/x-raw,format=BGRx,"
+                    f"width={stream['width']},height={stream['height']},"
+                    "pixel-aspect-ratio=1/1"
+                ),
+            )
+            sink.set_property("sync", False)
+            sink.set_property("emit-signals", True)
+            sink.set_property("max-buffers", 2)
+            sink.set_property("drop", True)
+            for element in stream_elements:
+                self.capture_pipeline.add(element)
+            for first, second in zip(
+                stream_elements, stream_elements[1:]
+            ):
+                if not first.link(second):
+                    raise RuntimeError(
+                        "无法连接 Wayland 多屏画面源 "
+                        f"{first.name} → {second.name}"
+                    )
+            sink.connect("new-sample", write_stream, index, stream)
+        self._start_cursor_bridge()
         if self.capture_pipeline.set_state(
             self.Gst.State.PLAYING
         ) == self.Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("Wayland 画面桥无法进入 PLAYING 状态")
         bus = self.capture_pipeline.get_bus()
         deadline = time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS
-        while self.capture_frames == 0 and time.monotonic() < deadline:
+        while (
+            any(int(stats["frames"]) == 0 for stats in self.capture_stream_stats)
+            and time.monotonic() < deadline
+        ):
             message = bus.timed_pop_filtered(
                 200 * self.Gst.MSECOND,
                 self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS,
@@ -1147,8 +1534,16 @@ class WaylandPortalBackend:
                         f"Wayland 画面桥 GStreamer 错误：{error}（{debug}）"
                     )
                 raise RuntimeError("Wayland Portal 屏幕流意外结束")
-        if self.capture_frames == 0:
-            raise RuntimeError("Wayland Portal 在 10 秒内未产生画面帧")
+        missing = [
+            str(stats["node"])
+            for stats in self.capture_stream_stats
+            if int(stats["frames"]) == 0
+        ]
+        if missing:
+            raise RuntimeError(
+                "Wayland Portal 在 10 秒内未产生全部屏幕画面帧："
+                + ",".join(missing)
+            )
         self.ensure_healthy()
         self.capture_state = "active"
 
@@ -1157,6 +1552,22 @@ class WaylandPortalBackend:
             return
         if self.capture_pipeline is None:
             raise RuntimeError("Wayland PipeWire 画面转发未启动")
+        if (
+            self.cursor_helper_process is None or
+            self.cursor_helper_process.poll() is not None
+        ):
+            detail = ""
+            try:
+                detail = self.cursor_helper_log_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()[-1]
+            except (OSError, IndexError):
+                pass
+            raise RuntimeError(
+                "Wayland PipeWire 动态光标桥已停止"
+                + (f"：{detail}" if detail else "")
+            )
         message = self.capture_pipeline.get_bus().pop_filtered(
             self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS
         )
@@ -1173,6 +1584,21 @@ class WaylandPortalBackend:
             self.Gst.State.PLAYING,
         ):
             raise RuntimeError("Wayland PipeWire 画面转发已停止")
+        now_ns = time.monotonic_ns()
+        stale_ns = int(CAPTURE_STREAM_STALE_SECONDS * 1_000_000_000)
+        stalled = [
+            stats
+            for stats in self.capture_stream_stats
+            if int(stats.get("frames", 0)) > 0
+            and int(stats.get("last_ns", 0)) > 0
+            and now_ns - int(stats["last_ns"]) > stale_ns
+        ]
+        if stalled:
+            nodes = ",".join(str(stats["node"]) for stats in stalled)
+            raise RuntimeError(
+                "Wayland PipeWire 屏幕流停止交付新缓冲："
+                f"nodes={nodes}"
+            )
 
     def _configure_x11_keymap(self) -> None:
         self.x11 = ctypes.CDLL("libX11.so.6")
@@ -1212,13 +1638,23 @@ class WaylandPortalBackend:
         if self.fake_trace:
             self._fake_write("close")
         self.capture_state = "stopped"
+        if self.cursor_helper_process is not None:
+            process = self.cursor_helper_process
+            self.cursor_helper_process = None
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
         if self.capture_pipeline is not None:
             self.capture_pipeline.set_state(self.Gst.State.NULL)
             self.capture_pipeline.get_state(5 * self.Gst.SECOND)
             self.capture_pipeline = None
-        if self.capture_pipewire_fd >= 0:
-            os.close(self.capture_pipewire_fd)
-            self.capture_pipewire_fd = -1
+        for descriptor in self.capture_pipewire_fds:
+            os.close(descriptor)
+        self.capture_pipewire_fds.clear()
         if self.capture_map is not None:
             self.capture_map.close()
             self.capture_map = None
@@ -1259,15 +1695,77 @@ class WaylandPortalBackend:
         absolute: bool,
         virtual_desktop: bool = False,
     ) -> None:
-        del virtual_desktop
         options = {}
         if absolute:
-            x = max(0, min(dx, 65535)) * (self.stream_width - 1) / 65535
-            y = max(0, min(dy, 65535)) * (self.stream_height - 1) / 65535
+            primary = next(
+                (stream for stream in self.streams if stream.get("primary")),
+                self.streams[0],
+            )
+            target = primary
+            if virtual_desktop:
+                canvas_x = (
+                    max(0, min(dx, 65535))
+                    * (self.canvas_width - 1)
+                    / 65535
+                )
+                canvas_y = (
+                    max(0, min(dy, 65535))
+                    * (self.canvas_height - 1)
+                    / 65535
+                )
+                containing = [
+                    stream
+                    for stream in self.streams
+                    if stream["x"] <= canvas_x
+                    < stream["x"] + stream["width"]
+                    and stream["y"] <= canvas_y
+                    < stream["y"] + stream["height"]
+                ]
+                if containing:
+                    target = containing[0]
+                else:
+                    target = min(
+                        self.streams,
+                        key=lambda stream: (
+                            max(
+                                stream["x"] - canvas_x,
+                                0,
+                                canvas_x
+                                - (stream["x"] + stream["width"] - 1),
+                            )
+                            ** 2
+                            + max(
+                                stream["y"] - canvas_y,
+                                0,
+                                canvas_y
+                                - (stream["y"] + stream["height"] - 1),
+                            )
+                            ** 2
+                        ),
+                    )
+                x = max(
+                    0.0,
+                    min(canvas_x - target["x"], target["width"] - 1),
+                )
+                y = max(
+                    0.0,
+                    min(canvas_y - target["y"], target["height"] - 1),
+                )
+            else:
+                x = (
+                    max(0, min(dx, 65535))
+                    * (target["width"] - 1)
+                    / 65535
+                )
+                y = (
+                    max(0, min(dy, 65535))
+                    * (target["height"] - 1)
+                    / 65535
+                )
             self._notify(
                 "NotifyPointerMotionAbsolute",
                 "(oa{sv}udd)",
-                (self.session_handle, options, self.stream_node, x, y),
+                (self.session_handle, options, int(target["node"]), x, y),
             )
         else:
             self._notify(
@@ -1693,13 +2191,14 @@ def endpoint_content(
     cursor_geometry: tuple[int, int, int, int] | None = None,
     native_lock_keys: bool = False,
     lock_mask: int | None = None,
+    force_cursor: bool = True,
 ) -> str:
     content = (
         "[bridge]\n"
         f"version={PROTOCOL_VERSION}\n"
         f"port={port}\n"
         f"token={token.hex()}\n"
-        "force_cursor=1\n"
+        f"force_cursor={int(force_cursor)}\n"
         "cursor_image=uu-remote-native-cursor.bin\n"
         f"cursor_image_version={CURSOR_VERSION}\n"
         f"native_lock_keys={int(native_lock_keys)}\n"
@@ -1744,6 +2243,9 @@ def write_status(
     portal_stream: int = 0,
     capture_state: str = "inactive",
     capture_frames: int = 0,
+    capture_output_hash: int = 0,
+    capture_output_hash_changes: int = 0,
+    capture_streams: list[dict[str, int]] | None = None,
     absolute_target: tuple[int, int, int, int] | None = None,
     absolute_target_source: str = "",
     cursor_state: str = "inactive",
@@ -1783,6 +2285,9 @@ def write_status(
             "portal_stream": portal_stream,
             "capture_state": capture_state,
             "capture_frames": capture_frames,
+            "capture_output_hash": capture_output_hash,
+            "capture_output_hash_changes": capture_output_hash_changes,
+            "capture_streams": capture_streams or [],
             "absolute_target": (
                 list(absolute_target) if absolute_target is not None else None
             ),
@@ -1900,11 +2405,29 @@ def watch(
             portal_stream=portal_stream,
             capture_state=capture_state,
             capture_frames=current_capture_frames,
+            capture_output_hash=int(
+                getattr(backend, "capture_output_hash", 0)
+                if backend is not None else 0
+            ),
+            capture_output_hash_changes=int(
+                getattr(backend, "capture_output_hash_changes", 0)
+                if backend is not None else 0
+            ),
+            capture_streams=[
+                dict(stats)
+                for stats in getattr(
+                    backend, "capture_stream_stats", []
+                )
+            ] if backend is not None else [],
             absolute_target=getattr(backend, "absolute_geometry", None),
             absolute_target_source=str(
                 getattr(backend, "absolute_geometry_source", "")
             ),
-            cursor_state="active" if cursor_snapshot is not None else "inactive",
+            cursor_state=(
+                "active"
+                if cursor_snapshot is not None
+                else str(getattr(backend, "cursor_state", "inactive"))
+            ),
             cursor_sequence=cursor_sequence,
             cursor_width=cursor_snapshot[1] if cursor_snapshot else 0,
             cursor_height=cursor_snapshot[2] if cursor_snapshot else 0,
@@ -1939,8 +2462,13 @@ def watch(
                 port,
                 token,
                 current_geometry,
-                selected_backend() == "x11",
-                current_lock_mask,
+                native_lock_keys=selected_backend() == "x11",
+                lock_mask=current_lock_mask,
+                # X11 supplies cursor pixels through XFixes; Wayland metadata
+                # mode supplies the same UUCI file through the PipeWire
+                # sidecar.  UU therefore always renders exactly one native
+                # controller cursor and never traps a transparent pointer.
+                force_cursor=True,
             ),
         )
         endpoint_cursor_geometry = current_geometry
@@ -2115,9 +2643,16 @@ def watch(
                 last_status = now
         return 0
     except Exception as error:
+        # A completed Wayland backend has already passed Portal authorization
+        # and delivered frames.  Runtime PipeWire failures must therefore
+        # exit non-zero so the launcher's Restart=on-failure unit can rebuild
+        # the Portal session and shared-frame inode.  Initial authorization
+        # failures (backend is still None) exit cleanly, preventing a denied
+        # share dialog from reopening in a loop.
+        restartable = selected_backend() != "wayland" or backend is not None
         logger.write(f"原生输入桥异常：{error}")
         publish_status("error", str(error))
-        return 1
+        return 1 if restartable else 0
     finally:
         if controller is not None:
             try:

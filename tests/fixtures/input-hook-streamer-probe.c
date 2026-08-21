@@ -195,6 +195,7 @@ static int write_lifetime_cursor(DWORD sequence) {
 
 __declspec(dllexport) int WINAPI ProbeStreamerCursorCacheLifetime(void) {
     HCURSOR retained = NULL;
+    HCURSOR previous = NULL;
     CURSORINFO cursor;
     ICONINFO icon;
     DWORD index;
@@ -209,9 +210,14 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursorCacheLifetime(void) {
         if (!GetCursorInfo(&cursor) || !cursor.hCursor) {
             return 31;
         }
+        if (previous && cursor.hCursor == previous) {
+            /* Every fixture image is unique, including entries 65 and 66. */
+            return 33;
+        }
         if (index == 0u) {
             retained = cursor.hCursor;
         }
+        previous = cursor.hCursor;
     }
     ZeroMemory(&icon, sizeof(icon));
     if (!retained || !GetIconInfo(retained, &icon)) {
@@ -224,4 +230,104 @@ __declspec(dllexport) int WINAPI ProbeStreamerCursorCacheLifetime(void) {
         DeleteObject(icon.hbmColor);
     }
     return 0;
+}
+
+__declspec(dllexport) int WINAPI ProbeStreamerEmbeddedCursor(void) {
+    CURSORINFO cursor;
+    BITMAPINFO bitmap_info;
+    HDC screen = NULL;
+    HDC memory = NULL;
+    HBITMAP bitmap = NULL;
+    HGDIOBJ previous = NULL;
+    DWORD *pixels = NULL;
+    DWORD expected = 0x0055aa33u;
+    DWORD index;
+    int result = 0;
+
+    if (!WritePrivateProfileStringW(
+            L"bridge",
+            L"force_cursor",
+            L"0",
+            L"C:\\uu-remote-input-bridge.endpoint"
+        )) {
+        return 40;
+    }
+    /* The hook intentionally rate-limits endpoint refreshes to one second. */
+    Sleep(1100);
+    ZeroMemory(&cursor, sizeof(cursor));
+    cursor.cbSize = sizeof(cursor);
+    if (
+        !GetCursorInfo(&cursor) ||
+        cursor.flags != CURSOR_SHOWING ||
+        !cursor.hCursor
+    ) {
+        return 41;
+    }
+
+    screen = GetDC(NULL);
+    if (!screen) {
+        return 42;
+    }
+    memory = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (!memory) {
+        return 43;
+    }
+    ZeroMemory(&bitmap_info, sizeof(bitmap_info));
+    bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+    bitmap_info.bmiHeader.biWidth = 32;
+    bitmap_info.bmiHeader.biHeight = -32;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    bitmap = CreateDIBSection(
+        memory,
+        &bitmap_info,
+        DIB_RGB_COLORS,
+        (void **)&pixels,
+        NULL,
+        0
+    );
+    if (!bitmap || !pixels) {
+        result = 44;
+        goto cleanup;
+    }
+    previous = SelectObject(memory, bitmap);
+    if (!previous || previous == HGDI_ERROR) {
+        result = 45;
+        goto cleanup;
+    }
+    for (index = 0; index < 32u * 32u; ++index) {
+        pixels[index] = expected;
+    }
+    if (!DrawIconEx(
+            memory,
+            0,
+            0,
+            cursor.hCursor,
+            32,
+            32,
+            0,
+            NULL,
+            DI_NORMAL
+        )) {
+        result = 46;
+        goto cleanup;
+    }
+    for (index = 0; index < 32u * 32u; ++index) {
+        if (pixels[index] != expected) {
+            result = 47;
+            break;
+        }
+    }
+
+cleanup:
+    if (previous && previous != HGDI_ERROR) {
+        SelectObject(memory, previous);
+    }
+    if (bitmap) {
+        DeleteObject(bitmap);
+    }
+    DeleteDC(memory);
+    return result;
 }

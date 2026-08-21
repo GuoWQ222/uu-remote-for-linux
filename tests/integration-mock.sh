@@ -13,6 +13,7 @@ export PATH="$fixture_bin:$PATH"
 export XDG_DATA_HOME="$test_root/data"
 export XDG_STATE_HOME="$test_root/state"
 export XDG_CACHE_HOME="$test_root/cache"
+export XDG_CONFIG_HOME="$test_root/config"
 export UU_REMOTE_RUNTIME_DIR="$project_root/lib/uu-remote-for-linux"
 export UU_REMOTE_FAKE_TRACE="$test_root/fake-tools.log"
 export UU_REMOTE_HWDECODE_ASSUME_HOST_READY=1
@@ -30,6 +31,14 @@ export HTTP_PROXY=http://should-not-reach-wine.invalid:8888
 export HTTPS_PROXY=http://should-not-reach-wine.invalid:8888
 export DISPLAY=:99
 export XDG_SESSION_TYPE=x11
+
+case "$XDG_CONFIG_HOME" in
+    "$test_root"/*) ;;
+    *)
+        printf '集成测试配置目录未隔离：%s\n' "$XDG_CONFIG_HOME" >&2
+        exit 1
+        ;;
+esac
 
 "$launcher" --diagnose | grep -q '桌面后端.*x11'
 XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
@@ -275,6 +284,7 @@ encoder_cache_backup="$XDG_DATA_HOME/uu-remote-for-linux/encoder-cache-before-hw
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-manifest"
 test -e "$state_dir/hwencode-probe-status"
+grep -q $'\tluid=4045620583\t' "$state_dir/hwencode-probe-status"
 grep -q 'base_slots=1' "$state_dir/setup.log"
 grep -q 'long_slots=4' "$state_dir/setup.log"
 grep -q 'wrapper_vtable_rva=0x3280' "$state_dir/setup.log"
@@ -317,7 +327,7 @@ assert {
     and row.get("width") == row.get("height")
 } >= {1, 2}
 assert all(
-    row.get("adapter_id") == 1012 and row.get("device_id") == 8578
+    row.get("adapter_id") == 4045620583 and row.get("device_id") == 8578
     for row in rows
     if row.get("codec_impl") == 0
 )
@@ -325,6 +335,10 @@ PY
 test -e "$encoder_cache_backup"
 "$launcher" --diagnose | grep -q \
     'NVENC 编码策略.*已启用（NVENC/HEVC 深层验证通过）'
+UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC=1 "$launcher"
+grep -q \
+    'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client .*--setenv=UU_REMOTE_NVENC_ADAPTER_LUID=4045620583' \
+    "$UU_REMOTE_FAKE_TRACE"
 "$launcher" --disable-hwencode
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
 test ! -e "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
@@ -336,6 +350,24 @@ import sys
 rows = json.load(open(sys.argv[1], encoding="utf-8"))["encoder_capabilities"]
 assert any(row.get("codec_impl") == 6 for row in rows)
 PY
+
+if UU_REMOTE_FAKE_HWENCODE_PROBE_FAILURE=1 \
+    "$launcher" --enable-hwencode \
+        >"$test_root/hwencode-transaction.out" \
+        2>"$test_root/hwencode-transaction.err"; then
+    printf '深层探测失败的 NVENC 部署被意外接受。\n' >&2
+    exit 1
+fi
+grep -q 'NVENC 部署失败，已精确恢复部署前文件' \
+    "$test_root/hwencode-transaction.err"
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-manifest"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/dxvk-hwencode.conf"
+test ! -e "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+test ! -e "$install_dir/bin/uu-remote-nvenc-d3d11-probe.exe"
+test ! -e "$install_dir/bin/d3d11.dll"
+test ! -e "$install_dir/bin/dxgi.dll"
 
 streamer="$install_dir/bin/streamer.dll"
 streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
@@ -353,6 +385,28 @@ printf '\152\041\130' |
 export UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA
 UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA=$(sha256sum "$patched_fixture")
 UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA=${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA%% *}
+
+if UU_REMOTE_FAKE_INSTALL_FAILURE_SUFFIX=nvcuvid.dll.uu-remote-new \
+    "$launcher" --enable-hwdecode \
+        >"$test_root/hwdecode-transaction.out" \
+        2>"$test_root/hwdecode-transaction.err"; then
+    printf '中途写入失败的 NVDEC 部署被意外接受。\n' >&2
+    exit 1
+fi
+grep -q 'NVDEC 部署失败，已精确恢复部署前文件' \
+    "$test_root/hwdecode-transaction.err"
+test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
+    "$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA"
+grep -q '"mock":"original-cache"' "$decoder_cache"
+test ! -e "$streamer_original"
+test ! -e "$decoder_cache_backup"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-enabled"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-manifest"
+test ! -e "$install_dir/bin/d3d11.dll"
+test ! -e "$install_dir/bin/dxgi.dll"
+test ! -e "$prefix/drive_c/windows/system32/nvcuda.dll"
+test ! -e "$prefix/drive_c/windows/system32/nvcuvid.dll"
+test ! -e "$install_dir/bin/uu-remote-dxgi-probe.exe"
 
 "$launcher" --enable-hwdecode
 grep -q '^selection=nvidia:0$' \
@@ -430,6 +484,7 @@ sha256sum \
     "$prefix/drive_c/uu-remote-input-hook.dll" >"$protected_before"
 if UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
     UU_REMOTE_FAKE_INSTALLER_VERSION=4.34.0.8979 \
+    UU_REMOTE_FAKE_INSTALL_SYSTEM32_NVENC=1 \
     "$launcher" --check-update; then
     printf '版本核验失败的通用更新被意外接受。\n' >&2
     exit 1
@@ -448,6 +503,7 @@ sha256sum \
 cmp -s "$protected_before" "$protected_after"
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-enabled"
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-manifest"
+test ! -e "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
 
 UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
 UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \

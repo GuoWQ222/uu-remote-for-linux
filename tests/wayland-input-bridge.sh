@@ -32,6 +32,7 @@ export XDG_RUNTIME_DIR="$runtime_dir"
 export UU_REMOTE_DESKTOP_BACKEND=wayland-xwayland
 export UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE="$trace"
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO=1
+export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
 
 [[ $("$bridge" check) == wayland-portal ]]
 "$bridge" watch \
@@ -44,6 +45,7 @@ for _ in {1..100}; do
 done
 [[ -s $endpoint ]]
 grep -q '^native_lock_keys=0$' "$endpoint"
+grep -q '^force_cursor=1$' "$endpoint"
 if grep -q '^lock_state_valid=' "$endpoint"; then
     printf 'Wayland 端点不应发布 XKB 锁定状态。\n' >&2
     exit 1
@@ -82,6 +84,7 @@ send(2, 5, struct.pack("<iiIIIQ", 0, 0, 0, 0x0004, 0, 0))
 send(2, 6, struct.pack("<iiIIIQ", 0, 0, 120, 0x0800, 0, 0))
 send(3, 7, struct.pack("<HHIIQ", 0x41, 0x1E, 0x0008, 0, 0))
 send(3, 8, struct.pack("<HHIIQ", 0x41, 0x1E, 0x000A, 0, 0))
+send(2, 9, struct.pack("<iiIIIQ", 0, 32768, 0, 0xC001, 0, 0))
 time.sleep(0.2)
 PY
 
@@ -90,9 +93,10 @@ for _ in {1..100}; do
     sleep 0.02
 done
 
-grep -q '^session authorized devices=3 stream=77 128x72$' "$trace"
+grep -q '^session authorized devices=3 streams=77:128x72,78:64x128 canvas=192x128$' "$trace"
 grep -q '^capture active transport=shared-frame$' "$trace"
 grep -q '^NotifyPointerMotionAbsolute 77 ' "$trace"
+grep -q '^NotifyPointerMotionAbsolute 78 0.0 ' "$trace"
 grep -q '^NotifyPointerMotion 5.0 -3.0$' "$trace"
 grep -q '^NotifyPointerButton 272 1$' "$trace"
 grep -q '^NotifyPointerButton 272 0$' "$trace"
@@ -105,9 +109,27 @@ grep -q '"portal_stream": 77' \
     "$state_dir/input-bridge-status.json"
 grep -q '"capture_state": "active"' \
     "$state_dir/input-bridge-status.json"
+grep -q '"cursor_state": "metadata"' \
+    "$state_dir/input-bridge-status.json"
 grep -Eq '"capture_frames": [1-9][0-9]*' \
     "$state_dir/input-bridge-status.json"
 test -s "$(dirname "$endpoint")/uu-remote-wayland-frame.bin"
+/usr/bin/python3 - "$(dirname "$endpoint")/uu-remote-wayland-frame.bin" <<'PY'
+import mmap
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+with path.open("rb") as handle, mmap.mmap(
+    handle.fileno(), 0, access=mmap.ACCESS_READ
+) as frame:
+    header = struct.unpack_from("<10I2i16x", frame)
+assert header[:3] == (0x46575555, 2, 64), header
+assert header[3:6] == (192, 128, 768), header
+assert header[7] == 2 and header[9] > 0, header
+assert header[10:12] == (-64, 0), header
+PY
 grep -q '"hook_pid": 5151' \
     "$state_dir/input-bridge-status.json"
 

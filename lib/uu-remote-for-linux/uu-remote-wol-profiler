@@ -48,14 +48,16 @@ class PeImage:
     rdata: Section
     pdata: Section
 
-    def file_offset(self, rva: int) -> int:
+    def file_offset(self, rva: int, size: int = 1) -> int:
         for section in self.sections:
-            span = max(section.virtual_size, section.raw_size)
-            if section.rva <= rva < section.rva + span:
-                offset = section.raw_offset + rva - section.rva
-                if offset >= len(self.data):
-                    break
-                return offset
+            relative = rva - section.rva
+            if (
+                relative >= 0
+                and size > 0
+                and size <= section.raw_size
+                and relative <= section.raw_size - size
+            ):
+                return section.raw_offset + relative
         raise ProfileError(f"RVA 不属于文件节：{rva:#x}")
 
     def rva(self, file_offset: int) -> int:
@@ -76,9 +78,17 @@ def parse_pe(data: bytes) -> PeImage:
     if machine != 0x8664:
         raise ProfileError("仅支持官方 Win64 GameViewerServer.exe")
     optional = pe_offset + 24
-    if optional + optional_size > len(data) or struct.unpack_from("<H", data, optional)[0] != 0x20B:
+    if not 1 <= section_count <= 96:
+        raise ProfileError(f"PE 节数量无效：{section_count}")
+    if (
+        optional_size < 2
+        or optional + optional_size > len(data)
+        or struct.unpack_from("<H", data, optional)[0] != 0x20B
+    ):
         raise ProfileError("PE32+ 可选头无效")
     table = optional + optional_size
+    if section_count > (len(data) - table) // 40:
+        raise ProfileError("PE 节表越界")
     sections: list[Section] = []
     for index in range(section_count):
         header = table + index * 40
@@ -308,6 +318,17 @@ def synthetic_pe(duplicate: bool = False) -> bytes:
 
 
 def self_test() -> None:
+    truncated = bytearray(0x100)
+    truncated[:2] = b"MZ"
+    struct.pack_into("<I", truncated, 0x3C, 0xE8)
+    truncated[0xE8:0xEC] = b"PE\0\0"
+    struct.pack_into("<HH", truncated, 0xEC, 0x8664, 1)
+    try:
+        parse_pe(bytes(truncated))
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检未拒绝文件末尾截断的 PE 可选头")
     fixture = synthetic_pe()
     row, patched = derive_profile(fixture, "9.9.9.9")
     columns = row.split("\t")

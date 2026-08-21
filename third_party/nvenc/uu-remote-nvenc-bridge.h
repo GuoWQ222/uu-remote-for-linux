@@ -11,10 +11,13 @@
 #endif
 #include <d3d11.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #define UU_NVENC_ENCODER_MAGIC  0x55554e56454e4331ULL
 #define UU_NVENC_RESOURCE_MAGIC 0x55554e5652455331ULL
@@ -79,6 +82,7 @@ struct uu_nvenc_resource
     uint64_t magic;
     struct uu_nvenc_encoder *owner;
     NV_ENC_REGISTERED_PTR native_resource;
+    NV_ENC_INPUT_PTR mapped_resource;
     ID3D11Texture2D *texture;
     ID3D11Texture2D *staging;
     uu_CUdeviceptr cuda_memory;
@@ -87,6 +91,7 @@ struct uu_nvenc_resource
     uint32_t row_bytes;
     uint32_t rows;
     NV_ENC_BUFFER_FORMAT format;
+    BOOL upload_fresh;
     struct uu_nvenc_resource *next;
 };
 
@@ -97,6 +102,7 @@ struct uu_nvenc_encoder
     uu_CUdevice cuda_device;
     uu_CUcontext cuda_context;
     pthread_mutex_t mutex;
+    BOOL destroying;
     struct uu_nvenc_resource *resources;
     struct uu_nvenc_encoder *next;
 };
@@ -105,6 +111,15 @@ static void *uu_cuda_handle;
 static pthread_mutex_t uu_cuda_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t uu_bridge_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct uu_nvenc_encoder *uu_encoders;
+static uint64_t uu_map_calls;
+static uint64_t uu_map_matches;
+static uint64_t uu_encode_calls;
+static uint64_t uu_encode_matches;
+static uint64_t uu_encode_uploads;
+static uint64_t uu_unmap_calls;
+static uint64_t uu_upload_calls;
+static uint64_t uu_upload_hash_changes;
+static uint64_t uu_last_upload_hash;
 
 static uu_CUresult (*uu_cuInit)(unsigned int);
 static uu_CUresult (*uu_cuDeviceGetCount)(int *);
@@ -117,6 +132,86 @@ static uu_CUresult (*uu_cuMemAllocPitch)(uu_CUdeviceptr *, size_t *, size_t,
                                          size_t, unsigned int);
 static uu_CUresult (*uu_cuMemFree)(uu_CUdeviceptr);
 static uu_CUresult (*uu_cuMemcpyHtoD)(uu_CUdeviceptr, const void *, size_t);
+
+static void uu_free_resource(struct uu_nvenc_resource *resource);
+static NVENCSTATUS uu_upload_d3d11_resource_locked(
+    struct uu_nvenc_encoder *encoder,
+    struct uu_nvenc_resource *resource);
+
+static void uu_write_bridge_status(void)
+{
+    char path[160];
+    char status[1024];
+    int descriptor;
+    int length;
+
+    snprintf(path, sizeof(path),
+             "/tmp/uu-remote-nvenc-bridge-%lu.status",
+             (unsigned long)getpid());
+    length = snprintf(
+        status, sizeof(status),
+        "version=2\n"
+        "pid=%lu\n"
+        "map_calls=%llu\n"
+        "map_matches=%llu\n"
+        "encode_calls=%llu\n"
+        "encode_matches=%llu\n"
+        "encode_uploads=%llu\n"
+        "unmap_calls=%llu\n"
+        "upload_calls=%llu\n"
+        "upload_hash_changes=%llu\n"
+        "last_upload_hash=%016llx\n",
+        (unsigned long)getpid(),
+        (unsigned long long)__atomic_load_n(&uu_map_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_map_matches, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_encode_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_encode_matches, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_encode_uploads, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_unmap_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&uu_upload_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(
+            &uu_upload_hash_changes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(
+            &uu_last_upload_hash, __ATOMIC_RELAXED));
+    if (length <= 0 || (size_t)length >= sizeof(status))
+        return;
+    descriptor = open(path,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                      0600);
+    if (descriptor < 0)
+        return;
+    if (write(descriptor, status, (size_t)length) < 0)
+        WARN("failed to write NVENC bridge status: %s\n", strerror(errno));
+    close(descriptor);
+}
+
+static uint64_t uu_sample_mapped_texture(
+    const D3D11_MAPPED_SUBRESOURCE *mapped,
+    const struct uu_nvenc_resource *resource)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    uint32_t row_step = resource->rows > 32u ? resource->rows / 32u : 1u;
+    uint32_t byte_step = resource->row_bytes > 128u ?
+        resource->row_bytes / 128u : 1u;
+    uint32_t row;
+
+    for (row = 0; row < resource->rows; row += row_step)
+    {
+        const BYTE *source = (const BYTE *)mapped->pData +
+                             (size_t)row * mapped->RowPitch;
+        uint32_t offset;
+
+        for (offset = 0; offset < resource->row_bytes; offset += byte_step)
+        {
+            hash ^= source[offset];
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+#include "uu-remote-nvenc-lifecycle.h"
+#include "uu-remote-nvenc-texture.h"
 
 static BOOL uu_load_cuda_symbol(void *handle, void **target, const char *name)
 {
@@ -220,17 +315,6 @@ static BOOL uu_selected_cuda_device(uu_CUdevice *device)
     return TRUE;
 }
 
-static struct uu_nvenc_encoder *uu_find_encoder(void *native_encoder)
-{
-    struct uu_nvenc_encoder *encoder;
-
-    for (encoder = uu_encoders; encoder; encoder = encoder->next)
-        if (encoder->magic == UU_NVENC_ENCODER_MAGIC &&
-            encoder->native_encoder == native_encoder)
-            return encoder;
-    return NULL;
-}
-
 static struct uu_nvenc_resource *uu_find_resource(
     struct uu_nvenc_encoder *encoder, NV_ENC_REGISTERED_PTR handle)
 {
@@ -241,6 +325,20 @@ static struct uu_nvenc_resource *uu_find_resource(
     for (resource = encoder->resources; resource; resource = resource->next)
         if (resource->magic == UU_NVENC_RESOURCE_MAGIC &&
             (NV_ENC_REGISTERED_PTR)resource == handle)
+            return resource;
+    return NULL;
+}
+
+static struct uu_nvenc_resource *uu_find_mapped_resource(
+    struct uu_nvenc_encoder *encoder, NV_ENC_INPUT_PTR handle)
+{
+    struct uu_nvenc_resource *resource;
+
+    if (!encoder || !handle)
+        return NULL;
+    for (resource = encoder->resources; resource; resource = resource->next)
+        if (resource->magic == UU_NVENC_RESOURCE_MAGIC &&
+            resource->mapped_resource == handle)
             return resource;
     return NULL;
 }
@@ -256,26 +354,10 @@ static void uu_pop_encoder(void)
     uu_cuCtxPopCurrent(&previous);
 }
 
-static struct uu_nvenc_encoder *uu_lock_encoder(void *encoder_handle)
+static struct uu_nvenc_encoder *uu_enter_encoder(
+    void *encoder_handle, BOOL *bridged)
 {
-    struct uu_nvenc_encoder *encoder;
-
-    pthread_mutex_lock(&uu_bridge_mutex);
-    encoder = uu_find_encoder(encoder_handle);
-    if (encoder)
-        pthread_mutex_lock(&encoder->mutex);
-    pthread_mutex_unlock(&uu_bridge_mutex);
-    return encoder;
-}
-
-static void uu_unlock_encoder(struct uu_nvenc_encoder *encoder)
-{
-    pthread_mutex_unlock(&encoder->mutex);
-}
-
-static struct uu_nvenc_encoder *uu_enter_encoder(void *encoder_handle)
-{
-    struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle);
+    struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle, bridged);
 
     if (!encoder)
         return NULL;
@@ -296,11 +378,14 @@ static void uu_leave_encoder(struct uu_nvenc_encoder *encoder)
 static NVENCSTATUS uu_initialize_encoder(
     void *encoder_handle, NV_ENC_INITIALIZE_PARAMS *params)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncInitializeEncoder(encoder_handle, params);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncInitializeEncoder(encoder_handle,
+                                                              params);
     status = origFunctions.nvEncInitializeEncoder(encoder_handle, params);
     uu_leave_encoder(encoder);
     return status;
@@ -309,11 +394,14 @@ static NVENCSTATUS uu_initialize_encoder(
 static NVENCSTATUS uu_create_bitstream_buffer(
     void *encoder_handle, NV_ENC_CREATE_BITSTREAM_BUFFER *params)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncCreateBitstreamBuffer(encoder_handle, params);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncCreateBitstreamBuffer(encoder_handle,
+                                                                  params);
     status = origFunctions.nvEncCreateBitstreamBuffer(encoder_handle, params);
     uu_leave_encoder(encoder);
     return status;
@@ -322,11 +410,14 @@ static NVENCSTATUS uu_create_bitstream_buffer(
 static NVENCSTATUS uu_destroy_bitstream_buffer(
     void *encoder_handle, NV_ENC_OUTPUT_PTR buffer)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncDestroyBitstreamBuffer(encoder_handle, buffer);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncDestroyBitstreamBuffer(encoder_handle,
+                                                                   buffer);
     status = origFunctions.nvEncDestroyBitstreamBuffer(encoder_handle, buffer);
     uu_leave_encoder(encoder);
     return status;
@@ -335,24 +426,54 @@ static NVENCSTATUS uu_destroy_bitstream_buffer(
 static NVENCSTATUS uu_encode_picture(
     void *encoder_handle, NV_ENC_PIC_PARAMS *params)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle, &bridged);
+    struct uu_nvenc_resource *resource;
     NVENCSTATUS status;
+    uint64_t calls = __atomic_add_fetch(
+        &uu_encode_calls, 1u, __ATOMIC_RELAXED);
 
     if (!encoder)
-        return origFunctions.nvEncEncodePicture(encoder_handle, params);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncEncodePicture(encoder_handle, params);
+
+    resource = params ?
+        uu_find_mapped_resource(encoder, params->inputBuffer) : NULL;
+    if (resource)
+        __atomic_add_fetch(&uu_encode_matches, 1u, __ATOMIC_RELAXED);
+    if (resource && uu_nvenc_encode_upload_required(&resource->upload_fresh))
+    {
+        __atomic_add_fetch(&uu_encode_uploads, 1u, __ATOMIC_RELAXED);
+        status = uu_upload_d3d11_resource_locked(encoder, resource);
+        if (status != NV_ENC_SUCCESS)
+        {
+            uu_unlock_encoder(encoder);
+            return status;
+        }
+    }
+    if (!uu_push_encoder(encoder))
+    {
+        uu_unlock_encoder(encoder);
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
+    }
     status = origFunctions.nvEncEncodePicture(encoder_handle, params);
-    uu_leave_encoder(encoder);
+    uu_pop_encoder();
+    uu_unlock_encoder(encoder);
+    if (calls == 1u || calls % 120u == 0u)
+        uu_write_bridge_status();
     return status;
 }
 
 static NVENCSTATUS uu_lock_bitstream(
     void *encoder_handle, NV_ENC_LOCK_BITSTREAM *params)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncLockBitstream(encoder_handle, params);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncLockBitstream(encoder_handle, params);
     status = origFunctions.nvEncLockBitstream(encoder_handle, params);
     uu_leave_encoder(encoder);
     return status;
@@ -361,11 +482,14 @@ static NVENCSTATUS uu_lock_bitstream(
 static NVENCSTATUS uu_unlock_bitstream(
     void *encoder_handle, NV_ENC_OUTPUT_PTR buffer)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncUnlockBitstream(encoder_handle, buffer);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncUnlockBitstream(encoder_handle,
+                                                            buffer);
     status = origFunctions.nvEncUnlockBitstream(encoder_handle, buffer);
     uu_leave_encoder(encoder);
     return status;
@@ -374,83 +498,49 @@ static NVENCSTATUS uu_unlock_bitstream(
 static NVENCSTATUS uu_unmap_input_resource(
     void *encoder_handle, NV_ENC_INPUT_PTR resource)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle, &bridged);
+    struct uu_nvenc_resource *bridge_resource;
     NVENCSTATUS status;
 
+    __atomic_add_fetch(&uu_unmap_calls, 1u, __ATOMIC_RELAXED);
+
     if (!encoder)
-        return origFunctions.nvEncUnmapInputResource(encoder_handle, resource);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncUnmapInputResource(encoder_handle,
+                                                               resource);
+    bridge_resource = uu_find_mapped_resource(encoder, resource);
+    if (!uu_push_encoder(encoder))
+    {
+        uu_unlock_encoder(encoder);
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
+    }
     status = origFunctions.nvEncUnmapInputResource(encoder_handle, resource);
-    uu_leave_encoder(encoder);
+    uu_pop_encoder();
+    if (status == NV_ENC_SUCCESS && bridge_resource)
+    {
+        bridge_resource->mapped_resource = NULL;
+        bridge_resource->upload_fresh = FALSE;
+    }
+    uu_unlock_encoder(encoder);
+    uu_write_bridge_status();
     return status;
 }
 
 static NVENCSTATUS uu_reconfigure_encoder(
     void *encoder_handle, NV_ENC_RECONFIGURE_PARAMS *params)
 {
-    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle);
+    BOOL bridged;
+    struct uu_nvenc_encoder *encoder = uu_enter_encoder(encoder_handle, &bridged);
     NVENCSTATUS status;
 
     if (!encoder)
-        return origFunctions.nvEncReconfigureEncoder(encoder_handle, params);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncReconfigureEncoder(encoder_handle,
+                                                               params);
     status = origFunctions.nvEncReconfigureEncoder(encoder_handle, params);
     uu_leave_encoder(encoder);
     return status;
-}
-
-static BOOL uu_buffer_layout(NV_ENC_BUFFER_FORMAT format, uint32_t width,
-                             uint32_t height, uint32_t *row_bytes,
-                             uint32_t *rows)
-{
-    switch (format)
-    {
-        case NV_ENC_BUFFER_FORMAT_NV12:
-            *row_bytes = width;
-            *rows = height + (height + 1) / 2;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_NV16:
-            *row_bytes = width;
-            if (height > UINT32_MAX / 2)
-                return FALSE;
-            *rows = height * 2;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_YUV420_10BIT:
-            if (width > UINT32_MAX / 2)
-                return FALSE;
-            *row_bytes = width * 2;
-            *rows = height + (height + 1) / 2;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_P210:
-            if (width > UINT32_MAX / 2 || height > UINT32_MAX / 2)
-                return FALSE;
-            *row_bytes = width * 2;
-            *rows = height * 2;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_ARGB:
-        case NV_ENC_BUFFER_FORMAT_ARGB10:
-        case NV_ENC_BUFFER_FORMAT_AYUV:
-        case NV_ENC_BUFFER_FORMAT_ABGR:
-        case NV_ENC_BUFFER_FORMAT_ABGR10:
-            if (width > UINT32_MAX / 4)
-                return FALSE;
-            *row_bytes = width * 4;
-            *rows = height;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_YUV444:
-            *row_bytes = width;
-            if (height > UINT32_MAX / 3)
-                return FALSE;
-            *rows = height * 3;
-            return TRUE;
-        case NV_ENC_BUFFER_FORMAT_YUV444_10BIT:
-            if (width > UINT32_MAX / 2 || height > UINT32_MAX / 3)
-                return FALSE;
-            *row_bytes = width * 2;
-            *rows = height * 3;
-            return TRUE;
-        default:
-            ERR("unsupported D3D11 NVENC input format %#x\n", format);
-            return FALSE;
-    }
 }
 
 static void uu_free_resource(struct uu_nvenc_resource *resource)
@@ -471,6 +561,83 @@ static void uu_free_resource(struct uu_nvenc_resource *resource)
     if (resource->texture)
         ID3D11Texture2D_Release(resource->texture);
     HeapFree(GetProcessHeap(), 0, resource);
+}
+
+/*
+ * Copy the current D3D11 texture contents into the CUDA allocation backing a
+ * registered NVENC resource.  UU 4.38 keeps input resources mapped across
+ * frames, so doing this only from NvEncMapInputResource freezes the encoded
+ * video on the first mapped image even while NVENC continues at full rate.
+ */
+static NVENCSTATUS uu_upload_d3d11_resource_locked(
+    struct uu_nvenc_encoder *encoder,
+    struct uu_nvenc_resource *resource)
+{
+    ID3D11Device *device = NULL;
+    ID3D11DeviceContext *context = NULL;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    NVENCSTATUS status = UU_NV_ENC_ERR_GENERIC;
+    HRESULT hr;
+    uint32_t row;
+    uint64_t upload_hash;
+    uint64_t previous_hash;
+
+    ID3D11Texture2D_GetDevice(resource->texture, &device);
+    if (!device)
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
+    ID3D11Device_GetImmediateContext(device, &context);
+    ID3D11Device_Release(device);
+    if (!context)
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
+
+    ID3D11DeviceContext_CopySubresourceRegion(
+        context, (ID3D11Resource *)resource->staging, 0, 0, 0, 0,
+        (ID3D11Resource *)resource->texture,
+        resource->source_subresource, NULL);
+    memset(&mapped, 0, sizeof(mapped));
+    hr = ID3D11DeviceContext_Map(context,
+                                 (ID3D11Resource *)resource->staging, 0,
+                                 D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+    {
+        ERR("failed to map NVENC staging texture: %#x\n", (unsigned int)hr);
+        status = UU_NV_ENC_ERR_RESOURCE_NOT_MAPPED;
+        goto done;
+    }
+    if (mapped.RowPitch < resource->row_bytes || !uu_push_encoder(encoder))
+    {
+        status = UU_NV_ENC_ERR_INVALID_PARAM;
+        goto unmap;
+    }
+    upload_hash = uu_sample_mapped_texture(&mapped, resource);
+    previous_hash = __atomic_exchange_n(
+        &uu_last_upload_hash, upload_hash, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&uu_upload_calls, 1u, __ATOMIC_RELAXED);
+    if (previous_hash && previous_hash != upload_hash)
+        __atomic_add_fetch(
+            &uu_upload_hash_changes, 1u, __ATOMIC_RELAXED);
+    status = NV_ENC_SUCCESS;
+    for (row = 0; row < resource->rows; ++row)
+    {
+        const BYTE *source = (const BYTE *)mapped.pData +
+                             (size_t)row * mapped.RowPitch;
+        uu_CUdeviceptr destination = resource->cuda_memory +
+                                     (size_t)row * resource->cuda_pitch;
+        if (uu_cuMemcpyHtoD(destination, source, resource->row_bytes) !=
+            UU_CUDA_SUCCESS)
+        {
+            status = UU_NV_ENC_ERR_MAP_FAILED;
+            break;
+        }
+    }
+    uu_pop_encoder();
+
+unmap:
+    ID3D11DeviceContext_Unmap(context,
+                              (ID3D11Resource *)resource->staging, 0);
+done:
+    ID3D11DeviceContext_Release(context);
+    return status;
 }
 
 static NVENCSTATUS uu_open_d3d11_session(
@@ -526,10 +693,7 @@ static NVENCSTATUS uu_open_d3d11_session(
     }
 
     bridge->magic = UU_NVENC_ENCODER_MAGIC;
-    pthread_mutex_lock(&uu_bridge_mutex);
-    bridge->next = uu_encoders;
-    uu_encoders = bridge;
-    pthread_mutex_unlock(&uu_bridge_mutex);
+    uu_publish_encoder(bridge);
     *encoder = bridge->native_encoder;
     TRACE("translated D3D11 NVENC session %p to CUDA device %d context %p\n",
           bridge->native_encoder, bridge->cuda_device, bridge->cuda_context);
@@ -539,6 +703,7 @@ static NVENCSTATUS uu_open_d3d11_session(
 static NVENCSTATUS uu_register_d3d11_resource(
     void *encoder_handle, NV_ENC_REGISTER_RESOURCE *params)
 {
+    BOOL bridged;
     struct uu_nvenc_encoder *encoder;
     struct uu_nvenc_resource *resource;
     NV_ENC_REGISTER_RESOURCE native_params;
@@ -546,8 +711,12 @@ static NVENCSTATUS uu_register_d3d11_resource(
     D3D11_TEXTURE2D_DESC staging_desc;
     NVENCSTATUS status;
     HRESULT hr;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
 
-    encoder = uu_lock_encoder(encoder_handle);
+    encoder = uu_lock_encoder(encoder_handle, &bridged);
+    if (!encoder && bridged)
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
     if (!encoder || !params ||
         params->resourceType != UU_NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX)
     {
@@ -573,9 +742,20 @@ static NVENCSTATUS uu_register_d3d11_resource(
     ID3D11Texture2D_GetDesc(resource->texture, &source_desc);
     resource->source_subresource = params->subResourceIndex;
     resource->format = params->bufferFormat;
-    if (!uu_buffer_layout(params->bufferFormat, params->width, params->height,
-                          &resource->row_bytes, &resource->rows))
+    if (!uu_d3d11_subresource_dimensions(
+            &source_desc, params->subResourceIndex,
+            &source_width, &source_height) ||
+        source_width != params->width || source_height != params->height ||
+        !uu_d3d11_buffer_layout(
+            params->bufferFormat, source_desc.Format,
+            params->width, params->height,
+            &resource->row_bytes, &resource->rows))
     {
+        ERR("invalid D3D11 NVENC texture: format=%#x nvenc=%#x "
+            "resource=%ux%u requested=%ux%u subresource=%u\n",
+            source_desc.Format, params->bufferFormat,
+            source_width, source_height, params->width, params->height,
+            params->subResourceIndex);
         status = NV_ENC_ERR_UNSUPPORTED_PARAM;
         goto failed;
     }
@@ -657,20 +837,22 @@ failed:
 static NVENCSTATUS uu_upload_and_map_resource(
     void *encoder_handle, NV_ENC_MAP_INPUT_RESOURCE *params)
 {
+    BOOL bridged;
     struct uu_nvenc_encoder *encoder;
     struct uu_nvenc_resource *resource;
     NV_ENC_MAP_INPUT_RESOURCE native_params;
-    ID3D11Device *device = NULL;
-    ID3D11DeviceContext *context = NULL;
-    D3D11_MAPPED_SUBRESOURCE mapped;
     NVENCSTATUS status = UU_NV_ENC_ERR_GENERIC;
-    HRESULT hr;
-    uint32_t row;
+
+    __atomic_add_fetch(&uu_map_calls, 1u, __ATOMIC_RELAXED);
 
     if (!params)
         return NV_ENC_ERR_INVALID_PTR;
-    encoder = uu_lock_encoder(encoder_handle);
+    encoder = uu_lock_encoder(encoder_handle, &bridged);
+    if (!encoder && bridged)
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
     resource = uu_find_resource(encoder, params->registeredResource);
+    if (resource)
+        __atomic_add_fetch(&uu_map_matches, 1u, __ATOMIC_RELAXED);
     if (!resource)
     {
         if (encoder)
@@ -678,53 +860,14 @@ static NVENCSTATUS uu_upload_and_map_resource(
         return origFunctions.nvEncMapInputResource(encoder_handle, params);
     }
 
-    ID3D11Texture2D_GetDevice(resource->texture, &device);
-    if (!device)
+    status = uu_upload_d3d11_resource_locked(encoder, resource);
+    if (status != NV_ENC_SUCCESS)
+        goto done;
+    if (!uu_push_encoder(encoder))
     {
-        uu_unlock_encoder(encoder);
-        return UU_NV_ENC_ERR_INVALID_DEVICE;
-    }
-    ID3D11Device_GetImmediateContext(device, &context);
-    ID3D11Device_Release(device);
-    if (!context)
-    {
-        uu_unlock_encoder(encoder);
-        return UU_NV_ENC_ERR_INVALID_DEVICE;
-    }
-
-    ID3D11DeviceContext_CopySubresourceRegion(
-        context, (ID3D11Resource *)resource->staging, 0, 0, 0, 0,
-        (ID3D11Resource *)resource->texture, resource->source_subresource, NULL);
-    memset(&mapped, 0, sizeof(mapped));
-    hr = ID3D11DeviceContext_Map(context,
-                                 (ID3D11Resource *)resource->staging, 0,
-                                 D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr))
-    {
-        ERR("failed to map NVENC staging texture: %#x\n", (unsigned int)hr);
-        status = UU_NV_ENC_ERR_RESOURCE_NOT_MAPPED;
+        status = UU_NV_ENC_ERR_INVALID_DEVICE;
         goto done;
     }
-    if (mapped.RowPitch < resource->row_bytes || !uu_push_encoder(encoder))
-    {
-        status = UU_NV_ENC_ERR_INVALID_PARAM;
-        goto unmap;
-    }
-    for (row = 0; row < resource->rows; ++row)
-    {
-        const BYTE *source = (const BYTE *)mapped.pData +
-                             (size_t)row * mapped.RowPitch;
-        uu_CUdeviceptr destination = resource->cuda_memory +
-                                     (size_t)row * resource->cuda_pitch;
-        if (uu_cuMemcpyHtoD(destination, source, resource->row_bytes) !=
-            UU_CUDA_SUCCESS)
-        {
-            status = UU_NV_ENC_ERR_MAP_FAILED;
-            uu_pop_encoder();
-            goto unmap;
-        }
-    }
-
     native_params = *params;
     native_params.registeredResource = resource->native_resource;
     status = origFunctions.nvEncMapInputResource(encoder_handle, &native_params);
@@ -733,36 +876,42 @@ static NVENCSTATUS uu_upload_and_map_resource(
     {
         params->mappedResource = native_params.mappedResource;
         params->mappedBufferFmt = native_params.mappedBufferFmt;
+        resource->mapped_resource = native_params.mappedResource;
+        resource->upload_fresh = TRUE;
     }
-
-unmap:
-    ID3D11DeviceContext_Unmap(context,
-                              (ID3D11Resource *)resource->staging, 0);
 done:
-    ID3D11DeviceContext_Release(context);
     uu_unlock_encoder(encoder);
+    uu_write_bridge_status();
     return status;
+}
+
+static NVENCSTATUS uu_unregister_bridge_resource_locked(
+    void *encoder_handle,
+    struct uu_nvenc_encoder *encoder,
+    struct uu_nvenc_resource *resource)
+{
+    NVENCSTATUS status;
+
+    if (!uu_push_encoder(encoder))
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
+    status = origFunctions.nvEncUnregisterResource(
+        encoder_handle, resource->native_resource);
+    uu_pop_encoder();
+    return uu_complete_resource_unregister(encoder, resource, status);
 }
 
 static NVENCSTATUS uu_unregister_resource(
     void *encoder_handle, NV_ENC_REGISTERED_PTR handle)
 {
+    BOOL bridged;
     struct uu_nvenc_encoder *encoder;
     struct uu_nvenc_resource *resource;
-    struct uu_nvenc_resource **cursor;
     NVENCSTATUS status;
 
-    encoder = uu_lock_encoder(encoder_handle);
+    encoder = uu_lock_encoder(encoder_handle, &bridged);
+    if (!encoder && bridged)
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
     resource = uu_find_resource(encoder, handle);
-    if (resource)
-    {
-        for (cursor = &encoder->resources; *cursor; cursor = &(*cursor)->next)
-            if (*cursor == resource)
-            {
-                *cursor = resource->next;
-                break;
-            }
-    }
     if (!resource)
     {
         if (encoder)
@@ -770,58 +919,51 @@ static NVENCSTATUS uu_unregister_resource(
         return origFunctions.nvEncUnregisterResource(encoder_handle, handle);
     }
 
-    if (!uu_push_encoder(encoder))
-        status = UU_NV_ENC_ERR_INVALID_DEVICE;
-    else
-    {
-        status = origFunctions.nvEncUnregisterResource(
-            encoder_handle, resource->native_resource);
-        uu_pop_encoder();
-    }
-    uu_free_resource(resource);
+    status = uu_unregister_bridge_resource_locked(
+        encoder_handle, encoder, resource);
     uu_unlock_encoder(encoder);
     return status;
 }
 
 static NVENCSTATUS uu_destroy_encoder(void *encoder_handle)
 {
+    BOOL bridged;
     struct uu_nvenc_encoder *encoder;
-    struct uu_nvenc_encoder **cursor;
     struct uu_nvenc_resource *resource;
     NVENCSTATUS status;
 
-    pthread_mutex_lock(&uu_bridge_mutex);
-    encoder = uu_find_encoder(encoder_handle);
-    if (encoder)
-    {
-        for (cursor = &uu_encoders; *cursor; cursor = &(*cursor)->next)
-            if (*cursor == encoder)
-            {
-                *cursor = encoder->next;
-                break;
-            }
-        pthread_mutex_lock(&encoder->mutex);
-    }
-    pthread_mutex_unlock(&uu_bridge_mutex);
+    encoder = uu_begin_encoder_destroy(encoder_handle, &bridged);
     if (!encoder)
-        return origFunctions.nvEncDestroyEncoder(encoder_handle);
+        return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
+                         origFunctions.nvEncDestroyEncoder(encoder_handle);
 
     while ((resource = encoder->resources))
     {
-        encoder->resources = resource->next;
-        uu_free_resource(resource);
+        status = uu_unregister_bridge_resource_locked(
+            encoder_handle, encoder, resource);
+        if (status != NV_ENC_SUCCESS)
+        {
+            uu_cancel_encoder_destroy(encoder);
+            return status;
+        }
     }
-    if (uu_push_encoder(encoder))
+    if (!uu_push_encoder(encoder))
     {
-        status = origFunctions.nvEncDestroyEncoder(encoder_handle);
-        uu_pop_encoder();
+        uu_cancel_encoder_destroy(encoder);
+        return UU_NV_ENC_ERR_INVALID_DEVICE;
     }
-    else
-        status = UU_NV_ENC_ERR_INVALID_DEVICE;
-    encoder->magic = 0;
+    status = origFunctions.nvEncDestroyEncoder(encoder_handle);
+    uu_pop_encoder();
+    if (status != NV_ENC_SUCCESS)
+    {
+        uu_cancel_encoder_destroy(encoder);
+        return status;
+    }
     uu_cuDevicePrimaryCtxRelease(encoder->cuda_device);
+    uu_retire_destroyed_encoder(encoder);
     pthread_mutex_unlock(&encoder->mutex);
     pthread_mutex_destroy(&encoder->mutex);
+    encoder->magic = 0;
     HeapFree(GetProcessHeap(), 0, encoder);
     return status;
 }

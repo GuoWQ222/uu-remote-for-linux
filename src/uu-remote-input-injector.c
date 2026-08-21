@@ -17,9 +17,10 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define INJECTOR_VERSION 3u
+#define INJECTOR_VERSION 4u
 #define WATCH_INTERVAL_MS 500u
 #define PRELOAD_MODULE_WAIT_MS 10000u
+#define DIRECT_INJECTION_WAIT_MS 10000u
 
 static DWORD find_process(const WCHAR *image_name) {
     HANDLE snapshot;
@@ -90,7 +91,8 @@ static BOOL remote_module_info(
 static BOOL initialize_remote_hook(
     DWORD pid,
     const WCHAR *dll_path,
-    BOOL preloaded
+    BOOL preloaded,
+    DWORD wait_timeout
 ) {
     uintptr_t remote_hook;
     HMODULE local_hook = NULL;
@@ -98,6 +100,7 @@ static BOOL initialize_remote_hook(
     LPTHREAD_START_ROUTINE remote_initialize;
     HANDLE process = NULL;
     HANDLE thread = NULL;
+    DWORD wait_result;
     DWORD thread_exit = 0;
     BOOL success = FALSE;
 
@@ -144,8 +147,15 @@ static BOOL initialize_remote_hook(
     if (!thread) {
         goto cleanup;
     }
-    if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
-        SetLastError(ERROR_TIMEOUT);
+    wait_result = WaitForSingleObject(thread, wait_timeout);
+    if (wait_result != WAIT_OBJECT_0) {
+        SetLastError(
+            wait_result == WAIT_TIMEOUT
+                ? ERROR_TIMEOUT
+                : (wait_result == WAIT_FAILED
+                    ? GetLastError()
+                    : ERROR_GEN_FAILURE)
+        );
         goto cleanup;
     }
     if (!GetExitCodeThread(thread, &thread_exit) || thread_exit == 0) {
@@ -170,7 +180,8 @@ cleanup:
 static BOOL inject_library(
     DWORD pid,
     const WCHAR *dll_path,
-    BOOL preloaded
+    BOOL preloaded,
+    DWORD wait_timeout
 ) {
     HANDLE process = NULL;
     HANDLE thread = NULL;
@@ -188,7 +199,9 @@ static BOOL inject_library(
     BOOL success = FALSE;
 
     if (remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)) {
-        return initialize_remote_hook(pid, dll_path, preloaded);
+        return initialize_remote_hook(
+            pid, dll_path, preloaded, wait_timeout
+        );
     }
     if (!remote_module_info(pid, L"kernel32.dll", &remote_kernel32)) {
         SetLastError(ERROR_MOD_NOT_FOUND);
@@ -248,7 +261,7 @@ static BOOL inject_library(
     if (!thread) {
         goto cleanup;
     }
-    wait_result = WaitForSingleObject(thread, 10000);
+    wait_result = WaitForSingleObject(thread, wait_timeout);
     if (wait_result != WAIT_OBJECT_0) {
         failure_error = wait_result == WAIT_TIMEOUT
             ? ERROR_TIMEOUT
@@ -262,7 +275,7 @@ static BOOL inject_library(
         goto cleanup;
     }
     success = remote_module_info(pid, L"uu-remote-input-hook.dll", NULL) &&
-        initialize_remote_hook(pid, dll_path, preloaded);
+        initialize_remote_hook(pid, dll_path, preloaded, wait_timeout);
     if (!success) {
         SetLastError(ERROR_MOD_NOT_FOUND);
     }
@@ -286,13 +299,100 @@ cleanup:
     return success;
 }
 
+enum remote_operation_kind {
+    REMOTE_OPERATION_INJECT,
+    REMOTE_OPERATION_INITIALIZE
+};
+
+struct remote_operation {
+    HANDLE worker;
+    DWORD pid;
+    const WCHAR *dll_path;
+    enum remote_operation_kind kind;
+    BOOL success;
+    DWORD error;
+};
+
+static DWORD WINAPI remote_operation_worker(void *context) {
+    struct remote_operation *operation = context;
+
+    if (operation->kind == REMOTE_OPERATION_INITIALIZE) {
+        operation->success = initialize_remote_hook(
+            operation->pid, operation->dll_path, FALSE, INFINITE
+        );
+    } else {
+        operation->success = inject_library(
+            operation->pid, operation->dll_path, FALSE, INFINITE
+        );
+    }
+    operation->error = operation->success
+        ? ERROR_SUCCESS
+        : GetLastError();
+    return 0;
+}
+
+static struct remote_operation *start_remote_operation(
+    DWORD pid,
+    const WCHAR *dll_path,
+    enum remote_operation_kind kind
+) {
+    struct remote_operation *operation;
+    DWORD error;
+
+    operation = HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*operation)
+    );
+    if (!operation) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    operation->pid = pid;
+    operation->dll_path = dll_path;
+    operation->kind = kind;
+    operation->worker = CreateThread(
+        NULL, 0, remote_operation_worker, operation, 0, NULL
+    );
+    if (!operation->worker) {
+        error = GetLastError();
+        HeapFree(GetProcessHeap(), 0, operation);
+        SetLastError(error);
+        return NULL;
+    }
+    return operation;
+}
+
+static BOOL poll_remote_operation(
+    struct remote_operation **operation_pointer,
+    BOOL *success,
+    DWORD *error
+) {
+    struct remote_operation *operation = *operation_pointer;
+    DWORD wait_result;
+
+    if (!operation) {
+        return FALSE;
+    }
+    wait_result = WaitForSingleObject(operation->worker, 0);
+    if (wait_result != WAIT_OBJECT_0) {
+        return FALSE;
+    }
+    *success = operation->success;
+    *error = operation->error;
+    CloseHandle(operation->worker);
+    HeapFree(GetProcessHeap(), 0, operation);
+    *operation_pointer = NULL;
+    return TRUE;
+}
+
 static int inject_once(const WCHAR *image_name, const WCHAR *dll_path) {
     DWORD pid = find_process(image_name);
     if (!pid) {
         fwprintf(stderr, L"target-not-running image=%ls\n", image_name);
         return 2;
     }
-    if (!inject_library(pid, dll_path, FALSE)) {
+    if (!inject_library(
+            pid, dll_path, FALSE, DIRECT_INJECTION_WAIT_MS
+        )) {
         fwprintf(
             stderr,
             L"inject-failed pid=%lu error=%lu\n",
@@ -309,9 +409,60 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     DWORD last_pid = 0;
     BOOL last_injected = FALSE;
     uintptr_t initialized_streamer = 0;
+    struct remote_operation *operation = NULL;
+    enum remote_operation_kind operation_kind = REMOTE_OPERATION_INJECT;
+    DWORD operation_pid = 0;
+    uintptr_t operation_streamer = 0;
 
     for (;;) {
         DWORD pid = find_process(image_name);
+        BOOL operation_success;
+        DWORD operation_error;
+
+        if (
+            poll_remote_operation(
+                &operation, &operation_success, &operation_error
+            )
+        ) {
+            if (operation_pid == last_pid) {
+                if (operation_kind == REMOTE_OPERATION_INJECT) {
+                    last_injected = operation_success;
+                    if (operation_success) {
+                        initialized_streamer = 0;
+                        wprintf(
+                            L"injected pid=%lu\n",
+                            (unsigned long)operation_pid
+                        );
+                        fflush(stdout);
+                    } else {
+                        fwprintf(
+                            stderr,
+                            L"inject-retry pid=%lu error=%lu\n",
+                            (unsigned long)operation_pid,
+                            (unsigned long)operation_error
+                        );
+                        fflush(stderr);
+                    }
+                } else if (operation_success) {
+                    initialized_streamer = operation_streamer;
+                    wprintf(
+                        L"streamer-initialized pid=%lu\n",
+                        (unsigned long)operation_pid
+                    );
+                    fflush(stdout);
+                } else {
+                    fwprintf(
+                        stderr,
+                        L"streamer-initialize-retry pid=%lu error=%lu\n",
+                        (unsigned long)operation_pid,
+                        (unsigned long)operation_error
+                    );
+                    fflush(stderr);
+                }
+            }
+            operation_pid = 0;
+            operation_streamer = 0;
+        }
         if (!pid) {
             last_pid = 0;
             last_injected = FALSE;
@@ -325,41 +476,56 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
             initialized_streamer = 0;
         }
         if (
-            !last_injected ||
-            !remote_module_info(pid, L"uu-remote-input-hook.dll", NULL)
+            !operation &&
+            (
+                !last_injected ||
+                !remote_module_info(
+                    pid, L"uu-remote-input-hook.dll", NULL
+                )
+            )
         ) {
-            last_injected = inject_library(pid, dll_path, FALSE);
-            if (last_injected) {
-                initialized_streamer = 0;
-                wprintf(L"injected pid=%lu\n", (unsigned long)pid);
-                fflush(stdout);
+            operation = start_remote_operation(
+                pid, dll_path, REMOTE_OPERATION_INJECT
+            );
+            if (operation) {
+                operation_kind = REMOTE_OPERATION_INJECT;
+                operation_pid = pid;
+                operation_streamer = 0;
             } else {
                 fwprintf(
                     stderr,
-                    L"inject-retry pid=%lu error=%lu\n",
+                    L"inject-start-retry pid=%lu error=%lu\n",
                     (unsigned long)pid,
                     (unsigned long)GetLastError()
                 );
                 fflush(stderr);
             }
         }
-        if (last_injected) {
+        if (last_injected && !operation) {
             uintptr_t streamer_module = 0;
 
             if (!remote_module_info(
                     pid, L"streamer.dll", &streamer_module
                 )) {
                 initialized_streamer = 0;
-            } else if (
-                streamer_module != initialized_streamer &&
-                initialize_remote_hook(pid, dll_path, FALSE)
-            ) {
-                initialized_streamer = streamer_module;
-                wprintf(
-                    L"streamer-initialized pid=%lu\n",
-                    (unsigned long)pid
+            } else if (streamer_module != initialized_streamer) {
+                operation = start_remote_operation(
+                    pid, dll_path, REMOTE_OPERATION_INITIALIZE
                 );
-                fflush(stdout);
+                if (operation) {
+                    operation_kind = REMOTE_OPERATION_INITIALIZE;
+                    operation_pid = pid;
+                    operation_streamer = streamer_module;
+                } else {
+                    fwprintf(
+                        stderr,
+                        L"streamer-initialize-start-retry pid=%lu "
+                        L"error=%lu\n",
+                        (unsigned long)pid,
+                        (unsigned long)GetLastError()
+                    );
+                    fflush(stderr);
+                }
             }
         }
         Sleep(WATCH_INTERVAL_MS);
@@ -376,6 +542,7 @@ static int watch_process_with_module(
         DWORD pid;
         BOOL initialized;
         BOOL seen;
+        struct remote_operation *operation;
     } watched[32];
     unsigned int watched_count = 0;
 
@@ -412,13 +579,45 @@ static int watch_process_with_module(
                     }
                     if (!state && watched_count < 32u) {
                         state = &watched[watched_count++];
+                        ZeroMemory(state, sizeof(*state));
                         state->pid = entry.th32ProcessID;
-                        state->initialized = FALSE;
                     }
                     if (!state) {
                         continue;
                     }
                     state->seen = TRUE;
+                    if (state->operation) {
+                        BOOL operation_success;
+                        DWORD operation_error;
+
+                        if (
+                            poll_remote_operation(
+                                &state->operation,
+                                &operation_success,
+                                &operation_error
+                            )
+                        ) {
+                            state->initialized = operation_success;
+                            if (operation_success) {
+                                wprintf(
+                                    L"injected pid=%lu module=%ls\n",
+                                    (unsigned long)state->pid,
+                                    required_module
+                                );
+                                fflush(stdout);
+                            } else {
+                                fwprintf(
+                                    stderr,
+                                    L"inject-retry pid=%lu module=%ls "
+                                    L"error=%lu\n",
+                                    (unsigned long)state->pid,
+                                    required_module,
+                                    (unsigned long)operation_error
+                                );
+                                fflush(stderr);
+                            }
+                        }
+                    }
                     if (
                         state->initialized &&
                         !remote_module_info(
@@ -429,21 +628,16 @@ static int watch_process_with_module(
                     ) {
                         state->initialized = FALSE;
                     }
-                    if (!state->initialized) {
-                        state->initialized = inject_library(
-                            state->pid, dll_path, FALSE
+                    if (!state->initialized && !state->operation) {
+                        state->operation = start_remote_operation(
+                            state->pid,
+                            dll_path,
+                            REMOTE_OPERATION_INJECT
                         );
-                        if (state->initialized) {
-                            wprintf(
-                                L"injected pid=%lu module=%ls\n",
-                                (unsigned long)state->pid,
-                                required_module
-                            );
-                            fflush(stdout);
-                        } else {
+                        if (!state->operation) {
                             fwprintf(
                                 stderr,
-                                L"inject-retry pid=%lu module=%ls "
+                                L"inject-start-retry pid=%lu module=%ls "
                                 L"error=%lu\n",
                                 (unsigned long)state->pid,
                                 required_module,
@@ -458,6 +652,20 @@ static int watch_process_with_module(
         }
         for (index = 0; index < watched_count;) {
             if (!watched[index].seen) {
+                if (watched[index].operation) {
+                    BOOL ignored_success;
+                    DWORD ignored_error;
+
+                    poll_remote_operation(
+                        &watched[index].operation,
+                        &ignored_success,
+                        &ignored_error
+                    );
+                }
+                if (watched[index].operation) {
+                    ++index;
+                    continue;
+                }
                 watched[index] = watched[watched_count - 1u];
                 --watched_count;
             } else {
@@ -561,7 +769,12 @@ static int launch_suspended(
             return 1;
         }
     }
-    if (!inject_library(process.dwProcessId, dll_path, TRUE)) {
+    if (!inject_library(
+            process.dwProcessId,
+            dll_path,
+            TRUE,
+            DIRECT_INJECTION_WAIT_MS
+        )) {
         fwprintf(
             stderr,
             L"preload-failed pid=%lu error=%lu\n",

@@ -25,6 +25,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <dxgi1_2.h>
 
 #include <stdint.h>
 #include <limits.h>
@@ -38,9 +39,9 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 35u
+#define HOOK_VERSION 43u
 #define UUWF_MAGIC 0x46575555u
-#define UUWF_VERSION 1u
+#define UUWF_VERSION 2u
 #define UUWF_HEADER_SIZE 64u
 #define UUWF_BUFFER_COUNT 2u
 #define UUWF_STALE_TIMEOUT_MS 2000u
@@ -50,9 +51,11 @@
 #define UUCI_MAX_DIMENSION 512u
 #define UUCI_CHECK_INTERVAL_MS 8u
 #define UUCI_CACHE_CAPACITY 64u
+#define UUCI_TRANSPARENT_SIZE 32u
 #define EXECUTABLE_PATCH_SIZE 12u
 #define EXECUTABLE_PATCH_MAX_THREADS 1024u
 #define EXECUTABLE_PATCH_MAX_ATTEMPTS 32u
+#define EXECUTABLE_PATCH_MAX_ROUTES 64u
 #define FOCUS_UNHOOK_GRACE_MS 350u
 #define FOCUS_INTERNAL_GRACE_MS 700u
 #define FOCUS_STORM_WINDOW_MS 250u
@@ -134,6 +137,27 @@ typedef ULONG(WINAPI *get_adapters_addresses_fn)(
 );
 typedef ULONG(WINAPI *get_adapters_info_fn)(PIP_ADAPTER_INFO, PULONG);
 typedef NETIO_STATUS(WINAPI *get_if_table2_fn)(PMIB_IF_TABLE2 *);
+typedef HRESULT(WINAPI *create_dxgi_factory1_fn)(REFIID, void **);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_enum_adapters_fn)(
+    IDXGIFactory1 *, UINT, IDXGIAdapter **
+);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_enum_adapters1_fn)(
+    IDXGIFactory1 *, UINT, IDXGIAdapter1 **
+);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_enum_outputs_fn)(
+    IDXGIAdapter *, UINT, IDXGIOutput **
+);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_duplicate_output_fn)(
+    IDXGIOutput1 *, IUnknown *, IDXGIOutputDuplication **
+);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_acquire_next_frame_fn)(
+    IDXGIOutputDuplication *, UINT, DXGI_OUTDUPL_FRAME_INFO *,
+    IDXGIResource **
+);
+typedef HRESULT(STDMETHODCALLTYPE *dxgi_get_frame_pointer_shape_fn)(
+    IDXGIOutputDuplication *, UINT, void *, UINT *,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO *
+);
 
 static send_input_fn original_send_input;
 static get_key_state_fn original_get_key_state;
@@ -156,6 +180,14 @@ static post_message_w_fn original_post_message_w;
 static get_adapters_addresses_fn original_get_adapters_addresses;
 static get_adapters_info_fn original_get_adapters_info;
 static get_if_table2_fn original_get_if_table2;
+static create_dxgi_factory1_fn original_create_dxgi_factory1;
+static dxgi_enum_adapters_fn original_dxgi_enum_adapters;
+static dxgi_enum_adapters1_fn original_dxgi_enum_adapters1;
+static dxgi_enum_outputs_fn original_dxgi_enum_outputs;
+static dxgi_duplicate_output_fn original_dxgi_duplicate_output;
+static dxgi_acquire_next_frame_fn original_dxgi_acquire_next_frame;
+static dxgi_get_frame_pointer_shape_fn
+    original_dxgi_get_frame_pointer_shape;
 static HMODULE hook_module;
 static WCHAR endpoint_path[MAX_PATH];
 static CHAR wol_config_path[MAX_PATH];
@@ -197,6 +229,21 @@ static BOOL streamer_send_input_hooked;
 static BOOL streamer_cursor_info_hooked;
 static BOOL streamer_bit_blt_hooked;
 static BOOL streamer_stretch_blt_hooked;
+static BOOL streamer_dxgi_factory_hooked;
+static BOOL dxgi_factory_vtable_hooked;
+static BOOL dxgi_adapter_vtable_hooked;
+static BOOL dxgi_output_vtable_hooked;
+static BOOL dxgi_duplication_vtable_hooked;
+static volatile LONG dxgi_factories_created;
+static volatile LONG dxgi_adapters_enumerated;
+static volatile LONG dxgi_outputs_enumerated;
+static volatile LONG dxgi_duplications_created;
+static volatile LONG dxgi_acquire_calls;
+static volatile LONG dxgi_cursor_announcements;
+static volatile LONG dxgi_cursor_shape_requests;
+static volatile LONG dxgi_cursor_shape_updates;
+static volatile LONG dxgi_cursor_shape_fallbacks;
+static volatile LONG dxgi_cursor_delivered_sequence;
 static BOOL streamer_frame_adapter_hooked;
 static DWORD configured_frame_adapter_luid;
 static void *original_frame_adapter_id;
@@ -236,12 +283,15 @@ static BOOL tracked_cursor_valid;
 static BOOL tracked_cursor_virtual_desktop;
 static SRWLOCK native_cursor_lock = SRWLOCK_INIT;
 static HCURSOR native_cursor_handle;
+static INIT_ONCE transparent_cursor_once = INIT_ONCE_STATIC_INIT;
+static HCURSOR transparent_cursor_handle;
 static uint64_t native_cursor_hash;
 static ULONGLONG native_cursor_checked_at;
 static volatile LONG native_cursor_active;
 static volatile LONG native_cursor_calls;
 static volatile LONG native_cursor_updates;
 static volatile LONG native_cursor_fallbacks;
+static volatile LONG native_cursor_transparent;
 static volatile LONG native_cursor_sequence;
 static volatile LONG native_cursor_width;
 static volatile LONG native_cursor_height;
@@ -261,8 +311,14 @@ static volatile LONG frame_destination_x;
 static volatile LONG frame_destination_y;
 static volatile LONG frame_destination_width;
 static volatile LONG frame_destination_height;
+static volatile LONG frame_destination_bitmap_width;
+static volatile LONG frame_destination_bitmap_height;
+static volatile LONG frame_destination_bitmap_stride;
+static volatile LONG frame_destination_checksum;
+static volatile LONG frame_destination_checksum_changes;
 static volatile LONG frame_source_x;
 static volatile LONG frame_source_y;
+static volatile LONG frame_dib_source_y;
 static volatile LONG frame_source_width;
 static volatile LONG frame_source_height;
 static volatile LONG frame_monitor_left;
@@ -479,7 +535,9 @@ struct wayland_frame_header {
     uint32_t buffer_count;
     volatile uint32_t active_buffer;
     volatile uint32_t sequence;
-    unsigned char reserved[24];
+    int32_t origin_x;
+    int32_t origin_y;
+    unsigned char reserved[16];
 };
 
 struct native_cursor_header {
@@ -510,10 +568,14 @@ struct native_cursor_cache_entry {
     uint32_t hotspot_x;
     uint32_t hotspot_y;
     HCURSOR cursor;
+    struct native_cursor_cache_entry *next;
 };
 
 static struct native_cursor_cache_entry
     native_cursor_cache[UUCI_CACHE_CAPACITY];
+static struct native_cursor_cache_entry *native_cursor_cache_overflow;
+static volatile LONG native_cursor_cache_entries;
+static volatile LONG native_cursor_cache_overflows;
 
 static BOOL CALLBACK initialize_winsock(
     PINIT_ONCE once,
@@ -1092,6 +1154,80 @@ static UINT WINAPI hooked_send_input(
     return count;
 }
 
+static BOOL read_native_cursor_file(
+    struct native_cursor_header *header,
+    unsigned char **pixels_out
+) {
+    HANDLE file;
+    LARGE_INTEGER size;
+    DWORD received;
+    unsigned char *pixels = NULL;
+    BOOL result = FALSE;
+
+    if (!header || !pixels_out || !native_cursor_path[0]) {
+        return FALSE;
+    }
+    *pixels_out = NULL;
+    file = CreateFileW(
+        native_cursor_path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    if (
+        !GetFileSizeEx(file, &size) ||
+        size.QuadPart < (LONGLONG)sizeof(*header) ||
+        size.QuadPart >
+            (LONGLONG)sizeof(*header) +
+                (LONGLONG)UUCI_MAX_DIMENSION * UUCI_MAX_DIMENSION * 4
+    ) {
+        goto cleanup;
+    }
+    ZeroMemory(header, sizeof(*header));
+    if (
+        !ReadFile(file, header, sizeof(*header), &received, NULL) ||
+        received != sizeof(*header) ||
+        header->magic != UUCI_MAGIC ||
+        header->version != UUCI_VERSION ||
+        header->header_size != sizeof(*header) ||
+        header->width == 0 ||
+        header->width > UUCI_MAX_DIMENSION ||
+        header->height == 0 ||
+        header->height > UUCI_MAX_DIMENSION ||
+        header->hotspot_x >= header->width ||
+        header->hotspot_y >= header->height ||
+        header->pixel_size != header->width * header->height * 4u ||
+        size.QuadPart !=
+            (LONGLONG)sizeof(*header) + header->pixel_size
+    ) {
+        goto cleanup;
+    }
+    pixels = HeapAlloc(GetProcessHeap(), 0, header->pixel_size);
+    if (
+        !pixels ||
+        !ReadFile(file, pixels, header->pixel_size, &received, NULL) ||
+        received != header->pixel_size
+    ) {
+        goto cleanup;
+    }
+    *pixels_out = pixels;
+    pixels = NULL;
+    result = TRUE;
+
+cleanup:
+    if (pixels) {
+        HeapFree(GetProcessHeap(), 0, pixels);
+    }
+    CloseHandle(file);
+    return result;
+}
+
 static uint64_t hash_native_cursor(
     const struct native_cursor_header *header,
     const unsigned char *pixels
@@ -1200,10 +1336,12 @@ static HCURSOR cached_native_cursor(
 ) {
     SIZE_T index;
     SIZE_T target = UUCI_CACHE_CAPACITY;
+    struct native_cursor_cache_entry *entry;
+    struct native_cursor_cache_entry *allocated = NULL;
     HCURSOR cursor;
 
     for (index = 0; index < UUCI_CACHE_CAPACITY; ++index) {
-        struct native_cursor_cache_entry *entry = &native_cursor_cache[index];
+        entry = &native_cursor_cache[index];
         if (
             entry->cursor &&
             entry->hash == hash &&
@@ -1222,33 +1360,64 @@ static HCURSOR cached_native_cursor(
     if (target == UUCI_CACHE_CAPACITY) {
         /*
          * GetCursorInfo returns a borrowed handle with no release callback.
-         * Keep created cursors valid for the process lifetime; once the
-         * bounded cache is full, retain the last valid native cursor rather
-         * than invalidating a handle another thread may still hold.
+         * GameViewerServer also survives controller reconnects.  Reusing the
+         * last cached handle once this fixed table fills makes every later
+         * Wayland shape look identical to the new controller session.  Keep
+         * overflow entries for the process lifetime instead: Windows owns
+         * the handles until process exit, while repeated shapes still reuse
+         * their existing entry.
          */
-        return native_cursor_handle
-            ? native_cursor_handle
-            : native_cursor_cache[0].cursor;
+        for (
+            entry = native_cursor_cache_overflow;
+            entry;
+            entry = entry->next
+        ) {
+            if (
+                entry->cursor &&
+                entry->hash == hash &&
+                entry->width == header->width &&
+                entry->height == header->height &&
+                entry->hotspot_x == header->hotspot_x &&
+                entry->hotspot_y == header->hotspot_y
+            ) {
+                return entry->cursor;
+            }
+        }
+        allocated = HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*allocated)
+        );
+        if (!allocated) {
+            return NULL;
+        }
+        entry = allocated;
+    } else {
+        entry = &native_cursor_cache[target];
     }
 
     cursor = create_native_cursor(header, pixels);
     if (!cursor) {
+        if (allocated) {
+            HeapFree(GetProcessHeap(), 0, allocated);
+        }
         return NULL;
     }
-    native_cursor_cache[target].hash = hash;
-    native_cursor_cache[target].width = header->width;
-    native_cursor_cache[target].height = header->height;
-    native_cursor_cache[target].hotspot_x = header->hotspot_x;
-    native_cursor_cache[target].hotspot_y = header->hotspot_y;
-    native_cursor_cache[target].cursor = cursor;
+    entry->hash = hash;
+    entry->width = header->width;
+    entry->height = header->height;
+    entry->hotspot_x = header->hotspot_x;
+    entry->hotspot_y = header->hotspot_y;
+    entry->cursor = cursor;
+    if (allocated) {
+        entry->next = native_cursor_cache_overflow;
+        native_cursor_cache_overflow = entry;
+        InterlockedIncrement(&native_cursor_cache_overflows);
+    }
+    InterlockedIncrement(&native_cursor_cache_entries);
     return cursor;
 }
 
 static HCURSOR refresh_native_cursor(void) {
     struct native_cursor_header header;
-    HANDLE file;
-    LARGE_INTEGER size;
-    DWORD received;
     unsigned char *pixels = NULL;
     HCURSOR cursor = NULL;
     uint64_t hash;
@@ -1265,54 +1434,10 @@ static HCURSOR refresh_native_cursor(void) {
         return cursor;
     }
     native_cursor_checked_at = now;
-    file = CreateFileW(
-        native_cursor_path,
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-    if (file == INVALID_HANDLE_VALUE) {
+    if (!read_native_cursor_file(&header, &pixels)) {
         InterlockedExchange(&native_cursor_active, 0);
         ReleaseSRWLockExclusive(&native_cursor_lock);
         return NULL;
-    }
-    if (
-        !GetFileSizeEx(file, &size) ||
-        size.QuadPart < (LONGLONG)sizeof(header) ||
-        size.QuadPart >
-            (LONGLONG)sizeof(header) +
-                (LONGLONG)UUCI_MAX_DIMENSION * UUCI_MAX_DIMENSION * 4
-    ) {
-        goto cleanup;
-    }
-    ZeroMemory(&header, sizeof(header));
-    if (
-        !ReadFile(file, &header, sizeof(header), &received, NULL) ||
-        received != sizeof(header) ||
-        header.magic != UUCI_MAGIC ||
-        header.version != UUCI_VERSION ||
-        header.header_size != sizeof(header) ||
-        header.width == 0 ||
-        header.width > UUCI_MAX_DIMENSION ||
-        header.height == 0 ||
-        header.height > UUCI_MAX_DIMENSION ||
-        header.hotspot_x >= header.width ||
-        header.hotspot_y >= header.height ||
-        header.pixel_size != header.width * header.height * 4u ||
-        size.QuadPart != (LONGLONG)sizeof(header) + header.pixel_size
-    ) {
-        goto cleanup;
-    }
-    pixels = HeapAlloc(GetProcessHeap(), 0, header.pixel_size);
-    if (
-        !pixels ||
-        !ReadFile(file, pixels, header.pixel_size, &received, NULL) ||
-        received != header.pixel_size
-    ) {
-        goto cleanup;
     }
     hash = hash_native_cursor(&header, pixels);
     cursor = cached_native_cursor(&header, pixels, hash);
@@ -1338,7 +1463,6 @@ cleanup:
     if (pixels) {
         HeapFree(GetProcessHeap(), 0, pixels);
     }
-    CloseHandle(file);
     if (!cursor) {
         InterlockedExchange(&native_cursor_active, 0);
     }
@@ -1347,6 +1471,82 @@ cleanup:
         write_frame_hook_status();
     }
     return cursor;
+}
+
+static HRESULT fill_native_dxgi_cursor_shape(
+    UINT buffer_size,
+    void *buffer,
+    UINT *required_size,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO *shape_info,
+    uint32_t *sequence_out
+) {
+    struct native_cursor_header header;
+    unsigned char *pixels = NULL;
+
+    if (!required_size || !shape_info) {
+        return E_INVALIDARG;
+    }
+    if (!read_native_cursor_file(&header, &pixels)) {
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    }
+    *required_size = header.pixel_size;
+    ZeroMemory(shape_info, sizeof(*shape_info));
+    shape_info->Type = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
+    shape_info->Width = header.width;
+    shape_info->Height = header.height;
+    shape_info->Pitch = header.width * 4u;
+    shape_info->HotSpot.x = (LONG)header.hotspot_x;
+    shape_info->HotSpot.y = (LONG)header.hotspot_y;
+    if (!buffer || buffer_size < header.pixel_size) {
+        HeapFree(GetProcessHeap(), 0, pixels);
+        return DXGI_ERROR_MORE_DATA;
+    }
+    CopyMemory(buffer, pixels, header.pixel_size);
+    HeapFree(GetProcessHeap(), 0, pixels);
+    if (sequence_out) {
+        *sequence_out = header.sequence;
+    }
+    return S_OK;
+}
+
+static BOOL CALLBACK initialize_transparent_cursor(
+    PINIT_ONCE once,
+    PVOID parameter,
+    PVOID *context
+) {
+    BYTE and_mask[
+        UUCI_TRANSPARENT_SIZE * UUCI_TRANSPARENT_SIZE / 8u
+    ];
+    BYTE xor_mask[
+        UUCI_TRANSPARENT_SIZE * UUCI_TRANSPARENT_SIZE / 8u
+    ];
+
+    (void)once;
+    (void)parameter;
+    (void)context;
+    /* AND=1 and XOR=0 leaves every destination pixel unchanged. */
+    FillMemory(and_mask, sizeof(and_mask), 0xff);
+    ZeroMemory(xor_mask, sizeof(xor_mask));
+    transparent_cursor_handle = CreateCursor(
+        hook_module,
+        0,
+        0,
+        UUCI_TRANSPARENT_SIZE,
+        UUCI_TRANSPARENT_SIZE,
+        and_mask,
+        xor_mask
+    );
+    return TRUE;
+}
+
+static HCURSOR embedded_transparent_cursor(void) {
+    InitOnceExecuteOnce(
+        &transparent_cursor_once,
+        initialize_transparent_cursor,
+        NULL,
+        NULL
+    );
+    return transparent_cursor_handle;
 }
 
 static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
@@ -1363,9 +1563,31 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
     if (
         cursor_info &&
         cursor_info->cbSize >= sizeof(*cursor_info) &&
-        refresh_endpoint() &&
-        force_cursor_visible
+        refresh_endpoint()
     ) {
+        if (!force_cursor_visible) {
+            /*
+             * Wayland Portal embeds the compositor cursor in the video.
+             * UU's Windows controller retains its local arrow when the server
+             * merely reports CURSOR_SUPPRESSED.  Publish a real transparent
+             * cursor instead, causing the controller to replace that arrow
+             * while the embedded compositor cursor remains authoritative.
+             */
+            stable_cursor = embedded_transparent_cursor();
+            if (stable_cursor) {
+                cursor_info->flags = CURSOR_SHOWING;
+                cursor_info->hCursor = stable_cursor;
+                InterlockedExchange(&native_cursor_transparent, 1);
+            } else {
+                cursor_info->flags = 0;
+                cursor_info->hCursor = NULL;
+                InterlockedExchange(&native_cursor_transparent, 0);
+                InterlockedIncrement(&native_cursor_fallbacks);
+            }
+            InterlockedExchange(&native_cursor_active, 0);
+            return TRUE;
+        }
+        InterlockedExchange(&native_cursor_transparent, 0);
         cursor_info->flags = CURSOR_SHOWING;
         stable_cursor = refresh_native_cursor();
         if (!stable_cursor) {
@@ -1378,20 +1600,21 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
         tracked_ready = read_tracked_cursor(
             &tracked, &tracked_virtual_desktop
         );
-        actual = cursor_info->ptScreenPos;
         if (tracked_ready && tracked_virtual_desktop) {
             if (!result) {
                 cursor_info->ptScreenPos = tracked;
                 result = TRUE;
             }
-        } else if (result && actual_cursor_to_screen_local(&actual, &local)) {
-            cursor_info->ptScreenPos = local;
+        } else if (result) {
+            actual = cursor_info->ptScreenPos;
+            if (actual_cursor_to_screen_local(&actual, &local)) {
+                cursor_info->ptScreenPos = local;
+            }
         } else if (tracked_ready) {
             cursor_info->ptScreenPos = tracked;
             result = TRUE;
         } else if (!result) {
-            GetCursorPos(&cursor_info->ptScreenPos);
-            result = TRUE;
+            result = GetCursorPos(&cursor_info->ptScreenPos);
         }
     }
     return result;
@@ -1410,7 +1633,6 @@ static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
         tracked_ready = read_tracked_cursor(
             &tracked, &tracked_virtual_desktop
         );
-        actual = *point;
         if (tracked_ready && tracked_virtual_desktop) {
             if (!result) {
                 *point = tracked;
@@ -1418,9 +1640,12 @@ static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
             }
             return result;
         }
-        if (result && actual_cursor_to_screen_local(&actual, &local)) {
-            *point = local;
-            return TRUE;
+        if (result) {
+            actual = *point;
+            if (actual_cursor_to_screen_local(&actual, &local)) {
+                *point = local;
+                return TRUE;
+            }
         }
         if (tracked_ready) {
             *point = tracked;
@@ -1570,6 +1795,13 @@ static void write_frame_hook_status(void) {
         InterlockedCompareExchange(&native_cursor_active, 0, 0) ? "1" : "0",
         frame_status_path
     );
+    WritePrivateProfileStringA(
+        "cursor",
+        "transparent",
+        InterlockedCompareExchange(&native_cursor_transparent, 0, 0)
+            ? "1" : "0",
+        frame_status_path
+    );
     wsprintfA(
         value,
         "%ld",
@@ -1618,6 +1850,134 @@ static void write_frame_hook_status(void) {
         InterlockedCompareExchange(&native_cursor_hotspot_y, 0, 0)
     );
     WritePrivateProfileStringA("cursor", "hotspot_y", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&native_cursor_cache_entries, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "cache_entries", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&native_cursor_cache_overflows, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "cache_overflows", value, frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "dxgi_factory_iat",
+        streamer_dxgi_factory_hooked ? "1" : "0",
+        frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "dxgi_factory_vtable",
+        dxgi_factory_vtable_hooked ? "1" : "0",
+        frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "dxgi_adapter_vtable",
+        dxgi_adapter_vtable_hooked ? "1" : "0",
+        frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "dxgi_output_vtable",
+        dxgi_output_vtable_hooked ? "1" : "0",
+        frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "dxgi_duplication_vtable",
+        dxgi_duplication_vtable_hooked ? "1" : "0",
+        frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_factories_created, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_factories", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_adapters_enumerated, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_adapters", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_outputs_enumerated, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_outputs", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_duplications_created, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_duplications", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_acquire_calls, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_acquire_calls", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_cursor_announcements, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_announcements", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_cursor_shape_requests, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_shape_requests", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_cursor_shape_updates, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_shape_updates", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&dxgi_cursor_shape_fallbacks, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_shape_fallbacks", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &dxgi_cursor_delivered_sequence, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "cursor", "dxgi_sequence", value, frame_status_path
+    );
     wsprintfA(
         value,
         "%ld",
@@ -1673,6 +2033,50 @@ static void write_frame_hook_status(void) {
     wsprintfA(
         value,
         "%ld",
+        InterlockedCompareExchange(&frame_destination_bitmap_width, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_bitmap_width", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_bitmap_height, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_bitmap_height", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_destination_bitmap_stride, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_bitmap_stride", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%lu",
+        (unsigned long)InterlockedCompareExchange(
+            &frame_destination_checksum, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_checksum", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(
+            &frame_destination_checksum_changes, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "capture", "destination_checksum_changes", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
         InterlockedCompareExchange(&frame_source_x, 0, 0)
     );
     WritePrivateProfileStringA("capture", "source_x", value, frame_status_path);
@@ -1682,6 +2086,14 @@ static void write_frame_hook_status(void) {
         InterlockedCompareExchange(&frame_source_y, 0, 0)
     );
     WritePrivateProfileStringA("capture", "source_y", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_dib_source_y, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "dib_source_y", value, frame_status_path
+    );
     wsprintfA(
         value,
         "%ld",
@@ -1946,6 +2358,102 @@ static BOOL refresh_frame_mapping(void) {
     return FALSE;
 }
 
+static DWORD sample_destination_bitmap(const BITMAP *bitmap) {
+    const BYTE *bits;
+    LONG height;
+    LONG stride;
+    LONG row_step;
+    LONG byte_step;
+    LONG row;
+    DWORD hash = 2166136261u;
+
+    if (!bitmap || !bitmap->bmBits || !bitmap->bmWidthBytes) {
+        return 0;
+    }
+    height = bitmap->bmHeight < 0 ? -bitmap->bmHeight : bitmap->bmHeight;
+    stride = bitmap->bmWidthBytes < 0 ?
+        -bitmap->bmWidthBytes : bitmap->bmWidthBytes;
+    if (height <= 0 || stride <= 0) {
+        return 0;
+    }
+    bits = (const BYTE *)bitmap->bmBits;
+    row_step = height > 32 ? height / 32 : 1;
+    byte_step = stride > 128 ? stride / 128 : 1;
+    for (row = 0; row < height; row += row_step) {
+        LONG offset;
+        const BYTE *line = bits + (SIZE_T)row * stride;
+
+        for (offset = 0; offset < stride; offset += byte_step) {
+            hash ^= line[offset];
+            hash *= 16777619u;
+        }
+    }
+    return hash;
+}
+
+struct frame_monitor_match {
+    LONG width;
+    LONG height;
+    unsigned int count;
+    RECT rectangle;
+};
+
+static BOOL CALLBACK match_frame_source_monitor(
+    HMONITOR monitor,
+    HDC monitor_dc,
+    LPRECT rectangle,
+    LPARAM parameter
+) {
+    struct frame_monitor_match *match =
+        (struct frame_monitor_match *)parameter;
+    LONG width;
+    LONG height;
+    (void)monitor;
+    (void)monitor_dc;
+    if (!match || !rectangle) {
+        return TRUE;
+    }
+    width = rectangle->right - rectangle->left;
+    height = rectangle->bottom - rectangle->top;
+    if (width == match->width && height == match->height) {
+        match->rectangle = *rectangle;
+        ++match->count;
+    }
+    return TRUE;
+}
+
+/*
+ * CreateDC("\\\\.\\DISPLAYn") exposes monitor-local source coordinates,
+ * while GetDC(NULL) uses Wine's primary-relative virtual coordinates.  Portal
+ * frames are a single virtual-desktop canvas, so translate the former into the
+ * latter when the source DC uniquely identifies one physical monitor.
+ */
+static void normalize_frame_source_coordinates(
+    HDC source,
+    int *source_x,
+    int *source_y
+) {
+    struct frame_monitor_match match;
+    LONG dc_width;
+    LONG dc_height;
+    if (!source || !source_x || !source_y || *source_x < 0 || *source_y < 0) {
+        return;
+    }
+    dc_width = GetDeviceCaps(source, HORZRES);
+    dc_height = GetDeviceCaps(source, VERTRES);
+    if (dc_width <= 0 || dc_height <= 0) {
+        return;
+    }
+    ZeroMemory(&match, sizeof(match));
+    match.width = dc_width;
+    match.height = dc_height;
+    EnumDisplayMonitors(NULL, NULL, match_frame_source_monitor, (LPARAM)&match);
+    if (match.count == 1u) {
+        *source_x += match.rectangle.left;
+        *source_y += match.rectangle.top;
+    }
+}
+
 static BOOL render_wayland_frame(
     HDC destination,
     int destination_x,
@@ -1968,6 +2476,13 @@ static BOOL render_wayland_frame(
     POINT source_point;
     HMONITOR source_monitor;
     MONITORINFO monitor_info;
+    int64_t translated_source_x;
+    int64_t translated_source_y;
+    int dib_source_y;
+    DWORD destination_checksum;
+    LONG previous_checksum;
+    HGDIOBJ destination_bitmap_object;
+    BITMAP destination_bitmap;
 
     calls = InterlockedIncrement(&frame_hook_calls);
     InterlockedExchange(&frame_destination_x, destination_x);
@@ -1978,6 +2493,27 @@ static BOOL render_wayland_frame(
     InterlockedExchange(&frame_source_y, source_y);
     InterlockedExchange(&frame_source_width, source_width);
     InterlockedExchange(&frame_source_height, source_height);
+    destination_bitmap_object = destination ?
+        GetCurrentObject(destination, OBJ_BITMAP) : NULL;
+    ZeroMemory(&destination_bitmap, sizeof(destination_bitmap));
+    if (
+        destination_bitmap_object &&
+        GetObjectW(
+            destination_bitmap_object,
+            sizeof(destination_bitmap),
+            &destination_bitmap
+        ) == sizeof(destination_bitmap)
+    ) {
+        InterlockedExchange(
+            &frame_destination_bitmap_width, destination_bitmap.bmWidth
+        );
+        InterlockedExchange(
+            &frame_destination_bitmap_height, destination_bitmap.bmHeight
+        );
+        InterlockedExchange(
+            &frame_destination_bitmap_stride, destination_bitmap.bmWidthBytes
+        );
+    }
     source_point.x = source_x;
     source_point.y = source_y;
     source_monitor = MonitorFromPoint(source_point, MONITOR_DEFAULTTONEAREST);
@@ -2022,23 +2558,38 @@ static BOOL render_wayland_frame(
     header = (const struct wayland_frame_header *)frame_view;
     MemoryBarrier();
     active = header->active_buffer;
+    normalize_frame_source_coordinates(source, &source_x, &source_y);
+    translated_source_x = (int64_t)source_x - (int64_t)header->origin_x;
+    translated_source_y = (int64_t)source_y - (int64_t)header->origin_y;
     if (
         active >= header->buffer_count ||
-        source_x < 0 ||
-        source_y < 0 ||
-        source_x >= (int)header->width ||
-        source_y >= (int)header->height
+        translated_source_x < 0 ||
+        translated_source_y < 0 ||
+        translated_source_x >= (int64_t)header->width ||
+        translated_source_y >= (int64_t)header->height
     ) {
         ReleaseSRWLockExclusive(&frame_lock);
         InterlockedIncrement(&frame_hook_fallbacks);
         return FALSE;
     }
+    source_x = (int)translated_source_x;
+    source_y = (int)translated_source_y;
     if (source_x + source_width > (int)header->width) {
         source_width = (int)header->width - source_x;
     }
     if (source_y + source_height > (int)header->height) {
         source_height = (int)header->height - source_y;
     }
+    /*
+     * StretchDIBits addresses the source rectangle from the DIB's lower edge,
+     * including when a negative biHeight makes the scan lines top-down.  The
+     * Portal canvas and monitor rectangles use a top-left origin.  Without
+     * this conversion, a 2560-high dual-monitor canvas cropped to the
+     * 1440-high landscape display starts at top-down row 1120: only its final
+     * 320 content rows are copied, followed by 1120 black padding rows.
+     */
+    dib_source_y = (int)header->height - source_y - source_height;
+    InterlockedExchange(&frame_dib_source_y, dib_source_y);
     pixels = frame_view + header->header_size +
         (SIZE_T)active * header->frame_size;
     ZeroMemory(&bitmap, sizeof(bitmap));
@@ -2055,7 +2606,7 @@ static BOOL render_wayland_frame(
         destination_width,
         destination_height,
         source_x,
-        source_y,
+        dib_source_y,
         source_width,
         source_height,
         pixels,
@@ -2067,6 +2618,18 @@ static BOOL render_wayland_frame(
     if (result == (int)GDI_ERROR || result == 0) {
         InterlockedIncrement(&frame_hook_fallbacks);
         return FALSE;
+    }
+    destination_checksum = sample_destination_bitmap(&destination_bitmap);
+    if (destination_checksum) {
+        previous_checksum = InterlockedExchange(
+            &frame_destination_checksum, (LONG)destination_checksum
+        );
+        if (
+            previous_checksum &&
+            previous_checksum != (LONG)destination_checksum
+        ) {
+            InterlockedIncrement(&frame_destination_checksum_changes);
+        }
     }
     InterlockedIncrement(&frame_hook_rendered);
     if ((calls % 120) == 1) {
@@ -2698,10 +3261,530 @@ static BOOL patch_frame_adapter_slot(
     return TRUE;
 }
 
+static BOOL patch_dxgi_vtable_slot(
+    void **slot,
+    void *replacement,
+    void **original
+) {
+    DWORD old_protection;
+    void *previous;
+
+    if (!slot || !replacement || !VirtualProtect(
+            slot, sizeof(*slot), PAGE_READWRITE, &old_protection
+        )) {
+        return FALSE;
+    }
+    previous = InterlockedExchangePointer(
+        (void *volatile *)slot,
+        replacement
+    );
+    VirtualProtect(slot, sizeof(*slot), old_protection, &old_protection);
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
+    if (original && previous != replacement) {
+        *original = previous;
+    }
+    return TRUE;
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_get_frame_pointer_shape(
+    IDXGIOutputDuplication *duplication,
+    UINT buffer_size,
+    void *buffer,
+    UINT *required_size,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO *shape_info
+) {
+    HRESULT result;
+    uint32_t sequence = 0;
+
+    InterlockedIncrement(&dxgi_cursor_shape_requests);
+    if (refresh_endpoint() && force_cursor_visible) {
+        result = fill_native_dxgi_cursor_shape(
+            buffer_size,
+            buffer,
+            required_size,
+            shape_info,
+            &sequence
+        );
+        if (result == S_OK) {
+            InterlockedExchange(
+                &dxgi_cursor_delivered_sequence,
+                (LONG)sequence
+            );
+            InterlockedIncrement(&dxgi_cursor_shape_updates);
+            return result;
+        }
+        if (result == DXGI_ERROR_MORE_DATA) {
+            return result;
+        }
+        InterlockedIncrement(&dxgi_cursor_shape_fallbacks);
+    }
+    return original_dxgi_get_frame_pointer_shape
+        ? original_dxgi_get_frame_pointer_shape(
+            duplication,
+            buffer_size,
+            buffer,
+            required_size,
+            shape_info
+        )
+        : DXGI_ERROR_INVALID_CALL;
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_acquire_next_frame(
+    IDXGIOutputDuplication *duplication,
+    UINT timeout_in_milliseconds,
+    DXGI_OUTDUPL_FRAME_INFO *frame_info,
+    IDXGIResource **desktop_resource
+) {
+    HRESULT result;
+    LONG sequence;
+    LONG delivered;
+    LONG width;
+    LONG height;
+
+    InterlockedIncrement(&dxgi_acquire_calls);
+    result = original_dxgi_acquire_next_frame
+        ? original_dxgi_acquire_next_frame(
+            duplication,
+            timeout_in_milliseconds,
+            frame_info,
+            desktop_resource
+        )
+        : DXGI_ERROR_INVALID_CALL;
+    if (result != S_OK || !frame_info || !refresh_endpoint() ||
+        !force_cursor_visible || !refresh_native_cursor()) {
+        return result;
+    }
+    sequence = InterlockedCompareExchange(&native_cursor_sequence, 0, 0);
+    delivered = InterlockedCompareExchange(
+        &dxgi_cursor_delivered_sequence, 0, 0
+    );
+    width = InterlockedCompareExchange(&native_cursor_width, 0, 0);
+    height = InterlockedCompareExchange(&native_cursor_height, 0, 0);
+    if (
+        sequence > 0 && sequence != delivered &&
+        width > 0 && height > 0 &&
+        width <= (LONG)UUCI_MAX_DIMENSION &&
+        height <= (LONG)UUCI_MAX_DIMENSION
+    ) {
+        frame_info->PointerShapeBufferSize =
+            (UINT)width * (UINT)height * 4u;
+        if (frame_info->LastMouseUpdateTime.QuadPart == 0) {
+            frame_info->LastMouseUpdateTime.QuadPart =
+                (LONGLONG)GetTickCount64();
+        }
+        InterlockedIncrement(&dxgi_cursor_announcements);
+    }
+    return result;
+}
+
+static void patch_dxgi_duplication(
+    IDXGIOutputDuplication *duplication
+) {
+    BOOL acquire_ready;
+    BOOL shape_ready;
+
+    if (!duplication || !duplication->lpVtbl) {
+        return;
+    }
+    acquire_ready = patch_dxgi_vtable_slot(
+        (void **)&duplication->lpVtbl->AcquireNextFrame,
+        (void *)hooked_dxgi_acquire_next_frame,
+        (void **)&original_dxgi_acquire_next_frame
+    );
+    shape_ready = patch_dxgi_vtable_slot(
+        (void **)&duplication->lpVtbl->GetFramePointerShape,
+        (void *)hooked_dxgi_get_frame_pointer_shape,
+        (void **)&original_dxgi_get_frame_pointer_shape
+    );
+    if (acquire_ready && shape_ready) {
+        dxgi_duplication_vtable_hooked = TRUE;
+        InterlockedExchange(&dxgi_cursor_delivered_sequence, 0);
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_duplicate_output(
+    IDXGIOutput1 *output,
+    IUnknown *device,
+    IDXGIOutputDuplication **duplication
+) {
+    HRESULT result = original_dxgi_duplicate_output
+        ? original_dxgi_duplicate_output(output, device, duplication)
+        : DXGI_ERROR_INVALID_CALL;
+
+    if (result == S_OK && duplication && *duplication) {
+        InterlockedIncrement(&dxgi_duplications_created);
+        patch_dxgi_duplication(*duplication);
+    }
+    return result;
+}
+
+static void patch_dxgi_output(IDXGIOutput *output) {
+    static const GUID iid_output1 = {
+        0x00cddea8,
+        0x939b,
+        0x4b83,
+        {0xa3, 0x40, 0xa6, 0x85, 0x22, 0x66, 0x66, 0xcc}
+    };
+    IDXGIOutput1 *output1 = NULL;
+    HRESULT result;
+
+    if (!output || !output->lpVtbl) {
+        return;
+    }
+    result = output->lpVtbl->QueryInterface(
+        output,
+        &iid_output1,
+        (void **)&output1
+    );
+    if (result != S_OK || !output1 || !output1->lpVtbl) {
+        return;
+    }
+    if (patch_dxgi_vtable_slot(
+            (void **)&output1->lpVtbl->DuplicateOutput,
+            (void *)hooked_dxgi_duplicate_output,
+            (void **)&original_dxgi_duplicate_output
+        )) {
+        dxgi_output_vtable_hooked = TRUE;
+    }
+    output1->lpVtbl->Release(output1);
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_enum_outputs(
+    IDXGIAdapter *adapter,
+    UINT output_index,
+    IDXGIOutput **output
+) {
+    HRESULT result = original_dxgi_enum_outputs
+        ? original_dxgi_enum_outputs(adapter, output_index, output)
+        : DXGI_ERROR_INVALID_CALL;
+
+    if (result == S_OK && output && *output) {
+        InterlockedIncrement(&dxgi_outputs_enumerated);
+        patch_dxgi_output(*output);
+    }
+    return result;
+}
+
+static void patch_dxgi_adapter(IDXGIAdapter *adapter) {
+    if (!adapter || !adapter->lpVtbl) {
+        return;
+    }
+    if (patch_dxgi_vtable_slot(
+            (void **)&adapter->lpVtbl->EnumOutputs,
+            (void *)hooked_dxgi_enum_outputs,
+            (void **)&original_dxgi_enum_outputs
+        )) {
+        dxgi_adapter_vtable_hooked = TRUE;
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_enum_adapters(
+    IDXGIFactory1 *factory,
+    UINT adapter_index,
+    IDXGIAdapter **adapter
+) {
+    HRESULT result = original_dxgi_enum_adapters
+        ? original_dxgi_enum_adapters(factory, adapter_index, adapter)
+        : DXGI_ERROR_INVALID_CALL;
+
+    if (result == S_OK && adapter && *adapter) {
+        InterlockedIncrement(&dxgi_adapters_enumerated);
+        patch_dxgi_adapter(*adapter);
+    }
+    return result;
+}
+
+static HRESULT STDMETHODCALLTYPE hooked_dxgi_enum_adapters1(
+    IDXGIFactory1 *factory,
+    UINT adapter_index,
+    IDXGIAdapter1 **adapter
+) {
+    HRESULT result = original_dxgi_enum_adapters1
+        ? original_dxgi_enum_adapters1(factory, adapter_index, adapter)
+        : DXGI_ERROR_INVALID_CALL;
+
+    if (result == S_OK && adapter && *adapter) {
+        InterlockedIncrement(&dxgi_adapters_enumerated);
+        patch_dxgi_adapter((IDXGIAdapter *)*adapter);
+    }
+    return result;
+}
+
+static void patch_dxgi_factory(IDXGIFactory1 *factory) {
+    BOOL enum_ready;
+    BOOL enum1_ready;
+
+    if (!factory || !factory->lpVtbl) {
+        return;
+    }
+    enum_ready = patch_dxgi_vtable_slot(
+        (void **)&factory->lpVtbl->EnumAdapters,
+        (void *)hooked_dxgi_enum_adapters,
+        (void **)&original_dxgi_enum_adapters
+    );
+    enum1_ready = patch_dxgi_vtable_slot(
+        (void **)&factory->lpVtbl->EnumAdapters1,
+        (void *)hooked_dxgi_enum_adapters1,
+        (void **)&original_dxgi_enum_adapters1
+    );
+    if (enum_ready && enum1_ready) {
+        dxgi_factory_vtable_hooked = TRUE;
+    }
+}
+
+static HRESULT WINAPI hooked_create_dxgi_factory1(
+    REFIID interface_id,
+    void **factory
+) {
+    HRESULT result = original_create_dxgi_factory1
+        ? original_create_dxgi_factory1(interface_id, factory)
+        : DXGI_ERROR_INVALID_CALL;
+
+    if (result == S_OK && factory && *factory) {
+        InterlockedIncrement(&dxgi_factories_created);
+        patch_dxgi_factory((IDXGIFactory1 *)*factory);
+    }
+    return result;
+}
+
 struct executable_patch_thread {
     HANDLE handle;
     DWORD id;
 };
+
+struct executable_patch_route {
+    void *volatile function;
+    void *volatile replacement;
+    void *volatile allocation_base;
+    DWORD allocation_type;
+    DWORD image_timestamp;
+    DWORD image_size;
+};
+
+static SRWLOCK executable_patch_lock = SRWLOCK_INIT;
+static struct executable_patch_route
+    executable_patch_routes[EXECUTABLE_PATCH_MAX_ROUTES];
+static volatile LONG executable_patch_route_count;
+static volatile LONG executable_patch_redirects;
+static volatile LONG executable_patch_test_gate_delay_ms;
+static PVOID executable_patch_exception_handler_handle;
+
+static BOOL executable_patch_image_identity(
+    void *allocation_base,
+    DWORD *timestamp,
+    DWORD *image_size
+) {
+    IMAGE_DOS_HEADER dos_header;
+    IMAGE_NT_HEADERS64 nt_headers;
+    SIZE_T read_size;
+
+    if (
+        !ReadProcessMemory(
+            GetCurrentProcess(),
+            allocation_base,
+            &dos_header,
+            sizeof(dos_header),
+            &read_size
+        ) ||
+        read_size != sizeof(dos_header) ||
+        dos_header.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos_header.e_lfanew <= 0 ||
+        dos_header.e_lfanew > 1024 * 1024
+    ) {
+        return FALSE;
+    }
+    if (
+        !ReadProcessMemory(
+            GetCurrentProcess(),
+            (unsigned char *)allocation_base + dos_header.e_lfanew,
+            &nt_headers,
+            sizeof(nt_headers),
+            &read_size
+        ) ||
+        read_size != sizeof(nt_headers) ||
+        nt_headers.Signature != IMAGE_NT_SIGNATURE ||
+        nt_headers.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    ) {
+        return FALSE;
+    }
+    *timestamp = nt_headers.FileHeader.TimeDateStamp;
+    *image_size = nt_headers.OptionalHeader.SizeOfImage;
+    return TRUE;
+}
+
+static LONG CALLBACK executable_patch_exception_handler(
+    EXCEPTION_POINTERS *exception
+) {
+    LONG index;
+
+    if (
+        !exception || !exception->ExceptionRecord ||
+        !exception->ContextRecord ||
+        exception->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT
+    ) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    for (index = 0; index < (LONG)EXECUTABLE_PATCH_MAX_ROUTES; ++index) {
+        void *function = InterlockedCompareExchangePointer(
+            &executable_patch_routes[index].function, NULL, NULL
+        );
+
+        if (exception->ExceptionRecord->ExceptionAddress == function) {
+            void *replacement = InterlockedCompareExchangePointer(
+                &executable_patch_routes[index].replacement, NULL, NULL
+            );
+
+            if (!replacement) {
+                break;
+            }
+            exception->ContextRecord->Rip = (DWORD64)(uintptr_t)replacement;
+            InterlockedIncrement(&executable_patch_redirects);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void collect_stale_executable_patch_routes_locked(void) {
+    LONG index;
+
+    for (index = 0; index < (LONG)EXECUTABLE_PATCH_MAX_ROUTES; ++index) {
+        struct executable_patch_route *route =
+            &executable_patch_routes[index];
+        void *function = InterlockedCompareExchangePointer(
+            &route->function, NULL, NULL
+        );
+        void *allocation_base;
+        MEMORY_BASIC_INFORMATION memory;
+        BOOL live;
+
+        if (!function) {
+            continue;
+        }
+        allocation_base = InterlockedCompareExchangePointer(
+            &route->allocation_base, NULL, NULL
+        );
+        live = (
+            VirtualQuery(function, &memory, sizeof(memory)) == sizeof(memory) &&
+            memory.State == MEM_COMMIT &&
+            memory.AllocationBase == allocation_base &&
+            memory.Type == route->allocation_type
+        );
+        if (live && memory.Type == MEM_IMAGE) {
+            DWORD timestamp;
+            DWORD image_size;
+
+            live = executable_patch_image_identity(
+                allocation_base, &timestamp, &image_size
+            ) &&
+                timestamp == route->image_timestamp &&
+                image_size == route->image_size;
+        }
+        if (live) {
+            continue;
+        }
+        InterlockedExchangePointer(&route->function, NULL);
+        MemoryBarrier();
+        InterlockedExchangePointer(&route->replacement, NULL);
+        InterlockedExchangePointer(&route->allocation_base, NULL);
+        route->allocation_type = 0;
+        route->image_timestamp = 0;
+        route->image_size = 0;
+        InterlockedDecrement(&executable_patch_route_count);
+    }
+    if (
+        InterlockedCompareExchange(
+            &executable_patch_route_count, 0, 0
+        ) == 0 &&
+        executable_patch_exception_handler_handle
+    ) {
+        PVOID handler = executable_patch_exception_handler_handle;
+
+        executable_patch_exception_handler_handle = NULL;
+        RemoveVectoredExceptionHandler(handler);
+    }
+}
+
+static void collect_stale_executable_patch_routes(void) {
+    AcquireSRWLockExclusive(&executable_patch_lock);
+    collect_stale_executable_patch_routes_locked();
+    ReleaseSRWLockExclusive(&executable_patch_lock);
+}
+
+static BOOL register_executable_patch_route(
+    void *function,
+    void *replacement
+) {
+    LONG index;
+    LONG free_index = -1;
+    MEMORY_BASIC_INFORMATION memory;
+    DWORD image_timestamp = 0;
+    DWORD image_size = 0;
+
+    if (
+        VirtualQuery(function, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT
+    ) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    if (
+        memory.Type == MEM_IMAGE &&
+        !executable_patch_image_identity(
+            memory.AllocationBase, &image_timestamp, &image_size
+        )
+    ) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return FALSE;
+    }
+    collect_stale_executable_patch_routes_locked();
+
+    if (!executable_patch_exception_handler_handle) {
+        executable_patch_exception_handler_handle =
+            AddVectoredExceptionHandler(
+                1u, executable_patch_exception_handler
+            );
+        if (!executable_patch_exception_handler_handle) {
+            return FALSE;
+        }
+    }
+    for (index = 0; index < (LONG)EXECUTABLE_PATCH_MAX_ROUTES; ++index) {
+        void *registered_function = InterlockedCompareExchangePointer(
+            &executable_patch_routes[index].function, NULL, NULL
+        );
+
+        if (registered_function == function) {
+            InterlockedExchangePointer(
+                &executable_patch_routes[index].replacement, replacement
+            );
+            return TRUE;
+        }
+        if (!registered_function && free_index < 0) {
+            free_index = index;
+        }
+    }
+    if (free_index < 0) {
+        SetLastError(ERROR_TOO_MANY_NAMES);
+        return FALSE;
+    }
+    InterlockedExchangePointer(
+        &executable_patch_routes[free_index].allocation_base,
+        memory.AllocationBase
+    );
+    executable_patch_routes[free_index].allocation_type = memory.Type;
+    executable_patch_routes[free_index].image_timestamp = image_timestamp;
+    executable_patch_routes[free_index].image_size = image_size;
+    InterlockedExchangePointer(
+        &executable_patch_routes[free_index].replacement, replacement
+    );
+    MemoryBarrier();
+    InterlockedExchangePointer(
+        &executable_patch_routes[free_index].function, function
+    );
+    MemoryBarrier();
+    InterlockedIncrement(&executable_patch_route_count);
+    return TRUE;
+}
 
 static BOOL executable_patch_thread_recorded(
     const struct executable_patch_thread *threads,
@@ -2861,22 +3944,56 @@ static BOOL executable_patch_range_is_idle(
 
 static BOOL patch_executable_entry(void *function, void *replacement) {
     unsigned char jump[EXECUTABLE_PATCH_SIZE];
-    DWORD old_protection;
+    DWORD old_protection = 0;
+    DWORD ignored_protection;
+    DWORD failure_error = ERROR_SUCCESS;
     struct executable_patch_thread threads[EXECUTABLE_PATCH_MAX_THREADS];
     SIZE_T thread_count;
     unsigned int attempt;
+    char original_first_byte = 0;
+    BOOL gate_installed = FALSE;
+    BOOL protection_changed = FALSE;
+    BOOL success = FALSE;
 
     if (!function || !replacement) {
         return FALSE;
     }
+    AcquireSRWLockExclusive(&executable_patch_lock);
     jump[0] = 0x48;
     jump[1] = 0xb8;
     CopyMemory(jump + 2, &replacement, sizeof(replacement));
     jump[10] = 0xff;
     jump[11] = 0xe0;
+    if (!register_executable_patch_route(function, replacement)) {
+        failure_error = GetLastError();
+        goto cleanup;
+    }
+    if (!VirtualProtect(
+            function,
+            sizeof(jump),
+            PAGE_EXECUTE_READWRITE,
+            &old_protection
+        )) {
+        failure_error = GetLastError();
+        goto cleanup;
+    }
+    protection_changed = TRUE;
+    original_first_byte = (char)__atomic_exchange_n(
+        (volatile unsigned char *)function, 0xccu, __ATOMIC_SEQ_CST
+    );
+    gate_installed = TRUE;
+    FlushInstructionCache(GetCurrentProcess(), function, 1u);
+    if (InterlockedCompareExchange(
+            &executable_patch_test_gate_delay_ms, 0, 0
+        ) > 0) {
+        Sleep((DWORD)InterlockedCompareExchange(
+            &executable_patch_test_gate_delay_ms, 0, 0
+        ));
+    }
     for (attempt = 0u; attempt < EXECUTABLE_PATCH_MAX_ATTEMPTS; ++attempt) {
         if (!suspend_executable_patch_threads(threads, &thread_count)) {
-            return FALSE;
+            failure_error = GetLastError();
+            goto cleanup;
         }
         if (!executable_patch_range_is_idle(
                 threads, thread_count, function
@@ -2885,25 +4002,49 @@ static BOOL patch_executable_entry(void *function, void *replacement) {
             Sleep(1);
             continue;
         }
-        if (!VirtualProtect(
-                function,
-                sizeof(jump),
-                PAGE_EXECUTE_READWRITE,
-                &old_protection
-            )) {
-            resume_executable_patch_threads(threads, thread_count);
-            return FALSE;
-        }
-        CopyMemory(function, jump, sizeof(jump));
-        FlushInstructionCache(GetCurrentProcess(), function, sizeof(jump));
-        VirtualProtect(
-            function, sizeof(jump), old_protection, &old_protection
+        CopyMemory(
+            (unsigned char *)function + 1u,
+            jump + 1u,
+            sizeof(jump) - 1u
         );
+        FlushInstructionCache(
+            GetCurrentProcess(), (unsigned char *)function + 1u,
+            sizeof(jump) - 1u
+        );
+        __atomic_exchange_n(
+            (volatile unsigned char *)function,
+            jump[0],
+            __ATOMIC_SEQ_CST
+        );
+        gate_installed = FALSE;
+        FlushInstructionCache(GetCurrentProcess(), function, 1u);
         resume_executable_patch_threads(threads, thread_count);
-        return TRUE;
+        success = TRUE;
+        break;
     }
-    SetLastError(ERROR_BUSY);
-    return FALSE;
+    if (!success && failure_error == ERROR_SUCCESS) {
+        failure_error = ERROR_BUSY;
+    }
+
+cleanup:
+    if (gate_installed) {
+        __atomic_exchange_n(
+            (volatile unsigned char *)function,
+            (unsigned char)original_first_byte,
+            __ATOMIC_SEQ_CST
+        );
+        FlushInstructionCache(GetCurrentProcess(), function, 1u);
+    }
+    if (protection_changed) {
+        VirtualProtect(
+            function, sizeof(jump), old_protection, &ignored_protection
+        );
+    }
+    ReleaseSRWLockExclusive(&executable_patch_lock);
+    if (!success) {
+        SetLastError(failure_error);
+    }
+    return success;
 }
 
 static BOOL patch_frame_adapter_accessor(void *function) {
@@ -6978,6 +8119,11 @@ static BOOL patch_streamer_imports(void) {
         streamer_cursor_info_hooked = FALSE;
         streamer_bit_blt_hooked = FALSE;
         streamer_stretch_blt_hooked = FALSE;
+        streamer_dxgi_factory_hooked = FALSE;
+        dxgi_factory_vtable_hooked = FALSE;
+        dxgi_adapter_vtable_hooked = FALSE;
+        dxgi_output_vtable_hooked = FALSE;
+        dxgi_duplication_vtable_hooked = FALSE;
         streamer_frame_adapter_hooked = FALSE;
         streamer_wrapper_frame_adapter_hooked = FALSE;
         streamer_portrait_scale_limit_hooked = FALSE;
@@ -7000,6 +8146,16 @@ static BOOL patch_streamer_imports(void) {
         InterlockedExchange(&frame_portrait_update_limit_patches, 0);
         InterlockedExchange(&frame_portrait_scaler_candidates, 0);
         InterlockedExchange(&frame_portrait_scaler_patches, 0);
+        InterlockedExchange(&dxgi_factories_created, 0);
+        InterlockedExchange(&dxgi_adapters_enumerated, 0);
+        InterlockedExchange(&dxgi_outputs_enumerated, 0);
+        InterlockedExchange(&dxgi_duplications_created, 0);
+        InterlockedExchange(&dxgi_acquire_calls, 0);
+        InterlockedExchange(&dxgi_cursor_announcements, 0);
+        InterlockedExchange(&dxgi_cursor_shape_requests, 0);
+        InterlockedExchange(&dxgi_cursor_shape_updates, 0);
+        InterlockedExchange(&dxgi_cursor_shape_fallbacks, 0);
+        InterlockedExchange(&dxgi_cursor_delivered_sequence, 0);
     }
     adapter_ready = patch_streamer_gdi_frame_adapter(module);
     patch_streamer_portrait_scale_limit(module);
@@ -7040,6 +8196,15 @@ static BOOL patch_streamer_imports(void) {
             "StretchBlt",
             (void *)hooked_stretch_blt,
             (void **)&original_stretch_blt
+        );
+    }
+    if (!streamer_dxgi_factory_hooked) {
+        streamer_dxgi_factory_hooked = patch_import(
+            module,
+            "dxgi.dll",
+            "CreateDXGIFactory1",
+            (void *)hooked_create_dxgi_factory1,
+            (void **)&original_create_dxgi_factory1
         );
     }
     ready = streamer_send_input_hooked &&
@@ -7453,6 +8618,7 @@ __declspec(dllexport) DWORD WINAPI UURemoteExecutablePatchSelfTest(void) {
     BOOL patched = FALSE;
     BOOL workers_ready = TRUE;
     DWORD result = 0u;
+    LONG redirects_before;
 
     ZeroMemory(&state, sizeof(state));
     state.function = VirtualAlloc(
@@ -7493,12 +8659,20 @@ __declspec(dllexport) DWORD WINAPI UURemoteExecutablePatchSelfTest(void) {
         goto cleanup;
     }
     Sleep(10);
+    redirects_before = InterlockedCompareExchange(
+        &executable_patch_redirects, 0, 0
+    );
+    InterlockedExchange(&executable_patch_test_gate_delay_ms, 10);
     patched = patch_executable_entry(
         state.function, (void *)executable_patch_test_replacement
     );
+    InterlockedExchange(&executable_patch_test_gate_delay_ms, 0);
     Sleep(10);
     if (
         patched && function() == 42u &&
+        InterlockedCompareExchange(
+            &executable_patch_redirects, 0, 0
+        ) > redirects_before &&
         InterlockedCompareExchange(&state.invalid_results, 0, 0) == 0
     ) {
         result = 1u;
@@ -7513,7 +8687,124 @@ cleanup:
         }
     }
     VirtualFree(state.function, 0, MEM_RELEASE);
+    state.function = NULL;
+    collect_stale_executable_patch_routes();
+    if (
+        InterlockedCompareExchange(
+            &executable_patch_route_count, 0, 0
+        ) != 0 ||
+        executable_patch_exception_handler_handle
+    ) {
+        result = 0u;
+    }
+    for (
+        index = 0u;
+        result && index < EXECUTABLE_PATCH_MAX_ROUTES + 8u;
+        ++index
+    ) {
+        state.function = VirtualAlloc(
+            NULL,
+            EXECUTABLE_PATCH_SIZE,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+        if (!state.function) {
+            result = 0u;
+            break;
+        }
+        CopyMemory(state.function, original_code, sizeof(original_code));
+        if (!VirtualProtect(
+                state.function,
+                EXECUTABLE_PATCH_SIZE,
+                PAGE_EXECUTE_READ,
+                &old_protection
+            )) {
+            result = 0u;
+        } else {
+            FlushInstructionCache(
+                GetCurrentProcess(),
+                state.function,
+                EXECUTABLE_PATCH_SIZE
+            );
+            CopyMemory(&function, &state.function, sizeof(function));
+            if (
+                !patch_executable_entry(
+                    state.function,
+                    (void *)executable_patch_test_replacement
+                ) ||
+                function() != 42u
+            ) {
+                result = 0u;
+            }
+        }
+        VirtualFree(state.function, 0, MEM_RELEASE);
+        state.function = NULL;
+        collect_stale_executable_patch_routes();
+        if (
+            InterlockedCompareExchange(
+                &executable_patch_route_count, 0, 0
+            ) != 0 ||
+            executable_patch_exception_handler_handle
+        ) {
+            result = 0u;
+        }
+    }
     return result;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteDXGICursorSelfTest(
+    DWORD expected_width,
+    DWORD expected_height,
+    DWORD expected_hotspot_x,
+    DWORD expected_hotspot_y
+) {
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info;
+    unsigned char *pixels = NULL;
+    UINT required = 0;
+    uint32_t sequence = 0;
+    HRESULT result;
+    DWORD passed = 0;
+
+    ZeroMemory(&shape_info, sizeof(shape_info));
+    result = fill_native_dxgi_cursor_shape(
+        0,
+        NULL,
+        &required,
+        &shape_info,
+        &sequence
+    );
+    if (
+        result != DXGI_ERROR_MORE_DATA ||
+        required != expected_width * expected_height * 4u ||
+        shape_info.Type != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR ||
+        shape_info.Width != expected_width ||
+        shape_info.Height != expected_height ||
+        shape_info.Pitch != expected_width * 4u ||
+        shape_info.HotSpot.x != (LONG)expected_hotspot_x ||
+        shape_info.HotSpot.y != (LONG)expected_hotspot_y
+    ) {
+        return 0u;
+    }
+    pixels = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, required);
+    if (!pixels) {
+        return 0u;
+    }
+    result = fill_native_dxgi_cursor_shape(
+        required,
+        pixels,
+        &required,
+        &shape_info,
+        &sequence
+    );
+    if (
+        result == S_OK && sequence > 0 &&
+        required == expected_width * expected_height * 4u &&
+        *(const DWORD *)pixels == 0xff20c060u
+    ) {
+        passed = 1u;
+    }
+    HeapFree(GetProcessHeap(), 0, pixels);
+    return passed;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteInputHookMarkPreloaded(
@@ -7554,6 +8845,15 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     HMODULE main_module;
+    if (reason == DLL_PROCESS_DETACH) {
+        PVOID handler = executable_patch_exception_handler_handle;
+
+        executable_patch_exception_handler_handle = NULL;
+        if (handler) {
+            RemoveVectoredExceptionHandler(handler);
+        }
+        return TRUE;
+    }
     (void)reserved;
     if (reason != DLL_PROCESS_ATTACH) {
         return TRUE;

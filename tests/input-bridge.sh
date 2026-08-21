@@ -44,6 +44,7 @@ namespace = runpy.run_path(
 )
 map_absolute_point = namespace["map_absolute_point"]
 x11_selected_monitor = namespace["x11_selected_monitor"]
+WaylandPortalBackend = namespace["WaylandPortalBackend"]
 
 # The streamed landscape monitor starts after a 1440-pixel-wide portrait
 # monitor. Absolute Windows input must stay inside that streamed rectangle.
@@ -76,7 +77,41 @@ with tempfile.TemporaryDirectory() as directory:
         (0, 0, 1440, 2560),
         (-1440, 0, 1440, 2560),
     )
+
+# GNOME Portal may return the portrait stream first.  The bridge must use the
+# XRandR primary flag instead of list order for Wine's primary-relative space.
+backend = object.__new__(WaylandPortalBackend)
+backend._configure_stream_layout(
+    [
+        {
+            "node": 78,
+            "width": 1440,
+            "height": 2560,
+            "position": (0, 0),
+        },
+        {
+            "node": 77,
+            "width": 2560,
+            "height": 1440,
+            "position": (1440, 0),
+        },
+    ]
+)
+assert backend.stream_node == 77
+assert backend.frame_origin_x == -1440
+assert backend.frame_origin_y == 0
+assert backend.virtual_geometry == (-1440, 0, 4000, 2560)
 PY
+
+# The launcher must supervise runtime Portal/PipeWire failures.  A stale
+# stream used to exit permanently and remove the shared frame, leaving every
+# later remote capture black until UU was launched by hand again.
+if rg -q 'restart_policy="no"' "$project_root/bin/uu-remote-for-linux"; then
+    printf 'Wayland 输入桥不应禁用 systemd 运行时恢复。\n' >&2
+    exit 1
+fi
+rg -q -- '--property=Restart=\$restart_policy' \
+    "$project_root/bin/uu-remote-for-linux"
 
 printf '{"version":1,"monitor_id":"AOC|HDMI-1"}\n' \
     >"$monitor_selection"

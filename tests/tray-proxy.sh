@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 import time
 from unittest import mock
@@ -25,6 +26,7 @@ assert '"选择解码器…"' in source
 assert '"远控窗口布局"' in source
 assert '"被控屏幕"' in source
 assert '"主显示器（自动）"' in source
+assert '"手动（不自动移动）"' in source
 assert '"单窗口（主屏）"' in source
 assert '"双窗口（每屏一个）"' in source
 assert '"--select-decoder-and-restart"' in source
@@ -35,7 +37,7 @@ proxy_class = namespace["TrayProxy"]
 with tempfile.TemporaryDirectory() as state:
     layout_file = Path(state) / "window-layout"
     assert namespace["read_window_layout"](layout_file) == (
-        namespace["WINDOW_LAYOUT_SINGLE"]
+        namespace["WINDOW_LAYOUT_MANUAL"]
     )
     namespace["write_window_layout"](
         layout_file, namespace["WINDOW_LAYOUT_DUAL"]
@@ -43,6 +45,10 @@ with tempfile.TemporaryDirectory() as state:
     assert layout_file.read_text() == namespace["WINDOW_LAYOUT_DUAL"] + "\n"
     assert namespace["read_window_layout"](layout_file) == (
         namespace["WINDOW_LAYOUT_DUAL"]
+    )
+    layout_file.write_bytes(b"\xff\xfe\x00")
+    assert namespace["read_window_layout"](layout_file) == (
+        namespace["WINDOW_LAYOUT_MANUAL"]
     )
 
 
@@ -197,13 +203,19 @@ layout_proxy.x11 = layout_x11
 layout_proxy.Gdk = LayoutGdk
 layout_proxy.GLib = ImmediateGLib
 layout_proxy.prefix = "/mock-prefix"
-layout_proxy.window_layout = namespace["WINDOW_LAYOUT_SINGLE"]
+layout_proxy.window_layout = namespace["WINDOW_LAYOUT_MANUAL"]
 layout_proxy.window_layout_monitor_signature = ()
 layout_proxy.window_layout_state = {}
 layout_globals = namespace["mapped_remote_windows"].__globals__
 original_layout_controller_processes = layout_globals["controller_processes"]
 layout_globals["controller_processes"] = lambda *_args: {4242}
 try:
+    # The default layout must leave a manually moved or maximized XWayland
+    # viewer completely under compositor/user control, even on a forced scan.
+    assert layout_proxy.apply_window_layout(force=True) == 0
+    assert layout_x11.moves == []
+
+    layout_proxy.window_layout = namespace["WINDOW_LAYOUT_SINGLE"]
     assert layout_proxy.apply_window_layout(force=True) == 1
     assert layout_x11.moves == [
         (0x300, 1537, 32, 2432, 1408),
@@ -406,6 +418,24 @@ with tempfile.TemporaryDirectory() as prefix:
         child.terminate()
         child.wait()
 
+# Linux comm is an arbitrary 16-byte field, not guaranteed UTF-8.  A process
+# with a non-text name must not crash the tray's global /proc scan.
+invalid_name = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import ctypes,time; "
+        "ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b'\\xffuu'), 0, 0, 0); "
+        "time.sleep(5)",
+    ]
+)
+try:
+    time.sleep(0.05)
+    assert namespace["process_name"](invalid_name.pid).endswith("uu")
+finally:
+    invalid_name.terminate()
+    invalid_name.wait()
+
 with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as other:
     environment = os.environ.copy()
     environment["WINEPREFIX"] = prefix
@@ -430,6 +460,39 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as o
             controller.wait()
         unrelated.terminate()
         unrelated.wait()
+
+# Controller recovery must not SIGKILL a different process that reused the
+# controller PID after the graceful termination request.
+with tempfile.TemporaryDirectory() as state:
+    reused = proxy_class.__new__(proxy_class)
+    reused.prefix = state
+    reused.controller_recovery_reason = "test"
+    reused.controller_restart_marker.parent.mkdir(parents=True)
+    reused.controller_restart_marker.touch()
+    reused.controlled_session_state = lambda: "idle"
+    reused.write_status = lambda *_args: None
+    reused.launcher = "/mock/uu-remote-for-linux"
+    reused.command_log_handle = lambda: open(
+        Path(state) / "recovery.log", "a", encoding="utf-8"
+    )
+    recovery_globals = reused.recover_controller.__globals__
+    original_controller_processes = recovery_globals["controller_processes"]
+    process_scans = iter(({4242}, set(), set()))
+    recovery_globals["controller_processes"] = lambda *_args: next(
+        process_scans
+    )
+    try:
+        with (
+            mock.patch.object(namespace["os"], "kill") as kill,
+            mock.patch.object(namespace["subprocess"], "Popen") as popen,
+        ):
+            assert reused.recover_controller()
+    finally:
+        recovery_globals["controller_processes"] = (
+            original_controller_processes
+        )
+    assert kill.call_args_list == [mock.call(4242, namespace["signal"].SIGTERM)]
+    popen.assert_called_once()
 
 with tempfile.TemporaryDirectory() as prefix:
     drive_c = Path(prefix) / "drive_c"

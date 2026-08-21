@@ -395,6 +395,12 @@ PY
             >"$prefix/drive_c/users/$(id -un)/AppData/Local/GameViewer/setting.ini"
         install -Dm0644 /dev/null "$install_dir/bin/MicrosoftEdgeWebview2Setup.exe"
         install -Dm0644 /dev/null "$install_dir/bin/.app-installed"
+        if [[ ${UU_REMOTE_FAKE_INSTALL_SYSTEM32_NVENC:-0} == 1 ]]; then
+            install -Dm0644 /dev/null \
+                "$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+            printf 'failed-update-nvenc\n' \
+                >"$prefix/drive_c/windows/system32/nvEncodeAPI64.dll"
+        fi
         printf '%s\n' "${UU_REMOTE_FAKE_INSTALLER_VERSION:-4.34.0.8979}" \
             >"$install_dir/bin/.installed-version"
         if [[ ${UU_REMOTE_FAKE_CORRUPT_ROLLBACK_SNAPSHOT:-0} == 1 ]]; then
@@ -411,11 +417,16 @@ PY
         exit 0
         ;;
     *uu-remote-nvenc-d3d11-probe.exe)
+        if [[ ${UU_REMOTE_FAKE_HWENCODE_PROBE_FAILURE:-0} == 1 ]]; then
+            exit 1
+        fi
         if [[ ${WINEDLLPATH:-} == *hwdecode/wine* &&
             ${WINEDLLOVERRIDES:-} == *"d3d11=n;dxgi=n;nvencodeapi64=b"* &&
             -r ${DXVK_CONFIG_FILE:-} ]]; then
-            printf '%s\n' \
-                $'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=1012\tapi=0x000000d0\th264=1\thevc=1\ttexture_upload=1\tnv12_upload=1'
+            printf 'NVENC_D3D11_OK\tadapter=0\tdevice=8578\tluid=%s' \
+                "${UU_REMOTE_FAKE_HWENCODE_LUID:-4045620583}"
+            printf '\tapi=0x000000d0\th264=1\thevc=1'
+            printf '\ttexture_upload=1\tnv12_upload=1\n'
             printf 'HWENCODE_PROBE\n' >>"$trace_file"
             exit 0
         fi
