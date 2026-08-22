@@ -16,6 +16,10 @@
 > [!IMPORTANT]
 > This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries.
 
+## ⚠️ Known Issues
+
+Ubuntu Wayland still has several stability issues. We will accelerate fixes in future releases.
+
 ## 🗺️ Contents
 
 - [✨ Highlights](#highlights)
