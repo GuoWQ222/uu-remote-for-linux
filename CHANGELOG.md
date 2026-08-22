@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.34] - 2026-08-23
+
+- Add separate `uu-remote-for-linux-x11` and
+  `uu-remote-for-linux-wayland` APT entry packages. The X11 package installs
+  only the shared UU runtime, while the Noble amd64 Wayland package declares
+  the four verified Mutter packages as minimum-version ordinary dependencies
+  so APT resolves, unpacks, and configures the complete set in one transaction
+  while allowing later Ubuntu security updates to supersede the repair.
+- Add a dedicated archive-keyring package, deterministic Debian repository
+  metadata generation, signed `InRelease`/`Release.gpg` output, exact binary
+  and source indexes, and isolated signature and package-relationship tests.
+  No maintainer script invokes APT or silently changes Mutter.
+
 ## [1.1.33] - 2026-08-23
 
 - Add a version- and SHA256-bound outer installer that verifies the Ubuntu

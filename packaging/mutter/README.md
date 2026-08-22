@@ -40,23 +40,23 @@ exact `.16` base while allowing same-base Ubuntu suffixes such as `+esm1` or
 manager never creates an APT hold or pin.
 
 The four matching repair packages, four byte-verified Ubuntu rollback packages,
-and complete corresponding source are embedded as inert data in the UU Remote
-system `.deb`. The Debian maintainer scripts never install the repair. For a
-single safe serial command, download the matching generated installer beside
-the `.deb` and run it as the desktop user, without a leading `sudo`:
+and complete corresponding source remain embedded as inert recovery data in the
+shared UU Remote system `.deb`. The Debian maintainer scripts never install the
+repair. Public installation uses the signed APT repository and two mutually
+exclusive entry packages:
 
 ```bash
-bash ./install-uu-remote-for-linux-1.1.33.sh
+sudo apt install uu-remote-for-linux-x11
+sudo apt install uu-remote-for-linux-wayland
 ```
 
-The generated installer is bound to the exact `.deb` version and SHA256. It
-checks Noble amd64, the graphical session, dpkg/APT health, package control
-metadata, and a no-removal simulation. On X11 it installs only the verified UU
-package; on GNOME Wayland it waits for that transaction to return before
-invoking the root-owned manager with `install --yes`. This ordering is outside
-`postinst`, so the Mutter transaction cannot nest inside the main dpkg
-transaction. The installer is itself explicit consent to the selected serial
-path, but administrator authentication and all root-side gates remain.
+The X11 entry depends only on the shared runtime. The Wayland entry is limited
+to Noble amd64 with GNOME Shell 46 and declares the verified four repair
+versions as minimum normal Debian dependencies. APT therefore resolves,
+unpacks, and configures the complete set in one transaction rather than
+launching a nested transaction from `postinst`; later Ubuntu revisions remain
+eligible upgrades. The package names are an explicit user choice; they describe
+session backends, not CPU architectures.
 
 The individual controls remain available on an exact Ubuntu 24.04 Noble amd64
 GNOME baseline:

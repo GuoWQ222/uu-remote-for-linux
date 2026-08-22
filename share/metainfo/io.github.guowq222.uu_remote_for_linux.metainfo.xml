@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.34" date="2026-08-23">
+      <description>
+        <p>Add signed APT repository packaging with separate X11 and Ubuntu Noble GNOME Wayland entry packages, keeping the Mutter replacement inside one dependency-resolved APT transaction.</p>
+      </description>
+    </release>
     <release version="1.1.33" date="2026-08-23">
       <description>
         <p>Add a unified version- and SHA256-bound installer that installs UU alone on X11 and completes the UU APT transaction before invoking the verified Mutter manager on GNOME Wayland.</p>

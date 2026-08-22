@@ -1,0 +1,6 @@
+Types: deb deb-src
+URIs: https://guowq222.github.io/uu-remote-for-linux/apt
+Suites: noble
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/uu-remote-for-linux-archive-keyring.gpg

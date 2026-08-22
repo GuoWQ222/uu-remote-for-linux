@@ -47,26 +47,32 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 
 **已验证环境：** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 或 GNOME Wayland
 
-1. 从 [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
-   下载最新 `.deb` 和同版本的统一安装器
-   `install-uu-remote-for-linux-1.1.33.sh`。
-2. 把两者放在同一目录，执行一条命令；不要在命令前加 `sudo`：
+1. 首次使用签名 APT 源时，从
+   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
+   下载 `uu-remote-for-linux-archive-keyring_1.1.34_all.deb`，然后安装公钥并刷新索引：
 
    ```bash
-   bash ./install-uu-remote-for-linux-1.1.33.sh
+   sudo apt install ./uu-remote-for-linux-archive-keyring_1.1.34_all.deb
+   sudo apt update
    ```
 
-   安装器会校验固定版本、SHA256、系统与 APT 计划。X11 只安装 UU；GNOME
-   Wayland 会完整等待 UU 主包事务退出，再串行安装 Mutter。它不会在
-   `postinst` 中嵌套 APT，也不会自动注销。
-3. 如果明确只安装 UU 主包，也可以使用普通安装：
+2. 根据当前桌面会话选择一个名称不同、互相冲突的入口包：
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.33_amd64.deb
-   uu-remote-for-linux
+   # X11：只安装 UU，不替换 Mutter
+   sudo apt install uu-remote-for-linux-x11
+
+   # Ubuntu 24.04 GNOME Wayland：UU + 至少已验证版本的四个 Mutter 修复包
+   sudo apt install uu-remote-for-linux-wayland
    ```
 
-4. 如需单独检查、安装或回滚 Mutter，仍可使用：
+   这里区分的是 **X11/Wayland 会话后端**，不是 CPU 架构；两个入口目前都只提供
+   amd64。Wayland 的四个 Mutter 包是普通 `Depends`，因此 APT 会在同一次求解、
+   解包和配置事务中完成，任何 `postinst` 都不会嵌套启动第二个 APT。X11 入口没有
+   Mutter 依赖。依赖使用已验证修复版作为最小版本，不会阻止版本排序更高的 Ubuntu
+   官方安全更新。Wayland 安装完成后必须注销并重新登录，让 GNOME Shell 加载新库；
+   X11 安装无需为此注销。
+3. 如需单独检查、安装或回滚 Mutter，仍可使用：
 
    ```bash
    /usr/bin/uu-remote-for-linux --mutter-fix-status
@@ -77,7 +83,8 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
    软件包、SHA256 和 APT 变更计划。只有 APT 已经解包并配置完这 4 个包才算
    成功；仅完成解包属于中断事务，必须先恢复，不能直接注销。首次写入修复后请
    保存工作并注销，再重新登录；如果状态已经是 `active`，则无需再次注销。
-   安装或卸载 UU 主包本身仍不会自动替换、锁定或回滚 Mutter。
+   安装或卸载基础运行时 `uu-remote-for-linux` 本身仍不会自动替换、锁定或回滚
+   Mutter；只有显式选择 `uu-remote-for-linux-wayland` 才会由 APT 安装修复依赖。
    如需卸载 UU，请先在仍有管理器时按需运行
    `--rollback-mutter-fix`；已缓存的官方恢复包会保留在
    `/var/lib/uu-remote-for-linux/mutter-fix/rollback/`，避免卸载后失去救援材料。

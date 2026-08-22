@@ -25,6 +25,7 @@ jobs:
             desktop-file-utils \
             dpkg-dev \
             file \
+            gnupg \
             gir1.2-appindicator3-0.1 \
             gir1.2-gstreamer-1.0 \
             gir1.2-gtk-3.0 \
@@ -49,9 +50,18 @@ jobs:
 
       - name: Inspect packaged repair and create checksums
         run: |
-          package=$(printf '%s\n' dist/uu-remote-for-linux_*_amd64.deb)
+          version=$(cat VERSION)
+          package="dist/uu-remote-for-linux_${version}_amd64.deb"
+          x11_package="dist/uu-remote-for-linux-x11_${version}_amd64.deb"
+          wayland_package="dist/uu-remote-for-linux-wayland_${version}_amd64.deb"
           installer=$(printf '%s\n' dist/install-uu-remote-for-linux-*.sh)
           dpkg-deb --info "$package"
+          dpkg-deb --info "$x11_package"
+          dpkg-deb --info "$wayland_package"
+          test "$(dpkg-deb -f "$x11_package" Depends)" = \
+            "uu-remote-for-linux (= $version)"
+          dpkg-deb -f "$wayland_package" Depends | \
+            grep -Fq 'libmutter-14-0 (>= 46.2-1ubuntu0.24.04.16+0uuremote3)'
           bash -n "$installer"
           shellcheck "$installer"
           dpkg-deb --contents "$package" > dist/CONTENTS.txt
@@ -74,6 +84,8 @@ jobs:
           (
             cd dist
             sha256sum "$(basename "$package")" \
+              "$(basename "$x11_package")" \
+              "$(basename "$wayland_package")" \
               "$(basename "$installer")" > SHA256SUMS
           )
 
@@ -82,7 +94,9 @@ jobs:
         with:
           name: uu-remote-for-linux-deb
           path: |
-            dist/uu-remote-for-linux_*_amd64.deb
+            dist/uu-remote-for-linux_[0-9]*_amd64.deb
+            dist/uu-remote-for-linux-x11_*_amd64.deb
+            dist/uu-remote-for-linux-wayland_*_amd64.deb
             dist/install-uu-remote-for-linux-*.sh
             dist/SHA256SUMS
             dist/CONTENTS.txt

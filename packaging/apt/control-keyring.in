@@ -1,0 +1,11 @@
+Package: uu-remote-for-linux-archive-keyring
+Version: @VERSION@
+Section: misc
+Priority: optional
+Architecture: all
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>
+Depends: ca-certificates
+Description: signing key and APT source for UU Remote for Linux
+ Installs the dedicated archive signing key and deb822 source definition for
+ the UU Remote for Linux Noble amd64 package repository.

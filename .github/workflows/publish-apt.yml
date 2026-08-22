@@ -1,0 +1,80 @@
+name: Publish signed APT repository
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
+
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            apt-utils \
+            dpkg-dev \
+            gnupg
+
+      - name: Import the archive signing key
+        env:
+          APT_SIGNING_PRIVATE_KEY: ${{ secrets.APT_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "$APT_SIGNING_PRIVATE_KEY"
+          install -d -m 0700 "$RUNNER_TEMP/uu-apt-gnupg"
+          printf '%s' "$APT_SIGNING_PRIVATE_KEY" | \
+            gpg --batch --homedir "$RUNNER_TEMP/uu-apt-gnupg" --import
+          fingerprint=$(gpg --batch --homedir "$RUNNER_TEMP/uu-apt-gnupg" \
+            --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+          test "${#fingerprint}" -ge 40
+          printf 'fingerprint=%s\n' "$fingerprint" >>"$GITHUB_ENV"
+
+      - name: Build and sign APT repository
+        env:
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          ./packaging/apt/build-repository.sh \
+            --output "$RUNNER_TEMP/site/apt" \
+            --gnupg-home "$RUNNER_TEMP/uu-apt-gnupg" \
+            --signing-key "$fingerprint" \
+            --expected-public-key \
+              packaging/apt/uu-remote-for-linux-archive-keyring.gpg
+          cp packaging/apt/index.html "$RUNNER_TEMP/site/index.html"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Deploy signed repository
+        id: deployment
+        uses: actions/deploy-pages@v4

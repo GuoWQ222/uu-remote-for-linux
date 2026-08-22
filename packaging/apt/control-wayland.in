@@ -1,0 +1,15 @@
+Package: uu-remote-for-linux-wayland
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: amd64
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>
+Depends: uu-remote-for-linux (= @VERSION@), base-files (>= 13ubuntu10), base-files (<< 13ubuntu11~), gnome-shell (>= 46~), gnome-shell (<< 47~), xdg-desktop-portal-gnome, gir1.2-mutter-14 (>= @MUTTER_VERSION@), libmutter-14-0 (>= @MUTTER_VERSION@), mutter-common (>= @MUTTER_VERSION@), mutter-common-bin (>= @MUTTER_VERSION@)
+Provides: uu-remote-for-linux-session
+Conflicts: uu-remote-for-linux-session
+Description: UU Remote for Linux Ubuntu 24.04 GNOME Wayland profile
+ Installs the shared UU Remote for Linux runtime and at least the verified Noble
+ amd64 Mutter screen-cast latency repair through normal APT dependencies.
+ Newer Ubuntu revisions remain eligible to supersede it. A logout and new GNOME
+ Wayland login are required after the Mutter packages change.
