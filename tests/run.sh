@@ -37,12 +37,8 @@ check "Mutter root helper syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root"
 check "serial Mutter installer template syntax" bash -n \
     "$project_root/packaging/install-with-mutter-fix.sh.in"
-check "APT flavor package builder syntax" bash -n \
-    "$project_root/packaging/apt/build-packages.sh"
-check "APT repository builder syntax" bash -n \
-    "$project_root/packaging/apt/build-repository.sh"
-check "APT static site builder syntax" bash -n \
-    "$project_root/packaging/apt/build-site.sh"
+check "direct release asset builder syntax" bash -n \
+    "$project_root/packaging/release/build-assets.sh"
 check "native frame helper self-test" /usr/bin/python3 -c \
     'import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); library.uu_frame_helper_self_test.restype = ctypes.c_uint32; raise SystemExit(0 if library.uu_frame_helper_self_test() == 1 else 1)' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
@@ -57,8 +53,8 @@ check "Mutter capture priority" \
     "$project_root/packaging/mutter/test-capture-priority.sh"
 check "Mutter release bundle" \
     "$project_root/packaging/mutter/verify-bundle.sh"
-check "signed APT repository isolation" \
-    "$project_root/tests/apt-repository.sh"
+check "direct release asset isolation" \
+    "$project_root/tests/release-assets.sh"
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
@@ -373,14 +369,12 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix" \
         "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root" \
         "$project_root/packaging/install-with-mutter-fix.sh.in" \
-        "$project_root/packaging/apt/build-packages.sh" \
-        "$project_root/packaging/apt/build-repository.sh" \
-        "$project_root/packaging/apt/build-site.sh" \
+        "$project_root/packaging/release/build-assets.sh" \
         "$project_root/packaging/mutter/test-capture-priority.sh" \
         "$project_root/packaging/mutter/verify-bundle.sh" \
         "$project_root/tests/mutter-fix-manager.sh" \
         "$project_root/tests/serial-installer.sh" \
-        "$project_root/tests/apt-repository.sh" \
+        "$project_root/tests/release-assets.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
         "$project_root/packaging/debian/postinst" \

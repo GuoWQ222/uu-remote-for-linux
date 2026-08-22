@@ -47,31 +47,39 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 
 **已验证环境：** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 或 GNOME Wayland
 
-1. 首次使用签名 APT 源时，从
+1. 从
    [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
-   下载 `uu-remote-for-linux-archive-keyring_1.1.34_all.deb`，然后安装公钥并刷新索引：
+   根据当前桌面会话下载一个发行资产。无需添加软件源或安装公钥。
+
+2. X11 下载独立安装包后直接安装：
 
    ```bash
-   sudo apt install ./uu-remote-for-linux-archive-keyring_1.1.34_all.deb
-   sudo apt update
+   sudo apt install ./uu-remote-for-linux-x11_1.1.35_amd64.deb
    ```
 
-2. 根据当前桌面会话选择一个名称不同、互相冲突的入口包：
+   Ubuntu 24.04 GNOME Wayland 下载 ZIP，解压后在其目录中一次性安装全部
+   6 个本地 Debian 包：
 
    ```bash
-   # X11：只安装 UU，不替换 Mutter
-   sudo apt install uu-remote-for-linux-x11
-
-   # Ubuntu 24.04 GNOME Wayland：UU + 至少已验证版本的四个 Mutter 修复包
-   sudo apt install uu-remote-for-linux-wayland
+   unzip uu-remote-for-linux-wayland_1.1.35_amd64.zip
+   cd uu-remote-for-linux-wayland_1.1.35_amd64
+   sha256sum --strict -c SHA256SUMS
+   sudo apt install ./*.deb
    ```
 
-   这里区分的是 **X11/Wayland 会话后端**，不是 CPU 架构；两个入口目前都只提供
-   amd64。Wayland 的四个 Mutter 包是普通 `Depends`，因此 APT 会在同一次求解、
-   解包和配置事务中完成，任何 `postinst` 都不会嵌套启动第二个 APT。X11 入口没有
-   Mutter 依赖。依赖使用已验证修复版作为最小版本，不会阻止版本排序更高的 Ubuntu
-   官方安全更新。Wayland 安装完成后必须注销并重新登录，让 GNOME Shell 加载新库；
-   X11 安装无需为此注销。
+   这里区分的是 **X11/Wayland 会话后端**，不是 CPU 架构；两项目前都只提供
+   amd64。Wayland ZIP 内含 UU 主包、Wayland 入口和四个 Mutter 修复包；外层
+   shell 只启动一次 APT，APT 在同一次求解、解包和配置事务中完成全部变更，任何
+   `postinst` 都不会嵌套启动第二个 APT。X11 独立包不会替换 Mutter。Wayland
+   依赖使用已验证修复版作为最小版本，不会阻止版本排序更高的 Ubuntu 官方安全
+   更新。Wayland 安装完成后必须注销并重新登录，让 GNOME Shell 加载新库；X11
+   安装无需为此注销。
+
+   从旧的 `1.1.34` 签名源迁移后，可移除不再使用的引导包：
+
+   ```bash
+   sudo apt remove uu-remote-for-linux-archive-keyring
+   ```
 3. 如需单独检查、安装或回滚 Mutter，仍可使用：
 
    ```bash
@@ -84,7 +92,7 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
    成功；仅完成解包属于中断事务，必须先恢复，不能直接注销。首次写入修复后请
    保存工作并注销，再重新登录；如果状态已经是 `active`，则无需再次注销。
    安装或卸载基础运行时 `uu-remote-for-linux` 本身仍不会自动替换、锁定或回滚
-   Mutter；只有显式选择 `uu-remote-for-linux-wayland` 才会由 APT 安装修复依赖。
+   Mutter；只有安装 Wayland ZIP 中的全部本地包才会由 APT 安装修复依赖。
    如需卸载 UU，请先在仍有管理器时按需运行
    `--rollback-mutter-fix`；已缓存的官方恢复包会保留在
    `/var/lib/uu-remote-for-linux/mutter-fix/rollback/`，避免卸载后失去救援材料。

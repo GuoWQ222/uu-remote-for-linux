@@ -72,7 +72,7 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 6
+STATE_VERSION = 7
 DEFAULT_RELEASE_TIMEOUT = 15.0
 X11_MONITOR_REFRESH_SECONDS = 2.0
 CURSOR_POLL_SECONDS = 1.0 / 60.0
@@ -995,12 +995,16 @@ class WaylandPortalBackend:
             "UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", ""
         )
         self.fake_lock_mask: int | None = None
+        self.fake_apply_lock_events = True
         if self.fake_trace:
             fake_lock_mask = os.environ.get(
                 "UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK"
             )
             if fake_lock_mask is not None:
                 self.fake_lock_mask = int(fake_lock_mask, 0) & 0x7
+            self.fake_apply_lock_events = os.environ.get(
+                "UU_REMOTE_INPUT_BRIDGE_FAKE_APPLY_LOCK_EVENTS", "1"
+            ) != "0"
         self.fake_video = os.environ.get(
             "UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO", ""
         )
@@ -2546,7 +2550,11 @@ class WaylandPortalBackend:
                 # Reconcile the hook's optimistic toggle with XKB immediately
                 # after a lock event, including a failed Portal notification.
                 self._lock_mask_checked_at = 0.0
-        if pressed and self.fake_lock_mask is not None:
+        if (
+            pressed
+            and self.fake_lock_mask is not None
+            and self.fake_apply_lock_events
+        ):
             self.fake_lock_mask ^= lock_bit
 
     def lock_mask(self) -> int | None:
@@ -2591,6 +2599,9 @@ class FakeBackend:
         self.fake_lock_mask = int(
             os.environ.get("UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK", "0"), 0
         ) & 0x7
+        self.fake_apply_lock_events = os.environ.get(
+            "UU_REMOTE_INPUT_BRIDGE_FAKE_APPLY_LOCK_EVENTS", "1"
+        ) != "0"
         fake_geometry = os.environ.get(
             "UU_REMOTE_INPUT_BRIDGE_FAKE_GEOMETRY", ""
         )
@@ -2672,7 +2683,7 @@ class FakeBackend:
 
     def keycode(self, keycode: int, pressed: bool) -> None:
         self._write(f"keycode {keycode} {int(pressed)}")
-        if pressed:
+        if pressed and self.fake_apply_lock_events:
             lock_bit = {66: 0x1, 77: 0x2, 78: 0x4}.get(keycode, 0)
             self.fake_lock_mask ^= lock_bit
 
@@ -2960,6 +2971,7 @@ def endpoint_content(
     cursor_geometry: tuple[int, int, int, int] | None = None,
     native_lock_keys: bool = False,
     lock_mask: int | None = None,
+    lock_generation: int = 0,
     force_cursor: bool = True,
     tracked_cursor_authoritative: bool = False,
 ) -> str:
@@ -2979,6 +2991,7 @@ def endpoint_content(
         content += (
             "lock_state_valid=1\n"
             f"lock_mask={lock_mask & 0x7}\n"
+            f"lock_generation={lock_generation & 0x7fffffff}\n"
         )
     if cursor_geometry is not None:
         origin_x, origin_y, width, height = cursor_geometry
@@ -3008,6 +3021,11 @@ def write_status(
     mouse_moves: int = 0,
     mouse_buttons: int = 0,
     keyboard_packets: int = 0,
+    lock_key_packets: int = 0,
+    last_lock_sequence: int = 0,
+    last_lock_virtual_key: int = 0,
+    last_lock_scan_code: int = 0,
+    last_lock_flags: int = 0,
     last_mouse_dx: int = 0,
     last_mouse_dy: int = 0,
     last_mouse_flags: int = 0,
@@ -3062,6 +3080,11 @@ def write_status(
             "mouse_moves": mouse_moves,
             "mouse_buttons": mouse_buttons,
             "keyboard_packets": keyboard_packets,
+            "lock_key_packets": lock_key_packets,
+            "last_lock_sequence": last_lock_sequence,
+            "last_lock_virtual_key": last_lock_virtual_key,
+            "last_lock_scan_code": last_lock_scan_code,
+            "last_lock_flags": last_lock_flags,
             "last_mouse_dx": last_mouse_dx,
             "last_mouse_dy": last_mouse_dy,
             "last_mouse_flags": last_mouse_flags,
@@ -3187,6 +3210,11 @@ def watch(
     mouse_moves = 0
     mouse_buttons = 0
     keyboard_packets = 0
+    lock_key_packets = 0
+    last_lock_sequence = 0
+    last_lock_virtual_key = 0
+    last_lock_scan_code = 0
+    last_lock_flags = 0
     last_mouse_dx = 0
     last_mouse_dy = 0
     last_mouse_flags = 0
@@ -3197,6 +3225,7 @@ def watch(
     last_status = 0.0
     endpoint_cursor_geometry: tuple[int, int, int, int] | None = None
     endpoint_lock_mask: int | None = None
+    endpoint_lock_generation = 0
     cursor_snapshot: tuple[int, int, int, int, int, bytes] | None = None
     cursor_sequence = 0
     cursor_checked_at = 0.0
@@ -3218,6 +3247,11 @@ def watch(
             mouse_moves=mouse_moves,
             mouse_buttons=mouse_buttons,
             keyboard_packets=keyboard_packets,
+            lock_key_packets=lock_key_packets,
+            last_lock_sequence=last_lock_sequence,
+            last_lock_virtual_key=last_lock_virtual_key,
+            last_lock_scan_code=last_lock_scan_code,
+            last_lock_flags=last_lock_flags,
             last_mouse_dx=last_mouse_dx,
             last_mouse_dy=last_mouse_dy,
             last_mouse_flags=last_mouse_flags,
@@ -3346,6 +3380,7 @@ def watch(
 
     def sync_endpoint(force: bool = False) -> None:
         nonlocal endpoint_cursor_geometry, endpoint_lock_mask
+        nonlocal endpoint_lock_generation
         if backend is None or port == 0:
             return
         if hasattr(backend, "refresh_absolute_geometry"):
@@ -3356,6 +3391,10 @@ def watch(
         )
         geometry_changed = current_geometry != endpoint_cursor_geometry
         lock_mask_changed = current_lock_mask != endpoint_lock_mask
+        if force or lock_mask_changed:
+            endpoint_lock_generation = (
+                (endpoint_lock_generation + 1) & 0x7fffffff
+            ) or 1
         if (
             not force
             and not geometry_changed
@@ -3370,6 +3409,7 @@ def watch(
                 current_geometry,
                 native_lock_keys=current_lock_mask is not None,
                 lock_mask=current_lock_mask,
+                lock_generation=endpoint_lock_generation,
                 # X11 supplies cursor pixels through XFixes; Wayland metadata
                 # mode supplies the same UUCI file through the PipeWire
                 # sidecar.  UU therefore always renders exactly one native
@@ -3501,7 +3541,7 @@ def watch(
                     rejected += 1
                     continue
                 try:
-                    kind, _sequence, payload = parse_packet(data, token)
+                    kind, sequence, payload = parse_packet(data, token)
                     if kind == PACKET_HELLO:
                         hook_pid, hook_version = payload
                         if hook_version < MINIMUM_HOOK_VERSION:
@@ -3535,6 +3575,31 @@ def watch(
                         vk, scan, flags, _timestamp, _extra = payload
                         controller.keyboard(vk, scan, flags)
                         keyboard_packets += 1
+                        lock_bit = 0
+                        if vk == 0x14 or (
+                            flags & KEY_SCANCODE and scan & 0xff == 0x3a
+                        ):
+                            lock_bit = 0x1
+                        elif vk == 0x90 or (
+                            flags & KEY_SCANCODE and scan & 0xff == 0x45
+                        ):
+                            lock_bit = 0x2
+                        elif vk == 0x91 or (
+                            flags & KEY_SCANCODE and scan & 0xff == 0x46
+                        ):
+                            lock_bit = 0x4
+                        if lock_bit:
+                            lock_key_packets += 1
+                            last_lock_sequence = sequence
+                            last_lock_virtual_key = vk
+                            last_lock_scan_code = scan
+                            last_lock_flags = flags
+                            logger.write(
+                                "锁定键输入包："
+                                f"seq={sequence} vk=0x{vk:x} "
+                                f"scan=0x{scan:x} flags=0x{flags:x} "
+                                f"up={int(bool(flags & KEY_UP))}"
+                            )
                         last_event = time.monotonic()
                     packets += 1
                 except (PermissionError, ValueError):

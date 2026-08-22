@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvencode-bridge update-blocker input-hook frame-helper pipewire-cursor powershell-bridge mutter-bundle test deb apt-packages apt-repository clean
+.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvencode-bridge update-blocker input-hook frame-helper pipewire-cursor powershell-bridge mutter-bundle test deb release-assets clean
 
 all: test
 
@@ -43,21 +43,8 @@ test:
 deb:
 	./packaging/build-deb.sh
 
-apt-packages: deb
-	@test -n "$(APT_PUBLIC_KEY)" || { echo 'APT_PUBLIC_KEY is required' >&2; exit 64; }
-	./packaging/apt/build-packages.sh --archive-keyring "$(APT_PUBLIC_KEY)"
-
-apt-repository:
-	@test -n "$(APT_GNUPGHOME)" || { echo 'APT_GNUPGHOME is required' >&2; exit 64; }
-	@test -n "$(APT_SIGNING_KEY)" || { echo 'APT_SIGNING_KEY is required' >&2; exit 64; }
-	@test -n "$(APT_PASSPHRASE_FILE)" || { echo 'APT_PASSPHRASE_FILE is required' >&2; exit 64; }
-	@test -n "$(APT_REPOSITORY_OUTPUT)" || { echo 'APT_REPOSITORY_OUTPUT is required' >&2; exit 64; }
-	./packaging/apt/build-repository.sh \
-		--output "$(APT_REPOSITORY_OUTPUT)" \
-		--gnupg-home "$(APT_GNUPGHOME)" \
-		--signing-key "$(APT_SIGNING_KEY)" \
-		--passphrase-file "$(APT_PASSPHRASE_FILE)" \
-		--expected-public-key packaging/apt/uu-remote-for-linux-archive-keyring.gpg
+release-assets: deb
+	./packaging/release/build-assets.sh
 
 clean:
 	@if [[ -d dist ]]; then find dist -mindepth 1 -maxdepth 1 -type f -name '*.deb' -delete; fi

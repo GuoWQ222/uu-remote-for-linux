@@ -283,7 +283,8 @@ static int probe_caps_lock_state(void) {
     if (set_lock_state(VK_CAPITAL, (initial & 1) == 0)) {
         return 10;
     }
-    Sleep(100);
+    /* Cross the hook's one-second endpoint refresh boundary. */
+    Sleep(1100);
     toggled = GetKeyState(VK_CAPITAL);
     if (((initial ^ toggled) & 1) == 0) {
         return 10;
@@ -291,7 +292,7 @@ static int probe_caps_lock_state(void) {
     if (set_lock_state(VK_CAPITAL, (initial & 1) != 0)) {
         return 10;
     }
-    Sleep(100);
+    Sleep(1100);
     restored = GetKeyState(VK_CAPITAL);
     return ((initial ^ restored) & 1) == 0 ? 0 : 10;
 }

@@ -42,21 +42,24 @@ manager never creates an APT hold or pin.
 The four matching repair packages, four byte-verified Ubuntu rollback packages,
 and complete corresponding source remain embedded as inert recovery data in the
 shared UU Remote system `.deb`. The Debian maintainer scripts never install the
-repair. Public installation uses the signed APT repository and two mutually
-exclusive entry packages:
+repair. Public releases provide one standalone X11 `.deb` and one Wayland ZIP:
 
 ```bash
-sudo apt install uu-remote-for-linux-x11
-sudo apt install uu-remote-for-linux-wayland
+sudo apt install ./uu-remote-for-linux-x11_VERSION_amd64.deb
+
+unzip uu-remote-for-linux-wayland_VERSION_amd64.zip
+cd uu-remote-for-linux-wayland_VERSION_amd64
+sudo apt install ./*.deb
 ```
 
-The X11 entry depends only on the shared runtime. The Wayland entry is limited
-to Noble amd64 with GNOME Shell 46 and declares the verified four repair
-versions as minimum normal Debian dependencies. APT therefore resolves,
-unpacks, and configures the complete set in one transaction rather than
-launching a nested transaction from `postinst`; later Ubuntu revisions remain
-eligible upgrades. The package names are an explicit user choice; they describe
-session backends, not CPU architectures.
+The X11 package contains the complete runtime and does not replace Mutter. The
+Wayland archive is limited to Noble amd64 with GNOME Shell 46 and contains the
+shared runtime, a profile package, and the verified four repair packages. The
+single outer APT command resolves, unpacks, and configures all six local Debian
+packages in one transaction rather than launching a nested transaction from
+`postinst`; later Ubuntu revisions remain eligible upgrades. No archive key or
+GitHub Pages repository is required. The asset names describe session backends,
+not CPU architectures.
 
 The individual controls remain available on an exact Ubuntu 24.04 Noble amd64
 GNOME baseline:

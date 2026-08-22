@@ -212,6 +212,8 @@ PY
 # backend is Wayland.  This guards the endpoint capability gate: GetKeyState
 # must mirror the native mask instead of stale Wine state.
 UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK=0 \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_APPLY_LOCK_EVENTS=0 \
     UU_REMOTE_INPUT_BRIDGE_FAKE_GEOMETRY='1440,0,2560,1440' \
     UU_REMOTE_INPUT_BRIDGE_FAKE_VIRTUAL_GEOMETRY='0,0,4000,2560' \
     UU_REMOTE_INPUT_BRIDGE_FAKE_CURSOR_GEOMETRY='100,50,2560,1440' \
@@ -275,7 +277,7 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=53'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=54'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 grep -A12 -F '[capture]' "$frame_status" | grep -Eq 'direct_copy_calls=[1-9]'

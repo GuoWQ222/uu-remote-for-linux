@@ -47,34 +47,42 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
 
 **Tested environment:** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 or GNOME Wayland
 
-1. On first use of the signed APT repository, download
-   `uu-remote-for-linux-archive-keyring_1.1.34_all.deb` from
-   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest),
-   install the public key, and refresh package indexes:
+1. Download one session-specific asset from
+   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
+   No repository or archive key is required.
+
+2. For X11, install the standalone package directly:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux-archive-keyring_1.1.34_all.deb
-   sudo apt update
+   sudo apt install ./uu-remote-for-linux-x11_1.1.35_amd64.deb
    ```
 
-2. Choose one differently named, mutually exclusive desktop-session package:
+   For Ubuntu 24.04 GNOME Wayland, download and extract the ZIP, then install
+   all six local Debian packages in one transaction:
 
    ```bash
-   # X11: install UU without replacing Mutter
-   sudo apt install uu-remote-for-linux-x11
-
-   # Ubuntu 24.04 GNOME Wayland: UU plus at least the verified four-package repair
-   sudo apt install uu-remote-for-linux-wayland
+   unzip uu-remote-for-linux-wayland_1.1.35_amd64.zip
+   cd uu-remote-for-linux-wayland_1.1.35_amd64
+   sha256sum --strict -c SHA256SUMS
+   sudo apt install ./*.deb
    ```
 
-   These names distinguish **X11 and Wayland session backends**, not CPU
-   architectures; both entry packages currently target amd64. The Wayland
-   packages are ordinary `Depends`, so APT resolves, unpacks, and configures
-   the whole set in one transaction. No `postinst` launches nested APT, and the
-   X11 package has no Mutter dependency. The verified repair is a minimum
-   version, so later Ubuntu security revisions can supersede it normally. Log
-   out and back in after the Wayland install so GNOME Shell loads the new
-   library; the X11 install does not need that logout.
+   These downloads distinguish **X11 and Wayland session backends**, not CPU
+   architectures; both currently target amd64. The Wayland ZIP contains the
+   shared runtime, Wayland profile, and four Mutter repair packages. The outer
+   shell starts APT once, so APT resolves, unpacks, and configures the complete
+   set in one transaction; no `postinst` launches nested APT. The standalone
+   X11 package does not replace Mutter. The repair is a minimum version, so a
+   later Ubuntu security revision can supersede it normally. Log out and back
+   in after the Wayland install so GNOME Shell loads the new library; the X11
+   install does not require that logout.
+
+   After migrating from the old `1.1.34` signed repository, remove its unused
+   bootstrap package if it is installed:
+
+   ```bash
+   sudo apt remove uu-remote-for-linux-archive-keyring
+   ```
 3. The individual Mutter status, install, and rollback commands remain
    available:
 
@@ -90,8 +98,8 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
    before logout. After first writing the repair, save your work and log out/in.
    If the reported state is already `active`, another logout is unnecessary.
    Installing or removing the shared `uu-remote-for-linux` runtime itself still
-   never replaces, pins, or rolls back Mutter. Only explicitly selecting
-   `uu-remote-for-linux-wayland` asks APT to install the repair dependencies.
+   never replaces, pins, or rolls back Mutter. Only installing every local
+   package from the Wayland ZIP asks APT to install the repair dependencies.
    Before removing UU, run `--rollback-mutter-fix` if desired. Verified
    recovery packages remain under
    `/var/lib/uu-remote-for-linux/mutter-fix/rollback/` so uninstalling the

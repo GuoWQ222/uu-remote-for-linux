@@ -39,7 +39,8 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 53u
+#define HOOK_VERSION 54u
+#define LOCK_STATE_CONFIRM_TIMEOUT_MS 2000u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 2u
 #define UUWF_HEADER_SIZE 64u
@@ -220,6 +221,11 @@ static BOOL force_cursor_visible;
 static volatile LONG native_lock_keys;
 static volatile LONG lock_state_valid;
 static volatile LONG native_lock_mask;
+static volatile LONG native_lock_generation;
+/* Protected by endpoint_lock. */
+static LONG pending_native_lock_bits;
+static LONG pending_native_lock_generation;
+static ULONGLONG pending_native_lock_until;
 static volatile LONG cursor_feedback_origin_x;
 static volatile LONG cursor_feedback_origin_y;
 static volatile LONG cursor_feedback_width;
@@ -745,6 +751,7 @@ static BOOL refresh_endpoint(void) {
     LONG new_native_lock_keys;
     LONG new_lock_state_valid;
     LONG new_lock_mask;
+    LONG new_lock_generation;
     LONG new_tracked_cursor_authoritative;
     LONG old_cursor_origin_x;
     LONG old_cursor_origin_y;
@@ -753,8 +760,10 @@ static BOOL refresh_endpoint(void) {
     LONG old_native_lock_keys;
     LONG old_lock_state_valid;
     LONG old_lock_mask;
+    LONG old_lock_generation;
     LONG old_tracked_cursor_authoritative;
     BOOL changed;
+    BOOL endpoint_identity_changed;
     BOOL ready;
 
     AcquireSRWLockExclusive(&endpoint_lock);
@@ -789,6 +798,9 @@ static BOOL refresh_endpoint(void) {
     new_lock_mask = GetPrivateProfileIntW(
         L"bridge", L"lock_mask", 0, endpoint_path
     ) & 0x7;
+    new_lock_generation = GetPrivateProfileIntW(
+        L"bridge", L"lock_generation", 0, endpoint_path
+    ) & LONG_MAX;
     new_tracked_cursor_authoritative = GetPrivateProfileIntW(
         L"bridge", L"tracked_cursor_authoritative", 0, endpoint_path
     ) != 0;
@@ -824,6 +836,10 @@ static BOOL refresh_endpoint(void) {
         return FALSE;
     }
 
+    endpoint_identity_changed = !endpoint_valid ||
+        bridge_address.sin_port != htons((u_short)port) ||
+        memcmp(bridge_token, new_token, sizeof(bridge_token)) != 0;
+
     old_cursor_width = InterlockedCompareExchange(
         &cursor_feedback_width, 0, 0
     );
@@ -845,12 +861,38 @@ static BOOL refresh_endpoint(void) {
     old_lock_mask = InterlockedCompareExchange(
         &native_lock_mask, 0, 0
     );
+    old_lock_generation = InterlockedCompareExchange(
+        &native_lock_generation, 0, 0
+    );
+    if (
+        endpoint_identity_changed ||
+        !new_native_lock_keys ||
+        !new_lock_state_valid
+    ) {
+        pending_native_lock_bits = 0;
+    } else if (pending_native_lock_bits) {
+        if (new_lock_generation > pending_native_lock_generation) {
+            /* The bridge observed a newer authoritative XKB state. */
+            pending_native_lock_bits = 0;
+        } else if (now < pending_native_lock_until) {
+            /*
+             * Do not let an unchanged endpoint snapshot undo the optimistic
+             * toggle immediately after a successfully forwarded lock-key
+             * press.  That stale overwrite made UU emit a second corrective
+             * Caps Lock press roughly one endpoint polling interval later.
+             */
+            new_lock_mask =
+                (new_lock_mask & ~pending_native_lock_bits) |
+                (old_lock_mask & pending_native_lock_bits);
+        } else {
+            /* Portal failure remains fail-correcting after a bounded grace. */
+            pending_native_lock_bits = 0;
+        }
+    }
     old_tracked_cursor_authoritative = InterlockedCompareExchange(
         &tracked_cursor_authoritative, 0, 0
     );
-    changed = !endpoint_valid ||
-        bridge_address.sin_port != htons((u_short)port) ||
-        memcmp(bridge_token, new_token, sizeof(bridge_token)) != 0 ||
+    changed = endpoint_identity_changed ||
         old_cursor_origin_x != new_cursor_origin_x ||
         old_cursor_origin_y != new_cursor_origin_y ||
         old_cursor_width != (LONG)new_cursor_width ||
@@ -858,6 +900,7 @@ static BOOL refresh_endpoint(void) {
         old_native_lock_keys != new_native_lock_keys ||
         old_lock_state_valid != new_lock_state_valid ||
         old_lock_mask != new_lock_mask ||
+        old_lock_generation != new_lock_generation ||
         old_tracked_cursor_authoritative !=
             new_tracked_cursor_authoritative;
     ZeroMemory(&bridge_address, sizeof(bridge_address));
@@ -876,6 +919,7 @@ static BOOL refresh_endpoint(void) {
     InterlockedExchange(&native_lock_keys, new_native_lock_keys);
     InterlockedExchange(&lock_state_valid, new_lock_state_valid);
     InterlockedExchange(&native_lock_mask, new_lock_mask);
+    InterlockedExchange(&native_lock_generation, new_lock_generation);
     InterlockedExchange(
         &tracked_cursor_authoritative,
         new_tracked_cursor_authoritative
@@ -1144,13 +1188,16 @@ static void toggle_native_lock_state(LONG bit) {
     if (!bit || !InterlockedCompareExchange(&lock_state_valid, 0, 0)) {
         return;
     }
-    do {
-        previous = InterlockedCompareExchange(&native_lock_mask, 0, 0);
-    } while (
-        InterlockedCompareExchange(
-            &native_lock_mask, previous ^ bit, previous
-        ) != previous
+    AcquireSRWLockExclusive(&endpoint_lock);
+    previous = InterlockedCompareExchange(&native_lock_mask, 0, 0);
+    InterlockedExchange(&native_lock_mask, previous ^ bit);
+    pending_native_lock_bits |= bit;
+    pending_native_lock_generation = InterlockedCompareExchange(
+        &native_lock_generation, 0, 0
     );
+    pending_native_lock_until =
+        GetTickCount64() + LOCK_STATE_CONFIRM_TIMEOUT_MS;
+    ReleaseSRWLockExclusive(&endpoint_lock);
 }
 
 static SHORT WINAPI hooked_get_key_state(int virtual_key) {

@@ -585,6 +585,7 @@ done
 grep -q '^native_lock_keys=1$' "$endpoint"
 grep -q '^lock_state_valid=1$' "$endpoint"
 grep -q '^lock_mask=2$' "$endpoint"
+grep -q '^lock_generation=1$' "$endpoint"
 grep -q '^force_cursor=1$' "$endpoint"
 
 /usr/bin/python3 - "$endpoint" <<'PY'
@@ -671,11 +672,22 @@ for event in \
     [[ $(grep -c "^${event}$" "$trace") == 1 ]]
 done
 grep -q '^lock_mask=5$' "$endpoint"
+grep -q '^lock_generation=4$' "$endpoint"
 grep -q '"backend": "wayland-portal"' \
     "$state_dir/input-bridge-status.json"
 grep -q '"portal_stream": 77' \
     "$state_dir/input-bridge-status.json"
 grep -q '"capture_state": "active"' \
+    "$state_dir/input-bridge-status.json"
+grep -q '"lock_key_packets": 6' \
+    "$state_dir/input-bridge-status.json"
+grep -q '"last_lock_sequence": 16' \
+    "$state_dir/input-bridge-status.json"
+grep -q '"last_lock_virtual_key": 145' \
+    "$state_dir/input-bridge-status.json"
+grep -q '"last_lock_scan_code": 70' \
+    "$state_dir/input-bridge-status.json"
+grep -q '"last_lock_flags": 10' \
     "$state_dir/input-bridge-status.json"
 grep -q '"target_fps": 60' \
     "$state_dir/input-bridge-status.json"

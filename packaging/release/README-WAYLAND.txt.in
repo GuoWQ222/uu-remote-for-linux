@@ -1,0 +1,14 @@
+UU Remote for Linux @VERSION@ - Ubuntu 24.04 GNOME Wayland offline bundle
+
+Supported host: Ubuntu 24.04 Noble amd64, GNOME Shell 46, Wayland session.
+
+Install every package in one APT transaction from this extracted directory:
+
+  sudo apt install ./*.deb
+
+Do not install this bundle on X11 or a different Ubuntu/GNOME release. APT must
+finish configuring every package successfully. Save your work, then log out
+and log back in to GNOME Wayland so the new Mutter library is loaded.
+
+No repository key or GitHub Pages source is required. SHA256SUMS covers all six
+Debian packages in this directory.

@@ -25,7 +25,6 @@ jobs:
             desktop-file-utils \
             dpkg-dev \
             file \
-            gnupg \
             gir1.2-appindicator3-0.1 \
             gir1.2-gstreamer-1.0 \
             gir1.2-gtk-3.0 \
@@ -37,6 +36,8 @@ jobs:
             python3-gi \
             ripgrep \
             shellcheck \
+            unzip \
+            zip \
             xvfb
 
       - name: Run offline tests
@@ -45,59 +46,43 @@ jobs:
       - name: Verify embedded Mutter binary and source bundle
         run: make mutter-bundle
 
-      - name: Build Debian package
-        run: make deb
+      - name: Build direct release assets
+        run: make release-assets
 
       - name: Inspect packaged repair and create checksums
         run: |
           version=$(cat VERSION)
-          package="dist/uu-remote-for-linux_${version}_amd64.deb"
           x11_package="dist/uu-remote-for-linux-x11_${version}_amd64.deb"
-          wayland_package="dist/uu-remote-for-linux-wayland_${version}_amd64.deb"
-          installer=$(printf '%s\n' dist/install-uu-remote-for-linux-*.sh)
-          dpkg-deb --info "$package"
+          wayland_archive="dist/uu-remote-for-linux-wayland_${version}_amd64.zip"
           dpkg-deb --info "$x11_package"
-          dpkg-deb --info "$wayland_package"
-          test "$(dpkg-deb -f "$x11_package" Depends)" = \
-            "uu-remote-for-linux (= $version)"
+          test "$(dpkg-deb -f "$x11_package" Package)" = \
+            uu-remote-for-linux-x11
+          ! dpkg-deb -f "$x11_package" Depends | \
+            grep -Fq 'uu-remote-for-linux (= '
+          stage=$(mktemp -d)
+          unzip -q "$wayland_archive" -d "$stage"
+          bundle="$stage/uu-remote-for-linux-wayland_${version}_amd64"
+          test "$(find "$bundle" -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 6
+          (
+            cd "$bundle"
+            sha256sum --strict -c SHA256SUMS
+          )
+          wayland_package="$bundle/uu-remote-for-linux-wayland_${version}_amd64.deb"
+          test "$(dpkg-deb -f "$wayland_package" Package)" = \
+            uu-remote-for-linux-wayland
           dpkg-deb -f "$wayland_package" Depends | \
             grep -Fq 'libmutter-14-0 (>= 46.2-1ubuntu0.24.04.16+0uuremote3)'
-          bash -n "$installer"
-          shellcheck "$installer"
-          dpkg-deb --contents "$package" > dist/CONTENTS.txt
-          stage=$(mktemp -d)
-          dpkg-deb -x "$package" "$stage"
-          dpkg-deb -e "$package" "$stage/DEBIAN"
-          test -x "$stage/usr/bin/uu-remote-mutter-fix"
-          test -x "$stage/usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root"
-          test -f "$stage/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3/SHA256SUMS"
-          test -f "$stage/usr/share/doc/uu-remote-for-linux/source/mutter/SHA256SUMS"
-          (
-            cd "$stage/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3"
-            sha256sum --strict -c SHA256SUMS
-          )
-          (
-            cd "$stage/usr/share/doc/uu-remote-for-linux/source/mutter"
-            sha256sum --strict -c SHA256SUMS
-          )
-          ! grep -Eiq '(apt(-get)?|dpkg|pkexec|mutter)' "$stage/DEBIAN/postinst" "$stage/DEBIAN/postrm"
-          (
-            cd dist
-            sha256sum "$(basename "$package")" \
-              "$(basename "$x11_package")" \
-              "$(basename "$wayland_package")" \
-              "$(basename "$installer")" > SHA256SUMS
-          )
+          test ! -e "$bundle/uu-remote-for-linux-archive-keyring_${version}_all.deb"
+          dpkg-deb --contents "$x11_package" > dist/CONTENTS.txt
+          (cd dist && sha256sum --strict -c SHA256SUMS)
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
-          name: uu-remote-for-linux-deb
+          name: uu-remote-for-linux-direct-downloads
           path: |
-            dist/uu-remote-for-linux_[0-9]*_amd64.deb
             dist/uu-remote-for-linux-x11_*_amd64.deb
-            dist/uu-remote-for-linux-wayland_*_amd64.deb
-            dist/install-uu-remote-for-linux-*.sh
+            dist/uu-remote-for-linux-wayland_*_amd64.zip
             dist/SHA256SUMS
             dist/CONTENTS.txt
           if-no-files-found: error

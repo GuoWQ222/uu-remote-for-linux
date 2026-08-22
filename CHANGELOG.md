@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.35] - 2026-08-23
+
+- Replace the GitHub Pages/keyring bootstrap with two direct Release downloads:
+  a standalone X11 Debian package and a Wayland ZIP whose six local packages
+  install in one normal APT transaction without a repository key.
+
+- Make native Caps/Num/Scroll Lock reconciliation generation-aware.  A stale
+  endpoint snapshot can no longer overwrite the hook's just-forwarded
+  optimistic toggle and provoke a second corrective Caps Lock press.
+- Record privacy-safe lock-key packet counters and the latest packet sequence,
+  virtual key, scan code, and flags in input bridge diagnostics.
+
 ## [1.1.34] - 2026-08-23
 
 - Add separate `uu-remote-for-linux-x11` and
