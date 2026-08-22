@@ -8,6 +8,12 @@ body{font:16px/1.6 system-ui,sans-serif;max-width:800px;margin:3rem auto;padding
 </style>
 <h1>UU Remote for Linux APT Repository</h1>
 <p>Ubuntu 24.04 Noble amd64 的签名软件源。</p>
+<h2>首次添加软件源</h2>
+<p>从 <a href="https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest">GitHub Release</a>
+下载 <code>uu-remote-for-linux-archive-keyring_1.1.34_all.deb</code>，然后执行：</p>
+<pre>sudo apt install ./uu-remote-for-linux-archive-keyring_1.1.34_all.deb
+sudo apt update</pre>
+<p>归档签名指纹：<code>652B 3433 62B2 BB96 588B 6085 2422 B98A 64A6 7CCD</code></p>
 <h2>X11</h2>
 <pre>sudo apt install uu-remote-for-linux-x11</pre>
 <p>不会替换 Mutter。</p>

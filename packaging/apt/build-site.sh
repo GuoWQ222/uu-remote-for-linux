@@ -47,6 +47,7 @@ fi
 
 mkdir -p "$output"
 install -m0644 "$project_root/packaging/apt/index.html" "$output/index.html"
+install -m0644 /dev/null "$output/.nojekyll"
 "$project_root/packaging/apt/build-repository.sh" \
     --output "$output/apt" \
     --gnupg-home "$gnupg_home" \
