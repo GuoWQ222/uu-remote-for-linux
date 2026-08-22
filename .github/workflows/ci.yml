@@ -30,9 +30,11 @@ jobs:
             gir1.2-gtk-3.0 \
             gstreamer1.0-plugins-base \
             libglib2.0-dev \
+            libpipewire-0.3-0 \
             libx11-6 \
             libxml2-utils \
             python3-gi \
+            ripgrep \
             shellcheck \
             xvfb
 
