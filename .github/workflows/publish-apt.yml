@@ -18,6 +18,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    environment: apt-signing
     steps:
       - name: Check out source
         uses: actions/checkout@v7

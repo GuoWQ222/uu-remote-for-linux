@@ -36,7 +36,8 @@ Build and sign a complete repository with:
 
 Set `APT_SIGNING_PASSPHRASE` in the environment for a passphrase-protected
 private key. GitHub Actions receives the armored private key and passphrase as
-two separate encrypted secrets. The exported public key must match the fixed
+two separate encrypted secrets in the protected `apt-signing` environment, not
+as repository-wide secrets. The exported public key must match the fixed
 repository copy byte for byte before packaging or signing begins.
 
 The output includes `Packages`, `Sources`, compressed indexes, `Release`,
