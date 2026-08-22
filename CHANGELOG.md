@@ -14,6 +14,9 @@ All notable changes to this project are documented here.
   metadata generation, signed `InRelease`/`Release.gpg` output, exact binary
   and source indexes, and isolated signature and package-relationship tests.
   No maintainer script invokes APT or silently changes Mutter.
+- Keep the production signing key entirely offline: build and sign the static
+  Pages site locally, publish only signed artifacts, and reject passphrase files
+  that are symlinks, owned by another user, or broader than mode 0600.
 
 ## [1.1.33] - 2026-08-23
 

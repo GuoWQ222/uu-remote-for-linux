@@ -41,6 +41,8 @@ check "APT flavor package builder syntax" bash -n \
     "$project_root/packaging/apt/build-packages.sh"
 check "APT repository builder syntax" bash -n \
     "$project_root/packaging/apt/build-repository.sh"
+check "APT static site builder syntax" bash -n \
+    "$project_root/packaging/apt/build-site.sh"
 check "native frame helper self-test" /usr/bin/python3 -c \
     'import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); library.uu_frame_helper_self_test.restype = ctypes.c_uint32; raise SystemExit(0 if library.uu_frame_helper_self_test() == 1 else 1)' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
@@ -373,6 +375,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/packaging/install-with-mutter-fix.sh.in" \
         "$project_root/packaging/apt/build-packages.sh" \
         "$project_root/packaging/apt/build-repository.sh" \
+        "$project_root/packaging/apt/build-site.sh" \
         "$project_root/packaging/mutter/test-capture-priority.sh" \
         "$project_root/packaging/mutter/verify-bundle.sh" \
         "$project_root/tests/mutter-fix-manager.sh" \

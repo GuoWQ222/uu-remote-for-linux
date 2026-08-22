@@ -50,11 +50,14 @@ apt-packages: deb
 apt-repository:
 	@test -n "$(APT_GNUPGHOME)" || { echo 'APT_GNUPGHOME is required' >&2; exit 64; }
 	@test -n "$(APT_SIGNING_KEY)" || { echo 'APT_SIGNING_KEY is required' >&2; exit 64; }
+	@test -n "$(APT_PASSPHRASE_FILE)" || { echo 'APT_PASSPHRASE_FILE is required' >&2; exit 64; }
 	@test -n "$(APT_REPOSITORY_OUTPUT)" || { echo 'APT_REPOSITORY_OUTPUT is required' >&2; exit 64; }
 	./packaging/apt/build-repository.sh \
 		--output "$(APT_REPOSITORY_OUTPUT)" \
 		--gnupg-home "$(APT_GNUPGHOME)" \
-		--signing-key "$(APT_SIGNING_KEY)"
+		--signing-key "$(APT_SIGNING_KEY)" \
+		--passphrase-file "$(APT_PASSPHRASE_FILE)" \
+		--expected-public-key packaging/apt/uu-remote-for-linux-archive-keyring.gpg
 
 clean:
 	@if [[ -d dist ]]; then find dist -mindepth 1 -maxdepth 1 -type f -name '*.deb' -delete; fi

@@ -31,14 +31,29 @@ Build and sign a complete repository with:
   --output /empty/output/directory \
   --gnupg-home /private/gnupg-home \
   --signing-key FULL_FINGERPRINT \
+  --passphrase-file /private/passphrase-file \
   --expected-public-key ./packaging/apt/uu-remote-for-linux-archive-keyring.gpg
 ```
 
-Set `APT_SIGNING_PASSPHRASE` in the environment for a passphrase-protected
-private key. GitHub Actions receives the armored private key and passphrase as
-two separate encrypted secrets in the protected `apt-signing` environment, not
-as repository-wide secrets. The exported public key must match the fixed
-repository copy byte for byte before packaging or signing begins.
+The passphrase file must be a non-symlink regular file owned by the current user
+with mode `0600`. It is passed directly to local GnuPG and is never placed in a
+process environment. The exported public key must match the fixed repository
+copy byte for byte before packaging or signing begins.
+
+For GitHub Pages, build the complete static site locally:
+
+```bash
+./packaging/apt/build-site.sh \
+  --output /empty/site-directory \
+  --gnupg-home /private/gnupg-home \
+  --signing-key FULL_FINGERPRINT \
+  --passphrase-file /private/passphrase-file
+```
+
+Publish only that already-signed site to the `gh-pages` branch and configure
+Pages to serve the branch root. No GitHub workflow or Secret receives the
+private key. A compromise of hosted files cannot create a signature accepted
+by clients that already trust the fixed archive public key.
 
 The output includes `Packages`, `Sources`, compressed indexes, `Release`,
 `InRelease`, `Release.gpg`, the public key, the shared runtime, both entry

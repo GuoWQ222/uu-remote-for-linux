@@ -9,7 +9,7 @@ readonly mutter_binary_dir="$project_root/third_party/mutter/ubuntu-24.04-amd64/
 readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu0.24.04.16-uuremote3"
 
 usage() {
-    printf '用法: %s --output DIR --gnupg-home DIR --signing-key FINGERPRINT [--expected-public-key FILE]\n' "$0" >&2
+    printf '用法: %s --output DIR --gnupg-home DIR --signing-key FINGERPRINT [--passphrase-file FILE] [--expected-public-key FILE]\n' "$0" >&2
     exit 64
 }
 
@@ -17,6 +17,7 @@ output=
 gnupg_home=
 signing_key=
 expected_public_key=
+passphrase_file=
 while (($#)); do
     case $1 in
         --output)
@@ -39,6 +40,11 @@ while (($#)); do
             expected_public_key=$2
             shift 2
             ;;
+        --passphrase-file)
+            (($# >= 2)) || usage
+            passphrase_file=$2
+            shift 2
+            ;;
         *) usage ;;
     esac
 done
@@ -51,6 +57,18 @@ done
     printf 'GNUPGHOME 不存在或不可信。\n' >&2
     exit 65
 }
+if [[ -n $passphrase_file ]]; then
+    [[ -f $passphrase_file && ! -L $passphrase_file ]] || {
+        printf '签名口令文件不存在或是符号链接。\n' >&2
+        exit 65
+    }
+    passphrase_owner=$(stat -c %u "$passphrase_file")
+    passphrase_mode=$(stat -c %a "$passphrase_file")
+    [[ $passphrase_owner == "$(id -u)" && $passphrase_mode == 600 ]] || {
+        printf '签名口令文件必须由当前用户拥有且权限严格为 0600。\n' >&2
+        exit 65
+    }
+fi
 if [[ -e $output ]] && find "$output" -mindepth 1 -print -quit | grep -q .; then
     printf '输出目录必须不存在或为空: %s\n' "$output" >&2
     exit 73
@@ -140,11 +158,10 @@ apt-ftparchive \
     release "$output/dists/noble" >"$release_file"
 
 sign_release() {
-    if [[ -n ${APT_SIGNING_PASSPHRASE:-} ]]; then
-        printf '%s\n' "$APT_SIGNING_PASSPHRASE" | \
-            gpg --batch --yes --no-tty --pinentry-mode loopback \
-                --passphrase-fd 0 --homedir "$gnupg_home" \
-                --local-user "$signing_key" --digest-algo SHA256 "$@"
+    if [[ -n $passphrase_file ]]; then
+        gpg --batch --yes --no-tty --pinentry-mode loopback \
+            --passphrase-file "$passphrase_file" --homedir "$gnupg_home" \
+            --local-user "$signing_key" --digest-algo SHA256 "$@"
     else
         gpg --batch --yes --no-tty --homedir "$gnupg_home" \
             --local-user "$signing_key" --digest-algo SHA256 "$@"
