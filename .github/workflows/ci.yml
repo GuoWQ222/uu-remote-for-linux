@@ -66,7 +66,10 @@ jobs:
             sha256sum --strict -c SHA256SUMS
           )
           ! grep -Eiq '(apt(-get)?|dpkg|pkexec|mutter)' "$stage/DEBIAN/postinst" "$stage/DEBIAN/postrm"
-          sha256sum "$package" > dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum "$(basename "$package")" > SHA256SUMS
+          )
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
