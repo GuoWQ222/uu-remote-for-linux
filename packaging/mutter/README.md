@@ -41,8 +41,25 @@ manager never creates an APT hold or pin.
 
 The four matching repair packages, four byte-verified Ubuntu rollback packages,
 and complete corresponding source are embedded as inert data in the UU Remote
-system `.deb`. Installing UU does not install the repair. On an exact Ubuntu
-24.04 Noble amd64 GNOME baseline, inspect and explicitly enable it with:
+system `.deb`. The Debian maintainer scripts never install the repair. For a
+single safe serial command, download the matching generated installer beside
+the `.deb` and run it as the desktop user, without a leading `sudo`:
+
+```bash
+bash ./install-uu-remote-for-linux-1.1.33.sh
+```
+
+The generated installer is bound to the exact `.deb` version and SHA256. It
+checks Noble amd64, the graphical session, dpkg/APT health, package control
+metadata, and a no-removal simulation. On X11 it installs only the verified UU
+package; on GNOME Wayland it waits for that transaction to return before
+invoking the root-owned manager with `install --yes`. This ordering is outside
+`postinst`, so the Mutter transaction cannot nest inside the main dpkg
+transaction. The installer is itself explicit consent to the selected serial
+path, but administrator authentication and all root-side gates remain.
+
+The individual controls remain available on an exact Ubuntu 24.04 Noble amd64
+GNOME baseline:
 
 ```bash
 /usr/bin/uu-remote-for-linux --mutter-fix-status
@@ -66,8 +83,9 @@ only after all four packages report `install ok installed`, the installed
 library has the expected hash, `dpkg --audit` is empty, and `apt-get -s check`
 succeeds. The four packages are installed through one APT transaction; their
 normal package configuration and declared triggers may also run. Their previous
-auto/manual APT marks are restored. A Wayland logout/login is required before
-GNOME Shell uses the new library.
+auto/manual APT marks are restored. A Wayland logout/login is required when the
+running GNOME Shell still maps the previous library; an already `active` target
+does not require another logout.
 
 Explicit offline recovery uses the official packages copied to the root-only
 state directory before the first system change:

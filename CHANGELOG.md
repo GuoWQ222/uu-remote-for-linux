@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.33] - 2026-08-23
+
+- Add a version- and SHA256-bound outer installer that verifies the Ubuntu
+  Noble amd64 host and the UU package, completes the main APT transaction
+  first, and invokes the existing fail-closed Mutter manager only for GNOME
+  Wayland. The same one-command entry point installs UU alone on X11 without
+  nesting APT inside a Debian maintainer script.
+- Reject package hash or metadata mismatches, unhealthy dpkg/APT state,
+  unsupported Wayland desktops, and main-package plans containing removals
+  before requesting administrator privileges. Report the exact post-install
+  Mutter state and require logout only when the running GNOME Shell still maps
+  the previous library.
+
 ## [1.1.32] - 2026-08-22
 
 - Mirror GNOME Wayland's XKB Caps Lock, Num Lock, and Scroll Lock state into

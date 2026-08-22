@@ -50,7 +50,10 @@ jobs:
       - name: Inspect packaged repair and create checksums
         run: |
           package=$(printf '%s\n' dist/uu-remote-for-linux_*_amd64.deb)
+          installer=$(printf '%s\n' dist/install-uu-remote-for-linux-*.sh)
           dpkg-deb --info "$package"
+          bash -n "$installer"
+          shellcheck "$installer"
           dpkg-deb --contents "$package" > dist/CONTENTS.txt
           stage=$(mktemp -d)
           dpkg-deb -x "$package" "$stage"
@@ -70,7 +73,8 @@ jobs:
           ! grep -Eiq '(apt(-get)?|dpkg|pkexec|mutter)' "$stage/DEBIAN/postinst" "$stage/DEBIAN/postrm"
           (
             cd dist
-            sha256sum "$(basename "$package")" > SHA256SUMS
+            sha256sum "$(basename "$package")" \
+              "$(basename "$installer")" > SHA256SUMS
           )
 
       - name: Upload Debian package
@@ -79,6 +83,7 @@ jobs:
           name: uu-remote-for-linux-deb
           path: |
             dist/uu-remote-for-linux_*_amd64.deb
+            dist/install-uu-remote-for-linux-*.sh
             dist/SHA256SUMS
             dist/CONTENTS.txt
           if-no-files-found: error

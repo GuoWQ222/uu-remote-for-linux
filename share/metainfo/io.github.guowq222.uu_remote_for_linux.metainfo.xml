@@ -25,6 +25,11 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.33" date="2026-08-23">
+      <description>
+        <p>Add a unified version- and SHA256-bound installer that installs UU alone on X11 and completes the UU APT transaction before invoking the verified Mutter manager on GNOME Wayland.</p>
+      </description>
+    </release>
     <release version="1.1.32" date="2026-08-22">
       <description>
         <p>Synchronize GNOME Wayland lock-key state with Wine so Caps Lock, Num Lock, and Scroll Lock change with one press, with cached fail-closed XKB queries and end-to-end regressions.</p>

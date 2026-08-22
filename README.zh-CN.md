@@ -47,15 +47,26 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 
 **已验证环境：** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 或 GNOME Wayland
 
-1. 从 [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest) 下载最新 `.deb`。
-2. 安装并启动：
+1. 从 [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
+   下载最新 `.deb` 和同版本的统一安装器
+   `install-uu-remote-for-linux-1.1.33.sh`。
+2. 把两者放在同一目录，执行一条命令；不要在命令前加 `sudo`：
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.32_amd64.deb
+   bash ./install-uu-remote-for-linux-1.1.33.sh
+   ```
+
+   安装器会校验固定版本、SHA256、系统与 APT 计划。X11 只安装 UU；GNOME
+   Wayland 会完整等待 UU 主包事务退出，再串行安装 Mutter。它不会在
+   `postinst` 中嵌套 APT，也不会自动注销。
+3. 如果明确只安装 UU 主包，也可以使用普通安装：
+
+   ```bash
+   sudo apt install ./uu-remote-for-linux_1.1.33_amd64.deb
    uu-remote-for-linux
    ```
 
-3. Ubuntu 24.04 GNOME Wayland 用户可显式启用随包附带的低延迟画面修复：
+4. 如需单独检查、安装或回滚 Mutter，仍可使用：
 
    ```bash
    /usr/bin/uu-remote-for-linux --mutter-fix-status
@@ -64,8 +75,9 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 
    管理器只接受精确匹配的 Noble amd64 Mutter 46.2 基线，会再次校验 4 个
    软件包、SHA256 和 APT 变更计划。只有 APT 已经解包并配置完这 4 个包才算
-   成功；仅完成解包属于中断事务，必须先恢复，不能直接注销。成功后请保存工作
-   并注销，再重新登录；安装或卸载 UU 本身都不会自动替换、锁定或回滚 Mutter。
+   成功；仅完成解包属于中断事务，必须先恢复，不能直接注销。首次写入修复后请
+   保存工作并注销，再重新登录；如果状态已经是 `active`，则无需再次注销。
+   安装或卸载 UU 主包本身仍不会自动替换、锁定或回滚 Mutter。
    如需卸载 UU，请先在仍有管理器时按需运行
    `--rollback-mutter-fix`；已缓存的官方恢复包会保留在
    `/var/lib/uu-remote-for-linux/mutter-fix/rollback/`，避免卸载后失去救援材料。

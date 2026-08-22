@@ -47,16 +47,29 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
 
 **Tested environment:** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 or GNOME Wayland
 
-1. Download the latest `.deb` from [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
-2. Install and launch:
+1. Download the latest `.deb` and matching unified installer
+   `install-uu-remote-for-linux-1.1.33.sh` from
+   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
+2. Keep both files in one directory and run a single command without putting
+   `sudo` before it:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.32_amd64.deb
+   bash ./install-uu-remote-for-linux-1.1.33.sh
+   ```
+
+   It verifies the fixed version, SHA256, platform, and APT plan. On X11 it
+   installs only UU; on GNOME Wayland it waits for the UU transaction to finish
+   before serially installing Mutter. It never nests APT in `postinst` and
+   never logs out automatically.
+3. To install only the UU wrapper explicitly, use the regular path:
+
+   ```bash
+   sudo apt install ./uu-remote-for-linux_1.1.33_amd64.deb
    uu-remote-for-linux
    ```
 
-3. On Ubuntu 24.04 GNOME Wayland, explicitly enable the bundled low-latency
-   capture repair:
+4. The individual Mutter status, install, and rollback commands remain
+   available:
 
    ```bash
    /usr/bin/uu-remote-for-linux --mutter-fix-status
@@ -67,8 +80,10 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
    rechecks all four packages, SHA256 digests, and the APT transaction plan.
    Success means APT has both unpacked and configured all four packages; an
    unpack-only result is an interrupted transaction that must be recovered
-   before logout. Save your work and log out/in after success. Installing or
-   removing UU itself never replaces, pins, or rolls back Mutter automatically.
+   before logout. After first writing the repair, save your work and log out/in.
+   If the reported state is already `active`, another logout is unnecessary.
+   Installing or removing the UU package itself still never replaces, pins, or
+   rolls back Mutter automatically.
    Before removing UU, run `--rollback-mutter-fix` if desired. Verified
    recovery packages remain under
    `/var/lib/uu-remote-for-linux/mutter-fix/rollback/` so uninstalling the

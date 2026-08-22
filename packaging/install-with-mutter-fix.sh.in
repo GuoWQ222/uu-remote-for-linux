@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+unset APT_CONFIG BASH_ENV CDPATH DPKG_ROOT ENV LD_LIBRARY_PATH LD_PRELOAD \
+    PYTHONHOME PYTHONPATH
+
+readonly expected_package='uu-remote-for-linux'
+readonly expected_version='@VERSION@'
+readonly expected_arch='amd64'
+readonly package_filename='uu-remote-for-linux_@VERSION@_amd64.deb'
+readonly package_sha256='@PACKAGE_SHA256@'
+readonly os_release_file=/etc/os-release
+readonly sudo_bin=/usr/bin/sudo
+readonly apt_get_bin=/usr/bin/apt-get
+readonly dpkg_bin=/usr/bin/dpkg
+readonly dpkg_deb_bin=/usr/bin/dpkg-deb
+readonly dpkg_query_bin=/usr/bin/dpkg-query
+readonly grep_bin=/usr/bin/grep
+readonly install_bin=/usr/bin/install
+readonly mktemp_bin=/usr/bin/mktemp
+readonly readlink_bin=/usr/bin/readlink
+readonly rm_bin=/usr/bin/rm
+readonly rmdir_bin=/usr/bin/rmdir
+readonly sha256sum_bin=/usr/bin/sha256sum
+readonly mutter_manager=/usr/bin/uu-remote-mutter-fix
+
+die() {
+    printf 'UU 串行安装器：%s\n' "$*" >&2
+    exit 1
+}
+
+os_release_value() {
+    local wanted=$1 line value
+
+    while IFS= read -r line; do
+        [[ $line == "$wanted="* ]] || continue
+        value=${line#*=}
+        value=${value#\"}
+        value=${value%\"}
+        printf '%s\n' "$value"
+        return
+    done <"$os_release_file"
+    return 1
+}
+
+detect_install_mode() {
+    local os_id os_version os_codename desktop
+
+    [[ -r $os_release_file ]] || die '无法读取 /etc/os-release。'
+    os_id=$(os_release_value ID || true)
+    os_version=$(os_release_value VERSION_ID || true)
+    os_codename=$(os_release_value VERSION_CODENAME || true)
+    [[ $os_id == ubuntu && $os_version == 24.04 &&
+        $os_codename == noble ]] ||
+        die '此安装器只支持 Ubuntu 24.04 Noble。'
+    [[ $($dpkg_bin --print-architecture) == amd64 ]] ||
+        die '此安装器只支持 amd64。'
+    case ${XDG_SESSION_TYPE:-} in
+        x11)
+            install_mode=x11
+            ;;
+        wayland)
+            desktop=${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-}}
+            case $desktop in
+                *GNOME*|*gnome*) install_mode=wayland-mutter ;;
+                *) die 'Wayland 串行修复目前只支持 GNOME；不会修改系统。' ;;
+            esac
+            ;;
+        *)
+            die '无法确定当前是 X11 还是 Wayland 图形会话；不会修改系统。'
+            ;;
+    esac
+}
+
+verify_package() {
+    local actual_hash package version architecture
+
+    [[ -f $package_path && ! -L $package_path ]] ||
+        die "缺少同目录普通文件：$package_filename"
+    actual_hash=$($sha256sum_bin "$package_path") ||
+        die '无法计算主安装包 SHA-256。'
+    actual_hash=${actual_hash%% *}
+    [[ $actual_hash == "$package_sha256" ]] ||
+        die '主安装包 SHA-256 不匹配；不会请求管理员权限。'
+
+    package=$($dpkg_deb_bin -f "$package_path" Package) ||
+        die '无法读取主安装包名称。'
+    version=$($dpkg_deb_bin -f "$package_path" Version) ||
+        die '无法读取主安装包版本。'
+    architecture=$($dpkg_deb_bin -f "$package_path" Architecture) ||
+        die '无法读取主安装包架构。'
+    [[ $package == "$expected_package" &&
+        $version == "$expected_version" &&
+        $architecture == "$expected_arch" ]] ||
+        die '主安装包元数据与此串行安装器不匹配。'
+}
+
+preflight_package_manager() {
+    local audit_output simulation
+
+    if ! audit_output=$($dpkg_bin --audit); then
+        die 'dpkg 健康检查执行失败。'
+    fi
+    [[ -z $audit_output ]] ||
+        die '系统存在未完成的 dpkg 事务；请先恢复后再安装。'
+    $apt_get_bin -s check >/dev/null ||
+        die 'APT 依赖状态异常；不会修改系统。'
+    if ! simulation=$($apt_get_bin -s --no-remove --reinstall install \
+        "$package_path" 2>&1); then
+        printf '%s\n' "$simulation" >&2
+        die 'UU 主包 APT 模拟失败；不会修改系统。'
+    fi
+    if $grep_bin -q '^Remv ' <<<"$simulation"; then
+        printf '%s\n' "$simulation" >&2
+        die 'UU 主包安装计划包含删除软件包；不会修改系统。'
+    fi
+}
+
+verify_main_package_installed() {
+    local snapshot verify_output
+
+    # The dpkg-query format is intentionally single-quoted for dpkg itself.
+    # shellcheck disable=SC2016
+    snapshot=$($dpkg_query_bin -W \
+        -f='${db:Status}\t${Version}\t${Architecture}\n' \
+        "$expected_package") || die '无法读取安装后的 UU 主包状态。'
+    [[ $snapshot == $'install ok installed\t'"$expected_version"$'\t'"$expected_arch" ]] ||
+        die 'UU 主包未处于完整 configured 状态；不会继续安装 Mutter。'
+    if ! verify_output=$($dpkg_bin --verify "$expected_package"); then
+        die 'UU 主包文件校验执行失败；不会继续安装 Mutter。'
+    fi
+    [[ -z $verify_output ]] ||
+        die 'UU 主包文件与 dpkg 记录不一致；不会继续安装 Mutter。'
+}
+
+cleanup_root_stage() {
+    [[ -n ${root_stage_dir:-} ]] || return
+    case $root_stage_dir in
+        /var/tmp/uu-remote-serial-install.*) ;;
+        *) return ;;
+    esac
+    $sudo_bin $rm_bin -f -- "$root_package_path" >/dev/null 2>&1 || true
+    $sudo_bin $rmdir_bin -- "$root_stage_dir" >/dev/null 2>&1 || true
+    root_stage_dir=
+    root_package_path=
+}
+
+stage_verified_package_as_root() {
+    local staged_hash
+
+    root_stage_dir=$($sudo_bin $mktemp_bin -d \
+        /var/tmp/uu-remote-serial-install.XXXXXXXX) ||
+        die '无法建立 root 私有安装暂存目录。'
+    case $root_stage_dir in
+        /var/tmp/uu-remote-serial-install.*) ;;
+        *) die 'root 暂存目录路径不受信任。' ;;
+    esac
+    root_package_path="$root_stage_dir/$package_filename"
+    $sudo_bin $install_bin -o root -g root -m 0600 -- \
+        "$package_path" "$root_package_path" ||
+        die '无法把主安装包复制到 root 私有暂存目录。'
+    staged_hash=$($sudo_bin $sha256sum_bin "$root_package_path") ||
+        die '无法校验 root 私有暂存包。'
+    staged_hash=${staged_hash%% *}
+    [[ $staged_hash == "$package_sha256" ]] ||
+        die 'root 私有暂存包 SHA-256 不匹配；不会启动 APT。'
+}
+
+for required_command in \
+    "$sudo_bin" "$apt_get_bin" "$dpkg_bin" "$dpkg_deb_bin" \
+    "$dpkg_query_bin" "$grep_bin" "$install_bin" "$mktemp_bin" \
+    "$readlink_bin" "$rm_bin" "$rmdir_bin" "$sha256sum_bin"; do
+    [[ -x $required_command ]] ||
+        die "缺少必需命令：$required_command"
+done
+((EUID != 0)) ||
+    die '请以当前桌面用户直接运行本脚本，不要在脚本前加 sudo。'
+
+script_path=$($readlink_bin -f -- "$0") || die '无法解析安装器路径。'
+readonly script_path
+script_dir=${script_path%/*}
+readonly script_dir
+package_path="$script_dir/$package_filename"
+readonly package_path
+root_stage_dir=
+root_package_path=
+install_mode=
+trap cleanup_root_stage EXIT
+
+detect_install_mode
+readonly install_mode
+verify_package
+preflight_package_manager
+stage_verified_package_as_root
+
+if [[ $install_mode == x11 ]]; then
+    printf '正在安装 UU Remote %s；当前为 X11，不会修改 Mutter。\n' \
+        "$expected_version"
+else
+    printf '正在串行安装 UU Remote %s；主 APT 事务结束后才会安装 Mutter 修复。\n' \
+        "$expected_version"
+fi
+$sudo_bin $apt_get_bin -y --no-remove --reinstall install \
+    "$root_package_path" ||
+    die 'UU 主包安装失败；未启动 Mutter 安装。'
+verify_main_package_installed
+cleanup_root_stage
+
+if [[ $install_mode == x11 ]]; then
+    printf 'UU Remote %s 已安装；当前为 X11，会跳过仅适用于 GNOME Wayland 的 Mutter 修复。\n' \
+        "$expected_version"
+    exit 0
+fi
+
+[[ -x $mutter_manager ]] ||
+    die '主包已安装，但未找到受信任的 Mutter 管理器。'
+$mutter_manager install --yes ||
+    die 'UU 主包已安装，但 Mutter 修复未完成；请查看上方错误。'
+
+state=$($mutter_manager status --field state) ||
+    die 'Mutter 操作结束，但无法读取最终状态。'
+case $state in
+    active)
+        printf 'UU Remote 与 Mutter 修复均已安装，当前 GNOME Shell 已加载目标库。\n'
+        ;;
+    installed-pending-logout)
+        printf 'UU Remote 与 Mutter 修复均已安装。请保存工作并注销，再重新登录 Wayland。\n'
+        ;;
+    *)
+        die "Mutter 安装返回了非完成状态：$state"
+        ;;
+esac

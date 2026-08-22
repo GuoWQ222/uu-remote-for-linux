@@ -26,6 +26,8 @@ readonly arch="amd64"
 readonly artifact_name="uu-remote-for-linux"
 readonly output_dir="$project_root/dist"
 readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
+readonly serial_installer_template="$project_root/packaging/install-with-mutter-fix.sh.in"
+readonly serial_installer_file="$output_dir/install-${artifact_name}-${version}.sh"
 readonly mutter_profile_dir="$project_root/third_party/mutter/ubuntu-24.04-amd64/uuremote3"
 readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu0.24.04.16-uuremote3"
 
@@ -68,6 +70,7 @@ readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu
     exit 1
 }
 [[ -x "$project_root/packaging/mutter/verify-bundle.sh" &&
+    -r $serial_installer_template &&
     -d $mutter_profile_dir && -d $mutter_source_dir ]] || {
     printf '缺少经过校验的 Mutter 修复载荷或对应源码。\n' >&2
     exit 1
@@ -197,7 +200,22 @@ install -Dm0755 "$project_root/packaging/debian/postinst" \
 install -Dm0755 "$project_root/packaging/debian/postrm" \
     "$stage_dir/DEBIAN/postrm"
 
+# dpkg-deb only clamps mtimes newer than SOURCE_DATE_EPOCH. When a release is
+# prepared before its UTC midnight (for example, an Asia-local release date),
+# freshly staged files would otherwise retain per-build timestamps. Normalize
+# the complete archive tree explicitly so repeated builds remain byte-identical.
+find "$stage_dir" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+
 mkdir -p "$output_dir"
 dpkg-deb --root-owner-group --build "$stage_dir" "$output_file"
+package_sha256=$(sha256sum "$output_file")
+package_sha256=${package_sha256%% *}
+readonly package_sha256
+sed \
+    -e "s/@VERSION@/$version/g" \
+    -e "s/@PACKAGE_SHA256@/$package_sha256/g" \
+    "$serial_installer_template" >"$serial_installer_file"
+chmod 0755 "$serial_installer_file"
 printf '%s\n' "$output_file"
-sha256sum "$output_file"
+printf '%s\n' "$serial_installer_file"
+sha256sum "$output_file" "$serial_installer_file"
