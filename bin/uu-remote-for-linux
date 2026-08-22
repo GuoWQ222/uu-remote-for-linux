@@ -61,6 +61,7 @@ readonly hwdecode_profiler="${UU_REMOTE_HWDECODE_PROFILER_BIN:-$runtime_dir/uu-r
 readonly hwdecode_dxgi_probe_source="$runtime_dir/uu-remote-dxgi-probe.exe"
 readonly hwencode_policy="$runtime_dir/uu-remote-encoder-policy"
 readonly hwencode_probe_source="$runtime_dir/uu-remote-nvenc-d3d11-probe.exe"
+readonly mutter_fix_manager="/usr/bin/uu-remote-mutter-fix"
 
 detect_desktop_backend() {
     case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
@@ -426,6 +427,12 @@ usage() {
   --repair             强制重新检查和修复前缀
   --refresh-installer  从网易官方接口重新下载最新版安装程序
   --check-update       立即检查并安装网易官方最新版本
+  --recover-update-snapshot
+                       从最近一次完整回滚点恢复（不联网、不启动）
+  --mutter-fix-status  查看 GNOME Wayland 画面延迟修复状态
+  --install-mutter-fix 显式安装经过版本锁定的 Mutter 修复
+  --rollback-mutter-fix
+                       显式恢复随包保存的 Ubuntu 官方 Mutter
   --enable-hwdecode    启用 NVIDIA NVDEC→D3D11 实验兼容桥
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
   --enable-hwencode    强制启用 NVIDIA NVENC/HEVC 被控端编码桥
@@ -451,7 +458,12 @@ setup_only=false
 repair=false
 refresh_installer=false
 update_check_requested=false
+automatic_update_check=false
 upstream_update_handoff=false
+recover_update_snapshot=false
+mutter_fix_status_requested=false
+install_mutter_fix=false
+rollback_mutter_fix=false
 stop_requested=false
 diagnose_requested=false
 enable_hwdecode=false
@@ -489,8 +501,22 @@ while (($# > 0)); do
         --check-update)
             update_check_requested=true
             ;;
+        --recover-update-snapshot)
+            recover_update_snapshot=true
+            setup_only=true
+            ;;
+        --mutter-fix-status)
+            mutter_fix_status_requested=true
+            ;;
+        --install-mutter-fix)
+            install_mutter_fix=true
+            ;;
+        --rollback-mutter-fix)
+            rollback_mutter_fix=true
+            ;;
         --auto-update-check)
             update_check_requested=true
+            automatic_update_check=true
             ;;
         --upstream-update-handoff)
             update_check_requested=true
@@ -591,7 +617,9 @@ fi
 if $autostart_launch && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested ||
-        $diagnose_requested || $enable_hwdecode || $disable_hwdecode ||
+        $diagnose_requested || $mutter_fix_status_requested ||
+        $install_mutter_fix || $rollback_mutter_fix ||
+        $enable_hwdecode || $disable_hwdecode ||
         $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
         $select_decoder_requested || $select_decoder_restart_requested ||
@@ -606,6 +634,8 @@ fi
 if $restart_selected_decoder && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested || $diagnose_requested ||
+        $mutter_fix_status_requested || $install_mutter_fix ||
+        $rollback_mutter_fix ||
         $enable_hwdecode || $disable_hwdecode ||
         $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
@@ -619,6 +649,8 @@ if $restart_selected_decoder && {
 fi
 
 if $stop_requested || $diagnose_requested || $update_check_requested ||
+    $mutter_fix_status_requested || $install_mutter_fix ||
+    $rollback_mutter_fix ||
     $enable_hwdecode || $disable_hwdecode ||
     $enable_hwencode || $disable_hwencode ||
     $enable_wol || $disable_wol ||
@@ -643,6 +675,12 @@ $stop_requested && maintenance_action_count=$((maintenance_action_count + 1))
 $diagnose_requested && maintenance_action_count=$((maintenance_action_count + 1))
 $update_check_requested &&
     maintenance_action_count=$((maintenance_action_count + 1))
+$mutter_fix_status_requested &&
+    maintenance_action_count=$((maintenance_action_count + 1))
+$install_mutter_fix &&
+    maintenance_action_count=$((maintenance_action_count + 1))
+$rollback_mutter_fix &&
+    maintenance_action_count=$((maintenance_action_count + 1))
 $enable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
 $enable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
@@ -650,7 +688,7 @@ $disable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
 $enable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 if ((maintenance_action_count > 1)); then
-    die "--stop、--diagnose、更新检查、硬件解码和远程开机维护选项不能组合"
+    die "--stop、--diagnose、更新检查、Mutter、硬件解码和远程开机维护选项不能组合"
 fi
 
 maintenance_selection_count=0
@@ -667,6 +705,8 @@ if ((maintenance_selection_count > 0)) &&
     { $stop_requested || $diagnose_requested || $enable_hwdecode ||
         $disable_hwdecode || $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
+        $mutter_fix_status_requested || $install_mutter_fix ||
+        $rollback_mutter_fix ||
         $update_check_requested; }; then
     die "解码设备选择选项不能和其他维护选项组合"
 fi
@@ -676,6 +716,19 @@ if [[ -r $package_version_file ]]; then
     package_version=$(<"$package_version_file")
 fi
 readonly package_version
+
+if $mutter_fix_status_requested || $install_mutter_fix ||
+    $rollback_mutter_fix; then
+    [[ -x $mutter_fix_manager ]] ||
+        die "Mutter 修复管理器只随系统级 UU Remote .deb 提供：$mutter_fix_manager"
+    if $mutter_fix_status_requested; then
+        exec "$mutter_fix_manager" status
+    elif $install_mutter_fix; then
+        exec "$mutter_fix_manager" install
+    else
+        exec "$mutter_fix_manager" rollback
+    fi
+fi
 
 if $list_decoders_requested; then
     [[ -x $decoder_selector ]] ||
@@ -1075,6 +1128,7 @@ write_update_status() {
         printf 'status=%s\n' "$status"
         printf 'installed=%s\n' "$installed"
         printf 'latest=%s\n' "$latest"
+        printf 'package_version=%s\n' "$package_version"
         printf 'message=%s\n' "${message//$'\n'/ }"
         printf 'checked_at=%(%FT%T%z)T\n' -1
     } >"$temp"
@@ -2006,6 +2060,7 @@ input_bridge_target_label() {
 native_cursor_status_label() {
     local bridge_state="" sequence="" width="" height=""
     local hook_active="" calls="" updates="" fallbacks=""
+    local returned_changes=""
 
     if [[ ! -r $input_bridge_status ]]; then
         printf '就绪（待应用启动）'
@@ -2031,15 +2086,32 @@ native_cursor_status_label() {
             "$wayland_frame_hook_status" cursor updates)
         fallbacks=$(ini_section_value \
             "$wayland_frame_hook_status" cursor fallbacks)
+        returned_changes=$(ini_section_value \
+            "$wayland_frame_hook_status" cursor returned_handle_changes)
+        if [[ $desktop_backend == wayland-xwayland ]]; then
+            sequence=$(ini_section_value \
+                "$wayland_frame_hook_status" cursor sequence)
+            width=$(ini_section_value \
+                "$wayland_frame_hook_status" cursor width)
+            height=$(ini_section_value \
+                "$wayland_frame_hook_status" cursor height)
+        fi
     fi
     if [[ $bridge_state == embedded ]]; then
         printf '生效中（Wayland Portal 嵌入帧；UU 固定指针已抑制）'
     elif [[ $bridge_state != active ]]; then
         printf 'X11 光标图像未建立'
     elif [[ $hook_active == 1 ]]; then
-        printf '生效中（XFixes → HCURSOR；%sx%s；序列 %s；调用/更新/回退 %s/%s/%s）' \
-            "${width:-0}" "${height:-0}" "${sequence:-0}" \
-            "${calls:-0}" "${updates:-0}" "${fallbacks:-0}"
+        if [[ $desktop_backend == wayland-xwayland ]]; then
+            printf '生效中（Wayland Portal 元数据 → HCURSOR；%sx%s；序列 %s；调用/更新/返回变化/回退 %s/%s/%s/%s）' \
+                "${width:-0}" "${height:-0}" "${sequence:-0}" \
+                "${calls:-0}" "${updates:-0}" \
+                "${returned_changes:-0}" "${fallbacks:-0}"
+        else
+            printf '生效中（XFixes → HCURSOR；%sx%s；序列 %s；调用/更新/回退 %s/%s/%s）' \
+                "${width:-0}" "${height:-0}" "${sequence:-0}" \
+                "${calls:-0}" "${updates:-0}" "${fallbacks:-0}"
+        fi
     else
         printf 'X11 图像已发布，等待 Win64 光标钩子'
     fi
@@ -2100,7 +2172,7 @@ wayland_frame_hook_status_label() {
     rendered=$(ini_section_value \
         "$wayland_frame_hook_status" capture rendered)
     if [[ $version =~ ^[0-9]+$ && $version -ge 7 &&
-        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 13) == 13 )); then
+        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 28) == 28 )); then
         printf '完整（v%s；GDI %s/%s）' \
             "$version" "${rendered:-0}" "${calls:-0}"
     else
@@ -3752,6 +3824,35 @@ hwencode_last_session_label() {
     fi
 }
 
+mutter_fix_status_label() {
+    local status
+
+    if [[ ! -x $mutter_fix_manager ]]; then
+        printf '系统级 .deb 未提供'
+        return
+    fi
+    status=$($mutter_fix_manager status --field state 2>/dev/null || true)
+    case $status in
+        active) printf '已生效' ;;
+        installed-pending-logout) printf '已安装，等待注销登录' ;;
+        legacy-active|legacy-installed-pending-logout)
+            printf '诊断版已生效，可规范化'
+            ;;
+        rolled-back-pending-logout) printf '已回滚，等待注销登录' ;;
+        eligible) printf '可显式安装' ;;
+        superseded-or-unknown) printf '检测到更高或未知版本，未修改' ;;
+        payload-corrupt) printf '载荷校验失败' ;;
+        interrupted-known-partial)
+            printf 'Mutter 事务中断，需按文档从 TTY 人工恢复'
+            ;;
+        partial|recoverable-partial|installed-corrupt|unknown-build)
+            printf 'Mutter 状态异常，仅允许显式恢复'
+            ;;
+        unsupported-*) printf '当前系统不适用' ;;
+        *) printf '%s' "${status:-未知}" ;;
+    esac
+}
+
 print_diagnostics() {
     local os_name="unknown"
     local detected_wine="missing"
@@ -3812,6 +3913,7 @@ print_diagnostics() {
         "原生光标形状" "$(native_cursor_status_label)" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
+        "GNOME Wayland 延迟修复" "$(mutter_fix_status_label)" \
         "竖屏原画缩放" "$(portrait_original_quality_status_label)" \
         "自适应语义档案" "$(streamer_compatibility_profile_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
@@ -4979,6 +5081,7 @@ version_bridge_state_names() {
     local -n result=$1
 
     result=(
+        update-blocker-manifest
         hwdecode-enabled
         hwdecode-manifest
         hwdecode-generated.tsv
@@ -4994,6 +5097,19 @@ version_bridge_state_names() {
         dxvk-hwencode.conf
         wol-enabled
     )
+}
+
+refresh_restored_update_blocker_manifest() {
+    local original_sha app_version
+
+    [[ -r $update_blocker_source &&
+        -f $native_upgrade && -f $native_upgrade_original ]] || return 1
+    cmp -s "$update_blocker_source" "$native_upgrade" || return 1
+    original_sha=$(file_sha256 "$native_upgrade_original") || return 1
+    app_version=$(registry_value "$installed_version_key" Version || true)
+    [[ -n $app_version ]] || return 1
+    write_update_blocker_manifest "$original_sha" "$app_version"
+    update_blocker_ready
 }
 
 write_version_bridge_state_snapshot() {
@@ -5186,6 +5302,14 @@ restore_update_snapshot() {
             commit_failed=1
         fi
     fi
+    # Older snapshots predate update-blocker-manifest being part of the
+    # version-bound bridge state.  Rebuild that small manifest from the
+    # restored, archived Upgrade.exe before validating the restored client.
+    if ((!commit_failed)) &&
+        ! refresh_restored_update_blocker_manifest; then
+        printf '恢复后的官方更新器保护清单无法重建。\n' >&2
+        commit_failed=1
+    fi
     if ((!commit_failed)) &&
         ! { app_files_present && shim_ready && update_blocker_ready; }; then
         printf '恢复后的旧版 UU 基础文件核验失败。\n' >&2
@@ -5194,6 +5318,16 @@ restore_update_snapshot() {
     if ((!commit_failed)) && hwdecode_enabled &&
         ! hwdecode_files_deployed; then
         printf '恢复后的 NVDEC 兼容桥核验失败。\n' >&2
+        commit_failed=1
+    fi
+    # The package can be upgraded independently of the UU client.  In that
+    # case the restored probe result is intentionally stale because its
+    # signature includes the current capture/input hook hash.  Re-probe the
+    # restored client with the current runtime before rejecting the rollback.
+    if ((!commit_failed)) && hwencode_enabled &&
+        hwencode_files_deployed && ! hwencode_probe_current &&
+        ! probe_hwencode_bridge; then
+        printf '恢复后的 NVENC 兼容桥重新探测失败。\n' >&2
         commit_failed=1
     fi
     if ((!commit_failed)) && hwencode_enabled &&
@@ -5433,8 +5567,28 @@ run_update_transaction() {
     die "更新失败且回滚未完成；请勿启动远控并查看 $update_bridge_log"
 }
 
+automatic_update_retry_blocked() {
+    local installed=$1 latest=$2
+    local status="" recorded_installed="" recorded_latest=""
+    local recorded_package="" key value
+
+    [[ -r $update_status_file ]] || return 1
+    while IFS='=' read -r key value; do
+        case $key in
+            status) status=$value ;;
+            installed) recorded_installed=$value ;;
+            latest) recorded_latest=$value ;;
+            package_version) recorded_package=$value ;;
+        esac
+    done <"$update_status_file"
+    [[ $status == rolled-back &&
+        $recorded_installed == "$installed" &&
+        $recorded_latest == "$latest" &&
+        $recorded_package == "$package_version" ]]
+}
+
 perform_update_check() {
-    local installed latest="" check_error=""
+    local mode=${1:-manual} installed latest="" check_error=""
 
     app_files_present ||
         die "UU 客户端尚未安装，无法检查更新"
@@ -5451,6 +5605,13 @@ perform_update_check() {
         write_update_status up-to-date "$installed" "$latest" "无需更新"
         printf 'UU 当前版本 %s，官方版本 %s；无需更新。\n' \
             "$installed" "$latest"
+        return
+    fi
+    if [[ $mode == automatic ]] &&
+        automatic_update_retry_blocked "$installed" "$latest"; then
+        notify_status "已暂缓再次安装未通过兼容性核验的 UU $latest"
+        printf 'UU %s 上次未通过兼容性核验；自动更新已暂缓，保留 %s。\n' \
+            "$latest" "$installed"
         return
     fi
 
@@ -5499,9 +5660,29 @@ perform_upstream_update_handoff() {
     return "$check_status"
 }
 
+if $recover_update_snapshot; then
+    recovery_snapshot="$update_rollback_dir/pre-update.tar"
+    recovery_bridge_snapshot="$update_rollback_dir/pre-update-bridge-state.tar"
+    restore_update_snapshot \
+        "$recovery_snapshot" "$recovery_bridge_snapshot" ||
+        die "最近一次更新回滚点无法安全恢复"
+    recovery_failed_version=unknown
+    if [[ -r $installer_version_file ]]; then
+        recovery_failed_version=$(<"$installer_version_file")
+    fi
+    write_update_status rolled-back \
+        "$(registry_value "$installed_version_key" Version || printf unknown)" \
+        "$recovery_failed_version" \
+        "已从最近一次完整回滚点恢复"
+    notify_status "UU 已从最近一次完整回滚点恢复"
+    printf 'UU 已从最近一次完整回滚点恢复；继续核验并部署当前兼容桥。\n'
+fi
+
 if $update_check_requested; then
     if $upstream_update_handoff; then
         perform_upstream_update_handoff
+    elif $automatic_update_check; then
+        perform_update_check automatic
     else
         perform_update_check
     fi
@@ -5523,7 +5704,7 @@ if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
 fi
 if $startup_update_requested; then
     if ! (
-        UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check
+        UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check automatic
     ); then
         notify_status "启动时自动更新未完成，将继续打开当前版本"
         printf '警告：启动时自动更新未完成；继续打开当前已安装版本。\n' >&2

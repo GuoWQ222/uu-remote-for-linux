@@ -39,7 +39,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 48u
+#define HOOK_VERSION 53u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 2u
 #define UUWF_HEADER_SIZE 64u
@@ -56,6 +56,9 @@
 #define UUCI_CACHE_CAPACITY 64u
 #define UUCI_CACHE_HARD_LIMIT 128u
 #define UUCI_TRANSPARENT_SIZE 32u
+#define CURSOR_POSITION_SOURCE_ORIGINAL 1
+#define CURSOR_POSITION_SOURCE_TRACKED 2
+#define CURSOR_POSITION_SOURCE_LOCAL 3
 #define EXECUTABLE_PATCH_SIZE 12u
 #define EXECUTABLE_PATCH_MAX_THREADS 1024u
 #define EXECUTABLE_PATCH_MAX_ATTEMPTS 32u
@@ -221,6 +224,7 @@ static volatile LONG cursor_feedback_origin_x;
 static volatile LONG cursor_feedback_origin_y;
 static volatile LONG cursor_feedback_width;
 static volatile LONG cursor_feedback_height;
+static volatile LONG tracked_cursor_authoritative;
 static BOOL send_input_hooked;
 static BOOL get_key_state_hooked;
 static BOOL cursor_info_hooked;
@@ -301,6 +305,15 @@ static volatile LONG native_cursor_width;
 static volatile LONG native_cursor_height;
 static volatile LONG native_cursor_hotspot_x;
 static volatile LONG native_cursor_hotspot_y;
+static PVOID volatile native_cursor_returned_handle;
+static volatile LONG native_cursor_returned_handle_changes;
+static volatile LONG native_cursor_returned_sequence;
+static volatile LONG cursor_position_tracked_returns;
+static volatile LONG cursor_position_original_returns;
+static volatile LONG cursor_position_source_changes;
+static volatile LONG cursor_position_last_source;
+static volatile LONG cursor_position_last_x;
+static volatile LONG cursor_position_last_y;
 static SRWLOCK frame_lock = SRWLOCK_INIT;
 static HANDLE frame_file = INVALID_HANDLE_VALUE;
 static HANDLE frame_mapping;
@@ -308,8 +321,19 @@ static unsigned char *frame_view;
 static SIZE_T frame_view_size;
 static unsigned char *frame_snapshot;
 static SIZE_T frame_snapshot_capacity;
+static BOOL frame_snapshot_valid;
+static uint32_t frame_snapshot_sequence;
+static uint32_t frame_snapshot_active;
+static int frame_snapshot_source_x;
+static int frame_snapshot_source_y;
+static int frame_snapshot_source_width;
+static int frame_snapshot_source_height;
+static volatile LONG frame_snapshot_cache_hits;
 static volatile LONG frame_snapshot_retries;
 static volatile LONG frame_snapshot_failures;
+static volatile LONG frame_direct_copy_mode;
+static volatile LONG frame_direct_copy_calls;
+static volatile LONG frame_gdi_copy_calls;
 static uint32_t frame_last_sequence;
 static ULONGLONG frame_path_checked_at;
 static volatile LONG frame_hook_calls;
@@ -721,6 +745,7 @@ static BOOL refresh_endpoint(void) {
     LONG new_native_lock_keys;
     LONG new_lock_state_valid;
     LONG new_lock_mask;
+    LONG new_tracked_cursor_authoritative;
     LONG old_cursor_origin_x;
     LONG old_cursor_origin_y;
     LONG old_cursor_width;
@@ -728,6 +753,7 @@ static BOOL refresh_endpoint(void) {
     LONG old_native_lock_keys;
     LONG old_lock_state_valid;
     LONG old_lock_mask;
+    LONG old_tracked_cursor_authoritative;
     BOOL changed;
     BOOL ready;
 
@@ -763,6 +789,9 @@ static BOOL refresh_endpoint(void) {
     new_lock_mask = GetPrivateProfileIntW(
         L"bridge", L"lock_mask", 0, endpoint_path
     ) & 0x7;
+    new_tracked_cursor_authoritative = GetPrivateProfileIntW(
+        L"bridge", L"tracked_cursor_authoritative", 0, endpoint_path
+    ) != 0;
     new_cursor_origin_x = read_profile_long(
         L"bridge", L"cursor_origin_x", 0, endpoint_path
     );
@@ -816,6 +845,9 @@ static BOOL refresh_endpoint(void) {
     old_lock_mask = InterlockedCompareExchange(
         &native_lock_mask, 0, 0
     );
+    old_tracked_cursor_authoritative = InterlockedCompareExchange(
+        &tracked_cursor_authoritative, 0, 0
+    );
     changed = !endpoint_valid ||
         bridge_address.sin_port != htons((u_short)port) ||
         memcmp(bridge_token, new_token, sizeof(bridge_token)) != 0 ||
@@ -825,7 +857,9 @@ static BOOL refresh_endpoint(void) {
         old_cursor_height != (LONG)new_cursor_height ||
         old_native_lock_keys != new_native_lock_keys ||
         old_lock_state_valid != new_lock_state_valid ||
-        old_lock_mask != new_lock_mask;
+        old_lock_mask != new_lock_mask ||
+        old_tracked_cursor_authoritative !=
+            new_tracked_cursor_authoritative;
     ZeroMemory(&bridge_address, sizeof(bridge_address));
     bridge_address.sin_family = AF_INET;
     bridge_address.sin_port = htons((u_short)port);
@@ -842,6 +876,10 @@ static BOOL refresh_endpoint(void) {
     InterlockedExchange(&native_lock_keys, new_native_lock_keys);
     InterlockedExchange(&lock_state_valid, new_lock_state_valid);
     InterlockedExchange(&native_lock_mask, new_lock_mask);
+    InterlockedExchange(
+        &tracked_cursor_authoritative,
+        new_tracked_cursor_authoritative
+    );
     endpoint_valid = TRUE;
     if (changed) {
         clear_tracked_cursor();
@@ -895,13 +933,37 @@ static void track_mouse_position(const MOUSEINPUT *input) {
     if (virtual_desktop) {
         /*
          * MOUSEEVENTF_VIRTUALDESK is semantic, not decorative: UU uses the
-         * normalized value for the complete multi-monitor desktop.  Keep the
-         * feedback in Wine's primary-relative virtual coordinate space.
+         * normalized value for the complete multi-monitor desktop.  Native
+         * Wayland input never moves Wine's private cursor, so use the Portal
+         * geometry published by the bridge when its tracked position is the
+         * authoritative controller feedback.  The X11 path retains Wine's
+         * system metrics for compatibility with its native cursor.
          */
-        origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (
+            InterlockedCompareExchange(
+                &tracked_cursor_authoritative, 0, 0
+            ) &&
+            InterlockedCompareExchange(&cursor_feedback_width, 0, 0) > 0 &&
+            InterlockedCompareExchange(&cursor_feedback_height, 0, 0) > 0
+        ) {
+            origin_x = InterlockedCompareExchange(
+                &cursor_feedback_origin_x, 0, 0
+            );
+            origin_y = InterlockedCompareExchange(
+                &cursor_feedback_origin_y, 0, 0
+            );
+            width = InterlockedCompareExchange(
+                &cursor_feedback_width, 0, 0
+            );
+            height = InterlockedCompareExchange(
+                &cursor_feedback_height, 0, 0
+            );
+        } else {
+            origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        }
     } else {
         width = InterlockedCompareExchange(&cursor_feedback_width, 0, 0);
         height = InterlockedCompareExchange(&cursor_feedback_height, 0, 0);
@@ -1578,6 +1640,43 @@ static HCURSOR embedded_transparent_cursor(void) {
     return transparent_cursor_handle;
 }
 
+static void track_returned_cursor(HCURSOR cursor) {
+    PVOID previous = InterlockedExchangePointer(
+        &native_cursor_returned_handle,
+        (PVOID)cursor
+    );
+
+    if (previous != (PVOID)cursor) {
+        InterlockedIncrement(&native_cursor_returned_handle_changes);
+    }
+    InterlockedExchange(
+        &native_cursor_returned_sequence,
+        InterlockedCompareExchange(&native_cursor_sequence, 0, 0)
+    );
+}
+
+static void track_returned_cursor_position(
+    const POINT *position,
+    LONG source
+) {
+    LONG previous;
+
+    if (!position || source == 0) {
+        return;
+    }
+    if (source == CURSOR_POSITION_SOURCE_TRACKED) {
+        InterlockedIncrement(&cursor_position_tracked_returns);
+    } else {
+        InterlockedIncrement(&cursor_position_original_returns);
+    }
+    previous = InterlockedExchange(&cursor_position_last_source, source);
+    if (previous != 0 && previous != source) {
+        InterlockedIncrement(&cursor_position_source_changes);
+    }
+    InterlockedExchange(&cursor_position_last_x, position->x);
+    InterlockedExchange(&cursor_position_last_y, position->y);
+}
+
 static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
     HCURSOR stable_cursor;
     POINT actual;
@@ -1585,6 +1684,7 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
     POINT tracked;
     BOOL tracked_virtual_desktop = FALSE;
     BOOL tracked_ready;
+    LONG position_source = 0;
     InterlockedIncrement(&native_cursor_calls);
     BOOL result = original_get_cursor_info
         ? original_get_cursor_info(cursor_info)
@@ -1606,10 +1706,12 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
             if (stable_cursor) {
                 cursor_info->flags = CURSOR_SHOWING;
                 cursor_info->hCursor = stable_cursor;
+                track_returned_cursor(stable_cursor);
                 InterlockedExchange(&native_cursor_transparent, 1);
             } else {
                 cursor_info->flags = 0;
                 cursor_info->hCursor = NULL;
+                track_returned_cursor(NULL);
                 InterlockedExchange(&native_cursor_transparent, 0);
                 InterlockedIncrement(&native_cursor_fallbacks);
             }
@@ -1625,25 +1727,50 @@ static BOOL WINAPI hooked_get_cursor_info(PCURSORINFO cursor_info) {
         }
         if (stable_cursor) {
             cursor_info->hCursor = stable_cursor;
+            track_returned_cursor(stable_cursor);
         }
         tracked_ready = read_tracked_cursor(
             &tracked, &tracked_virtual_desktop
         );
-        if (tracked_ready && tracked_virtual_desktop) {
+        if (
+            tracked_ready &&
+            InterlockedCompareExchange(
+                &tracked_cursor_authoritative, 0, 0
+            )
+        ) {
+            cursor_info->ptScreenPos = tracked;
+            result = TRUE;
+            position_source = CURSOR_POSITION_SOURCE_TRACKED;
+        } else if (tracked_ready && tracked_virtual_desktop) {
             if (!result) {
                 cursor_info->ptScreenPos = tracked;
                 result = TRUE;
+                position_source = CURSOR_POSITION_SOURCE_TRACKED;
+            } else {
+                position_source = CURSOR_POSITION_SOURCE_ORIGINAL;
             }
         } else if (result) {
             actual = cursor_info->ptScreenPos;
             if (actual_cursor_to_screen_local(&actual, &local)) {
                 cursor_info->ptScreenPos = local;
+                position_source = CURSOR_POSITION_SOURCE_LOCAL;
+            } else {
+                position_source = CURSOR_POSITION_SOURCE_ORIGINAL;
             }
         } else if (tracked_ready) {
             cursor_info->ptScreenPos = tracked;
             result = TRUE;
+            position_source = CURSOR_POSITION_SOURCE_TRACKED;
         } else if (!result) {
             result = GetCursorPos(&cursor_info->ptScreenPos);
+            if (result) {
+                position_source = CURSOR_POSITION_SOURCE_ORIGINAL;
+            }
+        }
+        if (result) {
+            track_returned_cursor_position(
+                &cursor_info->ptScreenPos, position_source
+            );
         }
     }
     return result;
@@ -1655,6 +1782,7 @@ static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
     POINT tracked;
     BOOL tracked_virtual_desktop = FALSE;
     BOOL tracked_ready;
+    LONG position_source = 0;
     BOOL result = original_get_cursor_pos
         ? original_get_cursor_pos(point)
         : FALSE;
@@ -1662,24 +1790,52 @@ static BOOL WINAPI hooked_get_cursor_pos(LPPOINT point) {
         tracked_ready = read_tracked_cursor(
             &tracked, &tracked_virtual_desktop
         );
+        if (
+            tracked_ready &&
+            InterlockedCompareExchange(
+                &tracked_cursor_authoritative, 0, 0
+            )
+        ) {
+            *point = tracked;
+            track_returned_cursor_position(
+                point, CURSOR_POSITION_SOURCE_TRACKED
+            );
+            return TRUE;
+        }
         if (tracked_ready && tracked_virtual_desktop) {
             if (!result) {
                 *point = tracked;
+                track_returned_cursor_position(
+                    point, CURSOR_POSITION_SOURCE_TRACKED
+                );
                 return TRUE;
             }
+            track_returned_cursor_position(
+                point, CURSOR_POSITION_SOURCE_ORIGINAL
+            );
             return result;
         }
         if (result) {
             actual = *point;
             if (actual_cursor_to_screen_local(&actual, &local)) {
                 *point = local;
+                position_source = CURSOR_POSITION_SOURCE_LOCAL;
+                track_returned_cursor_position(point, position_source);
                 return TRUE;
             }
         }
         if (tracked_ready) {
             *point = tracked;
+            track_returned_cursor_position(
+                point, CURSOR_POSITION_SOURCE_TRACKED
+            );
             return TRUE;
         }
+    }
+    if (result && point) {
+        track_returned_cursor_position(
+            point, CURSOR_POSITION_SOURCE_ORIGINAL
+        );
     }
     return result;
 }
@@ -1700,6 +1856,8 @@ static void close_frame_mapping(void) {
     frame_view_size = 0;
     frame_last_sequence = 0;
     frame_path_checked_at = 0;
+    frame_snapshot_valid = FALSE;
+    InterlockedExchange(&frame_direct_copy_mode, 0);
 }
 
 static BOOL frame_header_valid(
@@ -1917,6 +2075,24 @@ static void write_frame_hook_status(void) {
     wsprintfA(
         value,
         "%ld",
+        InterlockedCompareExchange(
+            &native_cursor_returned_handle_changes, 0, 0
+        )
+    );
+    WritePrivateProfileStringA(
+        "cursor", "returned_handle_changes", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&native_cursor_returned_sequence, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "returned_sequence", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
         InterlockedCompareExchange(&native_cursor_cache_entries, 0, 0)
     );
     WritePrivateProfileStringA(
@@ -1937,6 +2113,61 @@ static void write_frame_hook_status(void) {
     );
     WritePrivateProfileStringA(
         "cursor", "cache_drops", value, frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "cursor",
+        "position_authoritative",
+        InterlockedCompareExchange(&tracked_cursor_authoritative, 0, 0)
+            ? "1" : "0",
+        frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_tracked_returns, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_tracked_returns", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_original_returns, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_original_returns", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_source_changes, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_source_changes", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_last_source, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_last_source", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_last_x, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_last_x", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&cursor_position_last_y, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "cursor", "position_last_y", value, frame_status_path
     );
     WritePrivateProfileStringA(
         "cursor",
@@ -2068,6 +2299,54 @@ static void write_frame_hook_status(void) {
         InterlockedCompareExchange(&frame_hook_fallbacks, 0, 0)
     );
     WritePrivateProfileStringA("capture", "fallbacks", value, frame_status_path);
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_snapshot_cache_hits, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "snapshot_cache_hits", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_snapshot_retries, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "snapshot_retries", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_snapshot_failures, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "snapshot_failures", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_direct_copy_calls, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "direct_copy_calls", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_gdi_copy_calls, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "gdi_copy_calls", value, frame_status_path
+    );
+    wsprintfA(
+        value,
+        "%ld",
+        InterlockedCompareExchange(&frame_direct_copy_mode, 0, 0)
+    );
+    WritePrivateProfileStringA(
+        "capture", "direct_copy_mode", value, frame_status_path
+    );
     wsprintfA(value, "%lu", (unsigned long)frame_last_sequence);
     WritePrivateProfileStringA("capture", "sequence", value, frame_status_path);
     wsprintfA(
@@ -2463,6 +2742,57 @@ static DWORD sample_destination_bitmap(const BITMAP *bitmap) {
     return hash;
 }
 
+/*
+ * Commit the common 1:1 path through GDI.  Writing bmBits with CopyMemory was
+ * fast, but bypassed Wine GDI's dirty/synchronization bookkeeping.  UU rotates
+ * several D3D11 encoder textures, so small transient regions could remain old
+ * in one texture and current in another, making tooltips and IME candidates
+ * alternate at the encoder cadence.  SetDIBitsToDevice is still an unscaled
+ * transfer, while making the update visible to every downstream texture.
+ */
+static BOOL copy_frame_with_gdi_commit(
+    HDC destination,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    const unsigned char *source,
+    int source_width,
+    int source_height,
+    const BITMAPINFO *bitmap
+) {
+    int result;
+
+    if (
+        !destination || !source || !bitmap ||
+        destination_width != source_width ||
+        destination_height != source_height
+    ) {
+        return FALSE;
+    }
+    result = SetDIBitsToDevice(
+        destination,
+        destination_x,
+        destination_y,
+        (DWORD)destination_width,
+        (DWORD)destination_height,
+        0,
+        0,
+        0,
+        (UINT)source_height,
+        source,
+        bitmap,
+        DIB_RGB_COLORS
+    );
+    if (result == 0 || result == (int)GDI_ERROR) {
+        InterlockedExchange(&frame_direct_copy_mode, 0);
+        return FALSE;
+    }
+    InterlockedExchange(&frame_direct_copy_mode, 2);
+    InterlockedIncrement(&frame_direct_copy_calls);
+    return TRUE;
+}
+
 struct frame_monitor_match {
     LONG width;
     LONG height;
@@ -2608,15 +2938,23 @@ static BOOL ensure_frame_snapshot(SIZE_T required) {
     }
     frame_snapshot = snapshot;
     frame_snapshot_capacity = required;
+    frame_snapshot_valid = FALSE;
     return TRUE;
 }
 
 static BOOL snapshot_wayland_frame(
     const struct wayland_frame_header *header,
     const unsigned char *view,
+    int source_x,
+    int source_y,
+    int source_width,
+    int source_height,
     const unsigned char **pixels_out
 ) {
     const unsigned char *source;
+    SIZE_T row;
+    SIZE_T row_bytes;
+    SIZE_T required;
     uint32_t attempt;
     uint32_t sequence_before;
     uint32_t sequence_after;
@@ -2625,8 +2963,18 @@ static BOOL snapshot_wayland_frame(
 
     if (
         !header || !view || !pixels_out || header->sequence == 0 ||
-        !ensure_frame_snapshot((SIZE_T)header->frame_size)
+        source_x < 0 || source_y < 0 ||
+        source_width <= 0 || source_height <= 0 ||
+        source_x >= (int)header->width || source_y >= (int)header->height ||
+        source_width > (int)header->width - source_x ||
+        source_height > (int)header->height - source_y
     ) {
+        InterlockedIncrement(&frame_snapshot_failures);
+        return FALSE;
+    }
+    row_bytes = (SIZE_T)source_width * 4u;
+    required = row_bytes * (SIZE_T)source_height;
+    if (!ensure_frame_snapshot(required)) {
         InterlockedIncrement(&frame_snapshot_failures);
         return FALSE;
     }
@@ -2641,9 +2989,30 @@ static BOOL snapshot_wayland_frame(
             InterlockedIncrement(&frame_snapshot_failures);
             return FALSE;
         }
+        if (
+            frame_snapshot_valid &&
+            frame_snapshot_sequence == sequence_before &&
+            frame_snapshot_active == active_before &&
+            frame_snapshot_source_x == source_x &&
+            frame_snapshot_source_y == source_y &&
+            frame_snapshot_source_width == source_width &&
+            frame_snapshot_source_height == source_height
+        ) {
+            *pixels_out = frame_snapshot;
+            InterlockedIncrement(&frame_snapshot_cache_hits);
+            return TRUE;
+        }
         source = view + header->header_size +
-            (SIZE_T)active_before * header->frame_size;
-        CopyMemory(frame_snapshot, source, header->frame_size);
+            (SIZE_T)active_before * header->frame_size +
+            (SIZE_T)source_y * header->stride +
+            (SIZE_T)source_x * 4u;
+        for (row = 0; row < (SIZE_T)source_height; ++row) {
+            CopyMemory(
+                frame_snapshot + row * row_bytes,
+                source + row * header->stride,
+                row_bytes
+            );
+        }
         MemoryBarrier();
         active_after = header->active_buffer;
         sequence_after = header->sequence;
@@ -2651,6 +3020,13 @@ static BOOL snapshot_wayland_frame(
             sequence_before == sequence_after &&
             active_before == active_after
         ) {
+            frame_snapshot_sequence = sequence_before;
+            frame_snapshot_active = active_before;
+            frame_snapshot_source_x = source_x;
+            frame_snapshot_source_y = source_y;
+            frame_snapshot_source_width = source_width;
+            frame_snapshot_source_height = source_height;
+            frame_snapshot_valid = TRUE;
             *pixels_out = frame_snapshot;
             return TRUE;
         }
@@ -2803,35 +3179,58 @@ static BOOL render_wayland_frame(
      */
     dib_source_y = (int)header->height - source_y - source_height;
     InterlockedExchange(&frame_dib_source_y, dib_source_y);
-    if (!snapshot_wayland_frame(header, frame_view, &pixels)) {
+    if (!snapshot_wayland_frame(
+            header,
+            frame_view,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            &pixels
+        )) {
         ReleaseSRWLockExclusive(&frame_lock);
         InterlockedIncrement(&frame_hook_fallbacks);
         return FALSE;
     }
     ZeroMemory(&bitmap, sizeof(bitmap));
     bitmap.bmiHeader.biSize = sizeof(bitmap.bmiHeader);
-    bitmap.bmiHeader.biWidth = (LONG)header->width;
-    bitmap.bmiHeader.biHeight = -(LONG)header->height;
+    bitmap.bmiHeader.biWidth = source_width;
+    bitmap.bmiHeader.biHeight = -source_height;
     bitmap.bmiHeader.biPlanes = 1;
     bitmap.bmiHeader.biBitCount = 32;
     bitmap.bmiHeader.biCompression = BI_RGB;
-    result = StretchDIBits(
-        destination,
-        destination_x,
-        destination_y,
-        destination_width,
-        destination_height,
-        source_x,
-        dib_source_y,
-        source_width,
-        source_height,
-        pixels,
-        &bitmap,
-        DIB_RGB_COLORS,
-        SRCCOPY
-    );
-    ReleaseSRWLockExclusive(&frame_lock);
+    if (copy_frame_with_gdi_commit(
+            destination,
+            destination_x,
+            destination_y,
+            destination_width,
+            destination_height,
+            pixels,
+            source_width,
+            source_height,
+            &bitmap
+        )) {
+        result = source_height;
+    } else {
+        result = StretchDIBits(
+            destination,
+            destination_x,
+            destination_y,
+            destination_width,
+            destination_height,
+            0,
+            0,
+            source_width,
+            source_height,
+            pixels,
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY
+        );
+        InterlockedIncrement(&frame_gdi_copy_calls);
+    }
     if (result == (int)GDI_ERROR || result == 0) {
+        ReleaseSRWLockExclusive(&frame_lock);
         InterlockedIncrement(&frame_hook_fallbacks);
         return FALSE;
     }
@@ -2847,6 +3246,7 @@ static BOOL render_wayland_frame(
             InterlockedIncrement(&frame_destination_checksum_changes);
         }
     }
+    ReleaseSRWLockExclusive(&frame_lock);
     InterlockedIncrement(&frame_hook_rendered);
     if ((calls % 120) == 1) {
         write_frame_hook_status();
@@ -8726,6 +9126,7 @@ __declspec(dllexport) DWORD WINAPI UURemoteFrameSnapshotSelfTest(void) {
         (struct wayland_frame_header *)storage;
     const unsigned char *pixels = NULL;
     SIZE_T index;
+    LONG cache_hits;
 
     ZeroMemory(storage, sizeof(storage));
     header->magic = UUWF_MAGIC;
@@ -8740,11 +9141,40 @@ __declspec(dllexport) DWORD WINAPI UURemoteFrameSnapshotSelfTest(void) {
     header->sequence = 7u;
     memset(storage + UUWF_HEADER_SIZE, 0x11, 16u);
     memset(storage + UUWF_HEADER_SIZE + 16u, 0x22, 16u);
-    if (!snapshot_wayland_frame(header, storage, &pixels) || !pixels) {
+    if (!snapshot_wayland_frame(
+            header, storage, 0, 0, 2, 2, &pixels
+        ) || !pixels) {
         return 0u;
     }
     for (index = 0; index < 16u; ++index) {
         if (pixels[index] != 0x22) {
+            return 0u;
+        }
+    }
+    cache_hits = InterlockedCompareExchange(
+        &frame_snapshot_cache_hits, 0, 0
+    );
+    if (!snapshot_wayland_frame(
+            header, storage, 0, 0, 2, 2, &pixels
+        ) || !pixels ||
+        InterlockedCompareExchange(&frame_snapshot_cache_hits, 0, 0) !=
+            cache_hits + 1) {
+        return 0u;
+    }
+    for (index = 0; index < 16u; ++index) {
+        storage[UUWF_HEADER_SIZE + 16u + index] =
+            (unsigned char)index;
+    }
+    if (!snapshot_wayland_frame(
+            header, storage, 1, 0, 1, 2, &pixels
+        ) || !pixels) {
+        return 0u;
+    }
+    for (index = 0; index < 4u; ++index) {
+        if (pixels[index] != (unsigned char)(index + 4u)) {
+            return 0u;
+        }
+        if (pixels[index + 4u] != (unsigned char)(index + 12u)) {
             return 0u;
         }
     }
@@ -9169,6 +9599,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
             VirtualFree(frame_snapshot, 0, MEM_RELEASE);
             frame_snapshot = NULL;
             frame_snapshot_capacity = 0;
+            frame_snapshot_valid = FALSE;
+            InterlockedExchange(&frame_direct_copy_mode, 0);
         }
         return TRUE;
     }

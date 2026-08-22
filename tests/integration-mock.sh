@@ -610,6 +610,14 @@ sha256sum \
 cmp -s "$protected_before" "$protected_after"
 "$launcher" --diagnose | grep -q 'UU 版本.*4.33.0.8000'
 "$launcher" --diagnose | grep -q '安全更新状态.*更新失败并已回滚'
+grep -q '^uu_version=4.33.0.8000$' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/update-blocker-manifest"
+UU_REMOTE_FAKE_LATEST_VERSION=4.34.0.8979 \
+    "$launcher" --auto-update-check \
+    >"$test_root/automatic-rollback-retry.out"
+grep -q '自动更新已暂缓，保留 4.33.0.8000' \
+    "$test_root/automatic-rollback-retry.out"
+"$launcher" --diagnose | grep -q 'UU 版本.*4.33.0.8000'
 printf '4.34.0.8979\n' >"$install_dir/bin/.installed-version"
 
 "$launcher" --diagnose | grep -q '4.34.0.8979'

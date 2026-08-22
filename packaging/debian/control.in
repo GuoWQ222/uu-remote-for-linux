@@ -3,8 +3,9 @@ Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: @ARCH@
-Maintainer: UU Remote for Linux Contributors
-Depends: bash, ca-certificates, coreutils, curl, ethtool, findutils, gir1.2-appindicator3-0.1, gir1.2-gtk-3.0, gir1.2-gstreamer-1.0, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, iproute2, libglib2.0-bin, libpipewire-0.3-0, libx11-6, libxfixes3, libxtst6, network-manager, policykit-1, python3, python3-gi, systemd, tar, util-linux, xdg-desktop-portal, zenity
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>
+Depends: apt, bash, ca-certificates, coreutils, curl, ethtool, findutils, gir1.2-appindicator3-0.1, gir1.2-gtk-3.0, gir1.2-gstreamer-1.0, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, iproute2, libglib2.0-bin, libpipewire-0.3-0, libx11-6, libxfixes3, libxtst6, network-manager, policykit-1, procps, python3, python3-gi, systemd, tar, util-linux, xdg-desktop-portal, zenity
 Recommends: wine (>= 11.1) | winehq-stable (>= 11.1) | winehq-devel (>= 11.1) | winehq-staging (>= 11.1), libnotify-bin, pciutils
 Suggests: vainfo
 Description: unofficial UU Remote compatibility wrapper for Linux

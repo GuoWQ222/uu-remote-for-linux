@@ -39,9 +39,18 @@
 #define UUCI_HEADER_SIZE 64u
 #define UUCI_MAX_DIMENSION 512u
 #define UUCI_MAX_STREAMS 16u
+#define UUCI_DEFAULT_PIPEWIRE_BUFFERS 3
+#define UUCI_MIN_PIPEWIRE_BUFFERS 2
+#define UUCI_MAX_PIPEWIRE_BUFFERS 4
 #define UUCI_META_SIZE(width, height) \
     (sizeof(struct spa_meta_cursor) + \
      sizeof(struct spa_meta_bitmap) + (width) * (height) * 4u)
+
+_Static_assert(
+    UUCI_MIN_PIPEWIRE_BUFFERS <= UUCI_DEFAULT_PIPEWIRE_BUFFERS &&
+        UUCI_DEFAULT_PIPEWIRE_BUFFERS <= UUCI_MAX_PIPEWIRE_BUFFERS,
+    "PipeWire buffer default must stay inside the advertised range"
+);
 
 struct cursor_file_header {
     uint32_t magic;
@@ -600,7 +609,20 @@ static void on_param_changed(
         SPA_TYPE_OBJECT_ParamBuffers,
         SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_buffers,
-        SPA_POD_CHOICE_RANGE_Int(2, 2, 4),
+        /*
+         * This metadata consumer is the first link attached to Mutter's
+         * output, so its default fixes the shared producer pool size.  With
+         * only two buffers, the cursor and pixel consumers can transiently
+         * hold the whole pool and make Mutter drop the only clean frame for
+         * a damage-driven update.  Keep two as the compatibility minimum,
+         * but prefer a third slot so the newest full frame can still be
+         * recorded while the previous two are being returned.
+         */
+        SPA_POD_CHOICE_RANGE_Int(
+            UUCI_DEFAULT_PIPEWIRE_BUFFERS,
+            UUCI_MIN_PIPEWIRE_BUFFERS,
+            UUCI_MAX_PIPEWIRE_BUFFERS
+        ),
         SPA_PARAM_BUFFERS_blocks,
         SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_size,
@@ -745,7 +767,8 @@ static void quit_signal(void *userdata, int signal_number)
 {
     struct application *application = userdata;
 
-    (void)signal_number;
+    fprintf(stderr, "cursor bridge received signal %d\n", signal_number);
+    fflush(stderr);
     pw_main_loop_quit(application->loop);
 }
 
@@ -978,7 +1001,15 @@ int main(int argc, char **argv)
         application.n_streams
     );
     fflush(stderr);
-    pw_main_loop_run(application.loop);
+    result = pw_main_loop_run(application.loop);
+    if (result < 0) {
+        fprintf(
+            stderr,
+            "PipeWire main loop failed: %s\n",
+            spa_strerror(result)
+        );
+        application.failed = true;
+    }
     result = application.failed ? 1 : 0;
 
 cleanup:

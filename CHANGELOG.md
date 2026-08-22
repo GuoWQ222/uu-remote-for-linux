@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.32] - 2026-08-22
+
+- Mirror GNOME Wayland's XKB Caps Lock, Num Lock, and Scroll Lock state into
+  Wine so UU's `GetKeyState` checks match the keys forwarded through the
+  RemoteDesktop Portal. Caps Lock now changes state with one press instead of
+  requiring a second request to compensate for stale Wine state.
+- Cache the XKB query for high-rate pointer traffic, invalidate it immediately
+  after a lock-key event, and fail closed when XKB state is unavailable. Add
+  Wayland and Wine regressions that require exactly one down/up pair per lock
+  key and verify immediate Caps state toggle and restore.
+
+## [1.1.31] - 2026-08-22
+
+- Let APT complete the configuration phase for the four explicitly verified
+  Mutter packages. Version 1.1.30 incorrectly disabled pending configuration,
+  so a real transaction could unpack all four packages successfully and then
+  fail the installed-state check; the recovery transaction had the same flaw.
+- Add a transaction regression that distinguishes unpacked packages from fully
+  configured packages, while retaining the locked pre-invoke health check and
+  exact four-package pre-install plan validation.
+
+## [1.1.30] - 2026-08-22
+
+- Reject zero-length `CORRUPTED` PipeWire cursor-only buffers before any video
+  transform and publish each accepted capture sample atomically, eliminating
+  the recycled transform-pool frames that made Wayland video and IME preedit
+  text alternate between old and new states.
+- Process every accepted damage-driven sample instead of discarding a unique
+  final state at a fixed-rate deadline, and negotiate the native four-byte
+  BGRA format without an unnecessary full-frame color conversion.
+- Bound Mutter 46.2's detached MemFd screen-cast callback at default GLib
+  priority and retry full-frame PipeWire overruns, removing the compositor-side
+  0.1–1.3 second IME presentation stalls found on Ubuntu 24.04 GNOME Wayland.
+- Ship the exact Noble amd64 Mutter repair and official offline recovery set
+  inside the system package, with an explicit PolicyKit-gated manager that
+  verifies the OS, architecture, package set, hashes, solver plan, and rollback
+  data before changing any desktop package. Installing or removing UU itself
+  never installs, pins, or rolls back Mutter.
+- Increase the shared PipeWire cursor consumer request from two to three video
+  buffers and recover a failed cursor sidecar inside the existing Portal
+  session, avoiding full bridge restarts and two-slot starvation windows.
+- Add frame-helper, corrupted-buffer, capture-priority, Mutter bundle, package
+  transaction, and real Wayland IME timing regressions.
+
 ## [1.1.29] - 2026-08-21
 
 - Request and consume every Wayland Portal monitor stream, composite them in

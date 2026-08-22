@@ -29,3 +29,16 @@ The optional NVIDIA hardware codec bridge includes:
 
 Exact revisions, checksums, build details, licenses, and the corresponding
 CUVID/NVENC source archive are documented in `third_party/HWDECODE.md`.
+
+The optional Ubuntu 24.04 GNOME Wayland latency repair redistributes modified
+Mutter binary packages derived from Ubuntu source package
+`mutter 46.2-1ubuntu0.24.04.16`. Mutter contains code under the GNU General
+Public License and GNU Lesser General Public License; the original copyright
+notices and license files remain in the packages and source.
+
+The exact Ubuntu orig tarball, the modified Debian source package, build
+metadata, both UU Remote patches, package manifests, and SHA256 checksums are
+shipped under `third_party/mutter/` and, in the installed system package,
+`/usr/share/doc/uu-remote-for-linux/source/mutter/`. The binary payload is
+version-locked to Ubuntu 24.04 Noble amd64 and is never installed implicitly.
+Build and recovery details are documented in `packaging/mutter/README.md`.

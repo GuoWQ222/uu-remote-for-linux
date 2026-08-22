@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly helper=/usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root
+readonly pkexec_bin=/usr/bin/pkexec
+
+die() {
+    printf 'Mutter 修复：%s\n' "$*" >&2
+    exit 1
+}
+
+machine_status() {
+    [[ -x $helper ]] || {
+        printf 'state=unavailable\n'
+        printf 'reason=system-deb-required\n'
+        printf 'installed_version=unknown\n'
+        printf 'target_version=unknown\n'
+        printf 'restart_required=0\n'
+        return 2
+    }
+    "$helper" status
+}
+
+status_value() {
+    local wanted=$1 line key value
+
+    while IFS= read -r line; do
+        [[ $line == *=* ]] || continue
+        key=${line%%=*}
+        value=${line#*=}
+        [[ $key == "$wanted" ]] || continue
+        printf '%s\n' "$value"
+        return
+    done
+    return 1
+}
+
+human_status() {
+    local output state reason installed target
+
+    output=$(machine_status 2>/dev/null || true)
+    state=$(status_value state <<<"$output" || printf unavailable)
+    reason=$(status_value reason <<<"$output" || printf unknown)
+    installed=$(status_value installed_version <<<"$output" || printf unknown)
+    target=$(status_value target_version <<<"$output" || printf unknown)
+
+    printf '状态：%s\n' "$state"
+    printf '原因：%s\n' "$reason"
+    printf '已安装 Mutter：%s\n' "$installed"
+    printf '修复目标：%s\n' "$target"
+    case $state in
+        eligible)
+            printf '此系统可以显式安装 GNOME Wayland 低延迟修复。\n'
+            ;;
+        active)
+            printf '修复已由当前 GNOME Shell 加载。\n'
+            ;;
+        legacy-active)
+            printf '本机诊断版修复正在生效；可显式规范化为正式发行版本。\n'
+            ;;
+        installed-pending-logout)
+            printf '修复已写入磁盘；请注销并重新登录 Wayland。\n'
+            ;;
+        legacy-installed-pending-logout)
+            printf '诊断版修复已写入磁盘；可先规范化为正式版本，然后注销。\n'
+            ;;
+        rolled-back-pending-logout)
+            printf 'Ubuntu 官方库已恢复到磁盘；可直接安装修复，并在安装后只注销一次。\n'
+            ;;
+        installed-corrupt|recoverable-partial|unknown-build)
+            printf '检测到可安全恢复的已知 Mutter 异常状态；只允许显式回滚。\n'
+            ;;
+        interrupted-known-partial)
+            printf '检测到中断的软件包事务；为避免扩大修改，自动恢复已停止。\n'
+            printf '请按 README 的 TTY 固定路径命令恢复 4 个已校验的官方包。\n'
+            ;;
+        superseded-or-unknown)
+            printf '检测到更高或未知来源的 Mutter；为避免降级，修复管理器不会修改它。\n'
+            ;;
+        unavailable)
+            printf '系统级管理器不可用；请安装正式 UU Remote .deb，源码用户安装不提供提权入口。\n'
+            ;;
+        *)
+            printf '安全门禁未通过；不会修改 Mutter。\n'
+            ;;
+    esac
+}
+
+require_gnome_wayland_session() {
+    [[ ${XDG_SESSION_TYPE:-} == wayland ]] ||
+        die '此修复只面向正在运行的 GNOME Wayland 会话。'
+    case ${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-}} in
+        *GNOME*|*gnome*) ;;
+        *) die '未检测到 GNOME 桌面；不会替换系统 Mutter。' ;;
+    esac
+}
+
+confirm_action() {
+    local action=$1 answer
+
+    if [[ ${2:-} == --yes ]]; then
+        return
+    fi
+    [[ -t 0 && -t 1 ]] ||
+        die '非交互执行必须显式追加 --yes。'
+    case $action in
+        install)
+            printf '\n将一次性替换 4 个 Ubuntu Mutter 46.2 包。\n'
+            printf '安装成功后必须保存工作并注销，再重新登录 Wayland。\n'
+            ;;
+        rollback)
+            printf '\n将一次性恢复随 UU 保存的 4 个 Ubuntu 官方 Mutter 46.2 包。\n'
+            printf '恢复后同样必须注销并重新登录 Wayland。\n'
+            ;;
+    esac
+    read -r -p '确认继续？请输入 YES：' answer
+    [[ $answer == YES ]] || die '用户取消。'
+}
+
+run_action() {
+    local action=$1 assume_yes=${2:-} output state
+
+    [[ $action != install ]] || require_gnome_wayland_session
+    output=$(machine_status) || true
+    state=$(status_value state <<<"$output" || printf unavailable)
+    case $action:$state in
+        install:eligible|install:rolled-back-pending-logout|install:legacy-active|install:legacy-installed-pending-logout) ;;
+        install:active)
+            printf 'Mutter 低延迟修复已生效。\n'
+            return
+            ;;
+        install:installed-pending-logout)
+            printf '修复已安装；请注销并重新登录 Wayland。\n'
+            return
+            ;;
+        rollback:active|rollback:installed-pending-logout|rollback:legacy-active|rollback:legacy-installed-pending-logout|rollback:installed-corrupt|rollback:recoverable-partial|rollback:unknown-build) ;;
+        *)
+            human_status
+            die "状态 $state 不允许执行 $action。"
+            ;;
+    esac
+    confirm_action "$action" "$assume_yes"
+    [[ -x $pkexec_bin ]] || die '缺少 /usr/bin/pkexec，无法安全请求管理员授权。'
+    exec "$pkexec_bin" "$helper" "$action"
+}
+
+usage() {
+    cat <<'EOF'
+用法：uu-remote-mutter-fix COMMAND [选项]
+
+命令：
+  status [--machine] [--field NAME]  查看只读状态
+  install [--yes]                    显式安装修复
+  rollback [--yes]                   显式恢复 Ubuntu 官方包
+EOF
+}
+
+(($# >= 1)) || {
+    usage
+    exit 64
+}
+command=$1
+shift
+case $command in
+    status)
+        case ${1:-} in
+            '') human_status ;;
+            --machine)
+                (($# == 1)) || die 'status --machine 不接受其他参数。'
+                machine_status
+                ;;
+            --field)
+                (($# == 2)) || die 'status --field 需要且只接受一个字段名。'
+                case $2 in
+                    state|reason|installed_version|target_version|restart_required) ;;
+                    *) die '未知状态字段。' ;;
+                esac
+                output=$(machine_status 2>/dev/null || true)
+                status_value "$2" <<<"$output" || exit 2
+                ;;
+            *) die '未知 status 选项。' ;;
+        esac
+        ;;
+    install|rollback)
+        (($# <= 1)) || die "$command 只接受可选的 --yes。"
+        [[ $# == 0 || $1 == --yes ]] || die "$command 只接受可选的 --yes。"
+        run_action "$command" "${1:-}"
+        ;;
+    -h|--help|help)
+        (($# == 0)) || die 'help 不接受其他参数。'
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 64
+        ;;
+esac

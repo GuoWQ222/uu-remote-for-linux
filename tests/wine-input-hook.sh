@@ -208,11 +208,15 @@ for y in range(display_height):
 path.write_bytes(header + bytes(size) + frame)
 PY
 
+# The fake backend exposes a real lock mask even while the selected desktop
+# backend is Wayland.  This guards the endpoint capability gate: GetKeyState
+# must mirror the native mask instead of stale Wine state.
 UU_REMOTE_INPUT_BRIDGE_FAKE_TRACE="$trace" \
     UU_REMOTE_INPUT_BRIDGE_FAKE_GEOMETRY='1440,0,2560,1440' \
     UU_REMOTE_INPUT_BRIDGE_FAKE_VIRTUAL_GEOMETRY='0,0,4000,2560' \
     UU_REMOTE_INPUT_BRIDGE_FAKE_CURSOR_GEOMETRY='100,50,2560,1440' \
-    XDG_SESSION_TYPE=x11 \
+    UU_REMOTE_INPUT_BRIDGE_FAKE_TRACKED_CURSOR=1 \
+    XDG_SESSION_TYPE=wayland \
     "$bridge" watch \
     "$state_dir" "$endpoint" "$log" "$lock" 2 &
 bridge_pid=$!
@@ -271,10 +275,12 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=48'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=53'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
-grep -A20 -F '[capture]' "$frame_status" | grep -Fq 'dib_source_y=56'
+grep -A12 -F '[capture]' "$frame_status" | grep -Eq 'direct_copy_calls=[1-9]'
+grep -A12 -F '[capture]' "$frame_status" | grep -Fq 'direct_copy_mode=2'
+grep -A40 -F '[capture]' "$frame_status" | grep -Fq 'dib_source_y=56'
 grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'active=1'
 grep -A10 -F '[cursor]' "$frame_status" | grep -Eq 'updates=[1-9][0-9]+'
 grep -A10 -F '[cursor]' "$frame_status" | grep -Eq 'sequence=2[0-9][0-9]'
@@ -285,6 +291,12 @@ grep -A10 -F '[cursor]' "$frame_status" | grep -Fq 'hotspot_y=0'
 grep -A16 -F '[cursor]' "$frame_status" | grep -Fq 'cache_entries=128'
 grep -A16 -F '[cursor]' "$frame_status" | grep -Eq 'cache_overflows=[1-9][0-9]*'
 grep -A16 -F '[cursor]' "$frame_status" | grep -Eq 'cache_drops=[1-9][0-9]*'
+grep -A30 -F '[cursor]' "$frame_status" | grep -Fq \
+    'position_authoritative=1'
+grep -A30 -F '[cursor]' "$frame_status" | grep -Eq \
+    'position_tracked_returns=[1-9][0-9]*'
+grep -A30 -F '[cursor]' "$frame_status" | grep -Fq \
+    'position_original_returns=0'
 
 kill "$bridge_pid" 2>/dev/null || true
 wait "$bridge_pid" 2>/dev/null || true

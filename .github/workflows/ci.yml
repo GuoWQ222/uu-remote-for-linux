@@ -23,11 +23,13 @@ jobs:
             appstream \
             binutils \
             desktop-file-utils \
+            dpkg-dev \
             file \
             gir1.2-appindicator3-0.1 \
             gir1.2-gstreamer-1.0 \
             gir1.2-gtk-3.0 \
             gstreamer1.0-plugins-base \
+            libglib2.0-dev \
             libx11-6 \
             libxml2-utils \
             python3-gi \
@@ -37,12 +39,41 @@ jobs:
       - name: Run offline tests
         run: xvfb-run -a make test
 
+      - name: Verify embedded Mutter binary and source bundle
+        run: make mutter-bundle
+
       - name: Build Debian package
         run: make deb
+
+      - name: Inspect packaged repair and create checksums
+        run: |
+          package=$(printf '%s\n' dist/uu-remote-for-linux_*_amd64.deb)
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package" > dist/CONTENTS.txt
+          stage=$(mktemp -d)
+          dpkg-deb -x "$package" "$stage"
+          dpkg-deb -e "$package" "$stage/DEBIAN"
+          test -x "$stage/usr/bin/uu-remote-mutter-fix"
+          test -x "$stage/usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root"
+          test -f "$stage/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3/SHA256SUMS"
+          test -f "$stage/usr/share/doc/uu-remote-for-linux/source/mutter/SHA256SUMS"
+          (
+            cd "$stage/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3"
+            sha256sum --strict -c SHA256SUMS
+          )
+          (
+            cd "$stage/usr/share/doc/uu-remote-for-linux/source/mutter"
+            sha256sum --strict -c SHA256SUMS
+          )
+          ! grep -Eiq '(apt(-get)?|dpkg|pkexec|mutter)' "$stage/DEBIAN/postinst" "$stage/DEBIAN/postrm"
+          sha256sum "$package" > dist/SHA256SUMS
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
           name: uu-remote-for-linux-deb
-          path: dist/uu-remote-for-linux_*_amd64.deb
+          path: |
+            dist/uu-remote-for-linux_*_amd64.deb
+            dist/SHA256SUMS
+            dist/CONTENTS.txt
           if-no-files-found: error

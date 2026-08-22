@@ -25,6 +25,26 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.32" date="2026-08-22">
+      <description>
+        <p>Synchronize GNOME Wayland lock-key state with Wine so Caps Lock, Num Lock, and Scroll Lock change with one press, with cached fail-closed XKB queries and end-to-end regressions.</p>
+      </description>
+    </release>
+    <release version="1.1.31" date="2026-08-22">
+      <description>
+        <p>Complete the verified Mutter package configuration phase during install and recovery, and add a regression that distinguishes unpacked packages from fully configured packages.</p>
+      </description>
+    </release>
+    <release version="1.1.30" date="2026-08-22">
+      <description>
+        <p>Eliminate recycled corrupted Wayland frames and damage-driven final-frame loss, bound Mutter 46.2 screen-cast scheduling latency, and provide an explicit version-locked installer with offline recovery for the Ubuntu 24.04 GNOME fix.</p>
+      </description>
+    </release>
+    <release version="1.1.29" date="2026-08-21">
+      <description>
+        <p>Capture and compose all Portal monitors, synchronize native cursor metadata, preserve mixed-orientation coordinates and original portrait quality, and harden the input, capture, update, NVDEC, and NVENC compatibility paths.</p>
+      </description>
+    </release>
     <release version="1.1.28" date="2026-08-20">
       <description>
         <p>Harden concurrent NVENC/CUDA initialization, input injection, live streamer hotpatching, transactional update rollback, encoder-policy recovery, Wine startup, and native cursor lifetime to prevent crashes and runaway retry loops.</p>

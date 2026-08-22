@@ -499,8 +499,9 @@ int WINAPI WinMain(
     if (SendInput(1, &input, sizeof(input)) != 1) {
         return 2;
     }
-    expected_x = 500;
-    expected_y = 300;
+    /* Wayland feeds back the exact bridge-tracked normalized position. */
+    expected_x = 1380;
+    expected_y = 410;
     streamer_result = probe_streamer_cursor(
         32768,
         16384,
@@ -545,8 +546,8 @@ int WINAPI WinMain(
     if (SendInput(1, &input, sizeof(input)) != 1) {
         return 2;
     }
-    expected_x = 400;
-    expected_y = 250;
+    expected_x = 1280;
+    expected_y = 360;
     streamer_result = probe_streamer_cursor(
         32768, 16384, expected_x, expected_y, 0, 6, 8, 3, 4
     );

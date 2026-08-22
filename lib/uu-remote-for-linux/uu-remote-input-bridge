@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ STATE_VERSION = 6
 DEFAULT_RELEASE_TIMEOUT = 15.0
 X11_MONITOR_REFRESH_SECONDS = 2.0
 CURSOR_POLL_SECONDS = 1.0 / 60.0
+LOCK_STATE_POLL_SECONDS = 0.1
 XKB_USE_CORE_KBD = 0x0100
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
@@ -91,6 +93,10 @@ PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
 CAPTURE_START_TIMEOUT_SECONDS = 10
 CAPTURE_MAX_STREAMS = 16
+CAPTURE_PRIMARY_STREAM_RATE = 60
+CAPTURE_SECONDARY_STREAM_RATE = 30
+CAPTURE_MAX_STREAM_RATE = CAPTURE_PRIMARY_STREAM_RATE
+CAPTURE_MOTION_COPY_RATIO_DENOMINATOR = 32
 FRAME_MAGIC = 0x46575555  # "UUWF" in little-endian byte order
 FRAME_VERSION = 2
 # The final two signed fields are the Win32 virtual-desktop origin.  Keeping
@@ -106,6 +112,197 @@ CURSOR_MAGIC = 0x49435555  # "UUCI" in little-endian byte order
 CURSOR_VERSION = 1
 CURSOR_HEADER = struct.Struct("<9I28x")
 CURSOR_MAX_DIMENSION = 512
+CURSOR_HELPER_RESTART_WINDOW_SECONDS = 30.0
+CURSOR_HELPER_RESTART_LIMIT = 3
+
+
+class PythonBuffer(ctypes.Structure):
+    _fields_ = [
+        ("buf", ctypes.c_void_p),
+        ("obj", ctypes.c_void_p),
+        ("length", ctypes.c_ssize_t),
+        ("item_size", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int),
+        ("dimensions", ctypes.c_int),
+        ("format", ctypes.c_char_p),
+        ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("internal", ctypes.c_void_p),
+    ]
+
+
+class NativeFrameUpdateStats(ctypes.Structure):
+    _fields_ = [
+        ("compared_bytes", ctypes.c_uint64),
+        ("copied_bytes", ctypes.c_uint64),
+        ("source_changed_bytes", ctypes.c_uint64),
+        ("changed_rows", ctypes.c_uint32),
+        ("changed_blocks", ctypes.c_uint32),
+        ("temporal_deferred_blocks", ctypes.c_uint32),
+        ("temporal_suppressed_blocks", ctypes.c_uint32),
+        ("temporal_published_blocks", ctypes.c_uint32),
+        ("motion_bypass", ctypes.c_uint32),
+    ]
+
+
+class NativeFrameHelper:
+    """Exact native frame comparison and sparse inactive-buffer updates."""
+
+    def __init__(self, path: Path) -> None:
+        self.library = ctypes.CDLL(str(path))
+        self.create_temporal_filter = (
+            self.library.uu_frame_temporal_filter_create
+        )
+        self.create_temporal_filter.argtypes = [
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self.create_temporal_filter.restype = ctypes.c_void_p
+        self.destroy_temporal_filter = (
+            self.library.uu_frame_temporal_filter_destroy
+        )
+        self.destroy_temporal_filter.argtypes = [ctypes.c_void_p]
+        self.destroy_temporal_filter.restype = None
+        self.update_2d = self.library.uu_frame_update_temporal_2d
+        self.update_2d.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.POINTER(NativeFrameUpdateStats),
+        ]
+        self.update_2d.restype = ctypes.c_int
+        self.copy_2d = self.library.uu_frame_copy_2d
+        self.copy_2d.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self.copy_2d.restype = ctypes.c_int
+        self.get_buffer = ctypes.pythonapi.PyObject_GetBuffer
+        self.get_buffer.argtypes = [
+            ctypes.py_object,
+            ctypes.POINTER(PythonBuffer),
+            ctypes.c_int,
+        ]
+        self.get_buffer.restype = ctypes.c_int
+        self.release_buffer = ctypes.pythonapi.PyBuffer_Release
+        self.release_buffer.argtypes = [ctypes.POINTER(PythonBuffer)]
+        self.release_buffer.restype = None
+
+    def create_filter(self, row_bytes: int, rows: int) -> int:
+        state = self.create_temporal_filter(row_bytes, rows)
+        if not state:
+            raise RuntimeError("无法分配瞬态帧过滤器")
+        return int(state)
+
+    def destroy_filter(self, state: int) -> None:
+        if state:
+            self.destroy_temporal_filter(ctypes.c_void_p(state))
+
+    @staticmethod
+    def mapping_address(mapping) -> int:
+        anchor = (ctypes.c_ubyte * 1).from_buffer(mapping)
+        return ctypes.addressof(anchor)
+
+    def update(
+        self,
+        filter_state: int,
+        mapping,
+        target_offset: int,
+        current_offset: int,
+        target_stride: int,
+        source,
+        source_stride: int,
+        row_bytes: int,
+        rows: int,
+        force: bool,
+    ) -> tuple[bool, NativeFrameUpdateStats]:
+        exported = PythonBuffer()
+        if self.get_buffer(source, ctypes.byref(exported), 0) != 0:
+            raise RuntimeError("无法读取 PipeWire 帧缓冲区")
+        try:
+            required = (rows - 1) * source_stride + row_bytes
+            if exported.length < required:
+                raise RuntimeError("PipeWire 帧缓冲区短于声明的画面")
+            base = self.mapping_address(mapping)
+            stats = NativeFrameUpdateStats()
+            result = self.update_2d(
+                ctypes.c_void_p(filter_state),
+                base + target_offset,
+                target_stride,
+                base + current_offset,
+                target_stride,
+                exported.buf,
+                source_stride,
+                row_bytes,
+                rows,
+                CAPTURE_MOTION_COPY_RATIO_DENOMINATOR,
+                int(force),
+                ctypes.byref(stats),
+            )
+            if result < 0:
+                raise RuntimeError(f"原生帧差异更新失败：{-result}")
+            return bool(result), stats
+        finally:
+            self.release_buffer(ctypes.byref(exported))
+
+    def copy(
+        self,
+        mapping,
+        target_offset: int,
+        source_offset: int,
+        stride: int,
+        row_bytes: int,
+        rows: int,
+    ) -> None:
+        base = self.mapping_address(mapping)
+        result = self.copy_2d(
+            base + target_offset,
+            stride,
+            base + source_offset,
+            stride,
+            row_bytes,
+            rows,
+        )
+        if result < 0:
+            raise RuntimeError(f"原生帧区域回填失败：{-result}")
+
+
+def capture_stream_rate(node: int, primary_node: int) -> int:
+    """Report the preferred rate for each captured monitor."""
+    if node == primary_node:
+        return CAPTURE_PRIMARY_STREAM_RATE
+    return CAPTURE_SECONDARY_STREAM_RATE
+
+
+def capture_backfill_indexes(
+    target_generations: list[int],
+    current_generations: list[int],
+    changed_index: int,
+) -> list[int]:
+    """Return stale monitor regions needed to compose an inactive buffer."""
+    if len(target_generations) != len(current_generations):
+        raise ValueError("capture generation tables have different sizes")
+    if not 0 <= changed_index < len(current_generations):
+        raise ValueError("changed capture stream index is out of range")
+    return [
+        index
+        for index, generation in enumerate(current_generations)
+        if index != changed_index and target_generations[index] != generation
+    ]
+
 
 # Linux input-event codes consumed by RemoteDesktop.NotifyPointerButton.
 EVDEV_BUTTONS = {
@@ -204,14 +401,14 @@ def map_absolute_point(
     dy: int,
     geometry: tuple[int, int, int, int],
 ) -> tuple[int, int]:
-    """Map Win32 0..65535 absolute input into one X11 monitor rectangle."""
+    """Map Win32 0..65535 input with the hook's exact integer rounding."""
     origin_x, origin_y, width, height = geometry
     if width <= 0 or height <= 0:
         raise ValueError("显示器坐标范围无效")
     normalized_x = max(0, min(int(dx), 65535))
     normalized_y = max(0, min(int(dy), 65535))
-    x = origin_x + round(normalized_x * (width - 1) / 65535)
-    y = origin_y + round(normalized_y * (height - 1) / 65535)
+    x = origin_x + (normalized_x * (width - 1) + 32767) // 65535
+    y = origin_y + (normalized_y * (height - 1) + 32767) // 65535
     return x, y
 
 
@@ -751,10 +948,22 @@ class WaylandPortalBackend:
                 "uu-remote-pipewire-cursor"
             )
         )
+        frame_helper_path = Path(__file__).resolve().with_name(
+            "uu-remote-frame-helper.so"
+        )
+        try:
+            self.frame_helper = NativeFrameHelper(frame_helper_path)
+        except (AttributeError, OSError) as error:
+            raise RuntimeError(
+                f"无法加载 Wayland 原生帧辅助库：{frame_helper_path}"
+            ) from error
         self.cursor_helper_log_path = (
             state_dir / "pipewire-cursor.log"
         )
         self.cursor_helper_process: subprocess.Popen | None = None
+        self.cursor_helper_restart_times: list[float] = []
+        self.cursor_helper_restarts = 0
+        self.cursor_helper_last_exit = ""
         # v2 asks the portal for every monitor.  Do not reuse a v1 grant that
         # permanently restored only the first selected monitor.
         self.restore_token_path = state_dir / "wayland-portal-restore-token-v2"
@@ -775,6 +984,8 @@ class WaylandPortalBackend:
         self.capture_output_hash_changes = 0
         self.capture_callback_error = ""
         self.capture_stream_stats: list[dict[str, int]] = []
+        self.capture_buffer_generations: list[list[int]] = []
+        self.capture_frame_filters: list[int] = []
         self.capture_lock = threading.Lock()
         self.capture_map = None
         self.capture_frame_size = 0
@@ -783,12 +994,42 @@ class WaylandPortalBackend:
         self.fake_trace = os.environ.get(
             "UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE", ""
         )
+        self.fake_lock_mask: int | None = None
+        if self.fake_trace:
+            fake_lock_mask = os.environ.get(
+                "UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK"
+            )
+            if fake_lock_mask is not None:
+                self.fake_lock_mask = int(fake_lock_mask, 0) & 0x7
         self.fake_video = os.environ.get(
             "UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO", ""
         )
         self.connection = None
         self.x11 = None
         self.display = None
+        self._xkb_get_indicator_state = None
+        self._lock_mask_cached: int | None = None
+        self._lock_mask_checked_at = 0.0
+        self.last_absolute_pointer: tuple[int, int, int] | None = None
+        self.pointer_motion_requests = 0
+        self.pointer_motion_injected = 0
+        self.pointer_motion_suppressed = 0
+        self.pointer_motion_same_target = 0
+        self.pointer_motion_changed_target = 0
+        self.pointer_motion_unit_changes = 0
+        self.pointer_motion_two_point_oscillations = 0
+        self.pointer_motion_actual_matches = 0
+        self.pointer_motion_actual_mismatches = 0
+        self.pointer_absolute_requests = 0
+        self.pointer_relative_requests = 0
+        self.pointer_relative_zero_suppressed = 0
+        self.previous_absolute_request: tuple[int, int, int] | None = None
+        self.last_absolute_request: tuple[int, int, int] | None = None
+        self.pointer_recent_targets: list[list[int]] = []
+        self.pointer_actual_root_x = 0
+        self.pointer_actual_root_y = 0
+        self.pointer_target_root_x = 0
+        self.pointer_target_root_y = 0
         if self.fake_trace:
             self.session_handle = "/org/freedesktop/portal/desktop/session/fake"
             fake_streams = self._fake_stream_descriptors()
@@ -1060,6 +1301,7 @@ class WaylandPortalBackend:
             name
             for name in (
                 "pipewiresrc",
+                "identity",
                 "queue",
                 "videoconvert",
                 "videoscale",
@@ -1353,34 +1595,36 @@ class WaylandPortalBackend:
             raise RuntimeError("桌面门户未返回有效的 PipeWire 描述符")
         return descriptor
 
-    def _start_cursor_bridge(self) -> None:
+    def _start_cursor_bridge(self, reset_cursor: bool = True) -> None:
         if self.fake_trace:
             return
-        self.cursor_path.unlink(missing_ok=True)
+        if reset_cursor:
+            self.cursor_path.unlink(missing_ok=True)
         descriptor = self._open_pipewire_remote()
-        command = [
-            str(self.cursor_helper_path),
-            str(self.cursor_path),
-            str(descriptor),
-        ]
-        for stream in self.streams:
-            command.extend(
-                (
-                    str(stream["node"]),
-                    str(stream["width"]),
-                    str(stream["height"]),
-                )
-            )
-        self.cursor_helper_log_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        log_descriptor = os.open(
-            self.cursor_helper_log_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
+        log_descriptor: int | None = None
         try:
+            command = [
+                str(self.cursor_helper_path),
+                str(self.cursor_path),
+                str(descriptor),
+            ]
+            for stream in self.streams:
+                command.extend(
+                    (
+                        str(stream["node"]),
+                        str(stream["width"]),
+                        str(stream["height"]),
+                    )
+                )
+            self.cursor_helper_log_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            log_descriptor = os.open(
+                self.cursor_helper_log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
             self.cursor_helper_process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -1390,8 +1634,63 @@ class WaylandPortalBackend:
                 pass_fds=(descriptor,),
             )
         finally:
-            os.close(log_descriptor)
-            os.close(descriptor)
+            try:
+                if log_descriptor is not None:
+                    os.close(log_descriptor)
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _process_exit_detail(returncode: int) -> str:
+        if returncode >= 0:
+            return f"exit={returncode}"
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = "UNKNOWN"
+        return f"signal={signal_name}({signal_number})"
+
+    def _restart_cursor_bridge(self, returncode: int) -> None:
+        now = time.monotonic()
+        self.cursor_helper_restart_times = [
+            restarted_at
+            for restarted_at in self.cursor_helper_restart_times
+            if now - restarted_at < CURSOR_HELPER_RESTART_WINDOW_SECONDS
+        ]
+        exit_detail = self._process_exit_detail(returncode)
+        last_line = ""
+        try:
+            last_line = read_last_log_line(self.cursor_helper_log_path)
+        except OSError:
+            pass
+        self.cursor_helper_last_exit = exit_detail + (
+            f" last_log={last_line}" if last_line else ""
+        )
+        if len(self.cursor_helper_restart_times) >= CURSOR_HELPER_RESTART_LIMIT:
+            raise RuntimeError(
+                "Wayland PipeWire 动态光标桥反复停止："
+                + self.cursor_helper_last_exit
+            )
+
+        # Cursor metadata is an independent consumer of the already-authorized
+        # Portal session.  Reopen only its restricted PipeWire FD and keep the
+        # last valid UUCI bitmap until the replacement publishes a new one.
+        self.cursor_helper_process = None
+        self._start_cursor_bridge(reset_cursor=False)
+        self.cursor_helper_restart_times.append(now)
+        self.cursor_helper_restarts += 1
+        try:
+            with self.cursor_helper_log_path.open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    "cursor-bridge-restarted "
+                    f"count={self.cursor_helper_restarts} "
+                    f"previous={self.cursor_helper_last_exit}\n"
+                )
+        except OSError:
+            pass
 
     def _start_capture_bridge(self) -> None:
         self.capture_state = "starting"
@@ -1440,6 +1739,13 @@ class WaylandPortalBackend:
             self.frame_origin_x,
             self.frame_origin_y,
         )
+        self.capture_frame_filters = [
+            self.frame_helper.create_filter(
+                int(stream["width"]) * 4,
+                int(stream["height"]),
+            )
+            for stream in self.streams
+        ]
         self.capture_pipeline = self.Gst.Pipeline.new("wayland-capture")
         if self.capture_pipeline is None:
             raise RuntimeError("无法创建 Wayland 画面桥 GStreamer 管线")
@@ -1447,51 +1753,100 @@ class WaylandPortalBackend:
         self.capture_stream_stats = [
             {
                 "node": int(stream["node"]),
+                "target_fps": capture_stream_rate(
+                    int(stream["node"]), self.stream_node
+                ),
+                "effective_fps": capture_stream_rate(
+                    int(stream["node"]), self.stream_node
+                ),
+                "deduplicate": 1,
+                "samples": 0,
                 "frames": 0,
                 "hash": 0,
                 "hash_changes": 0,
+                "duplicates": 0,
+                "corrupted_frames_dropped": 0,
+                "map_failures_dropped": 0,
+                "short_frames_dropped": 0,
                 "pts": 0,
                 "last_ns": 0,
+                "published_hash": 0,
+                "published_frames": 0,
+                "source_copies": 0,
+                "backfill_copies": 0,
+                "native_updates": 0,
+                "compared_bytes": 0,
+                "copy_bytes": 0,
+                "source_changed_bytes": 0,
+                "changed_rows": 0,
+                "changed_blocks": 0,
+                "temporal_deferred_blocks": 0,
+                "temporal_suppressed_blocks": 0,
+                "temporal_published_blocks": 0,
+                "motion_bypasses": 0,
+                "last_copy_bytes": 0,
+                "max_copy_bytes": 0,
+                "motion_events": 0,
+                "motion_limit_until_ns": 0,
+                "last_duration_ns": 0,
+                "max_duration_ns": 0,
+                "last_publish_ns": 0,
+                "last_checked_ns": 0,
+                "next_check_ns": 0,
             }
             for stream in self.streams
         ]
-
-        def sampled_hash(data) -> int:
-            length = len(data)
-            if length <= 0:
-                return 0
-            step = max(length // 4096, 1)
-            value = 2166136261
-            for offset in range(0, length, step):
-                value = ((value ^ data[offset]) * 16777619) & 0xFFFFFFFF
-            return value
+        self.capture_buffer_generations = [
+            [0 for _stream in self.streams]
+            for _buffer in range(FRAME_BUFFERS)
+        ]
 
         def write_stream_frame(appsink, stream_index: int, stream) -> int:
             sample = appsink.emit("pull-sample")
             if sample is None or self.capture_map is None:
                 return self.Gst.FlowReturn.ERROR
             buffer = sample.get_buffer()
+            now_ns = time.monotonic_ns()
+            with self.capture_lock:
+                stats = self.capture_stream_stats[stream_index]
+                stats["samples"] += 1
+                if buffer.has_flags(self.Gst.BufferFlags.CORRUPTED):
+                    stats["corrupted_frames_dropped"] += 1
+                    return self.Gst.FlowReturn.OK
+                # Portal screen-cast streams are damage-driven and may not
+                # produce another clean frame after a short-lived UI change.
+                # Never discard a valid sample based on a fixed-rate deadline:
+                # doing so can permanently lose the only IME commit frame.
+                # The one-buffer leaky queue and appsink already provide
+                # latest-wins backpressure without dropping the frame that has
+                # reached this callback.
+                stats["effective_fps"] = int(stats["target_fps"])
+                stats["last_checked_ns"] = now_ns
             mapped, info = buffer.map(self.Gst.MapFlags.READ)
             if not mapped:
-                return self.Gst.FlowReturn.ERROR
+                with self.capture_lock:
+                    self.capture_stream_stats[stream_index][
+                        "map_failures_dropped"
+                    ] += 1
+                return self.Gst.FlowReturn.OK
             try:
                 width = int(stream["width"])
                 height = int(stream["height"])
                 row_bytes = width * 4
                 source_stride = len(info.data) // height
                 if source_stride < row_bytes:
-                    return self.Gst.FlowReturn.ERROR
-                value = sampled_hash(info.data)
+                    with self.capture_lock:
+                        self.capture_stream_stats[stream_index][
+                            "short_frames_dropped"
+                        ] += 1
+                    return self.Gst.FlowReturn.OK
+                source_view = memoryview(info.data)
                 with self.capture_lock:
                     stats = self.capture_stream_stats[stream_index]
-                    previous_hash = int(stats["hash"])
+                    first_frame = int(stats["frames"]) == 0
                     stats["frames"] += 1
-                    stats["hash"] = value
                     stats["pts"] = int(buffer.pts)
-                    stats["last_ns"] = time.monotonic_ns()
-                    if previous_hash and previous_hash != value:
-                        stats["hash_changes"] += 1
-
+                    stats["last_ns"] = now_ns
                     previous_active = struct.unpack_from(
                         "<I", self.capture_map, 32
                     )[0]
@@ -1505,31 +1860,130 @@ class WaylandPortalBackend:
                         FRAME_HEADER.size
                         + previous_active * self.capture_frame_size
                     )
-                    if active != previous_active:
-                        self.capture_map.move(
-                            destination,
-                            previous,
-                            self.capture_frame_size,
-                        )
-                    source_view = memoryview(info.data)
                     destination_x = int(stream["x"]) * 4
                     destination_y = int(stream["y"])
-                    for row in range(height):
-                        source_offset = row * source_stride
-                        destination_offset = (
-                            destination
-                            + (destination_y + row) * stride
-                            + destination_x
+                    stream_offset = destination_y * stride + destination_x
+                    changed, native_stats = self.frame_helper.update(
+                        self.capture_frame_filters[stream_index],
+                        self.capture_map,
+                        destination + stream_offset,
+                        previous + stream_offset,
+                        stride,
+                        source_view,
+                        source_stride,
+                        row_bytes,
+                        height,
+                        first_frame,
+                    )
+                    stats["native_updates"] += 1
+                    stats["compared_bytes"] += int(
+                        native_stats.compared_bytes
+                    )
+                    stats["copy_bytes"] += int(native_stats.copied_bytes)
+                    stats["source_changed_bytes"] += int(
+                        native_stats.source_changed_bytes
+                    )
+                    stats["changed_rows"] += int(native_stats.changed_rows)
+                    stats["changed_blocks"] += int(
+                        native_stats.changed_blocks
+                    )
+                    stats["temporal_deferred_blocks"] += int(
+                        native_stats.temporal_deferred_blocks
+                    )
+                    stats["temporal_suppressed_blocks"] += int(
+                        native_stats.temporal_suppressed_blocks
+                    )
+                    stats["temporal_published_blocks"] += int(
+                        native_stats.temporal_published_blocks
+                    )
+                    stats["motion_bypasses"] += int(
+                        native_stats.motion_bypass
+                    )
+                    copied_bytes = int(native_stats.copied_bytes)
+                    stats["last_copy_bytes"] = copied_bytes
+                    stats["max_copy_bytes"] = max(
+                        int(stats["max_copy_bytes"]), copied_bytes
+                    )
+                    if not changed:
+                        stats["duplicates"] += 1
+                        duration_ns = time.monotonic_ns() - now_ns
+                        stats["last_duration_ns"] = duration_ns
+                        stats["max_duration_ns"] = max(
+                            int(stats["max_duration_ns"]), duration_ns
                         )
-                        self.capture_map[
-                            destination_offset : destination_offset + row_bytes
-                        ] = source_view[
-                            source_offset : source_offset + row_bytes
-                        ]
-                    output = memoryview(self.capture_map)[
-                        destination : destination + self.capture_frame_size
+                        return self.Gst.FlowReturn.OK
+                    value = (int(stats["published_hash"]) + 1) & 0xFFFFFFFF
+                    if value == 0:
+                        value = 1
+                    stats["hash"] = value
+                    if not first_frame:
+                        stats["hash_changes"] += 1
+
+                    def copy_canvas_region(
+                        target: int, source: int, stale_stream
+                    ) -> None:
+                        stale_x = int(stale_stream["x"]) * 4
+                        stale_y = int(stale_stream["y"])
+                        stale_row_bytes = int(stale_stream["width"]) * 4
+                        stale_offset = stale_y * stride + stale_x
+                        self.frame_helper.copy(
+                            self.capture_map,
+                            target + stale_offset,
+                            source + stale_offset,
+                            stride,
+                            stale_row_bytes,
+                            int(stale_stream["height"]),
+                        )
+
+                    # Compose only the inactive buffer.  It normally needs
+                    # one source-region copy; monitor generations identify an
+                    # occasional stale sibling region to backfill from the
+                    # currently published buffer.  Updating the old buffer
+                    # after publication doubled memory traffic and delayed
+                    # delivery of the next compositor sample under motion.
+                    target_generations = self.capture_buffer_generations[
+                        active
                     ]
-                    output_hash = sampled_hash(output)
+                    current_generations = self.capture_buffer_generations[
+                        previous_active
+                    ]
+                    backfills = capture_backfill_indexes(
+                        target_generations,
+                        current_generations,
+                        stream_index,
+                    )
+                    for stale_index in backfills:
+                        stale_stream = self.streams[stale_index]
+                        copy_canvas_region(
+                            destination, previous, stale_stream
+                        )
+                        target_generations[stale_index] = (
+                            current_generations[stale_index]
+                        )
+                        stats["backfill_copies"] += 1
+                        stats["copy_bytes"] += (
+                            int(stale_stream["width"])
+                            * int(stale_stream["height"])
+                            * 4
+                        )
+                    target_generations[stream_index] = (
+                        current_generations[stream_index] + 1
+                    )
+                    stats["source_copies"] += 1
+                    stats["published_hash"] = value
+                    stats["published_frames"] += 1
+                    stats["last_publish_ns"] = now_ns
+                    output_hash = 0
+                    for output_stats in self.capture_stream_stats:
+                        output_hash = zlib.crc32(
+                            struct.pack(
+                                "<II",
+                                int(output_stats["node"]),
+                                int(output_stats["published_hash"]),
+                            ),
+                            output_hash,
+                        )
+                    output_hash &= 0xFFFFFFFF
                     if (
                         self.capture_output_hash
                         and self.capture_output_hash != output_hash
@@ -1539,6 +1993,11 @@ class WaylandPortalBackend:
                     struct.pack_into("<I", self.capture_map, 32, active)
                     struct.pack_into("<I", self.capture_map, 36, sequence)
                     self.capture_frames = sequence
+                    duration_ns = time.monotonic_ns() - now_ns
+                    stats["last_duration_ns"] = duration_ns
+                    stats["max_duration_ns"] = max(
+                        int(stats["max_duration_ns"]), duration_ns
+                    )
             finally:
                 buffer.unmap(info)
             return self.Gst.FlowReturn.OK
@@ -1570,13 +2029,17 @@ class WaylandPortalBackend:
                     source.set_property("fd", descriptor)
                     source.set_property("path", str(stream["node"]))
                     source.set_property("do-timestamp", True)
-                    # Each Portal node feeds an independent appsink.  Copy at
-                    # the PipeWire boundary so the Python shared-canvas writer
-                    # never keeps a compositor-owned or Portal-owned buffer
-                    # alive after the callback returns.
+                    # Keep PipeWire's rotating pool out of the Python callback.
+                    # The guard immediately downstream separately discards
+                    # Mutter cursor-only buffers marked CORRUPTED before a
+                    # transform can turn their empty payload into an apparent
+                    # full video frame.
                     source.set_property("always-copy", True)
             queue = self.Gst.ElementFactory.make(
                 "queue", f"frame-queue-{index}"
+            )
+            corrupt_guard = self.Gst.ElementFactory.make(
+                "identity", f"corrupt-frame-guard-{index}"
             )
             convert = self.Gst.ElementFactory.make(
                 "videoconvert", f"stream-convert-{index}"
@@ -1592,6 +2055,7 @@ class WaylandPortalBackend:
             )
             stream_elements = (
                 source,
+                corrupt_guard,
                 queue,
                 convert,
                 scale,
@@ -1600,21 +2064,31 @@ class WaylandPortalBackend:
             )
             if any(element is None for element in stream_elements):
                 raise RuntimeError("无法创建 Wayland 多屏画面源管线")
-            queue.set_property("max-size-buffers", 2)
+            queue.set_property("max-size-buffers", 1)
             queue.set_property("leaky", 2)
+            corrupt_guard.set_property(
+                "drop-buffer-flags", self.Gst.BufferFlags.CORRUPTED
+            )
             scale.set_property("add-borders", False)
+            caps_text = (
+                "video/x-raw,format=BGRA,"
+                f"width={stream['width']},height={stream['height']},"
+            )
+            caps_text += "pixel-aspect-ratio=1/1"
             stream_caps.set_property(
-                "caps",
-                self.Gst.Caps.from_string(
-                    "video/x-raw,format=BGRx,"
-                    f"width={stream['width']},height={stream['height']},"
-                    "pixel-aspect-ratio=1/1"
-                ),
+                "caps", self.Gst.Caps.from_string(caps_text)
             )
             sink.set_property("sync", False)
             sink.set_property("emit-signals", True)
-            sink.set_property("max-buffers", 2)
+            sink.set_property("max-buffers", 1)
             sink.set_property("drop", True)
+            # This is a latest-frame transport, not a clock-synchronized media
+            # sink.  BaseSink's default 20 ms processing deadline needlessly
+            # inflates the pipeline latency query and its retained last sample
+            # keeps one full 15 MB frame alive.
+            sink.set_property("processing-deadline", 0)
+            sink.set_property("enable-last-sample", False)
+            sink.set_property("wait-on-eos", False)
             for element in stream_elements:
                 self.capture_pipeline.add(element)
             for first, second in zip(
@@ -1670,19 +2144,6 @@ class WaylandPortalBackend:
             raise RuntimeError(
                 "Wayland 共享帧回调失败：" + self.capture_callback_error
             )
-        if (
-            self.cursor_helper_process is None or
-            self.cursor_helper_process.poll() is not None
-        ):
-            detail = ""
-            try:
-                detail = read_last_log_line(self.cursor_helper_log_path)
-            except OSError:
-                pass
-            raise RuntimeError(
-                "Wayland PipeWire 动态光标桥已停止"
-                + (f"：{detail}" if detail else "")
-            )
         message = self.capture_pipeline.get_bus().pop_filtered(
             self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS
         )
@@ -1699,16 +2160,49 @@ class WaylandPortalBackend:
             self.Gst.State.PLAYING,
         ):
             raise RuntimeError("Wayland PipeWire 画面转发已停止")
+        process = self.cursor_helper_process
+        if process is None:
+            raise RuntimeError("Wayland PipeWire 动态光标桥未启动")
+        returncode = process.poll()
+        if returncode is not None:
+            self._restart_cursor_bridge(int(returncode))
 
     def _configure_x11_keymap(self) -> None:
         self.x11 = ctypes.CDLL("libX11.so.6")
         self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
         self.x11.XOpenDisplay.restype = ctypes.c_void_p
         self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.x11.XQueryPointer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self.x11.XQueryPointer.restype = ctypes.c_int
         self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
         self.x11.XStringToKeysym.restype = ctypes.c_ulong
         self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         self.x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        try:
+            self._xkb_get_indicator_state = (
+                self.x11.XkbGetIndicatorState
+            )
+        except AttributeError:
+            self._xkb_get_indicator_state = None
+        else:
+            self._xkb_get_indicator_state.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            self._xkb_get_indicator_state.restype = ctypes.c_int
         display_name = os.environ.get("DISPLAY")
         encoded = display_name.encode() if display_name else None
         self.display = self.x11.XOpenDisplay(encoded)
@@ -1772,6 +2266,14 @@ class WaylandPortalBackend:
                 "等待画面管线停止",
                 lambda: pipeline.get_state(5 * self.Gst.SECOND),
             )
+        frame_filters = list(getattr(self, "capture_frame_filters", []))
+        self.capture_frame_filters = []
+        for frame_filter in frame_filters:
+            cleanup(
+                "释放瞬态帧过滤器",
+                lambda frame_filter=frame_filter:
+                    self.frame_helper.destroy_filter(frame_filter),
+            )
         descriptors = list(self.capture_pipewire_fds)
         self.capture_pipewire_fds.clear()
         for descriptor in descriptors:
@@ -1816,6 +2318,9 @@ class WaylandPortalBackend:
                     None,
                 ),
             )
+        self._lock_mask_cached = None
+        self._lock_mask_checked_at = 0.0
+        self._xkb_get_indicator_state = None
         if self.display and self.x11:
             display = self.display
             self.display = None
@@ -1828,6 +2333,33 @@ class WaylandPortalBackend:
     def flush(self) -> None:
         return
 
+    def _root_pointer_position(self) -> tuple[int, int] | None:
+        if self.display is None or self.x11 is None:
+            return None
+        root = self.x11.XDefaultRootWindow(self.display)
+        root_return = ctypes.c_ulong()
+        child_return = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        window_x = ctypes.c_int()
+        window_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not self.x11.XQueryPointer(
+            self.display,
+            root,
+            ctypes.byref(root_return),
+            ctypes.byref(child_return),
+            ctypes.byref(root_x),
+            ctypes.byref(root_y),
+            ctypes.byref(window_x),
+            ctypes.byref(window_y),
+            ctypes.byref(mask),
+        ):
+            return None
+        self.pointer_actual_root_x = int(root_x.value)
+        self.pointer_actual_root_y = int(root_y.value)
+        return self.pointer_actual_root_x, self.pointer_actual_root_y
+
     def motion(
         self,
         dx: int,
@@ -1836,22 +2368,24 @@ class WaylandPortalBackend:
         virtual_desktop: bool = False,
     ) -> None:
         options = {}
+        self.pointer_motion_requests += 1
         if absolute:
+            self.pointer_absolute_requests += 1
             primary = next(
                 (stream for stream in self.streams if stream.get("primary")),
                 self.streams[0],
             )
             target = primary
             if virtual_desktop:
-                canvas_x = (
-                    max(0, min(dx, 65535))
-                    * (self.canvas_width - 1)
-                    / 65535
-                )
-                canvas_y = (
-                    max(0, min(dy, 65535))
-                    * (self.canvas_height - 1)
-                    / 65535
+                # Keep Portal injection bit-for-bit aligned with the Win32
+                # cursor feedback hook.  Sending fractional Portal positions
+                # while GetCursorPos returned the rounded pixel let the
+                # controller alternate around a widget hit-test boundary even
+                # though its visible cursor stayed on the same pixel.
+                canvas_x, canvas_y = map_absolute_point(
+                    dx,
+                    dy,
+                    (0, 0, self.canvas_width, self.canvas_height),
                 )
                 containing = [
                     stream
@@ -1884,35 +2418,96 @@ class WaylandPortalBackend:
                         ),
                     )
                 x = max(
-                    0.0,
+                    0,
                     min(canvas_x - target["x"], target["width"] - 1),
                 )
                 y = max(
-                    0.0,
+                    0,
                     min(canvas_y - target["y"], target["height"] - 1),
                 )
             else:
-                x = (
-                    max(0, min(dx, 65535))
-                    * (target["width"] - 1)
-                    / 65535
+                x, y = map_absolute_point(
+                    dx,
+                    dy,
+                    (0, 0, target["width"], target["height"]),
                 )
-                y = (
-                    max(0, min(dy, 65535))
-                    * (target["height"] - 1)
-                    / 65535
-                )
+            pointer_key = (int(target["node"]), int(x), int(y))
+            previous_request = self.last_absolute_request
+            if previous_request is not None:
+                if previous_request == pointer_key:
+                    self.pointer_motion_same_target += 1
+                else:
+                    self.pointer_motion_changed_target += 1
+                    if (
+                        previous_request[0] == pointer_key[0]
+                        and max(
+                            abs(previous_request[1] - pointer_key[1]),
+                            abs(previous_request[2] - pointer_key[2]),
+                        ) <= 1
+                    ):
+                        self.pointer_motion_unit_changes += 1
+                    if self.previous_absolute_request == pointer_key:
+                        self.pointer_motion_two_point_oscillations += 1
+            self.previous_absolute_request = previous_request
+            self.last_absolute_request = pointer_key
+            self.pointer_recent_targets.append(list(pointer_key))
+            del self.pointer_recent_targets[:-16]
+            root_geometry = target["root_geometry"]
+            target_root = (
+                int(root_geometry[0]) + int(x),
+                int(root_geometry[1]) + int(y),
+            )
+            self.pointer_target_root_x, self.pointer_target_root_y = target_root
+            actual_root = self._root_pointer_position()
+            if actual_root == target_root:
+                self.pointer_motion_actual_matches += 1
+            elif actual_root is not None:
+                self.pointer_motion_actual_mismatches += 1
+            actual_is_target = actual_root is None or (
+                max(
+                    abs(actual_root[0] - target_root[0]),
+                    abs(actual_root[1] - target_root[1]),
+                ) <= 1
+            )
+            if self.last_absolute_pointer == pointer_key and actual_is_target:
+                self.pointer_motion_suppressed += 1
+                return
             self._notify(
                 "NotifyPointerMotionAbsolute",
                 "(oa{sv}udd)",
-                (self.session_handle, options, int(target["node"]), x, y),
+                (
+                    self.session_handle,
+                    options,
+                    int(target["node"]),
+                    float(x),
+                    float(y),
+                ),
             )
+            self.last_absolute_pointer = pointer_key
+            self.pointer_motion_injected += 1
         else:
+            self.pointer_relative_requests += 1
+            # UU emits an absolute position followed by a relative (0, 0)
+            # MOVE on every controller refresh.  Win32 treats the latter as
+            # no displacement, while RemoteDesktop Portal delivers it as a
+            # fresh pointer-motion event.  On a widget boundary that made
+            # Mutter alternate hit tests between the absolute pixel and the
+            # compositor-rounded pixel roughly 75 times per second.  Preserve
+            # the absolute cache and discard only this semantic no-op.
+            if dx == 0 and dy == 0:
+                self.pointer_motion_suppressed += 1
+                self.pointer_relative_zero_suppressed += 1
+                return
             self._notify(
                 "NotifyPointerMotion",
                 "(oa{sv}dd)",
                 (self.session_handle, options, float(dx), float(dy)),
             )
+            self.last_absolute_pointer = None
+            self.previous_absolute_request = None
+            self.last_absolute_request = None
+            self.pointer_recent_targets.clear()
+            self.pointer_motion_injected += 1
 
     def button(self, button: int, pressed: bool) -> None:
         if button in (4, 5, 6, 7):
@@ -1939,11 +2534,45 @@ class WaylandPortalBackend:
         evdev_keycode = keycode - 8
         if not 0 <= evdev_keycode <= 767:
             raise ValueError(f"无效 Wayland/evdev 键码：{evdev_keycode}")
-        self._notify(
-            "NotifyKeyboardKeycode",
-            "(oa{sv}iu)",
-            (self.session_handle, {}, evdev_keycode, int(pressed)),
-        )
+        lock_bit = {66: 0x1, 77: 0x2, 78: 0x4}.get(keycode, 0)
+        try:
+            self._notify(
+                "NotifyKeyboardKeycode",
+                "(oa{sv}iu)",
+                (self.session_handle, {}, evdev_keycode, int(pressed)),
+            )
+        finally:
+            if lock_bit:
+                # Reconcile the hook's optimistic toggle with XKB immediately
+                # after a lock event, including a failed Portal notification.
+                self._lock_mask_checked_at = 0.0
+        if pressed and self.fake_lock_mask is not None:
+            self.fake_lock_mask ^= lock_bit
+
+    def lock_mask(self) -> int | None:
+        if self.fake_trace:
+            return self.fake_lock_mask
+        now = time.monotonic()
+        if now - self._lock_mask_checked_at < LOCK_STATE_POLL_SECONDS:
+            return self._lock_mask_cached
+        self._lock_mask_checked_at = now
+        if (
+            self.display is None
+            or self.x11 is None
+            or self._xkb_get_indicator_state is None
+        ):
+            self._lock_mask_cached = None
+            return self._lock_mask_cached
+        indicators = ctypes.c_uint()
+        if self._xkb_get_indicator_state(
+            self.display,
+            XKB_USE_CORE_KBD,
+            ctypes.byref(indicators),
+        ) != 0:
+            self._lock_mask_cached = None
+        else:
+            self._lock_mask_cached = int(indicators.value & 0x7)
+        return self._lock_mask_cached
 
     def keysym_keycode(self, name: str) -> int:
         if not self.display or not self.x11:
@@ -2332,6 +2961,7 @@ def endpoint_content(
     native_lock_keys: bool = False,
     lock_mask: int | None = None,
     force_cursor: bool = True,
+    tracked_cursor_authoritative: bool = False,
 ) -> str:
     content = (
         "[bridge]\n"
@@ -2341,6 +2971,8 @@ def endpoint_content(
         f"force_cursor={int(force_cursor)}\n"
         "cursor_image=uu-remote-native-cursor.bin\n"
         f"cursor_image_version={CURSOR_VERSION}\n"
+        "tracked_cursor_authoritative="
+        f"{int(tracked_cursor_authoritative)}\n"
         f"native_lock_keys={int(native_lock_keys)}\n"
     )
     if lock_mask is not None:
@@ -2390,10 +3022,29 @@ def write_status(
     absolute_target_source: str = "",
     cursor_state: str = "inactive",
     cursor_sequence: int = 0,
+    cursor_helper_restarts: int = 0,
+    cursor_helper_last_exit: str = "",
     cursor_width: int = 0,
     cursor_height: int = 0,
     cursor_hotspot_x: int = 0,
     cursor_hotspot_y: int = 0,
+    pointer_motion_requests: int = 0,
+    pointer_motion_injected: int = 0,
+    pointer_motion_suppressed: int = 0,
+    pointer_motion_same_target: int = 0,
+    pointer_motion_changed_target: int = 0,
+    pointer_motion_unit_changes: int = 0,
+    pointer_motion_two_point_oscillations: int = 0,
+    pointer_motion_actual_matches: int = 0,
+    pointer_motion_actual_mismatches: int = 0,
+    pointer_absolute_requests: int = 0,
+    pointer_relative_requests: int = 0,
+    pointer_relative_zero_suppressed: int = 0,
+    pointer_recent_targets: list[list[int]] | None = None,
+    pointer_actual_root_x: int = 0,
+    pointer_actual_root_y: int = 0,
+    pointer_target_root_x: int = 0,
+    pointer_target_root_y: int = 0,
     detail: str = "",
 ) -> None:
     atomic_write_json(
@@ -2434,10 +3085,39 @@ def write_status(
             "absolute_target_source": absolute_target_source,
             "cursor_state": cursor_state,
             "cursor_sequence": cursor_sequence,
+            "cursor_helper_restarts": cursor_helper_restarts,
+            "cursor_helper_last_exit": cursor_helper_last_exit,
             "cursor_width": cursor_width,
             "cursor_height": cursor_height,
             "cursor_hotspot_x": cursor_hotspot_x,
             "cursor_hotspot_y": cursor_hotspot_y,
+            "pointer_motion_requests": pointer_motion_requests,
+            "pointer_motion_injected": pointer_motion_injected,
+            "pointer_motion_suppressed": pointer_motion_suppressed,
+            "pointer_motion_same_target": pointer_motion_same_target,
+            "pointer_motion_changed_target": pointer_motion_changed_target,
+            "pointer_motion_unit_changes": pointer_motion_unit_changes,
+            "pointer_motion_two_point_oscillations": (
+                pointer_motion_two_point_oscillations
+            ),
+            "pointer_motion_actual_matches": pointer_motion_actual_matches,
+            "pointer_motion_actual_mismatches": (
+                pointer_motion_actual_mismatches
+            ),
+            "pointer_absolute_requests": pointer_absolute_requests,
+            "pointer_relative_requests": pointer_relative_requests,
+            "pointer_relative_zero_suppressed": (
+                pointer_relative_zero_suppressed
+            ),
+            "pointer_recent_targets": pointer_recent_targets or [],
+            "pointer_actual_root": [
+                pointer_actual_root_x,
+                pointer_actual_root_y,
+            ],
+            "pointer_target_root": [
+                pointer_target_root_x,
+                pointer_target_root_y,
+            ],
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
@@ -2569,10 +3249,94 @@ def watch(
                 else str(getattr(backend, "cursor_state", "inactive"))
             ),
             cursor_sequence=cursor_sequence,
+            cursor_helper_restarts=int(
+                getattr(backend, "cursor_helper_restarts", 0)
+                if backend is not None else 0
+            ),
+            cursor_helper_last_exit=str(
+                getattr(backend, "cursor_helper_last_exit", "")
+                if backend is not None else ""
+            ),
             cursor_width=cursor_snapshot[1] if cursor_snapshot else 0,
             cursor_height=cursor_snapshot[2] if cursor_snapshot else 0,
             cursor_hotspot_x=cursor_snapshot[3] if cursor_snapshot else 0,
             cursor_hotspot_y=cursor_snapshot[4] if cursor_snapshot else 0,
+            pointer_motion_requests=int(
+                getattr(backend, "pointer_motion_requests", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_injected=int(
+                getattr(backend, "pointer_motion_injected", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_suppressed=int(
+                getattr(backend, "pointer_motion_suppressed", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_same_target=int(
+                getattr(backend, "pointer_motion_same_target", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_changed_target=int(
+                getattr(backend, "pointer_motion_changed_target", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_unit_changes=int(
+                getattr(backend, "pointer_motion_unit_changes", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_two_point_oscillations=int(
+                getattr(
+                    backend,
+                    "pointer_motion_two_point_oscillations",
+                    0,
+                ) if backend is not None else 0
+            ),
+            pointer_motion_actual_matches=int(
+                getattr(backend, "pointer_motion_actual_matches", 0)
+                if backend is not None else 0
+            ),
+            pointer_motion_actual_mismatches=int(
+                getattr(backend, "pointer_motion_actual_mismatches", 0)
+                if backend is not None else 0
+            ),
+            pointer_absolute_requests=int(
+                getattr(backend, "pointer_absolute_requests", 0)
+                if backend is not None else 0
+            ),
+            pointer_relative_requests=int(
+                getattr(backend, "pointer_relative_requests", 0)
+                if backend is not None else 0
+            ),
+            pointer_relative_zero_suppressed=int(
+                getattr(
+                    backend,
+                    "pointer_relative_zero_suppressed",
+                    0,
+                ) if backend is not None else 0
+            ),
+            pointer_recent_targets=[
+                list(target)
+                for target in getattr(
+                    backend, "pointer_recent_targets", []
+                )
+            ] if backend is not None else [],
+            pointer_actual_root_x=int(
+                getattr(backend, "pointer_actual_root_x", 0)
+                if backend is not None else 0
+            ),
+            pointer_actual_root_y=int(
+                getattr(backend, "pointer_actual_root_y", 0)
+                if backend is not None else 0
+            ),
+            pointer_target_root_x=int(
+                getattr(backend, "pointer_target_root_x", 0)
+                if backend is not None else 0
+            ),
+            pointer_target_root_y=int(
+                getattr(backend, "pointer_target_root_y", 0)
+                if backend is not None else 0
+            ),
             detail=detail,
         )
 
@@ -2590,10 +3354,12 @@ def watch(
         current_lock_mask = (
             backend.lock_mask() if hasattr(backend, "lock_mask") else None
         )
+        geometry_changed = current_geometry != endpoint_cursor_geometry
+        lock_mask_changed = current_lock_mask != endpoint_lock_mask
         if (
             not force
-            and current_geometry == endpoint_cursor_geometry
-            and current_lock_mask == endpoint_lock_mask
+            and not geometry_changed
+            and not lock_mask_changed
         ):
             return
         atomic_write(
@@ -2602,22 +3368,39 @@ def watch(
                 port,
                 token,
                 current_geometry,
-                native_lock_keys=selected_backend() == "x11",
+                native_lock_keys=current_lock_mask is not None,
                 lock_mask=current_lock_mask,
                 # X11 supplies cursor pixels through XFixes; Wayland metadata
                 # mode supplies the same UUCI file through the PipeWire
                 # sidecar.  UU therefore always renders exactly one native
                 # controller cursor and never traps a transparent pointer.
                 force_cursor=True,
+                # Portal pointer motion bypasses Wine's private cursor.  Feed
+                # the exact normalized input position back to UU instead of
+                # alternating between stale XWayland and tracked coordinates.
+                tracked_cursor_authoritative=(
+                    selected_backend() == "wayland"
+                    or os.environ.get(
+                        "UU_REMOTE_INPUT_BRIDGE_FAKE_TRACKED_CURSOR", ""
+                    ) == "1"
+                ),
             ),
         )
         endpoint_cursor_geometry = current_geometry
         endpoint_lock_mask = current_lock_mask
-        if current_geometry is not None:
+        if current_geometry is not None and (force or geometry_changed):
             logger.write(
                 "UU 光标反馈坐标已同步为所选屏幕局部范围："
                 f"origin=({current_geometry[0]},{current_geometry[1]}) "
                 f"size={current_geometry[2]}x{current_geometry[3]}"
+            )
+        if current_lock_mask is not None and (force or lock_mask_changed):
+            logger.write(
+                "Linux 锁定键状态已同步："
+                f"mask=0x{current_lock_mask:x} "
+                f"caps={int(bool(current_lock_mask & 0x1))} "
+                f"num={int(bool(current_lock_mask & 0x2))} "
+                f"scroll={int(bool(current_lock_mask & 0x4))}"
             )
 
     def sync_cursor(force: bool = False) -> None:
@@ -2761,7 +3544,7 @@ def watch(
                     logger.write(f"输入事件注入失败：{error}")
 
             now = time.monotonic()
-            if hasattr(backend, "ensure_healthy"):
+            if running and hasattr(backend, "ensure_healthy"):
                 backend.ensure_healthy()
             if (
                 last_event

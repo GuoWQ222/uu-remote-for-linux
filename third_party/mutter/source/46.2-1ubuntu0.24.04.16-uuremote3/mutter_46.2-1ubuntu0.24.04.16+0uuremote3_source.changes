@@ -1,0 +1,30 @@
+Format: 1.8
+Date: Sat, 22 Aug 2026 19:07:37 +0800
+Source: mutter
+Built-For-Profiles: noudeb
+Architecture: source
+Version: 46.2-1ubuntu0.24.04.16+0uuremote3
+Distribution: noble
+Urgency: medium
+Maintainer: Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>
+Changed-By: Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>
+Changes:
+ mutter (46.2-1ubuntu0.24.04.16+0uuremote3) noble; urgency=medium
+ .
+   * d/p/uuremote-bound-monitor-memfd-capture-latency.patch:
+     Run monitor MemFd capture at default priority to prevent redraw starvation.
+   * d/p/uuremote-retry-pipewire-overrun.patch:
+     Asynchronously retry full frames after PipeWire buffer overruns.
+Checksums-Sha1:
+ 4850733b6d841e8c59eace4812dd81d5ebfb0689 3603 mutter_46.2-1ubuntu0.24.04.16+0uuremote3.dsc
+ 6313fa50ae8c170ba606c84a9de9bd8faab73bf4 6754976 mutter_46.2.orig.tar.xz
+ ca7788f41f439e66ad7daf8697eaf942bf6e3c7b 153812 mutter_46.2-1ubuntu0.24.04.16+0uuremote3.debian.tar.xz
+Checksums-Sha256:
+ 8e122377086ce3d8865aee3d0a3097119a9be5aad081ffcb6132789e46b0936d 3603 mutter_46.2-1ubuntu0.24.04.16+0uuremote3.dsc
+ 009baa77f8362612caa2e18c338a1b3c8aad3b5fe2964c2fef7824d321228983 6754976 mutter_46.2.orig.tar.xz
+ edde12d8ed00d601cf92d185490e2feffb7e3c7662382fe83114212ab459b1c6 153812 mutter_46.2-1ubuntu0.24.04.16+0uuremote3.debian.tar.xz
+Files:
+ 1cdd153ca58482fae6e67d91da364c9e 3603 x11 optional mutter_46.2-1ubuntu0.24.04.16+0uuremote3.dsc
+ 610b76a24ad65ffb6617b2dd74796ebe 6754976 x11 optional mutter_46.2.orig.tar.xz
+ 077371dc0e3c9911fee0534b2cbbff1f 153812 x11 optional mutter_46.2-1ubuntu0.24.04.16+0uuremote3.debian.tar.xz
+Original-Maintainer: Debian GNOME Maintainers <pkg-gnome-maintainers@lists.alioth.debian.org>

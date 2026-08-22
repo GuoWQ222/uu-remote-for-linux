@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvencode-bridge update-blocker input-hook pipewire-cursor powershell-bridge test deb clean
+.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvencode-bridge update-blocker input-hook frame-helper pipewire-cursor powershell-bridge mutter-bundle test deb clean
 
 all: test
 
@@ -25,11 +25,17 @@ update-blocker:
 input-hook:
 	./scripts/build-input-hook.sh
 
+frame-helper:
+	./scripts/build-frame-helper.sh
+
 pipewire-cursor:
 	./scripts/build-pipewire-cursor.sh
 
 powershell-bridge:
 	./scripts/build-powershell-bridge.sh
+
+mutter-bundle:
+	./packaging/mutter/verify-bundle.sh
 
 test:
 	./tests/run.sh

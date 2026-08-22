@@ -27,7 +27,11 @@ Thank you for improving UU Remote for Linux.
 
 - Never commit the proprietary NetEase installer, client binaries, account
   data, Wine prefixes, cookies, device IDs, or complete client logs.
-- Do not commit generated `.deb` packages; releases carry those artifacts.
+- Do not commit generated release `.deb` files under `dist/`. A narrowly
+  scoped, version-locked third-party compatibility payload may be vendored
+  only under `third_party/` when its provenance, license, complete
+  corresponding source, fixed checksums, metadata verifier, and fail-closed
+  runtime gate are included in the same change.
 - Preserve license notices and corresponding source for bundled third-party
   components.
 - New binary compatibility patches must be version-locked by upstream hashes
@@ -46,3 +50,12 @@ make shim
 
 Hardware-decoding source, revisions, checksums, and build details are recorded
 in `third_party/HWDECODE.md`.
+
+The Ubuntu 24.04 Mutter capture repair, clean-source build requirements,
+payload verification, and rollback procedure are documented in
+`packaging/mutter/README.md`. Public Mutter binaries must come from the exact
+source package in a clean Noble build environment; local incremental hotfix
+packages are suitable for diagnosis only and must not be published. A release
+candidate must also pass the documented real APT install, legacy-normalization,
+and rollback gate in a disposable Noble environment; mock tests and
+`apt-get -s` alone are not release acceptance.

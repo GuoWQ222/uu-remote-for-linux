@@ -31,9 +31,22 @@ check "keyboard bridge Python syntax" /usr/bin/python3 -c \
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "Mutter fix manager syntax" bash -n \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix"
+check "Mutter root helper syntax" bash -n \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root"
+check "native frame helper self-test" /usr/bin/python3 -c \
+    'import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); library.uu_frame_helper_self_test.restype = ctypes.c_uint32; raise SystemExit(0 if library.uu_frame_helper_self_test() == 1 else 1)' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
 check "PipeWire cursor bridge self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     --self-test
+check "Mutter fix manager isolation" \
+    "$project_root/tests/mutter-fix-manager.sh"
+check "Mutter capture priority" \
+    "$project_root/packaging/mutter/test-capture-priority.sh"
+check "Mutter release bundle" \
+    "$project_root/packaging/mutter/verify-bundle.sh"
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
@@ -97,6 +110,8 @@ check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \
     "$project_root/scripts/build-input-hook.sh"
+check "native frame helper builder syntax" bash -n \
+    "$project_root/scripts/build-frame-helper.sh"
 check "PipeWire cursor builder syntax" bash -n \
     "$project_root/scripts/build-pipewire-cursor.sh"
 check "input injector concurrency policy" \
@@ -168,6 +183,15 @@ check "keyboard bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 check "input bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "Mutter fix manager exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix"
+check "Mutter root helper exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root"
+# The snippet intentionally defers "$1" expansion to the nested shell.
+# shellcheck disable=SC2016
+check "native frame helper is ELF" bash -c \
+    'file "$1" | grep -q "ELF 64-bit LSB.*shared object.*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
 check "update compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
 check "WOL compatibility profiles exist" test -s \
@@ -331,8 +355,14 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/build-nvencode-bridge.sh" \
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
+        "$project_root/scripts/build-frame-helper.sh" \
         "$project_root/scripts/build-pipewire-cursor.sh" \
         "$project_root/scripts/build-powershell-bridge.sh" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root" \
+        "$project_root/packaging/mutter/test-capture-priority.sh" \
+        "$project_root/packaging/mutter/verify-bundle.sh" \
+        "$project_root/tests/mutter-fix-manager.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
         "$project_root/packaging/debian/postinst" \

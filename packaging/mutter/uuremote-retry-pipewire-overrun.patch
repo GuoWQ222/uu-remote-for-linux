@@ -1,0 +1,83 @@
+From: Codex <codex@openai.com>
+Date: Sat, 22 Aug 2026 17:05:45 +0800
+Subject: screen-cast: Retry full frames after PipeWire overruns
+Origin: upstream, commit:652a8145b1a48a5d5354494933c82dde245e9119
+
+If every negotiated PipeWire buffer is still held by consumers,
+pw_stream_dequeue_buffer() returns NULL.  Mutter 46.2 drops that frame and
+does not try again until fresh damage arrives, leaving the stream with an
+out-of-date frame.  Upstream commit 652a8145 fixes this by queuing a follow-up.
+
+The 46.2 record_follow_up vfunc predates the upstream flags-aware queue API,
+and the area and window implementations synchronously try to record again.
+Calling it directly from the NULL-buffer branch could therefore recurse
+without bound.  Use the existing coalesced follow-up timer instead, paced at
+the negotiated maximum frame interval (or a conservative 60 Hz fallback) and
+rounded up to a millisecond.  Leave cursor-only retries unchanged because a
+faithful cursor-only follow-up needs the later flags-aware vfunc.
+
+The shared timer may fire after a captured window actor is destroyed.  Make
+the window follow-up a no-op once screen_cast_window has been cleared.  This
+also closes the same lifetime hole for the pre-existing maximum-framerate
+follow-up timer in Mutter 46.2.
+
+---
+ src/backends/meta-screen-cast-stream-src.c        | 23 +++++++++++++++++++++++
+ src/backends/meta-screen-cast-window-stream-src.c |  5 +++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/src/backends/meta-screen-cast-stream-src.c b/src/backends/meta-screen-cast-stream-src.c
+index 2bf6cd0..fb62695 100644
+--- a/src/backends/meta-screen-cast-stream-src.c
++++ b/src/backends/meta-screen-cast-stream-src.c
+@@ -845,6 +845,29 @@ meta_screen_cast_stream_src_maybe_record_frame_with_timestamp (MetaScreenCastStr
+                   "Couldn't dequeue a buffer from pipewire stream (node id %u), "
+                   "maybe your encoding is too slow?",
+                   pw_stream_get_node_id (priv->pipewire_stream));
++
++      if (!(flags & META_SCREEN_CAST_RECORD_FLAG_CURSOR_ONLY))
++        {
++          int64_t retry_interval_us;
++
++          if (priv->video_format.max_framerate.num > 0)
++            retry_interval_us =
++              ((G_USEC_PER_SEC *
++                ((int64_t) priv->video_format.max_framerate.denom)) /
++               ((int64_t) priv->video_format.max_framerate.num));
++          else
++            retry_interval_us = (G_USEC_PER_SEC + 59) / 60;
++
++          retry_interval_us = MAX (retry_interval_us, (int64_t) 1000);
++          retry_interval_us = ((retry_interval_us + 999) / 1000) * 1000;
++
++          /* Mutter 652a8145 queues a source-specific follow-up here.  In
++           * 46.2, area and window follow-ups record synchronously, so keep
++           * the retry asynchronous to avoid recursion while buffers are
++           * unavailable. */
++          maybe_schedule_follow_up_frame (src, retry_interval_us);
++        }
++
+       return record_result;
+     }
+ 
+diff --git a/src/backends/meta-screen-cast-window-stream-src.c b/src/backends/meta-screen-cast-window-stream-src.c
+index 9caf7b3..3d8e417 100644
+--- a/src/backends/meta-screen-cast-window-stream-src.c
++++ b/src/backends/meta-screen-cast-window-stream-src.c
+@@ -560,9 +560,14 @@
+ static void
+ meta_screen_cast_window_stream_record_follow_up (MetaScreenCastStreamSrc *src)
+ {
++  MetaScreenCastWindowStreamSrc *window_src =
++    META_SCREEN_CAST_WINDOW_STREAM_SRC (src);
+   MetaScreenCastPaintPhase paint_phase;
+   MetaScreenCastRecordFlag flags;
+ 
++  if (!window_src->screen_cast_window)
++    return;
++
+   flags = META_SCREEN_CAST_RECORD_FLAG_NONE;
+   paint_phase = META_SCREEN_CAST_PAINT_PHASE_DETACHED;
+   meta_screen_cast_stream_src_maybe_record_frame (src, flags,
+-- 
+2.43.0

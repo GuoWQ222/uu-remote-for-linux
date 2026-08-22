@@ -1,0 +1,47 @@
+From: Codex <codex@openai.com>
+Date: Sat, 22 Aug 2026 18:07:37 +0800
+Subject: screen-cast: Run monitor MemFd capture immediately after input
+
+Monitor streams using MemFd record frames in a detached paint scheduled from
+stage_painted().  g_idle_add() uses G_PRIORITY_DEFAULT_IDLE, so ordinary main
+loop sources can starve that recording callback for hundreds of milliseconds.
+
+The previous UU Remote candidate scheduled the same one-shot callback after a
+1 ms delay at CLUTTER_PRIORITY_REDRAW + 1.  That prevents capture from
+overtaking a redraw, but a continuously ready redraw source can keep the
+coalesced callback pending and make the visible stream lag behind IME edits.
+
+Mutter's own priority design notes in src/meta/common.h say work that should
+happen immediately must use G_PRIORITY_DEFAULT, and warn that sources below
+redraw can be delayed arbitrarily while the screen updates rapidly.  Run the
+delayed callback at G_PRIORITY_DEFAULT.  It is created only after
+stage_painted() has completed, so it cannot overtake the paint that created
+it; once its 1 ms timeout becomes ready, it can be dispatched with the other
+default-priority ready sources instead of being starved by redraw.  This
+retains the existing one-shot, coalescing, and lifetime behavior.
+
+---
+ src/backends/meta-screen-cast-monitor-stream-src.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/backends/meta-screen-cast-monitor-stream-src.c b/src/backends/meta-screen-cast-monitor-stream-src.c
+index b13b25d..8cd689e 100644
+--- a/src/backends/meta-screen-cast-monitor-stream-src.c
++++ b/src/backends/meta-screen-cast-monitor-stream-src.c
+@@ -184,8 +184,12 @@ stage_painted (MetaStage        *stage,
+ 
+   if (!(record_result & META_SCREEN_CAST_RECORD_RESULT_RECORDED_FRAME))
+     {
+-      monitor_src->maybe_record_idle_id = g_idle_add (maybe_record_frame_on_idle,
+-                                                      src);
++      monitor_src->maybe_record_idle_id =
++        g_timeout_add_full (G_PRIORITY_DEFAULT,
++                            1,
++                            maybe_record_frame_on_idle,
++                            src,
++                            NULL);
+       g_source_set_name_by_id (monitor_src->maybe_record_idle_id,
+                                "[mutter] maybe_record_frame_on_idle [monitor-src]");
+     }
+-- 
+2.43.0

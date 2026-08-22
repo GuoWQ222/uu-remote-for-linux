@@ -1,0 +1,1097 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly app_id="uu-remote-for-linux"
+readonly expected_self="/usr/libexec/$app_id/uu-remote-mutter-fix-root"
+readonly production_profile="/usr/lib/$app_id/mutter/ubuntu-24.04-amd64/uuremote3"
+readonly production_state_dir="/var/lib/$app_id/mutter-fix"
+readonly production_lock="/run/$app_id/mutter-fix.lock"
+readonly system_library="/usr/lib/x86_64-linux-gnu/libmutter-14.so.0.0.0"
+readonly legacy_target_version="46.2-1ubuntu0.24.04.16+uuremote3"
+
+testing=false
+if [[ ${UU_REMOTE_MUTTER_FIX_TEST_MODE:-0} == 1 ]]; then
+    ((EUID != 0)) || {
+        printf '测试模式拒绝以 root 身份运行。\n' >&2
+        exit 77
+    }
+    [[ ${UU_REMOTE_MUTTER_FIX_TEST_ROOT:-} == /tmp/* &&
+        ${UU_REMOTE_MUTTER_FIX_TEST_BIN:-} == /tmp/* &&
+        ${UU_REMOTE_MUTTER_FIX_TEST_PROFILE:-} == /tmp/* ]] || {
+        printf '测试模式只接受 /tmp 下的隔离根目录。\n' >&2
+        exit 77
+    }
+    testing=true
+    sysroot=${UU_REMOTE_MUTTER_FIX_TEST_ROOT%/}
+    profile_dir=${UU_REMOTE_MUTTER_FIX_TEST_PROFILE%/}
+    state_dir="$sysroot/var/lib/$app_id/mutter-fix"
+    lock_file="$sysroot/run/$app_id/mutter-fix.lock"
+    library_path="$sysroot$system_library"
+    command_dir=${UU_REMOTE_MUTTER_FIX_TEST_BIN%/}
+    DPKG_QUERY="$command_dir/dpkg-query"
+    DPKG="$command_dir/dpkg"
+    DPKG_DEB="$command_dir/dpkg-deb"
+    APT_GET="$command_dir/apt-get"
+    APT_MARK="$command_dir/apt-mark"
+    SHA256SUM="$command_dir/sha256sum"
+    STAT="$command_dir/stat"
+    READLINK="$command_dir/readlink"
+    INSTALL="$command_dir/install"
+    FLOCK="$command_dir/flock"
+    PGREP="$command_dir/pgrep"
+else
+    sysroot=""
+    profile_dir=$production_profile
+    state_dir=$production_state_dir
+    lock_file=$production_lock
+    library_path=$system_library
+    DPKG_QUERY=/usr/bin/dpkg-query
+    DPKG=/usr/bin/dpkg
+    DPKG_DEB=/usr/bin/dpkg-deb
+    APT_GET=/usr/bin/apt-get
+    APT_MARK=/usr/bin/apt-mark
+    SHA256SUM=/usr/bin/sha256sum
+    STAT=/usr/bin/stat
+    READLINK=/usr/bin/readlink
+    INSTALL=/usr/bin/install
+    FLOCK=/usr/bin/flock
+    PGREP=/usr/bin/pgrep
+fi
+transaction_marker="$state_dir/transaction-started"
+readonly testing sysroot profile_dir state_dir lock_file transaction_marker
+readonly library_path
+readonly DPKG_QUERY DPKG DPKG_DEB APT_GET APT_MARK SHA256SUM STAT READLINK
+readonly INSTALL FLOCK PGREP
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+unset APT_CONFIG BASH_ENV CDPATH DEBIAN_FRONTEND DPKG_ADMINDIR DPKG_ROOT ENV
+unset LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONPATH
+IFS=$' \t\n'
+umask 022
+
+die() {
+    printf 'Mutter 修复：%s\n' "$*" >&2
+    exit 1
+}
+
+profile_value() {
+    local wanted=$1 key value found=""
+
+    [[ -r $profile_dir/profile.conf ]] || return 1
+    while IFS='=' read -r key value; do
+        case $key in
+            ''|'#'*) continue ;;
+        esac
+        [[ $key =~ ^[a-z_][a-z0-9_]*$ &&
+            $value =~ ^[A-Za-z0-9.+:_/-]+$ ]] ||
+            return 1
+        if [[ $key == "$wanted" ]]; then
+            [[ -z $found ]] || return 1
+            found=$value
+        fi
+    done <"$profile_dir/profile.conf"
+    [[ -n $found ]] || return 1
+    printf '%s\n' "$found"
+}
+
+load_profile() {
+    profile_format=$(profile_value format) || return 1
+    profile_id=$(profile_value profile_id) || return 1
+    base_version=$(profile_value base_version) || return 1
+    target_version=$(profile_value target_version) || return 1
+    base_library_sha256=$(profile_value base_library_sha256) || return 1
+    target_library_sha256=$(profile_value target_library_sha256) || return 1
+    legacy_library_sha256=$(profile_value legacy_library_sha256) || return 1
+
+    [[ $profile_format == 1 &&
+        $profile_id == ubuntu-24.04-amd64-mutter-46.2-uuremote3 &&
+        $base_version == 46.2-1ubuntu0.24.04.16 &&
+        $target_version == 46.2-1ubuntu0.24.04.16+0uuremote3 &&
+        $base_library_sha256 =~ ^[0-9a-f]{64}$ &&
+        $target_library_sha256 =~ ^[0-9a-f]{64}$ &&
+        $legacy_library_sha256 =~ ^[0-9a-f]{64}$ ]] || return 1
+
+    readonly profile_format profile_id base_version target_version
+    readonly base_library_sha256 target_library_sha256 legacy_library_sha256
+}
+
+os_release_value() {
+    local wanted=$1 key value
+
+    [[ -r $sysroot/etc/os-release ]] || return 1
+    while IFS='=' read -r key value; do
+        [[ $key == "$wanted" ]] || continue
+        value=${value#\"}
+        value=${value%\"}
+        printf '%s\n' "$value"
+        return
+    done <"$sysroot/etc/os-release"
+    return 1
+}
+
+check_platform() {
+    local os_id os_version os_codename arch
+
+    os_id=$(os_release_value ID) || return 1
+    os_version=$(os_release_value VERSION_ID) || return 1
+    os_codename=$(os_release_value VERSION_CODENAME) || return 1
+    arch=$($DPKG --print-architecture 2>/dev/null) || return 1
+    [[ $os_id == ubuntu && $os_version == 24.04 &&
+        $os_codename == noble && $arch == amd64 ]]
+}
+
+check_gnome_installation() {
+    local status
+
+    # shellcheck disable=SC2016 # dpkg-query expands this format string.
+    status=$($DPKG_QUERY -W -f='${Status}' gnome-shell 2>/dev/null) || return 1
+    [[ $status == 'install ok installed' ]]
+}
+
+check_trusted_path() {
+    local path=$1 metadata uid gid mode mode_value
+
+    [[ -e $path && ! -L $path ]] || return 1
+    metadata=$($STAT -c '%u %g %a' -- "$path") || return 1
+    read -r uid gid mode <<<"$metadata"
+    [[ $uid == 0 && $gid == 0 && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    (( (mode_value & 8#022) == 0 ))
+}
+
+validate_trusted_installation() {
+    local canonical canonical_profile path
+
+    $testing && return 0
+    canonical=$($READLINK -f -- "$0") || return 1
+    canonical_profile=$($READLINK -f -- "$profile_dir") || return 1
+    [[ $canonical == "$expected_self" ]] || return 1
+    [[ $canonical_profile == "$profile_dir" ]] || return 1
+    for path in \
+        /usr /usr/lib /usr/libexec \
+        "/usr/lib/$app_id" "/usr/lib/$app_id/mutter" \
+        "/usr/lib/$app_id/mutter/ubuntu-24.04-amd64" \
+        "/usr/libexec/$app_id" "$expected_self" "$profile_dir" \
+        "$profile_dir/packages" "$profile_dir/rollback" \
+        "$profile_dir/profile.conf" "$profile_dir/SHA256SUMS" \
+        "${target_debs[@]}" "${rollback_debs[@]}"; do
+        check_trusted_path "$path" || return 1
+    done
+}
+
+readonly packages=(
+    mutter-common
+    mutter-common-bin
+    libmutter-14-0
+    gir1.2-mutter-14
+)
+readonly package_arches=(all amd64 amd64 amd64)
+
+target_debs=()
+rollback_debs=()
+transaction_started=false
+
+load_deb_paths() {
+    local index package arch
+
+    target_debs=()
+    rollback_debs=()
+    for index in "${!packages[@]}"; do
+        package=${packages[index]}
+        arch=${package_arches[index]}
+        target_debs+=(
+            "$profile_dir/packages/${package}_${target_version}_${arch}.deb"
+        )
+        rollback_debs+=(
+            "$profile_dir/rollback/${package}_${base_version}_${arch}.deb"
+        )
+    done
+}
+
+verify_checksum_manifest() {
+    local line path count=0
+    local -A expected=() seen=()
+    local file
+
+    expected[profile.conf]=1
+    for file in "${target_debs[@]}" "${rollback_debs[@]}"; do
+        path=${file#"$profile_dir/"}
+        [[ $path != "$file" ]] || return 1
+        expected["$path"]=1
+    done
+    [[ -r $profile_dir/SHA256SUMS ]] || return 1
+    while IFS= read -r line; do
+        [[ $line =~ ^[0-9a-f]{64}[[:space:]][[:space:]](.+)$ ]] || return 1
+        path=${BASH_REMATCH[1]}
+        [[ -n ${expected[$path]+present} && -z ${seen[$path]+present} ]] ||
+            return 1
+        seen["$path"]=1
+        ((count += 1))
+    done <"$profile_dir/SHA256SUMS"
+    ((count == ${#expected[@]})) || return 1
+    for path in "${!expected[@]}"; do
+        [[ -n ${seen[$path]+present} ]] || return 1
+    done
+    (cd "$profile_dir" && $SHA256SUM --strict -c SHA256SUMS >/dev/null)
+}
+
+verify_deb_metadata() {
+    local expected_version=$1
+    shift
+    local -a files=("$@")
+    local index file package version arch depends
+
+    ((${#files[@]} == ${#packages[@]})) || return 1
+    for index in "${!packages[@]}"; do
+        file=${files[index]}
+        [[ -f $file && ! -L $file ]] || return 1
+        package=$($DPKG_DEB -f "$file" Package 2>/dev/null) || return 1
+        version=$($DPKG_DEB -f "$file" Version 2>/dev/null) || return 1
+        arch=$($DPKG_DEB -f "$file" Architecture 2>/dev/null) || return 1
+        [[ $package == "${packages[index]}" &&
+            $version == "$expected_version" &&
+            $arch == "${package_arches[index]}" ]] || return 1
+        depends=$($DPKG_DEB -f "$file" Depends 2>/dev/null) || return 1
+        case $package in
+            gir1.2-mutter-14)
+                [[ $depends == *"libmutter-14-0 (= $expected_version)"* ]] ||
+                    return 1
+                ;;
+            libmutter-14-0)
+                [[ $depends == *"mutter-common-bin (= $expected_version)"* &&
+                    $depends == *"mutter-common (>= $expected_version)"* ]] ||
+                    return 1
+                ;;
+        esac
+    done
+}
+
+verify_payload() {
+    load_profile || return 1
+    load_deb_paths
+    validate_trusted_installation || return 1
+    verify_checksum_manifest || return 1
+    verify_deb_metadata "$target_version" "${target_debs[@]}" || return 1
+    verify_deb_metadata "$base_version" "${rollback_debs[@]}" || return 1
+}
+
+package_snapshot() {
+    local index package record status version arch
+
+    installed_versions=()
+    for index in "${!packages[@]}"; do
+        package=${packages[index]}
+        # shellcheck disable=SC2016 # dpkg-query expands this format string.
+        record=$($DPKG_QUERY -W -f='${Status}\t${Version}\t${Architecture}' \
+            "$package" 2>/dev/null) || return 1
+        IFS=$'\t' read -r status version arch <<<"$record"
+        [[ $status == 'install ok installed' &&
+            $arch == "${package_arches[index]}" ]] || return 1
+        installed_versions+=("$version")
+    done
+}
+
+package_version_snapshot_relaxed() {
+    local index package record version arch
+
+    installed_versions=()
+    for index in "${!packages[@]}"; do
+        package=${packages[index]}
+        # shellcheck disable=SC2016 # dpkg-query expands this format string.
+        record=$($DPKG_QUERY -W -f='${Version}\t${Architecture}' \
+            "$package" 2>/dev/null) || return 1
+        IFS=$'\t' read -r version arch <<<"$record"
+        [[ -n $version && $arch == "${package_arches[index]}" ]] || return 1
+        installed_versions+=("$version")
+    done
+}
+
+all_installed_versions_equal() {
+    local version
+    for version in "${installed_versions[@]:1}"; do
+        [[ $version == "${installed_versions[0]}" ]] || return 1
+    done
+}
+
+installed_versions_are_recoverable() {
+    local version
+
+    for version in "${installed_versions[@]}"; do
+        case $version in
+            "$base_version"|"$target_version"|"$legacy_target_version") ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+installed_library_sha256() {
+    [[ -f $library_path ]] || return 1
+    $SHA256SUM "$library_path" | awk '{print $1}'
+}
+
+verify_preinvoke_condition() {
+    local condition=$1 version hash
+
+    package_version_snapshot_relaxed || return 1
+    hash=$(installed_library_sha256 2>/dev/null || true)
+    case $condition in
+        base)
+            all_installed_versions_equal &&
+                [[ ${installed_versions[0]} == "$base_version" &&
+                    $hash == "$base_library_sha256" ]]
+            ;;
+        public)
+            all_installed_versions_equal &&
+                [[ ${installed_versions[0]} == "$target_version" &&
+                    $hash == "$target_library_sha256" ]]
+            ;;
+        legacy)
+            all_installed_versions_equal &&
+                [[ ${installed_versions[0]} == "$legacy_target_version" &&
+                    $hash == "$legacy_library_sha256" ]]
+            ;;
+        known)
+            installed_versions_are_recoverable
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_preinstall_plan() {
+    local expected_version=$1 file expected_file package version arch index
+    local actual_hash expected_hash count=0
+    local -A seen=()
+
+    while IFS= read -r file; do
+        [[ -n $file && -f $file && ! -L $file ]] || return 1
+        package=$($DPKG_DEB -f "$file" Package 2>/dev/null) || return 1
+        version=$($DPKG_DEB -f "$file" Version 2>/dev/null) || return 1
+        arch=$($DPKG_DEB -f "$file" Architecture 2>/dev/null) || return 1
+        [[ $version == "$expected_version" && -z ${seen[$package]+present} ]] ||
+            return 1
+        for index in "${!packages[@]}"; do
+            if [[ $package == "${packages[index]}" ]]; then
+                [[ $arch == "${package_arches[index]}" ]] || return 1
+                if [[ $expected_version == "$target_version" ]]; then
+                    expected_file=${target_debs[index]}
+                else
+                    expected_file=${rollback_debs[index]}
+                fi
+                actual_hash=$($SHA256SUM "$file") || return 1
+                actual_hash=${actual_hash%% *}
+                expected_hash=$($SHA256SUM "$expected_file") || return 1
+                expected_hash=${expected_hash%% *}
+                [[ $actual_hash == "$expected_hash" ]] || return 1
+                seen["$package"]=1
+                ((count += 1))
+                break
+            fi
+        done
+        [[ -n ${seen[$package]+present} ]] || return 1
+    done
+    ((count == ${#packages[@]})) || return 1
+    for package in "${packages[@]}"; do
+        [[ -n ${seen[$package]+present} ]] || return 1
+    done
+}
+
+mark_transaction_started() {
+    [[ -d $state_dir && ! -L $state_dir && ! -L $transaction_marker ]] ||
+        return 1
+    if ! $testing; then
+        check_trusted_path "$state_dir" || return 1
+    fi
+    $INSTALL -m0600 /dev/null "$transaction_marker" || return 1
+    $testing || check_trusted_path "$transaction_marker"
+}
+
+clear_transaction_marker() {
+    [[ ! -L $transaction_marker ]] || return 1
+    /usr/bin/rm -f -- "$transaction_marker"
+}
+
+has_unsupported_multiarch() {
+    local records package status
+
+    # shellcheck disable=SC2016 # dpkg-query expands this format string.
+    records=$($DPKG_QUERY -W \
+        -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null) || return 2
+    while IFS=$'\t' read -r package status; do
+        [[ $status == ii* ]] || continue
+        case $package in
+            libmutter-14-0:amd64|gir1.2-mutter-14:amd64|libmutter-14-0|gir1.2-mutter-14) ;;
+            libmutter-14-0:*|gir1.2-mutter-14:*) return 0 ;;
+        esac
+    done <<<"$records"
+    return 1
+}
+
+packages_on_hold() {
+    local held expected
+    held=$($APT_MARK showhold 2>/dev/null) || return 2
+    for expected in "${packages[@]}"; do
+        if grep -Fxq "$expected" <<<"$held" ||
+            grep -Fxq "$expected:amd64" <<<"$held"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_running_shell_library_state() {
+    local uid pid disk_inode mapped_inode pids pgrep_status found=0
+
+    running_shell_library_state=unknown
+    uid=${PKEXEC_UID:-${SUDO_UID:-${UID:-0}}}
+    [[ $uid =~ ^[0-9]+$ ]] || return 1
+    disk_inode=$($STAT -Lc '%i' -- "$library_path" 2>/dev/null) || return 1
+    set +e
+    pids=$($PGREP -u "$uid" -x gnome-shell 2>/dev/null)
+    pgrep_status=$?
+    set -e
+    if ((pgrep_status == 1)); then
+        running_shell_library_state=absent
+        return 0
+    fi
+    ((pgrep_status == 0)) || return 1
+    while IFS= read -r pid; do
+        [[ $pid =~ ^[0-9]+$ && -r $sysroot/proc/$pid/maps ]] || continue
+        mapped_inode=$(awk -v path="$system_library" \
+            '$6 == path { print $5; exit }' "$sysroot/proc/$pid/maps")
+        [[ -n $mapped_inode ]] || continue
+        found=1
+        if [[ $mapped_inode == "$disk_inode" ]]; then
+            running_shell_library_state=current
+            return 0
+        fi
+    done <<<"$pids"
+    if ((found)); then
+        running_shell_library_state=stale
+    else
+        running_shell_library_state=unknown
+    fi
+    return 0
+}
+
+classify_state() {
+    local version library_sha compare_status
+
+    check_platform || {
+        state=unsupported-platform
+        reason=requires-ubuntu-24.04-noble-amd64
+        installed_version=unknown
+        return
+    }
+    check_gnome_installation || {
+        state=unsupported-desktop
+        reason=gnome-shell-not-installed
+        installed_version=unknown
+        return
+    }
+    package_snapshot || {
+        if package_version_snapshot_relaxed &&
+            installed_versions_are_recoverable; then
+            installed_version=mixed
+            if all_installed_versions_equal; then
+                installed_version=${installed_versions[0]}
+            fi
+            state=interrupted-known-partial
+            reason=known-mutter-transaction-interrupted-manual-recovery-required
+        else
+            state=partial
+            reason=required-package-missing-or-unconfigured
+            installed_version=mixed
+        fi
+        return
+    }
+    installed_version=mixed
+    if all_installed_versions_equal; then
+        installed_version=${installed_versions[0]}
+    fi
+    if has_unsupported_multiarch; then
+        state=unsupported-multiarch
+        reason=foreign-mutter-architecture-installed
+        return
+    elif (($? == 2)); then
+        state=health-check-failed
+        reason=multiarch-query-failed
+        return
+    fi
+    if packages_on_hold; then
+        state=held
+        reason=mutter-package-held
+        return
+    elif (($? == 2)); then
+        state=health-check-failed
+        reason=hold-query-failed
+        return
+    fi
+    if ! all_installed_versions_equal; then
+        installed_version=mixed
+        if installed_versions_are_recoverable; then
+            state=recoverable-partial
+            reason=known-mutter-versions-skewed
+        else
+            state=partial
+            reason=mutter-package-version-skew
+        fi
+        return
+    fi
+    version=${installed_versions[0]}
+    installed_version=$version
+    library_sha=$(installed_library_sha256 2>/dev/null || true)
+    if [[ $version == "$base_version" ]]; then
+        if [[ $library_sha == "$base_library_sha256" ]]; then
+            if detect_running_shell_library_state &&
+                [[ $running_shell_library_state == stale ]]; then
+                state=rolled-back-pending-logout
+                reason=official-library-installed-logout-required
+            elif [[ $running_shell_library_state == unknown ]]; then
+                state=health-check-failed
+                reason=gnome-shell-library-query-failed
+            else
+                state=eligible
+                reason=official-supported-base
+            fi
+        else
+            state=unknown-build
+            reason=base-version-library-hash-mismatch
+        fi
+    elif [[ $version == "$target_version" &&
+        $library_sha == "$target_library_sha256" ]]; then
+        if detect_running_shell_library_state &&
+            [[ $running_shell_library_state == current ]]; then
+            state=active
+            reason=patched-library-loaded
+        else
+            state=installed-pending-logout
+            reason=logout-required
+        fi
+    elif [[ $version == "$legacy_target_version" &&
+        $library_sha == "$legacy_library_sha256" ]]; then
+        if detect_running_shell_library_state &&
+            [[ $running_shell_library_state == current ]]; then
+            state=legacy-active
+            reason=legacy-patch-normalization-available
+        else
+            state=legacy-installed-pending-logout
+            reason=legacy-patch-normalization-and-logout-required
+        fi
+    elif [[ $version == "$target_version" ||
+        $version == "$legacy_target_version" ]]; then
+        state=installed-corrupt
+        reason=target-library-hash-mismatch
+    else
+        set +e
+        $DPKG --compare-versions "$version" gt "$base_version"
+        compare_status=$?
+        set -e
+        case $compare_status in
+            0)
+                state=superseded-or-unknown
+                reason=newer-or-third-party-mutter-detected
+                ;;
+            1)
+                state=unsupported-version
+                reason=unsupported-mutter-version
+                ;;
+            *)
+                state=health-check-failed
+                reason='version-comparison-failed'
+                ;;
+        esac
+    fi
+}
+
+print_machine_status() {
+    printf 'state=%s\n' "$state"
+    printf 'reason=%s\n' "$reason"
+    printf 'installed_version=%s\n' "$installed_version"
+    printf 'target_version=%s\n' "$target_version"
+    case $state in
+        installed-pending-logout|legacy-installed-pending-logout|rolled-back-pending-logout)
+            printf 'restart_required=1\n'
+            ;;
+        *) printf 'restart_required=0\n' ;;
+    esac
+}
+
+preflight_system_health() {
+    system_health_ok ||
+        die 'dpkg 或 APT 依赖状态异常，未修改系统。'
+}
+
+dpkg_audit_clean() {
+    local audit
+
+    audit=$($DPKG --audit 2>&1) || return 1
+    [[ -z $audit ]]
+}
+
+system_health_ok() {
+    dpkg_audit_clean || return 1
+    $APT_GET -s check >/dev/null 2>&1
+}
+
+preflight_recovery_health() {
+    dpkg_audit_clean ||
+        die 'dpkg 存在未完成事务，不能自动恢复；未修改系统。'
+}
+
+simulation_changed_packages() {
+    awk '/^Inst / { sub(/:.*/, "", $2); print $2 }' "$1" | sort -u
+}
+
+validate_apt_simulation() {
+    local action=$1 log=$2 expected_version=$3
+    local expected actual configured inst_count line
+
+    ! grep -q '^Remv ' "$log" || return 1
+    expected=$(printf '%s\n' "${packages[@]}" | sort -u)
+    actual=$(simulation_changed_packages "$log")
+    inst_count=$(grep -c '^Inst ' "$log" || true)
+    while IFS= read -r line; do
+        [[ $line == *"($expected_version "* || $line == *"($expected_version)"* ]] ||
+            return 1
+    done < <(grep '^Inst ' "$log" || true)
+    configured=$(awk '/^Conf / { sub(/:.*/, "", $2); print $2 }' "$log" |
+        sort -u)
+    if [[ -n $configured ]]; then
+        [[ $(comm -23 <(printf '%s\n' "$configured") \
+            <(printf '%s\n' "$expected")) == "" ]] || return 1
+    fi
+    case $action in
+        install)
+            [[ $actual == "$expected" && $inst_count == 4 ]] || return 1
+            grep -Eq '^4 upgraded, 0 newly installed, 0 to remove' "$log" ||
+                return 1
+            ! grep -q ' downgraded' "$log" || return 1
+            ;;
+        normalize|rollback)
+            [[ $actual == "$expected" && $inst_count == 4 ]] || return 1
+            grep -Eq '^0 upgraded, 0 newly installed, 4 downgraded, 0 to remove' \
+                "$log" || return 1
+            ;;
+        recovery)
+            [[ $actual == "$expected" && $inst_count == 4 ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+record_package_marks() {
+    local auto package
+    auto=$($APT_MARK showauto 2>/dev/null) || return 1
+    : >"$state_dir/package-marks"
+    for package in "${packages[@]}"; do
+        if grep -Fxq "$package" <<<"$auto" ||
+            grep -Fxq "$package:amd64" <<<"$auto"; then
+            printf 'auto\t%s\n' "$package" >>"$state_dir/package-marks"
+        else
+            printf 'manual\t%s\n' "$package" >>"$state_dir/package-marks"
+        fi
+    done
+    chmod 0600 "$state_dir/package-marks"
+}
+
+restore_package_marks() {
+    local mark package
+    [[ -r $state_dir/package-marks ]] || return 0
+    while IFS=$'\t' read -r mark package; do
+        case $mark in
+            auto) $APT_MARK auto "$package" >/dev/null || return 1 ;;
+            manual) $APT_MARK manual "$package" >/dev/null || return 1 ;;
+            *) return 1 ;;
+        esac
+    done <"$state_dir/package-marks"
+}
+
+validate_package_marks() {
+    local mark package expected seen="" count=0
+
+    [[ -r $state_dir/package-marks ]] || return 1
+    while IFS=$'\t' read -r mark package; do
+        [[ $mark == auto || $mark == manual ]] || return 1
+        case $package in
+            mutter-common|mutter-common-bin|libmutter-14-0|gir1.2-mutter-14) ;;
+            *) return 1 ;;
+        esac
+        ! grep -Fxq "$package" <<<"$seen" || return 1
+        seen+="${seen:+$'\n'}$package"
+        ((count += 1))
+    done <"$state_dir/package-marks"
+    ((count == 4)) || return 1
+    for expected in "${packages[@]}"; do
+        grep -Fxq "$expected" <<<"$seen" || return 1
+    done
+}
+
+ensure_private_state_dirs() {
+    local path parent="$sysroot/var/lib/$app_id"
+
+    if $testing; then
+        $INSTALL -d -m0700 "$state_dir" "$@"
+        return
+    fi
+    check_trusted_path /var || die '系统状态目录 /var 不可信。'
+    check_trusted_path /var/lib || die '系统状态目录 /var/lib 不可信。'
+    [[ ! -L $parent ]] || die 'UU Remote 状态目录不能是符号链接。'
+    if [[ ! -e $parent ]]; then
+        $INSTALL -d -o root -g root -m0755 "$parent"
+    fi
+    check_trusted_path "$parent" || die 'UU Remote 状态目录不可信。'
+    for path in "$state_dir" "$@"; do
+        [[ ! -L $path ]] || die 'Mutter 私有状态路径不能是符号链接。'
+    done
+    $INSTALL -d -o root -g root -m0700 "$state_dir" "$@"
+    for path in "$state_dir" "$@"; do
+        check_trusted_path "$path" || die 'Mutter 私有状态目录不可信。'
+    done
+}
+
+prepare_state_payloads() {
+    local file destination
+
+    ensure_private_state_dirs "$state_dir/packages" "$state_dir/rollback"
+    record_package_marks || die '无法读取并保存原有 apt 自动/手动标记。'
+    for file in "${target_debs[@]}"; do
+        destination="$state_dir/packages/$(basename -- "$file")"
+        $INSTALL -m0600 "$file" "$destination"
+        cmp -s -- "$file" "$destination" ||
+            die '修复包私有副本校验失败。'
+    done
+    for file in "${rollback_debs[@]}"; do
+        destination="$state_dir/rollback/$(basename -- "$file")"
+        $INSTALL -m0600 "$file" "$destination"
+        cmp -s -- "$file" "$destination" ||
+            die '回滚包缓存校验失败。'
+    done
+    (cd "$profile_dir" && $SHA256SUM --strict -c SHA256SUMS >/dev/null) ||
+        die '复制回滚包后源载荷校验失败。'
+}
+
+prepare_rollback_payloads() {
+    local file destination
+
+    ensure_private_state_dirs "$state_dir/rollback"
+    if [[ -r $state_dir/package-marks ]]; then
+        validate_package_marks || die '已保存的 apt 自动/手动标记损坏。'
+    else
+        record_package_marks || die '无法读取并保存原有 apt 自动/手动标记。'
+    fi
+    for file in "${rollback_debs[@]}"; do
+        destination="$state_dir/rollback/$(basename -- "$file")"
+        $INSTALL -m0600 "$file" "$destination"
+        cmp -s -- "$file" "$destination" ||
+            die '回滚包缓存校验失败。'
+    done
+    (cd "$profile_dir" && $SHA256SUM --strict -c SHA256SUMS >/dev/null) ||
+        die '复制回滚包后源载荷校验失败。'
+}
+
+run_apt_transaction() {
+    local action=$1
+    local precondition=$2
+    shift 2
+    local -a files=("$@") command
+    local expected_version apt_status marker_seen=false
+    local simulation_log="$state_dir/${action}-simulation.log"
+    local transaction_log="$state_dir/${action}.log"
+
+    transaction_started=false
+
+    if [[ $action == install || $action == normalize ]]; then
+        expected_version=$target_version
+    else
+        expected_version=$base_version
+    fi
+    command=("$APT_GET" -s --no-install-recommends --no-remove
+        -o "DPkg::Pre-Invoke::=$expected_self preinvoke-$precondition"
+        -o "DPkg::Pre-Install-Pkgs::=$expected_self preinstall-$expected_version")
+    [[ $action == normalize || $action == rollback || $action == recovery ]] &&
+        command+=(--allow-downgrades)
+    [[ $action == recovery ]] && command+=(--reinstall)
+    command+=(install "${files[@]}")
+    if ! "${command[@]}" >"$simulation_log" 2>&1; then
+        printf 'APT %s 模拟失败，未修改系统。\n' "$action" >&2
+        return 1
+    fi
+    if ! validate_apt_simulation "$action" "$simulation_log" \
+        "$expected_version"; then
+        printf 'APT %s 模拟包含预期外的软件包变化，未修改系统。\n' \
+            "$action" >&2
+        return 1
+    fi
+
+    command=("$APT_GET" -y --no-install-recommends --no-remove
+        -o "DPkg::Pre-Invoke::=$expected_self preinvoke-$precondition"
+        -o "DPkg::Pre-Install-Pkgs::=$expected_self preinstall-$expected_version")
+    [[ $action == normalize || $action == rollback || $action == recovery ]] &&
+        command+=(--allow-downgrades)
+    [[ $action == recovery ]] && command+=(--reinstall)
+    command+=(install "${files[@]}")
+    clear_transaction_marker || return 1
+    set +e
+    "${command[@]}" >"$transaction_log" 2>&1
+    apt_status=$?
+    set -e
+    if [[ -f $transaction_marker ]]; then
+        marker_seen=true
+        transaction_started=true
+    fi
+    clear_transaction_marker || {
+        transaction_started=$marker_seen
+        return 1
+    }
+    if ! $marker_seen; then
+        # DPkg::Pre-Install-Pkgs runs before dpkg is allowed to write.  If the
+        # earlier Pre-Invoke assertion rejected a concurrent state change, the
+        # marker is absent and this transaction must not roll that change back.
+        transaction_started=false
+        ((apt_status != 0)) || return 1
+    elif ((apt_status != 0)) && [[ $precondition != known ]] &&
+        verify_preinvoke_condition "$precondition" && system_health_ok; then
+        # The plan reached the pre-install hook, but APT failed before changing
+        # the exact healthy starting state.  Recovery would be an unnecessary
+        # and potentially surprising system mutation.
+        transaction_started=false
+    fi
+    return "$apt_status"
+}
+
+verify_installed_version_and_hash() {
+    local expected_version=$1 expected_hash=$2 version hash
+
+    package_snapshot && all_installed_versions_equal || return 1
+    version=${installed_versions[0]}
+    hash=$(installed_library_sha256 2>/dev/null || true)
+    [[ $version == "$expected_version" && $hash == "$expected_hash" ]]
+}
+
+write_result_state() {
+    local action=$1 version=$2 temp
+    temp="$state_dir/state.tmp.$$"
+    {
+        printf 'profile=%s\n' "$profile_id"
+        printf 'action=%s\n' "$action"
+        printf 'version=%s\n' "$version"
+        printf 'completed_at=%(%FT%T%z)T\n' -1
+    } >"$temp"
+    chmod 0600 "$temp"
+    mv -f -- "$temp" "$state_dir/state"
+}
+
+recover_official_packages() {
+    local -a cached_rollback=("$@")
+
+    if ! verify_installed_version_and_hash "$base_version" \
+        "$base_library_sha256"; then
+        run_apt_transaction recovery known "${cached_rollback[@]}" || return 1
+    fi
+    verify_installed_version_and_hash "$base_version" \
+        "$base_library_sha256" || return 1
+    system_health_ok || return 1
+    restore_package_marks || return 1
+    write_result_state recovery "$base_version"
+}
+
+abort_and_recover() {
+    local message=$1
+    shift
+
+    printf '%s，正在恢复已校验的 Ubuntu 官方包。\n' "$message" >&2
+    if recover_official_packages "$@"; then
+        die "$message；已恢复 Ubuntu 官方包。"
+    fi
+    die "$message；自动恢复未完成，请查看 $state_dir 中的日志。"
+}
+
+install_fix() {
+    local target_file rollback_file transaction_action=install
+    local transaction_precondition=base
+    local -a cached_target=()
+    local -a cached_rollback=()
+
+    case $state in
+        eligible|rolled-back-pending-logout) ;;
+        legacy-active|legacy-installed-pending-logout)
+            transaction_action=normalize
+            transaction_precondition=legacy
+            ;;
+        active|installed-pending-logout)
+                printf 'Mutter 修复已经安装；请注销并重新登录 Wayland 会话。\n'
+                return
+            ;;
+        *) die "当前状态 $state 不允许安装：$reason" ;;
+    esac
+    preflight_system_health
+    prepare_state_payloads
+    for target_file in "${target_debs[@]}"; do
+        cached_target+=("$state_dir/packages/$(basename -- "$target_file")")
+    done
+    for rollback_file in "${rollback_debs[@]}"; do
+        cached_rollback+=("$state_dir/rollback/$(basename -- "$rollback_file")")
+    done
+    if ! { run_apt_transaction "$transaction_action" \
+        "$transaction_precondition" "${cached_target[@]}" &&
+        verify_installed_version_and_hash "$target_version" \
+            "$target_library_sha256" &&
+        system_health_ok &&
+        restore_package_marks; }; then
+        if ! $transaction_started; then
+            die 'Mutter 修复安装计划未通过安全门禁；系统未被修改。'
+        fi
+        abort_and_recover 'Mutter 修复安装或安装后校验失败' \
+            "${cached_rollback[@]}"
+    fi
+    write_result_state install "$target_version"
+    printf 'Mutter 低延迟修复已安装。请保存工作并注销，再重新登录 Wayland。\n'
+}
+
+rollback_fix() {
+    local file transaction_action=rollback transaction_precondition=known
+    local -a cached_rollback=()
+
+    case $state in
+        active|installed-pending-logout)
+            transaction_precondition=public
+            ;;
+        legacy-active|legacy-installed-pending-logout)
+            transaction_precondition=legacy
+            ;;
+        installed-corrupt|recoverable-partial|unknown-build)
+            transaction_action=recovery
+            ;;
+        eligible|rolled-back-pending-logout)
+            printf 'Ubuntu 官方 Mutter 已在磁盘上；若刚回滚，请注销并重新登录 Wayland。\n'
+            return
+            ;;
+        *) die "当前状态 $state 不允许回滚：$reason" ;;
+    esac
+    preflight_recovery_health
+    prepare_rollback_payloads
+    for file in "${rollback_debs[@]}"; do
+        cached_rollback+=("$state_dir/rollback/$(basename -- "$file")")
+    done
+    if ! { run_apt_transaction "$transaction_action" \
+        "$transaction_precondition" "${cached_rollback[@]}" &&
+        verify_installed_version_and_hash "$base_version" \
+            "$base_library_sha256" &&
+        system_health_ok &&
+        restore_package_marks; }; then
+        if ! $transaction_started; then
+            die 'Ubuntu 官方 Mutter 回滚计划未通过安全门禁；系统未被修改。'
+        fi
+        abort_and_recover 'Ubuntu 官方 Mutter 回滚或回滚后校验失败' \
+            "${cached_rollback[@]}"
+    fi
+    write_result_state rollback "$base_version"
+    printf 'Ubuntu 官方 Mutter 已恢复。请保存工作并注销，再重新登录 Wayland。\n'
+}
+
+usage() {
+    printf '用法：%s status|install|rollback\n' "${0##*/}"
+}
+
+(($# == 1)) || {
+    usage >&2
+    exit 64
+}
+action=$1
+case $action in
+    preinstall-*)
+        if ! $testing; then
+            ((EUID == 0)) || die 'APT 实际安装计划断言只能由 root 执行。'
+        fi
+        verify_payload || die 'APT 实际安装计划断言无法验证固定载荷。'
+        preinstall_version=${action#preinstall-}
+        [[ $preinstall_version == "$base_version" ||
+            $preinstall_version == "$target_version" ]] ||
+            die 'APT 实际安装计划断言版本不受支持。'
+        verify_preinstall_plan "$preinstall_version" ||
+            die 'APT 实际安装计划不再是精确四个 Mutter 包；拒绝修改。'
+        mark_transaction_started ||
+            die '无法建立受保护的 Mutter 事务写入标记；拒绝修改。'
+        exit 0
+        ;;
+esac
+case $action in
+    preinvoke-base|preinvoke-public|preinvoke-legacy|preinvoke-known)
+        if ! $testing; then
+            ((EUID == 0)) || die 'APT 前置版本断言只能由 root 执行。'
+        fi
+        verify_payload || die 'APT 前置断言无法验证固定载荷。'
+        preinvoke_condition=${action#preinvoke-}
+        verify_preinvoke_condition "$preinvoke_condition" ||
+            die 'APT 获得系统锁后检测到 Mutter 状态变化；拒绝修改。'
+        if [[ $preinvoke_condition != known ]]; then
+            dpkg_audit_clean ||
+                die 'APT 获得系统锁后检测到未完成的 dpkg 事务；拒绝修改。'
+        fi
+        if has_unsupported_multiarch; then
+            die 'APT 获得系统锁后检测到不受支持的 Mutter 多架构包。'
+        elif (($? == 2)); then
+            die 'APT 获得系统锁后无法复核 Mutter 多架构状态。'
+        fi
+        if packages_on_hold; then
+            die 'APT 获得系统锁后检测到 Mutter 软件包被 hold。'
+        elif (($? == 2)); then
+            die 'APT 获得系统锁后无法复核 Mutter hold 状态。'
+        fi
+        exit 0
+        ;;
+esac
+case $action in
+    status|install|rollback) ;;
+    *) usage >&2; exit 64 ;;
+esac
+
+if [[ $action == status ]]; then
+    verify_payload || {
+        printf 'state=payload-corrupt\nreason=payload-or-ownership-validation-failed\n'
+        printf 'installed_version=unknown\ntarget_version=unknown\nrestart_required=0\n'
+        exit 2
+    }
+    classify_state
+    print_machine_status
+    exit 0
+fi
+
+if ! $testing; then
+    ((EUID == 0)) || die '安装和回滚只能通过受信任的 pkexec 入口运行。'
+fi
+lock_dir=${lock_file%/*}
+if $testing; then
+    $INSTALL -d -m0700 "$lock_dir"
+else
+    check_trusted_path /run || die '运行时目录 /run 不可信。'
+    if [[ ! -e $lock_dir ]]; then
+        $INSTALL -d -o root -g root -m0700 "$lock_dir"
+    fi
+    check_trusted_path "$lock_dir" || die 'Mutter 修复锁目录不可信。'
+fi
+[[ ! -L $lock_file ]] || die 'Mutter 修复锁文件不能是符号链接。'
+if [[ -e $lock_file ]]; then
+    [[ -f $lock_file ]] || die 'Mutter 修复锁路径不是普通文件。'
+    $testing || check_trusted_path "$lock_file" ||
+        die 'Mutter 修复锁文件不可信。'
+fi
+exec 9<>"$lock_file"
+$testing || {
+    chmod 0600 "$lock_file"
+    check_trusted_path "$lock_file" || die '无法保护 Mutter 修复锁文件。'
+}
+$FLOCK -n 9 || die '另一个 Mutter 修复事务正在运行。'
+
+# The payload and package state must be read again after taking the mutation
+# lock.  Otherwise a second process could act on a pre-lock eligible snapshot
+# after the first process has already completed an install or rollback.
+verify_payload ||
+    die '修复载荷、元数据、哈希或 root 所有权校验失败。'
+classify_state
+
+case $action in
+    install) install_fix ;;
+    rollback) rollback_fix ;;
+esac

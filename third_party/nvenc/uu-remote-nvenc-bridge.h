@@ -75,6 +75,29 @@ typedef int uu_CUdevice;
 typedef struct CUctx_st *uu_CUcontext;
 typedef uint64_t uu_CUdeviceptr;
 
+struct uu_CUDA_MEMCPY2D
+{
+    size_t srcXInBytes;
+    size_t srcY;
+    unsigned int srcMemoryType;
+    const void *srcHost;
+    uu_CUdeviceptr srcDevice;
+    void *srcArray;
+    size_t srcPitch;
+    size_t dstXInBytes;
+    size_t dstY;
+    unsigned int dstMemoryType;
+    void *dstHost;
+    uu_CUdeviceptr dstDevice;
+    void *dstArray;
+    size_t dstPitch;
+    size_t WidthInBytes;
+    size_t Height;
+};
+
+#define UU_CU_MEMORYTYPE_HOST 1u
+#define UU_CU_MEMORYTYPE_DEVICE 2u
+
 struct uu_nvenc_encoder;
 
 struct uu_nvenc_resource
@@ -118,6 +141,7 @@ static uint64_t uu_encode_matches;
 static uint64_t uu_encode_uploads;
 static uint64_t uu_unmap_calls;
 static uint64_t uu_upload_calls;
+static uint64_t uu_upload_2d_calls;
 static uint64_t uu_upload_hash_changes;
 static uint64_t uu_last_upload_hash;
 
@@ -131,7 +155,7 @@ static uu_CUresult (*uu_cuCtxPopCurrent)(uu_CUcontext *);
 static uu_CUresult (*uu_cuMemAllocPitch)(uu_CUdeviceptr *, size_t *, size_t,
                                          size_t, unsigned int);
 static uu_CUresult (*uu_cuMemFree)(uu_CUdeviceptr);
-static uu_CUresult (*uu_cuMemcpyHtoD)(uu_CUdeviceptr, const void *, size_t);
+static uu_CUresult (*uu_cuMemcpy2D)(const struct uu_CUDA_MEMCPY2D *);
 
 static void uu_free_resource(struct uu_nvenc_resource *resource);
 static NVENCSTATUS uu_upload_d3d11_resource_locked(
@@ -150,7 +174,7 @@ static void uu_write_bridge_status(void)
              (unsigned long)getpid());
     length = snprintf(
         status, sizeof(status),
-        "version=2\n"
+        "version=3\n"
         "pid=%lu\n"
         "map_calls=%llu\n"
         "map_matches=%llu\n"
@@ -159,6 +183,7 @@ static void uu_write_bridge_status(void)
         "encode_uploads=%llu\n"
         "unmap_calls=%llu\n"
         "upload_calls=%llu\n"
+        "upload_2d_calls=%llu\n"
         "upload_hash_changes=%llu\n"
         "last_upload_hash=%016llx\n",
         (unsigned long)getpid(),
@@ -169,6 +194,8 @@ static void uu_write_bridge_status(void)
         (unsigned long long)__atomic_load_n(&uu_encode_uploads, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&uu_unmap_calls, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&uu_upload_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(
+            &uu_upload_2d_calls, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(
             &uu_upload_hash_changes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(
@@ -260,8 +287,8 @@ static BOOL uu_remote_load_cuda(void)
                                  "cuMemAllocPitch_v2") &&
              uu_load_cuda_symbol(handle, (void **)&uu_cuMemFree,
                                  "cuMemFree_v2") &&
-             uu_load_cuda_symbol(handle, (void **)&uu_cuMemcpyHtoD,
-                                 "cuMemcpyHtoD_v2");
+             uu_load_cuda_symbol(handle, (void **)&uu_cuMemcpy2D,
+                                 "cuMemcpy2D_v2");
     if (loaded)
     {
         /* Publish the handle only after every function pointer is valid. */
@@ -278,7 +305,7 @@ static BOOL uu_remote_load_cuda(void)
         uu_cuCtxPopCurrent = NULL;
         uu_cuMemAllocPitch = NULL;
         uu_cuMemFree = NULL;
-        uu_cuMemcpyHtoD = NULL;
+        uu_cuMemcpy2D = NULL;
         dlclose(handle);
     }
 
@@ -502,8 +529,9 @@ static NVENCSTATUS uu_unmap_input_resource(
     struct uu_nvenc_encoder *encoder = uu_lock_encoder(encoder_handle, &bridged);
     struct uu_nvenc_resource *bridge_resource;
     NVENCSTATUS status;
+    uint64_t calls;
 
-    __atomic_add_fetch(&uu_unmap_calls, 1u, __ATOMIC_RELAXED);
+    calls = __atomic_add_fetch(&uu_unmap_calls, 1u, __ATOMIC_RELAXED);
 
     if (!encoder)
         return bridged ? UU_NV_ENC_ERR_INVALID_DEVICE :
@@ -523,7 +551,8 @@ static NVENCSTATUS uu_unmap_input_resource(
         bridge_resource->upload_fresh = FALSE;
     }
     uu_unlock_encoder(encoder);
-    uu_write_bridge_status();
+    if (calls == 1u || calls % 120u == 0u)
+        uu_write_bridge_status();
     return status;
 }
 
@@ -576,9 +605,9 @@ static NVENCSTATUS uu_upload_d3d11_resource_locked(
     ID3D11Device *device = NULL;
     ID3D11DeviceContext *context = NULL;
     D3D11_MAPPED_SUBRESOURCE mapped;
+    struct uu_CUDA_MEMCPY2D copy;
     NVENCSTATUS status = UU_NV_ENC_ERR_GENERIC;
     HRESULT hr;
-    uint32_t row;
     uint64_t upload_hash;
     uint64_t previous_hash;
 
@@ -616,20 +645,18 @@ static NVENCSTATUS uu_upload_d3d11_resource_locked(
     if (previous_hash && previous_hash != upload_hash)
         __atomic_add_fetch(
             &uu_upload_hash_changes, 1u, __ATOMIC_RELAXED);
-    status = NV_ENC_SUCCESS;
-    for (row = 0; row < resource->rows; ++row)
-    {
-        const BYTE *source = (const BYTE *)mapped.pData +
-                             (size_t)row * mapped.RowPitch;
-        uu_CUdeviceptr destination = resource->cuda_memory +
-                                     (size_t)row * resource->cuda_pitch;
-        if (uu_cuMemcpyHtoD(destination, source, resource->row_bytes) !=
-            UU_CUDA_SUCCESS)
-        {
-            status = UU_NV_ENC_ERR_MAP_FAILED;
-            break;
-        }
-    }
+    memset(&copy, 0, sizeof(copy));
+    copy.srcMemoryType = UU_CU_MEMORYTYPE_HOST;
+    copy.srcHost = mapped.pData;
+    copy.srcPitch = mapped.RowPitch;
+    copy.dstMemoryType = UU_CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = resource->cuda_memory;
+    copy.dstPitch = resource->cuda_pitch;
+    copy.WidthInBytes = resource->row_bytes;
+    copy.Height = resource->rows;
+    __atomic_add_fetch(&uu_upload_2d_calls, 1u, __ATOMIC_RELAXED);
+    status = uu_cuMemcpy2D(&copy) == UU_CUDA_SUCCESS ?
+        NV_ENC_SUCCESS : UU_NV_ENC_ERR_MAP_FAILED;
     uu_pop_encoder();
 
 unmap:
@@ -842,8 +869,9 @@ static NVENCSTATUS uu_upload_and_map_resource(
     struct uu_nvenc_resource *resource;
     NV_ENC_MAP_INPUT_RESOURCE native_params;
     NVENCSTATUS status = UU_NV_ENC_ERR_GENERIC;
+    uint64_t calls;
 
-    __atomic_add_fetch(&uu_map_calls, 1u, __ATOMIC_RELAXED);
+    calls = __atomic_add_fetch(&uu_map_calls, 1u, __ATOMIC_RELAXED);
 
     if (!params)
         return NV_ENC_ERR_INVALID_PTR;
@@ -881,7 +909,8 @@ static NVENCSTATUS uu_upload_and_map_resource(
     }
 done:
     uu_unlock_encoder(encoder);
-    uu_write_bridge_status();
+    if (calls == 1u || calls % 120u == 0u)
+        uu_write_bridge_status();
     return status;
 }
 

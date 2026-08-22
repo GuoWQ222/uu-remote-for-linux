@@ -47,9 +47,53 @@
 2. Install and launch:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.29_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.32_amd64.deb
    uu-remote-for-linux
    ```
+
+3. On Ubuntu 24.04 GNOME Wayland, explicitly enable the bundled low-latency
+   capture repair:
+
+   ```bash
+   /usr/bin/uu-remote-for-linux --mutter-fix-status
+   /usr/bin/uu-remote-for-linux --install-mutter-fix
+   ```
+
+   The manager accepts only the exact Noble amd64 Mutter 46.2 baseline and
+   rechecks all four packages, SHA256 digests, and the APT transaction plan.
+   Success means APT has both unpacked and configured all four packages; an
+   unpack-only result is an interrupted transaction that must be recovered
+   before logout. Save your work and log out/in after success. Installing or
+   removing UU itself never replaces, pins, or rolls back Mutter automatically.
+   Before removing UU, run `--rollback-mutter-fix` if desired. Verified
+   recovery packages remain under
+   `/var/lib/uu-remote-for-linux/mutter-fix/rollback/` so uninstalling the
+   wrapper cannot remove the rescue material.
+   If GNOME Wayland cannot start, recover from a TTY or SSH session with:
+
+   ```bash
+   sudo /usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root rollback
+   ```
+
+   The direct command below is an emergency path only when the manager reports
+   `interrupted-known-partial` and every one of the four installed versions is
+   one of the exact `.16`, `+0uuremote3`, or diagnostic `+uuremote3` versions.
+   This also covers that known state after UU itself has been removed. If any
+   package is `.17` or another unknown/newer version, do **not** run this
+   downgrade; finish the Ubuntu repository upgrade instead. The paths are
+   intentionally written out without a user-shell glob:
+
+   ```bash
+   sudo apt-get --allow-downgrades --reinstall --no-remove install \
+     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common_46.2-1ubuntu0.24.04.16_all.deb \
+     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common-bin_46.2-1ubuntu0.24.04.16_amd64.deb \
+     /var/lib/uu-remote-for-linux/mutter-fix/rollback/libmutter-14-0_46.2-1ubuntu0.24.04.16_amd64.deb \
+     /var/lib/uu-remote-for-linux/mutter-fix/rollback/gir1.2-mutter-14_46.2-1ubuntu0.24.04.16_amd64.deb
+   ```
+
+   Log out and back in after recovery. If those cached files do not exist,
+   reinstall the matching UU `.deb` first; its maintainer scripts still do not
+   alter Mutter, but they restore the fixed-path recovery helper and payload.
 
 On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the isolated client and WebView2. Rejecting it leaves the client uninstalled.
 
@@ -67,6 +111,9 @@ cd uu-remote-for-linux
 ./scripts/install-user.sh
 ~/.local/bin/uu-remote-for-linux
 ```
+
+A user-writable source installation cannot safely provide a privileged Mutter
+manager. That feature is available only from the root-owned system `.deb`.
 
 </details>
 
@@ -91,7 +138,7 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 | Area | Backend | Status | Notes |
 |---|---|---:|---|
 | Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
-| Desktop | GNOME Wayland Portal | ✅ | XWayland UI; Portal input and PipeWire capture |
+| Desktop | GNOME Wayland Portal | ✅ | XWayland UI; Portal input and PipeWire capture; Noble latency repair is explicit |
 | Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |
 | Decode | NVIDIA NVDEC | 🧪 | Experimental; UU menu up to 4K/144 fps |
 | Encode | NVIDIA NVENC | ✅ | H.264/HEVC, enabled only after validation |
@@ -113,6 +160,9 @@ uu-remote-for-linux --diagnose
 uu-remote-for-linux --repair
 uu-remote-for-linux --stop
 uu-remote-for-linux --check-update
+/usr/bin/uu-remote-for-linux --mutter-fix-status
+/usr/bin/uu-remote-for-linux --install-mutter-fix
+/usr/bin/uu-remote-for-linux --rollback-mutter-fix
 
 # Decoder
 uu-remote-for-linux --select-decoder
@@ -129,4 +179,4 @@ uu-remote-for-linux --disable-hwencode
 <a id="license"></a>
 ## 📄 License
 
-Original project code uses the [Zero-Clause BSD license](LICENSE). Optional components retain their own licenses; revisions, source links, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).
+Original project code uses the [Zero-Clause BSD license](LICENSE). Optional components retain their own licenses; revisions, corresponding source, build notes, and checksums are listed in [NOTICE.md](NOTICE.md), [third_party/HWDECODE.md](third_party/HWDECODE.md), and [packaging/mutter/README.md](packaging/mutter/README.md).
