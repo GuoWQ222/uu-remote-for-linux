@@ -16,10 +16,6 @@
 > [!IMPORTANT]
 > This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries.
 
-## ⚠️ Known Issues
-
-Ubuntu Wayland still has several stability issues. We will accelerate fixes in future releases.
-
 ## 🗺️ Contents
 
 - [✨ Highlights](#highlights)
@@ -39,39 +35,17 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
 | 🎬 | Hardware video | Supports CPU/OpenH264, NVIDIA NVDEC, and NVENC H.264/HEVC |
 | 🧭 | Linux desktop | Native tray and all UU Remote settings |
 
-> [!NOTE]
-> Version-specific codec, portrait-quality, and WOL changes are applied only after unique semantic fingerprint, hash, and runtime validation. For releases newer than the verified 4.38 baseline, an update that cannot rebuild every enabled adaptation is rejected and rolled back to the last complete client; older releases retain the documented safe fallbacks.
-
 <a id="install"></a>
 ## 🚀 Install
 
-**Tested environment:** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 or GNOME Wayland
+[Download the latest Debian package](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest), then install it on X11 or GNOME Wayland:
 
-1. Download the universal Debian package from
-   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
-   No repository or archive key is required.
+```bash
+sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
+uu-remote-for-linux
+```
 
-2. Install it directly on either X11 or GNOME Wayland:
-
-   ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
-   ```
-
-   The package currently targets the **amd64 CPU architecture**. X11 and
-   Wayland are display-session backends, not CPU architectures; the launcher
-   detects the live session and selects XTest or Portal plus the bundled native
-   PipeWire/EGL DMA-BUF helper automatically. The Wayland capture path keeps
-   fixed three-buffer and three-staging pools. No compositor package is
-   replaced, patched, pinned, or downgraded. A logout is not required; restart
-   UU after upgrading an already running installation.
-
-   After migrating from the old `1.1.34` signed repository, remove its unused
-   bootstrap package if it is installed:
-
-   ```bash
-   sudo apt remove uu-remote-for-linux-archive-keyring
-   ```
-On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the isolated client and WebView2. Rejecting it leaves the client uninstalled.
+No repository or archive key is required. On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the client and WebView2.
 
 > [!TIP]
 > Terminal-only setup: `uu-remote-for-linux --accept-eula --setup-only`
@@ -109,6 +83,9 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 
 | Area | Backend | Status | Notes |
 |---|---|---:|---|
+| System | Ubuntu 24.04 | ✅ | Supported distribution |
+| CPU | amd64 / x86_64 | ✅ | Architecture of the published Debian package |
+| Runtime | Wine 11.1+ | ✅ | Required Wine version |
 | Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
 | Desktop | GNOME Wayland Portal | ✅ | XWayland UI and Portal input; native three-buffer PipeWire DMA-BUF capture, with explicit failure instead of a hidden transport fallback |
 | Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |

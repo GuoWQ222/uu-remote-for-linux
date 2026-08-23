@@ -16,10 +16,6 @@
 > [!IMPORTANT]
 > 这是非官方 Linux 兼容包装层，不分发网易专有安装程序或客户端二进制文件。
 
-## ⚠️ 已知问题
-
-Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快修复。
-
 ## 🗺️ 目录
 
 - [✨ 功能亮点](#highlights)
@@ -39,37 +35,17 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 | 🎬 | 硬件编解码 | 支持 CPU/OpenH264、NVIDIA NVDEC 与 NVENC H.264/HEVC |
 | 🧭 | Linux 桌面 | 原生托盘以及 UU 远程的所有设置功能 |
 
-> [!NOTE]
-> 版本相关的编解码、竖屏原画与 WOL 改动仅在唯一语义指纹、哈希和运行验证通过后部署。对高于已验证 4.38 基线的新版本，若任一已启用的兼容功能无法自动重建，更新会被拒绝并回滚到上一个完整版本；旧版本仍保留文档中的安全回退。
-
 <a id="install"></a>
 ## 🚀 安装
 
-**已验证环境：** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 或 GNOME Wayland
+[下载最新 Debian 安装包](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)，然后在 X11 或 GNOME Wayland 中直接安装：
 
-1. 从
-   [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
-   下载统一的 Debian 安装包。无需添加软件源或安装公钥。
+```bash
+sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
+uu-remote-for-linux
+```
 
-2. 无论当前使用 X11 还是 GNOME Wayland，都直接安装同一个包：
-
-   ```bash
-   sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
-   ```
-
-   安装包当前面向 **amd64 CPU 架构**。X11/Wayland 是显示会话后端，不是
-   CPU 架构；启动器会读取实际用户会话并自动选择 XTest，或 Portal 加自带的
-   PipeWire/EGL DMA-BUF 原生辅助进程。Wayland 路径的 PipeWire 与 staging
-   均固定三缓冲。
-   安装不会替换、修改、锁定或降级桌面合成器的软件包，也不需要注销；若升级时
-   UU 正在运行，安装后重启 UU 即可。
-
-   从旧的 `1.1.34` 签名源迁移后，可移除不再使用的引导包：
-
-   ```bash
-   sudo apt remove uu-remote-for-linux-archive-keyring
-   ```
-首次启动时，接受网易[官方协议](https://uuyc.163.com/contact/20240402/40294_1146065.html)即可安装独立客户端与 WebView2；拒绝后不会安装客户端。
+无需添加软件源或安装公钥。首次启动时，接受网易[官方协议](https://uuyc.163.com/contact/20240402/40294_1146065.html)即可安装客户端与 WebView2。
 
 > [!TIP]
 > 纯终端安装：`uu-remote-for-linux --accept-eula --setup-only`
@@ -107,6 +83,9 @@ cd uu-remote-for-linux
 
 | 范围 | 后端 | 状态 | 说明 |
 |---|---|---:|---|
+| 系统 | Ubuntu 24.04 | ✅ | 支持的发行版 |
+| CPU | amd64 / x86_64 | ✅ | 当前发布的 Debian 包架构 |
+| 运行环境 | Wine 11.1+ | ✅ | 所需 Wine 版本 |
 | 桌面 | X11 + XTest | ✅ | 原生输入与现有 UU 采集路径 |
 | 桌面 | GNOME Wayland Portal | ✅ | XWayland 界面、Portal 输入；PipeWire DMA-BUF 原生三缓冲采集，不可用时明确失败而不静默切换传输 |
 | 解码 | CPU / OpenH264 | ✅ | 安全回退，最高 1080p/60 fps |
