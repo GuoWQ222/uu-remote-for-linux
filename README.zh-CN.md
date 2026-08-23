@@ -54,7 +54,7 @@ uu-remote-for-linux
 <summary><strong>🧱 从源码安装</strong></summary>
 
 ```bash
-sudo apt install python3-gi zenity libpipewire-0.3-0 libegl1 libgles2
+sudo apt install ca-certificates curl osslsigncode python3-gi zenity libpipewire-0.3-0 libegl1 libgles2
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh

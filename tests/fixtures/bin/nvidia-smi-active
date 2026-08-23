@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = pmon ]; then
+    cat <<'EOF'
+# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command
+# Idx           #    C/G      %      %      %      %      %      %    name
+    0       1234   C+G      -      -     37      -      -      -    GameViewerServe
+EOF
+    exit 0
+fi
+
+exit 1

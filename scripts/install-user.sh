@@ -35,9 +35,6 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" &&
-    -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" &&
-    -r "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv" &&
-    -r "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
@@ -108,12 +105,6 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
 install -Dm0644 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" \
     "$runtime_target/uu-remote-nvenc-d3d11-probe.exe"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
-    "$runtime_target/update-compatibility.tsv"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv" \
-    "$runtime_target/wol-compatibility.tsv"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" \
-    "$runtime_target/hwdecode-compatibility.tsv"
 mkdir -p "$runtime_target/hwdecode"
 cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
     "$runtime_target/hwdecode/"

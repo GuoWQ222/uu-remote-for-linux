@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [1.1.42] - 2026-08-23
 
+- Remove all shipped UU version/RVA/hash compatibility tables. NVDEC and WOL
+  profiles are now derived from each installed official binary, hash-bound,
+  and can migrate a legacy patched install only from its verified original
+  backup. NVENC/portrait requirements follow the detected object layout rather
+  than a version cutoff; optional codec failures retain CPU/OpenH264 fallbacks.
+- Require HTTPS-only redirects plus a trusted Authenticode chain and the
+  NetEase publisher identity before caching or executing an official installer.
+  Keep the core runtime-import contract fail-closed and preserve transactional
+  rollback for an incompatible update.
+- Close the launcher operation-lock descriptor before NVDEC Wine probes so a
+  stuck child cannot keep setup/update operations locked.
+- Detect active `GameViewerServer` NVENC usage through NVIDIA process telemetry
+  when current UU releases write binary `.slog` files instead of legacy text
+  encoder logs, avoiding a false "not verified" diagnostic.
+
 - Unify the X11 and GNOME Wayland downloads into one complete
   `uu-remote-for-linux` amd64 Debian package. The launcher selects the XTest or
   Portal/DMA-BUF backend from the actual user session at runtime instead of

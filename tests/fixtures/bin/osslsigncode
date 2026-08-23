@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'OSSLSIGNCODE %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
+[[ ${1:-} == verify ]]
+
+input=""
+ca_file=""
+shift
+while (($# > 0)); do
+    case $1 in
+        -in)
+            shift
+            input=${1:?}
+            ;;
+        -CAfile)
+            shift
+            ca_file=${1:?}
+            ;;
+    esac
+    shift
+done
+
+[[ -f $input && -r $ca_file ]]
+if [[ ${UU_REMOTE_FAKE_SIGNATURE_FAILURE:-0} == 1 ]]; then
+    printf 'Signature verification: failed\n' >&2
+    exit 1
+fi
+if [[ ${UU_REMOTE_FAKE_SIGNATURE_WRONG_PUBLISHER:-0} == 1 ]]; then
+    printf '%s\n' \
+        "Signer's certificate:" \
+        '    Signer #0:' \
+        '        Subject: /O=Unrelated Publisher Ltd/CN=Unrelated Publisher Ltd' \
+        'URL description: NetEase (Hangzhou) Network Co., Ltd' \
+        'Signature verification: ok'
+    exit 0
+fi
+printf '%s\n' \
+    "Signer's certificate:" \
+    '    Signer #0:' \
+    '        Subject: /O=NetEase (Hangzhou) Network Co., Ltd/CN=NetEase (Hangzhou) Network Co., Ltd' \
+    'Signature verification: ok'

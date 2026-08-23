@@ -26,20 +26,16 @@ under Wine, while implementation 33 is NVDEC. Because DXVK does not implement
 the D3D11 video-decoder interfaces used by this probe, the parent process must
 select and record implementation 33 for the capability result to be usable.
 
-The launcher applies two version-locked three-byte edits to the user's
-installed `streamer.dll`:
+Early releases carried version-locked offsets and file hashes for these two
+instruction-field changes. Those tables are no longer shipped or consulted.
+`uu-remote-hwdecode-profiler` now derives both sites from the current official
+binary using PE function boundaries, semantic strings, RIP-relative references
+and local data flow. It emits the original/patched SHA-256 values and exact
+before-bytes for that local file; ambiguous, truncated or out-of-bounds input
+is rejected. A legacy patched install can migrate only by re-deriving from its
+hash-verified original backup.
 
-```text
-offset 0x94dc03: 89 55 d0 -> b2 21 90  (select implementation 33)
-offset 0x94e4ee: 8b 45 d0 -> 6a 21 58  (record implementation 33)
-```
-
-The original file must have SHA-256
-`2144cd9c199ee21ef55da984ef38d719e337a8202b26522458e56bff648ffb60`;
-the generated patched copy must have SHA-256
-`abf2e482c65397138aa69430e3413a10f80d942a28817c22f8f8ff78e3c5ca70`.
-Both the hashes and original bytes are checked before replacement. The
-original proprietary DLL remains in the user's prefix, is restored by
+The original proprietary DLL remains in the user's prefix, is restored by
 `--disable-hwdecode`, and is not distributed by this project. The decoder
 capability cache is invalidated on enable and restored on disable.
 

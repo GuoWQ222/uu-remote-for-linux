@@ -58,10 +58,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" &&
-    -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" &&
-    -r "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" &&
-    -r "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv" &&
-    -r "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" ]] || {
+    -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" ]] || {
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
     exit 1
 }
@@ -128,12 +125,6 @@ install -Dm0644 "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
 install -Dm0644 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
-    "$stage_dir/usr/lib/uu-remote-for-linux/update-compatibility.tsv"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv" \
-    "$stage_dir/usr/lib/uu-remote-for-linux/wol-compatibility.tsv"
-install -Dm0644 "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv" \
-    "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode-compatibility.tsv"
 mkdir -p "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode"
 cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
     "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode/"

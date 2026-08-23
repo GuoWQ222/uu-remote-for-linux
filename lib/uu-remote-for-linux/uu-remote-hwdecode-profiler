@@ -222,7 +222,7 @@ def derive_patch_offsets(image: PeImage) -> tuple[int, int]:
     finish = image.file_offset(function.end - 1) + 1
     code = image.data[start:finish]
 
-    # Both 4.34-4.37 and the recompiled 4.38 function first preserve r8 in rbx,
+    # Both verified compiler layouts first preserve r8 in rbx,
     # save the incoming probe selector (edx) in an rbp local, then preserve rcx.
     # Register allocation and the frame displacement may change, so bind the
     # two patch sites through that local rather than a full compiler byte blob.

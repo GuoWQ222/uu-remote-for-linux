@@ -25,23 +25,23 @@ original_sha=${original_sha%% *}
 patched_sha=$(sha256sum "$expected")
 patched_sha=${patched_sha%% *}
 
-UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
-    "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha"
-UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
-    "$bridge" patched "$server" "$backup" "$original_sha" "$patched_sha"
+"$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha" \
+    "$patch_offset" 48895c b001c3
+"$bridge" patched "$server" "$backup" "$original_sha" "$patched_sha" \
+    "$patch_offset" 48895c b001c3
 cmp -s "$server" "$expected"
 test "$(sha256sum "$backup" | cut -d' ' -f1)" = "$original_sha"
 
-UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
-    "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha"
-UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
-    "$bridge" restore "$server" "$backup" "$original_sha" "$patched_sha"
+"$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha" \
+    "$patch_offset" 48895c b001c3
+"$bridge" restore "$server" "$backup" "$original_sha" "$patched_sha" \
+    "$patch_offset" 48895c b001c3
 test "$(sha256sum "$server" | cut -d' ' -f1)" = "$original_sha"
 test ! -e "$backup"
 
 printf '\001' | dd of="$server" bs=1 seek=12 conv=notrunc status=none
-if UU_REMOTE_WOL_PATCH_OFFSET="$patch_offset" \
-    "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha" \
+if "$bridge" patch "$server" "$backup" "$original_sha" "$patched_sha" \
+    "$patch_offset" 48895c b001c3 \
     >"$test_root/reject.out" 2>"$test_root/reject.err"; then
     printf '未知服务端版本被意外修改。\n' >&2
     exit 1

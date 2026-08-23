@@ -7,7 +7,14 @@ readonly launcher="$project_root/bin/uu-remote-for-linux"
 readonly fixture_bin="$project_root/tests/fixtures/bin"
 
 test_root=$(mktemp -d)
-trap 'rm -rf -- "$test_root"' EXIT
+cleanup() {
+    if [[ ${UU_REMOTE_KEEP_TEST_ROOT:-0} == 1 ]]; then
+        printf '保留集成测试目录：%s\n' "$test_root" >&2
+    else
+        rm -rf -- "$test_root"
+    fi
+}
+trap cleanup EXIT
 
 export PATH="$fixture_bin:$PATH"
 export XDG_DATA_HOME="$test_root/data"
@@ -15,6 +22,7 @@ export XDG_STATE_HOME="$test_root/state"
 export XDG_CACHE_HOME="$test_root/cache"
 export XDG_CONFIG_HOME="$test_root/config"
 export UU_REMOTE_RUNTIME_DIR="$project_root/lib/uu-remote-for-linux"
+export UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler"
 export UU_REMOTE_RUNTIME_PROFILER_BIN="$fixture_bin/runtime-profiler"
 export UU_REMOTE_FAKE_TRACE="$test_root/fake-tools.log"
 export UU_REMOTE_HWDECODE_ASSUME_HOST_READY=1
@@ -44,6 +52,9 @@ esac
 "$launcher" --diagnose | grep -q '桌面后端.*x11'
 XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
     "$launcher" --diagnose | grep -q '桌面后端.*wayland-xwayland'
+UU_REMOTE_NVIDIA_SMI_BIN="$fixture_bin/nvidia-smi-active" \
+    "$launcher" --diagnose | grep -q \
+    '最近被控编码器.*NVIDIA NVENC（实时编码，GPU ENC 37%）'
 
 nvdec_rows="$test_root/nvdec-rows.tsv"
 printf '0\tMock NVIDIA GPU\t0000:01:00.0\tH264-8bit-420,H265-8bit-420,H265-10bit-420\t8192x8192\n' \
@@ -87,6 +98,10 @@ grep -q '^EULA_FETCH$' "$UU_REMOTE_FAKE_TRACE"
 grep -q \
     'CURL .*--doh-url https://dns.alidns.com/dns-query .*--resolve dns.alidns.com:443:223.5.5.5' \
     "$UU_REMOTE_FAKE_TRACE"
+grep -q 'CURL --proto =https --proto-redir =https ' \
+    "$UU_REMOTE_FAKE_TRACE"
+grep -q 'OSSLSIGNCODE verify -in .* -CAfile /etc/ssl/certs/ca-certificates.crt' \
+    "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--text-info' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--checkbox=' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--ok-label=接受并继续' "$UU_REMOTE_FAKE_TRACE"
@@ -96,6 +111,21 @@ prefix="$XDG_DATA_HOME/uu-remote-for-linux/wineprefix"
 install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 cache_dir="$XDG_CACHE_HOME/uu-remote-for-linux"
 state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
+installer_before=$(sha256sum "$cache_dir/UURemote_Setup.exe")
+installer_before=${installer_before%% *}
+for signature_failure in UU_REMOTE_FAKE_SIGNATURE_FAILURE \
+    UU_REMOTE_FAKE_SIGNATURE_WRONG_PUBLISHER; do
+    if env "$signature_failure=1" "$launcher" --refresh-installer \
+        >"$test_root/${signature_failure}.out" \
+        2>"$test_root/${signature_failure}.err"; then
+        printf '无效安装包签名被意外接受：%s\n' "$signature_failure" >&2
+        exit 1
+    fi
+    grep -q 'Authenticode 证书链或网易发布者身份验证失败' \
+        "$test_root/${signature_failure}.err"
+    test "$(sha256sum "$cache_dir/UURemote_Setup.exe" | cut -d' ' -f1)" = \
+        "$installer_before"
+done
 grep -Fq '"mode": "none"' \
     "$state_dir/system-proxy-bridge-status.json"
 grep -Fq '"source": "forced"' \
@@ -255,10 +285,14 @@ grep -q '^server_mode=adaptive-binary-patch$' \
 "$launcher" --diagnose >"$test_root/wol-adaptive-diagnose.txt"
 grep -q 'UU WOL 服务端兼容.*自适应档案补丁完整' \
     "$test_root/wol-adaptive-diagnose.txt"
-"$launcher" --disable-wol
+rm -f -- "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    "$launcher" --disable-wol
 test "$(sha256sum "$wol_server" | cut -d' ' -f1)" = \
     "$wol_adaptive_original_sha"
 test ! -e "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
+grep -q $'^4.34.0.8979\t' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
 # Keep WOL enabled across the following failed and successful UU updates. The
 # transaction must restore this binary before install, preserve it on rollback,
 # then safely fall back when the next mock server has no unique PE profile.
@@ -375,18 +409,12 @@ streamer="$install_dir/bin/streamer.dll"
 streamer_original="$install_dir/bin/streamer.uu-remote-original.dll"
 decoder_cache="$install_dir/config/streamer/decoder_codec_capability_cache.json"
 decoder_cache_backup="$XDG_DATA_HOME/uu-remote-for-linux/decoder-cache-before-hwdecode.json"
-export UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA
-UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA=$(sha256sum "$streamer")
-UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA=${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA%% *}
-patched_fixture="$test_root/patched-streamer.dll"
-cp "$streamer" "$patched_fixture"
-printf '\262\041\220' |
-    dd of="$patched_fixture" bs=1 seek=$((0x94dc03)) conv=notrunc status=none
-printf '\152\041\130' |
-    dd of="$patched_fixture" bs=1 seek=$((0x94e4ee)) conv=notrunc status=none
-export UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA
-UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA=$(sha256sum "$patched_fixture")
-UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA=${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA%% *}
+hwdecode_row=$("$UU_REMOTE_HWDECODE_PROFILER_BIN" \
+    --derive "$streamer" --version 4.34.0.8979)
+IFS=$'\t' read -r _ expected_streamer_original_sha \
+    expected_streamer_patched_sha _ <<<"$hwdecode_row"
+[[ $expected_streamer_original_sha =~ ^[[:xdigit:]]{64}$ &&
+    $expected_streamer_patched_sha =~ ^[[:xdigit:]]{64}$ ]]
 
 if UU_REMOTE_FAKE_INSTALL_FAILURE_SUFFIX=nvcuvid.dll.uu-remote-new \
     "$launcher" --enable-hwdecode \
@@ -398,7 +426,7 @@ fi
 grep -q 'NVDEC 部署失败，已精确恢复部署前文件' \
     "$test_root/hwdecode-transaction.err"
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
-    "$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA"
+    "$expected_streamer_original_sha"
 grep -q '"mock":"original-cache"' "$decoder_cache"
 test ! -e "$streamer_original"
 test ! -e "$decoder_cache_backup"
@@ -426,11 +454,21 @@ cmp -s \
     "$project_root/lib/uu-remote-for-linux/hwdecode/wine/x86_64-windows/nvcuvid.dll" \
     "$prefix/drive_c/windows/system32/nvcuvid.dll"
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
-    "$UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA"
+    "$expected_streamer_patched_sha"
 test "$(sha256sum "$streamer_original" | cut -d' ' -f1)" = \
-    "$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA"
+    "$expected_streamer_original_sha"
 test ! -e "$decoder_cache"
 grep -q '"mock":"original-cache"' "$decoder_cache_backup"
+rm -f -- "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
+"$launcher" --disable-hwdecode
+test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
+    "$expected_streamer_original_sha"
+test ! -e "$streamer_original"
+grep -q $'^4.34.0.8979\t' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
+"$launcher" --enable-hwdecode
+test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
+    "$expected_streamer_patched_sha"
 "$launcher" --diagnose | grep -q '硬解桥开关.*已启用'
 "$launcher" --diagnose | grep -q 'UU 内置更新开关.*开启'
 "$launcher" --diagnose | grep -q 'Linux 自动更新.*每次启动检查'
@@ -518,9 +556,11 @@ test -s "$XDG_DATA_HOME/uu-remote-for-linux/wol-generated.tsv"
 test ! -e "$install_dir/bin/GameViewerServer.uu-remote-wol-original.exe"
 "$launcher" --diagnose | grep -q \
     'UU WOL 服务端兼容.*通用 Win32 网卡映射'
-test ! -e "$install_dir/bin/d3d11.dll"
-test ! -e "$install_dir/bin/dxgi.dll"
-test ! -e "$streamer_original"
+test -e "$install_dir/bin/d3d11.dll"
+test -e "$install_dir/bin/dxgi.dll"
+test -e "$streamer_original"
+grep -q $'^4\.35\.0\.9000\t' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
 grep -q '^selection=nvidia:0$' \
     "$XDG_DATA_HOME/uu-remote-for-linux/decoder-selection"
 cmp -s \
@@ -568,23 +608,15 @@ grep -Fq \
     'DNS 解析失败：无法解析网易官方域名 api.nrd.nie.163.com' \
     "$test_root/handoff-update-dns.err"
 
-installer_sha=$(sed -n 's/^sha256=//p' "$cache_dir/installer-metadata")
-server_sha=$(sha256sum "$install_dir/bin/GameViewerServer.exe")
-server_sha=${server_sha%% *}
-test_profile="$test_root/update-compatibility.tsv"
-printf '4.34.0.8979\t%s\t%s\t%s\n' \
-    "$installer_sha" "$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA" "$server_sha" \
-    >"$test_profile"
-
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
-UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES="$test_profile" "$launcher" --check-update
+"$launcher" --check-update
 "$launcher" --diagnose | grep -q 'UU 版本.*4.34.0.8979'
 "$launcher" --diagnose | grep -q '安全更新状态.*已更新到 4.34.0.8979'
 cmp -s \
     "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" \
     "$install_dir/bin/Upgrade.exe"
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
-    "$UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA"
+    "$expected_streamer_patched_sha"
 
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
 sha256sum \
@@ -596,7 +628,7 @@ sha256sum \
     "$prefix/drive_c/windows/system32/nvcuda.dll" \
     "$prefix/drive_c/windows/system32/nvcuvid.dll" >"$protected_before"
 if UU_REMOTE_FAKE_CORRUPT_STREAMER=1 \
-    UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES="$test_profile" \
+    UU_REMOTE_FAKE_RUNTIME_INCOMPATIBLE=1 \
     "$launcher" --check-update; then
     printf '损坏的更新被意外接受。\n' >&2
     exit 1
@@ -728,7 +760,7 @@ test ! -e "$install_dir/bin/dxgi.dll"
 test ! -e "$prefix/drive_c/windows/system32/nvcuda.dll"
 test ! -e "$prefix/drive_c/windows/system32/nvcuvid.dll"
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
-    "$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA"
+    "$expected_streamer_original_sha"
 test ! -e "$streamer_original"
 grep -q '"mock":"original-cache"' "$decoder_cache"
 test ! -e "$decoder_cache_backup"
@@ -785,16 +817,18 @@ grep -Fq \
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
     "$client_count_before_failed_startup_update"
 
-# A normal graphical launch checks the official version before starting. An
-# unrecognizable newer binary is installed with the generic bridges, while the
-# requested NVIDIA choice is retained for a future safe profile.
+# A normal graphical launch checks the official version before starting. A
+# recognizable newer binary receives a freshly generated, hash-bound NVDEC
+# profile without waiting for a package release.
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
 client_count_before_startup_update=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
 UU_REMOTE_FAKE_INSTALLER_VERSION=4.35.0.9000 \
     "$launcher"
 "$launcher" --diagnose | grep -q 'UU 版本.*4.35.0.9000'
-test ! -e "$install_dir/bin/d3d11.dll"
+test -e "$install_dir/bin/d3d11.dll"
+grep -q $'^4\.35\.0\.9000\t' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/hwdecode-generated.tsv"
 grep -q '^selection=nvidia:0$' \
     "$XDG_DATA_HOME/uu-remote-for-linux/decoder-selection"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
@@ -920,34 +954,32 @@ grep -q '输入/焦点/画面钩子的导入语义不再兼容' \
     "$XDG_DATA_HOME/uu-remote-for-linux/runtime-compatibility.json" \
     --strict >/dev/null
 
-if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
-    UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
-    UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
-    UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
-    UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
-    UU_REMOTE_FAKE_LATEST_VERSION=4.40.0.9500 \
-    UU_REMOTE_FAKE_INSTALLER_VERSION=4.40.0.9500 \
-        "$launcher" --check-update \
-        >"$test_root/future-incompatible.out" \
-        2>"$test_root/future-incompatible.err"; then
-    printf '缺少竖屏语义点的未来版本被意外接受。\n' >&2
-    exit 1
-fi
-if ! grep -q '无法自动生成 NVENC/竖屏语义档案' \
-    "$test_root/future-incompatible.err"; then
-    printf '未来版本的自动补丁失败原因不符合预期：\n' >&2
-    sed -n '1,20p' "$test_root/future-incompatible.err" >&2
-    exit 1
-fi
-"$launcher" --diagnose >"$test_root/future-rollback-diagnose.txt"
-grep -q 'UU 版本.*4.39.0.9400' "$test_root/future-rollback-diagnose.txt"
-grep -q '自适应语义档案.*完整（UU 4.39.0.9400；NVENC/竖屏）' \
-    "$test_root/future-rollback-diagnose.txt"
+# Missing optional portrait semantics must no longer make a safe new client
+# unusable. The updater commits the version with OpenH264, while the strict
+# input/focus/frame runtime contract remains mandatory.
+UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT=1 \
+UU_REMOTE_FAKE_STREAMER_MISSING_PORTRAIT=1 \
+UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+UU_REMOTE_FAKE_LATEST_VERSION=4.40.0.9500 \
+UU_REMOTE_FAKE_INSTALLER_VERSION=4.40.0.9500 \
+    "$launcher" --check-update \
+    >"$test_root/future-incompatible.out" \
+    2>"$test_root/future-incompatible.err"
+grep -q 'OpenH264 安全模式' "$test_root/future-incompatible.err"
+"$launcher" --diagnose >"$test_root/future-fallback-diagnose.txt"
+grep -q 'UU 版本.*4.40.0.9500' "$test_root/future-fallback-diagnose.txt"
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
 
 # A damaged rollback archive must be rejected before the updater moves or
 # deletes the currently installed client. The failed new install remains
 # intact for diagnosis instead of leaving an empty GameViewer directory.
 if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+    UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT=1 \
+    UU_REMOTE_FAKE_STREAMER_MISSING_PORTRAIT=1 \
+    UU_REMOTE_FAKE_RUNTIME_INCOMPATIBLE=1 \
     UU_REMOTE_FAKE_CORRUPT_ROLLBACK_SNAPSHOT=1 \
     UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
     UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
@@ -967,9 +999,9 @@ test -f "$install_dir/GameViewer.exe"
 test -f "$install_dir/bin/GameViewer.exe"
 test "$(<"$install_dir/bin/.installed-version")" = 4.41.0.9600
 
-# Missing optional streamer patch points may degrade only the native Wayland
-# path.  It must restore OpenH264, clear stale NVENC state, and still launch;
-# X11 and runtime-import failures retain their fail-closed behavior.
+# Missing optional streamer patch points degrade to OpenH264 on both backends.
+# Runtime-import failures remain fail-closed because they affect input/focus
+# and frame-hook safety rather than an optional codec.
 printf 'stale\n' >"$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
 client_count_before_dmabuf_fallback=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_DISABLE_AUTO_HWENCODE=1 \
@@ -984,6 +1016,16 @@ test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
 test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
     "$((client_count_before_dmabuf_fallback + 1))"
+
+client_count_before_x11_fallback=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_DISABLE_AUTO_HWENCODE=1 \
+    "$launcher" \
+    >"$test_root/x11-openh264-fallback.out" \
+    2>"$test_root/x11-openh264-fallback.err"
+grep -q 'X11 使用 OpenH264 安全模式' \
+    "$test_root/x11-openh264-fallback.err"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$((client_count_before_x11_fallback + 1))"
 
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"

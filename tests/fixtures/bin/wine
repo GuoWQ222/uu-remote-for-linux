@@ -321,7 +321,10 @@ with open(path, "w+b") as stream:
         struct.pack("<7I", *case_rvas),
     )
 
-    if os.environ.get("UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT") == "1":
+    if (
+        os.environ.get("UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT") == "1"
+        and os.environ.get("UU_REMOTE_FAKE_STREAMER_MISSING_PORTRAIT") != "1"
+    ):
         portrait_patterns = (
             (
                 0x1A00,

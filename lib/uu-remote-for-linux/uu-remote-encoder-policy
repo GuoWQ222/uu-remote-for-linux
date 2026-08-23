@@ -1141,13 +1141,18 @@ def streamer_profile_payload(
     probe = probe_streamer(streamer, emit=True)
     if not encoder_profile_ready(probe):
         fail("编码器语义档案缺少必需的唯一候选点")
-    if require_portrait and not portrait_profile_ready(probe):
+    effective_portrait_requirement = (
+        require_portrait
+        or probe.get("implementation_profile") == "unified-nvenc"
+        or probe.get("gdi_adapter_slot_index") == 6
+    )
+    if effective_portrait_requirement and not portrait_profile_ready(probe):
         fail("无法为当前 UU 唯一生成四处竖屏原画补丁档案")
     return {
         "format": 1,
         "uu_version": version,
         "streamer_sha256": hashlib.sha256(data).hexdigest(),
-        "portrait_required": require_portrait,
+        "portrait_required": effective_portrait_requirement,
         "portrait_ready": portrait_profile_ready(probe),
         "probe": probe,
     }
@@ -1229,6 +1234,16 @@ def match_streamer_profile(
     except (OSError, json.JSONDecodeError) as error:
         fail(f"无法快速核验 streamer 自动兼容档案：{error}")
     probe = saved.get("probe") if isinstance(saved, dict) else None
+    effective_portrait_requirement = (
+        require_portrait
+        or (
+            isinstance(probe, dict)
+            and (
+                probe.get("implementation_profile") == "unified-nvenc"
+                or probe.get("gdi_adapter_slot_index") == 6
+            )
+        )
+    )
     if (
         not isinstance(saved, dict)
         or saved.get("format") != 1
@@ -1237,8 +1252,11 @@ def match_streamer_profile(
         or not isinstance(probe, dict)
         or not encoder_profile_ready(probe)
         or saved.get("portrait_ready") != portrait_profile_ready(probe)
-        or saved.get("portrait_required") != require_portrait
-        or (require_portrait and not portrait_profile_ready(probe))
+        or saved.get("portrait_required") != effective_portrait_requirement
+        or (
+            effective_portrait_requirement
+            and not portrait_profile_ready(probe)
+        )
     ):
         fail("streamer 自动兼容档案与当前 UU 二进制不匹配")
     print(

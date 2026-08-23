@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly patch_offset="${UU_REMOTE_WOL_PATCH_OFFSET:-$((0x40df20))}"
-readonly original_bytes="${UU_REMOTE_WOL_PATCH_BEFORE:-48895c}"
-readonly patched_bytes="${UU_REMOTE_WOL_PATCH_AFTER:-b001c3}"
+patch_offset=""
+original_bytes=""
+patched_bytes=""
 
 usage() {
     cat <<'EOF'
 用法：
   uu-remote-wol-bridge detect
-  uu-remote-wol-bridge patch SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
-  uu-remote-wol-bridge restore SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
-  uu-remote-wol-bridge patched SERVER BACKUP ORIGINAL_SHA PATCHED_SHA
+  uu-remote-wol-bridge patch SERVER BACKUP ORIGINAL_SHA PATCHED_SHA OFFSET BEFORE AFTER
+  uu-remote-wol-bridge restore SERVER BACKUP ORIGINAL_SHA PATCHED_SHA OFFSET BEFORE AFTER
+  uu-remote-wol-bridge patched SERVER BACKUP ORIGINAL_SHA PATCHED_SHA OFFSET BEFORE AFTER
   uu-remote-wol-bridge cloud-state CLIENT_LOG_DIR
 EOF
 }
@@ -103,7 +103,7 @@ patch_server() {
 
     temp="${server}.uu-remote-wol-new"
     install -m 0644 "$server" "$temp"
-    printf '\260\001\303' |
+    printf '%b' "\\x${patched_bytes:0:2}\\x${patched_bytes:2:2}\\x${patched_bytes:4:2}" |
         dd of="$temp" bs=1 seek="$patch_offset" conv=notrunc status=none
     if [[ $(file_sha256 "$temp") != "$patched_sha" ]] ||
         [[ $(bytes_at_patch "$temp") != "$patched_bytes" ]]; then
@@ -164,7 +164,7 @@ cloud_wol_state() {
         printf 'unknown\n'
         return
     }
-    # UU 4.38+ writes the current session as an encrypted SLOG container.
+    # Encrypted SLOG sessions do not expose a trustworthy current WOL value.
     # Never report a stale value from an older plaintext session as current.
     [[ $latest == *.txt ]] || {
         printf 'unknown\n'
@@ -195,24 +195,34 @@ case $mode in
         detect_interface
         ;;
     patch)
-        (($# == 5)) || {
+        (($# == 8)) || {
             usage >&2
             exit 2
         }
+        patch_offset=$6
+        original_bytes=${7,,}
+        patched_bytes=${8,,}
         patch_server "$2" "$3" "$4" "$5"
         ;;
     restore)
-        (($# == 5)) || {
+        (($# == 8)) || {
             usage >&2
             exit 2
         }
+        patch_offset=$6
+        original_bytes=${7,,}
+        patched_bytes=${8,,}
         restore_server "$2" "$3" "$4" "$5"
         ;;
     patched)
-        (($# == 5)) || {
+        (($# == 8)) || {
             usage >&2
             exit 2
         }
+        patch_offset=$6
+        original_bytes=${7,,}
+        patched_bytes=${8,,}
+        validate_patch_parameters || exit 1
         wol_patch_ready "$2" "$3" "$4" "$5"
         ;;
     cloud-state)

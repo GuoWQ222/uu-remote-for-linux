@@ -198,11 +198,12 @@ check "native frame helper is ELF" bash -c \
 check "PipeWire DMA-BUF capture is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB.*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture"
-check "update compatibility profiles exist" test -s \
-    "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
-check "WOL compatibility profiles exist" test -s \
-    "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv"
-check "NVDEC compatibility profiles exist" test -s \
+# The numbered parameters intentionally expand in the nested shell.
+# shellcheck disable=SC2016
+check "fixed compatibility tables removed" bash -c \
+    'test ! -e "$1" && test ! -e "$2" && test ! -e "$3"' _ \
+    "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv" \
+    "$project_root/lib/uu-remote-for-linux/wol-compatibility.tsv" \
     "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv"
 check "NVDEC automatic profiler exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"

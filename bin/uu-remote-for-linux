@@ -51,17 +51,16 @@ readonly input_injector_source="$runtime_dir/uu-remote-input-injector.exe"
 readonly powershell_bridge_source="$runtime_dir/uu-remote-powershell-bridge.exe"
 readonly wol_bridge="$runtime_dir/uu-remote-wol-bridge"
 readonly wol_configure="$runtime_dir/uu-remote-wol-configure"
-readonly wol_compatibility_profiles="${UU_REMOTE_WOL_COMPATIBILITY_PROFILES:-$runtime_dir/wol-compatibility.tsv}"
 readonly wol_profiler="${UU_REMOTE_WOL_PROFILER_BIN:-$runtime_dir/uu-remote-wol-profiler}"
 readonly update_bridge="$runtime_dir/uu-remote-update-bridge"
 readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
-readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
-readonly hwdecode_compatibility_profiles="${UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES:-$runtime_dir/hwdecode-compatibility.tsv}"
 readonly hwdecode_profiler="${UU_REMOTE_HWDECODE_PROFILER_BIN:-$runtime_dir/uu-remote-hwdecode-profiler}"
 readonly runtime_profiler="${UU_REMOTE_RUNTIME_PROFILER_BIN:-$runtime_dir/uu-remote-runtime-profiler}"
 readonly hwdecode_dxgi_probe_source="$runtime_dir/uu-remote-dxgi-probe.exe"
 readonly hwencode_policy="$runtime_dir/uu-remote-encoder-policy"
 readonly hwencode_probe_source="$runtime_dir/uu-remote-nvenc-d3d11-probe.exe"
+readonly authenticode_verifier="${UU_REMOTE_OSSLSIGNCODE_BIN:-osslsigncode}"
+readonly nvidia_smi_bin="${UU_REMOTE_NVIDIA_SMI_BIN:-nvidia-smi}"
 
 detect_desktop_backend() {
     case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
@@ -217,7 +216,6 @@ readonly streamer_profile_dir="$data_dir/streamer-profiles"
 readonly streamer_active_profile="$data_dir/streamer-compatibility.json"
 readonly runtime_profile_dir="$data_dir/runtime-profiles"
 readonly runtime_active_profile="$data_dir/runtime-compatibility.json"
-readonly adaptive_patch_baseline_version="4.38.0.9292"
 readonly hwencode_enabled_stamp="$data_dir/hwencode-enabled"
 readonly hwencode_disabled_stamp="$data_dir/hwencode-disabled"
 readonly hwencode_failed_stamp="$data_dir/hwencode-failed"
@@ -275,7 +273,7 @@ die() {
 
 network_curl() {
     if [[ ${UU_REMOTE_SYSTEM_PROXY_SOURCE:-none} != none ]]; then
-        curl "$@"
+        curl --proto '=https' --proto-redir '=https' "$@"
         return
     fi
 
@@ -285,6 +283,8 @@ network_curl() {
     env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy -u no_proxy \
         -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY -u NO_PROXY \
         curl \
+        --proto '=https' \
+        --proto-redir '=https' \
         --doh-url "$direct_doh_url" \
         --resolve "dns.alidns.com:443:$direct_doh_bootstrap" \
         "$@"
@@ -853,6 +853,12 @@ official_latest_version() {
             '网易官方接口已响应，但没有返回最终下载地址'
         return 1
     fi
+    if [[ $effective_url != https://* ||
+        $effective_url == *$'\n'* || $effective_url == *$'\r'* ]]; then
+        printf -v "$error_variable" '%s' \
+            '网易官方接口返回了非 HTTPS 或格式无效的下载地址'
+        return 1
+    fi
 
     clean_url=${effective_url%%\?*}
     filename=${clean_url##*/}
@@ -868,50 +874,9 @@ official_latest_version() {
     return 1
 }
 
-update_profile_value() {
-    local version=$1 field=$2
-    local row_version installer_sha streamer_sha wol_sha
-
-    [[ -r $update_compatibility_profiles ]] || return 1
-    while IFS=$'\t' read -r \
-        row_version installer_sha streamer_sha wol_sha; do
-        [[ -n $row_version && $row_version != \#* ]] || continue
-        [[ $row_version == "$version" ]] || continue
-        case $field in
-            installer)
-                printf '%s\n' "$installer_sha"
-                ;;
-            streamer)
-                printf '%s\n' "$streamer_sha"
-                ;;
-            wol)
-                printf '%s\n' "$wol_sha"
-                ;;
-            *)
-                return 2
-                ;;
-        esac
-        return
-    done <"$update_compatibility_profiles"
-    return 1
-}
-
-update_version_supported() {
-    local version=$1 installer_sha streamer_sha wol_sha
-
-    installer_sha=$(update_profile_value "$version" installer) || return 1
-    streamer_sha=$(update_profile_value "$version" streamer) || return 1
-    wol_sha=$(update_profile_value "$version" wol) || return 1
-    [[ $installer_sha =~ ^[[:xdigit:]]{64}$ &&
-        $streamer_sha =~ ^[[:xdigit:]]{64}$ &&
-        $wol_sha =~ ^[[:xdigit:]]{64}$ ]]
-}
-
 load_hwdecode_profile() {
     local version=${1:-} row_version original_sha patched_sha
     local offset_1 before_1 after_1 offset_2 before_2 after_2
-    local override_version="${UU_REMOTE_HWDECODE_STREAMER_VERSION:-4.34.0.8979}"
-    local profile_file
     local found=false
 
     if [[ -z $version ]]; then
@@ -922,34 +887,16 @@ load_hwdecode_profile() {
         return 0
     fi
 
-    if [[ $version == "$override_version" &&
-        -n ${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-} &&
-        -n ${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-} ]]; then
-        original_sha=$UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA
-        patched_sha=$UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA
-        offset_1=0x94dc03
-        before_1=8955d0
-        after_1=b22190
-        offset_2=0x94e4ee
-        before_2=8b45d0
-        after_2=6a2158
-    else
-        for profile_file in \
-            "$hwdecode_compatibility_profiles" \
-            "$hwdecode_generated_profiles"; do
-            [[ -r $profile_file ]] || continue
-            while IFS=$'\t' read -r \
-                row_version original_sha patched_sha \
-                offset_1 before_1 after_1 offset_2 before_2 after_2; do
-                [[ -n $row_version && $row_version != \#* ]] || continue
-                [[ $row_version == "$version" ]] || continue
-                found=true
-                break
-            done <"$profile_file"
-            $found && break
-        done
-        $found || return 1
-    fi
+    [[ -r $hwdecode_generated_profiles ]] || return 1
+    while IFS=$'\t' read -r \
+        row_version original_sha patched_sha \
+        offset_1 before_1 after_1 offset_2 before_2 after_2; do
+        [[ -n $row_version && $row_version != \#* ]] || continue
+        [[ $row_version == "$version" ]] || continue
+        found=true
+        break
+    done <"$hwdecode_generated_profiles"
+    $found || return 1
 
     [[ $original_sha =~ ^[[:xdigit:]]{64}$ &&
         $patched_sha =~ ^[[:xdigit:]]{64}$ &&
@@ -957,8 +904,9 @@ load_hwdecode_profile() {
         $offset_2 =~ ^0[xX][[:xdigit:]]+$ &&
         $before_1 =~ ^[[:xdigit:]]{6}$ &&
         $before_2 =~ ^[[:xdigit:]]{6}$ &&
-        $after_1 =~ ^[[:xdigit:]]{6}$ &&
-        $after_2 =~ ^[[:xdigit:]]{6}$ ]] || return 1
+        ${after_1,,} == b22190 &&
+        ${after_2,,} == 6a2158 &&
+        $offset_1 != "$offset_2" ]] || return 1
 
     streamer_profile_version=$version
     streamer_original_sha=${original_sha,,}
@@ -986,20 +934,11 @@ hwdecode_profile_generated() {
     return 1
 }
 
-generate_hwdecode_profile() {
-    local version=$1 row row_version original_sha current_sha
+store_hwdecode_profile() {
+    local version=$1 row=$2
     local temp existing_version existing_remainder
 
-    [[ -x $hwdecode_profiler && -f $streamer_dll ]] || return 1
-    row=$("$hwdecode_profiler" \
-        --derive "$streamer_dll" --version "$version" 2>>"$setup_log") ||
-        return 1
-    IFS=$'\t' read -r row_version original_sha _ <<<"$row"
-    [[ $row_version == "$version" &&
-        $original_sha =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    current_sha=$(file_sha256 "$streamer_dll") || return 1
-    [[ ${original_sha,,} == "$current_sha" ]] || return 1
-
+    mkdir -p "$data_dir"
     temp=$(mktemp "$data_dir/.hwdecode-generated.XXXXXX")
     printf '# Automatically derived, fail-closed NVDEC profiles.\n' >"$temp"
     if [[ -r $hwdecode_generated_profiles ]]; then
@@ -1014,7 +953,40 @@ generate_hwdecode_profile() {
     mv -f "$temp" "$hwdecode_generated_profiles"
     streamer_profile_version=""
     load_hwdecode_profile "$version" || return 1
+}
+
+generate_hwdecode_profile_from_file() {
+    local version=$1 candidate=$2 current=${3:-$2}
+    local row row_version original_sha patched_sha candidate_sha current_sha
+
+    [[ -x $hwdecode_profiler && -f $candidate && -f $current ]] || return 1
+    row=$("$hwdecode_profiler" \
+        --derive "$candidate" --version "$version" 2>>"$setup_log") ||
+        return 1
+    IFS=$'\t' read -r row_version original_sha patched_sha _ <<<"$row"
+    [[ $row_version == "$version" &&
+        $original_sha =~ ^[[:xdigit:]]{64}$ &&
+        $patched_sha =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    candidate_sha=$(file_sha256 "$candidate") || return 1
+    current_sha=$(file_sha256 "$current") || return 1
+    [[ ${original_sha,,} == "$candidate_sha" &&
+        ($current_sha == "${original_sha,,}" ||
+            $current_sha == "${patched_sha,,}") ]] || return 1
+
+    store_hwdecode_profile "$version" "$row"
     printf '已为 UU %s 自动生成并校验 NVDEC 二进制档案。\n' "$version"
+}
+
+generate_hwdecode_profile() {
+    generate_hwdecode_profile_from_file "$1" "$streamer_dll"
+}
+
+migrate_hwdecode_profile_from_backup() {
+    local version=$1
+
+    [[ -f $streamer_original && -f $streamer_dll ]] || return 1
+    generate_hwdecode_profile_from_file \
+        "$version" "$streamer_original" "$streamer_dll"
 }
 
 remove_generated_hwdecode_profile() {
@@ -1039,13 +1011,13 @@ ensure_hwdecode_profile() {
     local version=$1
 
     hwdecode_version_supported "$version" && return 0
+    migrate_hwdecode_profile_from_backup "$version" && return 0
     generate_hwdecode_profile "$version"
 }
 
 load_hwdecode_profile_from_streamer_files() {
     local original_hash="" patched_hash=""
-    local row_version original_sha patched_sha profile_file
-    local override_version="${UU_REMOTE_HWDECODE_STREAMER_VERSION:-4.34.0.8979}"
+    local row_version original_sha patched_sha
 
     [[ -f $streamer_original ]] &&
         original_hash=$(file_sha256 "$streamer_original")
@@ -1053,20 +1025,7 @@ load_hwdecode_profile_from_streamer_files() {
         patched_hash=$(file_sha256 "$streamer_dll")
     [[ -n $original_hash || -n $patched_hash ]] || return 1
 
-    if [[ -n ${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA:-} &&
-        -n ${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA:-} ]] &&
-        { [[ -n $original_hash &&
-            $original_hash == "${UU_REMOTE_HWDECODE_STREAMER_ORIGINAL_SHA,,}" ]] ||
-          [[ -n $patched_hash &&
-            $patched_hash == "${UU_REMOTE_HWDECODE_STREAMER_PATCHED_SHA,,}" ]]; }; then
-        load_hwdecode_profile "$override_version"
-        return
-    fi
-
-    for profile_file in \
-        "$hwdecode_compatibility_profiles" \
-        "$hwdecode_generated_profiles"; do
-        [[ -r $profile_file ]] || continue
+    if [[ -r $hwdecode_generated_profiles ]]; then
         while IFS=$'\t' read -r \
             row_version original_sha patched_sha _; do
             [[ -n $row_version && $row_version != \#* ]] || continue
@@ -1075,9 +1034,20 @@ load_hwdecode_profile_from_streamer_files() {
                 load_hwdecode_profile "$row_version"
                 return
             fi
-        done <"$profile_file"
-    done
+        done <"$hwdecode_generated_profiles"
+    fi
+
     return 1
+}
+
+load_or_migrate_hwdecode_profile() {
+    local version
+
+    load_hwdecode_profile || load_hwdecode_profile_from_streamer_files || {
+        version=$(registry_value \
+            "$installed_version_key" Version 2>/dev/null || true)
+        [[ -n $version ]] && migrate_hwdecode_profile_from_backup "$version"
+    }
 }
 
 write_update_status() {
@@ -1620,48 +1590,27 @@ hwencode_failure_current() {
     [[ $(<"$hwencode_failed_stamp") == "$signature" ]]
 }
 
-streamer_profile_requires_portrait() {
-    local version=$1
-
-    version_at_least "$version" "$adaptive_patch_baseline_version"
-}
-
-future_adaptive_patch_required() {
-    local version=$1
-
-    version_greater "$version" "$adaptive_patch_baseline_version"
-}
-
-native_wayland_capture_fallback_ready() {
-    [[ $desktop_backend == wayland-xwayland &&
-        -x $input_bridge &&
-        -x $runtime_dir/uu-remote-pipewire-capture &&
-        -x $runtime_dir/uu-remote-pipewire-cursor ]]
-}
-
-activate_native_wayland_capture_fallback() {
-    # Native DMA-BUF capture does not depend on the optional streamer patches.
-    # Remove all project-owned NVENC state before allowing this safe path; the
-    # strict input/focus/frame import check still runs immediately afterward.
+activate_safe_streamer_fallback() {
+    # OpenH264 does not depend on optional streamer patches.  On Wayland the
+    # native DMA-BUF capture path remains available as well.  Runtime import
+    # semantics are still checked separately before either backend may start.
     remove_hwencode_bridge
     printf '%s\n' "$package_version" >"${hwencode_disabled_stamp}.tmp"
     mv -f "${hwencode_disabled_stamp}.tmp" "$hwencode_disabled_stamp"
     rm -f -- "$hwencode_failed_stamp"
-    printf '%s\n' \
-        '警告：当前 UU 的 NVENC/竖屏可选补丁尚未兼容；Wayland 将使用原生 DMA-BUF + OpenH264 安全模式。' >&2
+    if [[ $desktop_backend == wayland-xwayland ]]; then
+        printf '%s\n' \
+            '警告：当前 UU 的 NVENC/竖屏语义尚未唯一识别；使用原生 DMA-BUF + OpenH264 安全模式。' >&2
+    else
+        printf '%s\n' \
+            '警告：当前 UU 的 NVENC 语义尚未唯一识别；X11 使用 OpenH264 安全模式。' >&2
+    fi
 }
 
 streamer_profile_command() {
     local command=$1 streamer=$2 version=$3 profile=$4
-    local -a arguments
 
-    arguments=(
-        "$hwencode_policy" "$command" "$streamer" "$version" "$profile"
-    )
-    if streamer_profile_requires_portrait "$version"; then
-        arguments+=(--require-portrait)
-    fi
-    "${arguments[@]}"
+    "$hwencode_policy" "$command" "$streamer" "$version" "$profile"
 }
 
 ensure_streamer_compatibility_profile() {
@@ -3077,7 +3026,7 @@ clear_wol_profile() {
 load_wol_profile() {
     local requested_version=${1:-} requested_sha=${2:-}
     local row_version original_sha patched_sha offset before after
-    local profile_file source override_version found=false
+    local found=false
 
     requested_sha=${requested_sha,,}
     if [[ -n $wol_profile_version &&
@@ -3088,47 +3037,17 @@ load_wol_profile() {
     fi
     clear_wol_profile
 
-    override_version=${UU_REMOTE_WOL_SERVER_VERSION:-$requested_version}
-    if [[ -n $override_version &&
-        -n ${UU_REMOTE_WOL_SERVER_ORIGINAL_SHA:-} &&
-        -n ${UU_REMOTE_WOL_SERVER_PATCHED_SHA:-} ]]; then
-        row_version=$override_version
-        original_sha=$UU_REMOTE_WOL_SERVER_ORIGINAL_SHA
-        patched_sha=$UU_REMOTE_WOL_SERVER_PATCHED_SHA
-        offset=${UU_REMOTE_WOL_PATCH_OFFSET:-0x40df20}
-        before=${UU_REMOTE_WOL_PATCH_BEFORE:-48895c}
-        after=${UU_REMOTE_WOL_PATCH_AFTER:-b001c3}
-        source=override
-        if [[ (-z $requested_version || $row_version == "$requested_version") &&
-            (-z $requested_sha || ${original_sha,,} == "$requested_sha" ||
-                ${patched_sha,,} == "$requested_sha") ]]; then
-            found=true
-        fi
-    fi
-
-    if ! $found; then
-        for profile_file in \
-            "$wol_compatibility_profiles" \
-            "$wol_generated_profiles"; do
-            [[ -r $profile_file ]] || continue
-            if [[ $profile_file == "$wol_generated_profiles" ]]; then
-                source=generated
-            else
-                source=builtin
-            fi
-            while IFS=$'\t' read -r \
-                row_version original_sha patched_sha offset before after; do
-                [[ -n $row_version && $row_version != \#* ]] || continue
-                [[ -z $requested_version || $row_version == "$requested_version" ]] ||
-                    continue
-                [[ -z $requested_sha || ${original_sha,,} == "$requested_sha" ||
-                    ${patched_sha,,} == "$requested_sha" ]] || continue
-                found=true
-                break
-            done <"$profile_file"
-            $found && break
-        done
-    fi
+    [[ -r $wol_generated_profiles ]] || return 1
+    while IFS=$'\t' read -r \
+        row_version original_sha patched_sha offset before after; do
+        [[ -n $row_version && $row_version != \#* ]] || continue
+        [[ -z $requested_version || $row_version == "$requested_version" ]] ||
+            continue
+        [[ -z $requested_sha || ${original_sha,,} == "$requested_sha" ||
+            ${patched_sha,,} == "$requested_sha" ]] || continue
+        found=true
+        break
+    done <"$wol_generated_profiles"
     $found || return 1
     [[ $row_version =~ ^[0-9]+([.][0-9]+){2,3}$ &&
         $original_sha =~ ^[[:xdigit:]]{64}$ &&
@@ -3138,7 +3057,7 @@ load_wol_profile() {
         ${after,,} == b001c3 ]] || return 1
 
     wol_profile_version=$row_version
-    wol_profile_source=$source
+    wol_profile_source=generated
     wol_profile_original_sha=${original_sha,,}
     wol_profile_patched_sha=${patched_sha,,}
     wol_profile_patch_offset=$((offset))
@@ -3155,23 +3074,10 @@ load_wol_profile_for_server() {
         load_wol_profile "" "$current_sha"
 }
 
-generate_wol_profile() {
-    local version=$1 row row_version original_sha patched_sha offset before after
-    local current_sha temp existing_version existing_original existing_patched
+store_wol_profile() {
+    local version=$1 row=$2 original_sha=$3
+    local temp existing_version existing_original existing_patched
     local existing_offset existing_before existing_after
-
-    [[ -x $wol_profiler && -f $server ]] || return 1
-    current_sha=$(wol_server_sha) || return 1
-    row=$("$wol_profiler" --derive "$server" --version "$version" \
-        2>>"$setup_log") || return 1
-    IFS=$'\t' read -r \
-        row_version original_sha patched_sha offset before after <<<"$row"
-    [[ $row_version == "$version" &&
-        ${original_sha,,} == "$current_sha" &&
-        $patched_sha =~ ^[[:xdigit:]]{64}$ &&
-        $offset =~ ^0[xX][[:xdigit:]]+$ &&
-        $before =~ ^[[:xdigit:]]{6}$ &&
-        ${after,,} == b001c3 ]] || return 1
 
     mkdir -p "$data_dir"
     temp=$(mktemp "$data_dir/.wol-generated.XXXXXX")
@@ -3182,7 +3088,7 @@ generate_wol_profile() {
             existing_offset existing_before existing_after; do
             [[ -n $existing_version && $existing_version != \#* ]] || continue
             if [[ $existing_version == "$version" &&
-                ${existing_original,,} == "$current_sha" ]]; then
+                ${existing_original,,} == "${original_sha,,}" ]]; then
                 continue
             fi
             printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -3194,8 +3100,44 @@ generate_wol_profile() {
     chmod 0600 "$temp"
     mv -f "$temp" "$wol_generated_profiles"
     clear_wol_profile
-    load_wol_profile "$version" "$current_sha" || return 1
+    load_wol_profile "$version" "${original_sha,,}" || return 1
+}
+
+generate_wol_profile_from_file() {
+    local version=$1 candidate=$2 current=${3:-$2}
+    local row row_version original_sha patched_sha offset before after
+    local candidate_sha current_sha
+
+    [[ -x $wol_profiler && -f $candidate && -f $current ]] || return 1
+    row=$("$wol_profiler" --derive "$candidate" --version "$version" \
+        2>>"$setup_log") || return 1
+    IFS=$'\t' read -r \
+        row_version original_sha patched_sha offset before after <<<"$row"
+    candidate_sha=$(file_sha256 "$candidate") || return 1
+    current_sha=$(file_sha256 "$current") || return 1
+    [[ $row_version == "$version" &&
+        ${original_sha,,} == "$candidate_sha" &&
+        $patched_sha =~ ^[[:xdigit:]]{64}$ &&
+        ($current_sha == "${original_sha,,}" ||
+            $current_sha == "${patched_sha,,}") &&
+        $offset =~ ^0[xX][[:xdigit:]]+$ &&
+        $before =~ ^[[:xdigit:]]{6}$ &&
+        ${after,,} == b001c3 ]] || return 1
+
+    store_wol_profile "$version" "$row" "$original_sha"
     printf '已为 UU %s 自动生成并校验 WOL 二进制档案。\n' "$version"
+}
+
+generate_wol_profile() {
+    generate_wol_profile_from_file "$1" "$server"
+}
+
+migrate_wol_profile_from_backup() {
+    local version=$1
+
+    [[ -f $wol_server_original && -f $server ]] || return 1
+    generate_wol_profile_from_file \
+        "$version" "$wol_server_original" "$server"
 }
 
 ensure_wol_profile() {
@@ -3206,20 +3148,21 @@ ensure_wol_profile() {
         version=$(registry_value "$installed_version_key" Version 2>/dev/null || true)
     fi
     [[ -n $version ]] || return 1
+    migrate_wol_profile_from_backup "$version" && return 0
     generate_wol_profile "$version"
 }
 
 wol_patch_ready() {
     load_wol_profile_for_server || return 1
     [[ -x $wol_bridge ]] &&
-        UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
-        UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
-        UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
         "$wol_bridge" patched \
             "$server" \
             "$wol_server_original" \
             "$wol_profile_original_sha" \
-            "$wol_profile_patched_sha"
+            "$wol_profile_patched_sha" \
+            "$wol_profile_patch_offset" \
+            "$wol_profile_patch_before" \
+            "$wol_profile_patch_after"
 }
 
 wol_binary_patch_ready_or_unused() {
@@ -3230,7 +3173,7 @@ wol_binary_patch_ready_or_unused() {
         current_sha=$(wol_server_sha) || return 1
         [[ $current_sha == "$wol_profile_patched_sha" ]] && wol_patch_ready
     else
-        return 0
+        [[ ! -e $wol_server_original ]]
     fi
 }
 
@@ -3250,31 +3193,36 @@ deploy_optional_wol_server_patch() {
             "${version:-unknown}" >>"$setup_log"
         return 0
     fi
-    UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
-    UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
-    UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
-        "$wol_bridge" patch \
+    "$wol_bridge" patch \
             "$server" \
             "$wol_server_original" \
             "$wol_profile_original_sha" \
-            "$wol_profile_patched_sha" || return 1
+            "$wol_profile_patched_sha" \
+            "$wol_profile_patch_offset" \
+            "$wol_profile_patch_before" \
+            "$wol_profile_patch_after" || return 1
     wol_patch_ready
 }
 
 restore_optional_wol_server_patch() {
-    local current_sha
+    local current_sha version
 
     current_sha=$(wol_server_sha) || return 0
-    load_wol_profile_for_server || return 0
+    if ! load_wol_profile_for_server; then
+        version=$(registry_value \
+            "$installed_version_key" Version 2>/dev/null || true)
+        [[ -n $version ]] || return 0
+        migrate_wol_profile_from_backup "$version" || return 0
+    fi
     [[ $current_sha == "$wol_profile_patched_sha" ]] || return 0
-    UU_REMOTE_WOL_PATCH_OFFSET="$wol_profile_patch_offset" \
-    UU_REMOTE_WOL_PATCH_BEFORE="$wol_profile_patch_before" \
-    UU_REMOTE_WOL_PATCH_AFTER="$wol_profile_patch_after" \
-        "$wol_bridge" restore \
+    "$wol_bridge" restore \
             "$server" \
             "$wol_server_original" \
             "$wol_profile_original_sha" \
-            "$wol_profile_patched_sha"
+            "$wol_profile_patched_sha" \
+            "$wol_profile_patch_offset" \
+            "$wol_profile_patch_before" \
+            "$wol_profile_patch_after"
 }
 
 wol_server_compat_label() {
@@ -3284,11 +3232,7 @@ wol_server_compat_label() {
         printf '服务端不存在'
     elif wol_patch_ready; then
         load_wol_profile_for_server || true
-        if [[ $wol_profile_source == generated ]]; then
-            printf '自适应档案补丁完整（UU %s）' "$wol_profile_version"
-        else
-            printf '版本档案补丁完整（UU %s）' "$wol_profile_version"
-        fi
+        printf '自适应档案补丁完整（UU %s）' "$wol_profile_version"
     elif load_wol_profile_for_server; then
         current_sha=$(wol_server_sha) || true
         if [[ $current_sha == "$wol_profile_original_sha" ]]; then
@@ -3296,6 +3240,8 @@ wol_server_compat_label() {
         else
             printf 'UU %s WOL 补丁/备份不匹配' "$wol_profile_version"
         fi
+    elif [[ -e $wol_server_original ]]; then
+        printf '检测到原版备份但自适应档案缺失（需要迁移修复）'
     else
         printf '通用 Win32 网卡映射（自动档案未唯一识别）'
     fi
@@ -3844,8 +3790,30 @@ streamer_compatibility_profile_status_label() {
     fi
 }
 
+active_gameviewer_nvenc_usage() {
+    local usage
+
+    command -v "$nvidia_smi_bin" >/dev/null 2>&1 || return 1
+    usage=$(timeout 5s "$nvidia_smi_bin" pmon -c 1 -s u 2>/dev/null |
+        awk '
+            $2 ~ /^[0-9]+$/ &&
+            $6 ~ /^[0-9]+$/ && $6 > 0 &&
+            $NF ~ /^GameViewerServe/ {
+                print $6
+                exit
+            }
+        ')
+    [[ $usage =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$usage"
+}
+
 hwencode_last_session_label() {
-    local latest line
+    local latest line usage slog_latest
+
+    if usage=$(active_gameviewer_nvenc_usage); then
+        printf 'NVIDIA NVENC（实时编码，GPU ENC %s%%）' "$usage"
+        return
+    fi
 
     [[ -d $streamer_log_dir ]] || {
         printf '尚无被控会话日志'
@@ -3855,7 +3823,14 @@ hwencode_last_session_label() {
         -name 'streamer_log_*.txt' -printf '%T@\t%p\n' 2>/dev/null |
         sort -nr | sed -n '1s/^[^\t]*\t//p')
     [[ -n $latest ]] || {
-        printf '尚无被控会话日志'
+        slog_latest=$(find "$streamer_log_dir" -maxdepth 1 -type f \
+            -name 'streamer_log*.slog' -printf '%T@\t%p\n' 2>/dev/null |
+            sort -nr | sed -n '1s/^[^\t]*\t//p')
+        if [[ -n $slog_latest ]]; then
+            printf 'SLOG 会话存在（当前未观察到实时 NVENC）'
+        else
+            printf '尚无被控会话日志'
+        fi
         return
     }
     line=$(grep '"encoder_impl"' "$latest" 2>/dev/null | tail -n1 || true)
@@ -4025,9 +4000,9 @@ check_base_requirements
 [[ -r $powershell_bridge_source ]] ||
     die "缺少 Win64 WOL 电源属性兼容桥：$powershell_bridge_source。请重新安装本项目"
 [[ -x $update_bridge && -r $update_blocker_source &&
-    -r $update_compatibility_profiles &&
-    -r $hwdecode_compatibility_profiles ]] ||
-    die "缺少自动更新兼容桥或兼容档案。请重新安装本项目"
+    -x $hwdecode_profiler && -x $wol_profiler &&
+    -x $hwencode_policy && -x $runtime_profiler ]] ||
+    die "缺少自动更新桥或语义补丁生成器。请重新安装本项目"
 
 mkdir -p "$data_dir" "$state_dir" "$cache_dir"
 
@@ -4123,6 +4098,45 @@ run_logged() {
     } >>"$setup_log" 2>&1
 }
 
+verify_official_installer_signature() {
+    local installer_file=$1 output_file signer_subject status=0
+    local ca_file=/etc/ssl/certs/ca-certificates.crt
+    local expected_signer='NetEase (Hangzhou) Network Co., Ltd'
+
+    if [[ $authenticode_verifier == */* ]]; then
+        [[ -x $authenticode_verifier ]] || return 1
+    else
+        command -v "$authenticode_verifier" >/dev/null 2>&1 || return 1
+    fi
+    [[ -r $ca_file ]] || return 1
+    output_file=$(mktemp "$cache_dir/.authenticode.XXXXXX") || return 1
+    timeout 90s "$authenticode_verifier" verify \
+        -in "$installer_file" -CAfile "$ca_file" \
+        >"$output_file" 2>&1 9>&- || status=$?
+    {
+        printf '\n[%(%FT%T%z)T] Authenticode installer verification\n' -1
+        sed -n '1,80p' "$output_file"
+    } >>"$setup_log"
+    signer_subject=$(awk '
+        /^Signer.s certificate:$/ { certificate_section = 1; next }
+        certificate_section && /^[[:space:]]*Signer #0:$/ {
+            primary_signer = 1
+            next
+        }
+        primary_signer && /^[[:space:]]*Subject:/ {
+            sub(/^[[:space:]]*Subject:[[:space:]]*/, "")
+            print
+            exit
+        }
+        ' "$output_file")
+    if ((status != 0)) ||
+        [[ $signer_subject != *"/O=$expected_signer/"* ]]; then
+        rm -f -- "$output_file"
+        return 1
+    fi
+    rm -f -- "$output_file"
+}
+
 download_installer() {
     local temp_file effective_url clean_url filename version checksum size magic
     local archive_file
@@ -4136,12 +4150,21 @@ download_installer() {
         rm -f -- "$temp_file"
         die "官方安装包下载失败"
     fi
+    if [[ $effective_url != https://* ||
+        $effective_url == *$'\n'* || $effective_url == *$'\r'* ]]; then
+        rm -f -- "$temp_file"
+        die "官方安装包重定向到了非 HTTPS 或格式无效的地址"
+    fi
 
     size=$(stat -c '%s' "$temp_file")
     magic=$(od -An -tx1 -N2 "$temp_file" | tr -d '[:space:]')
     if ((size < 10485760)) || [[ $magic != 4d5a ]]; then
         rm -f -- "$temp_file"
         die "下载内容不是有效的 Windows 安装程序"
+    fi
+    if ! verify_official_installer_signature "$temp_file"; then
+        rm -f -- "$temp_file"
+        die "官方安装包 Authenticode 证书链或网易发布者身份验证失败"
     fi
 
     clean_url=${effective_url%%\?*}
@@ -4161,8 +4184,10 @@ download_installer() {
             die "同版本同哈希的安装包归档发生冲突；拒绝覆盖缓存"
         }
     else
-        install -m0600 "$temp_file" "$archive_file" ||
+        if ! install -m0600 "$temp_file" "$archive_file"; then
+            rm -f -- "$temp_file"
             die "无法归档官方安装包"
+        fi
     fi
     mv -f "$temp_file" "$installer"
     printf '%s\n' "$version" >"${installer_version_file}.tmp"
@@ -4289,7 +4314,7 @@ deploy_streamer_patch() {
 remove_streamer_patch() {
     local current_sha original_sha
 
-    load_hwdecode_profile || load_hwdecode_profile_from_streamer_files ||
+    load_or_migrate_hwdecode_profile ||
         die "当前 UU 版本没有经过校验的 NVDEC 兼容档案；未修改客户端"
 
     if [[ -f $streamer_original ]]; then
@@ -4820,7 +4845,7 @@ probe_hwdecode_bridge() {
         env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
             -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
             -u ALL_PROXY -u NO_PROXY \
-            timeout 30s "$wine" "$hwdecode_dxgi_probe"
+            timeout 30s "$wine" "$hwdecode_dxgi_probe" 9>&-
     ) >"$adapters" 2>>"$setup_log"; then
         rm -f -- "$adapters" "$results"
         printf 'DXGI 无法枚举可用于 UU 的真实显卡。\n' >&2
@@ -4841,7 +4866,7 @@ probe_hwdecode_bridge() {
                 -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
                 -u ALL_PROXY -u NO_PROXY \
                 timeout 60s "$wine" "$codec_detector" \
-                    --batch 33 "$device_id" "$adapter_id"
+                    --batch 33 "$device_id" "$adapter_id" 9>&-
         ) >"$results" 2>>"$setup_log"; then
             sed -i 's/\r$//' "$results"
             if grep -qx 'BATCH_DONE' "$results" &&
@@ -5043,7 +5068,8 @@ configure_compatibility() {
         /v Version /t REG_SZ /d win8 /f ||
         die "无法配置 WebView2 兼容模式"
     # The Linux host supplies display and input integration.  Reporting Win7
-    # only to the server prevents UU 4.36+ from installing Windows IDD,
+    # Applying this compatibility mode only to the server prevents newer UU
+    # releases from installing Windows IDD,
     # gvInput, and ViGEm kernel drivers into Wine's emulated device database.
     # Repeated installs otherwise leave phantom devices and can terminate the
     # server before its IPC runtime starts, leaving only a transparent client
@@ -5471,10 +5497,12 @@ update_restart_ready() {
     installed_version=$(
         registry_value "$installed_version_key" Version 2>/dev/null || true
     )
-    if [[ -n $installed_version ]] &&
-        future_adaptive_patch_required "$installed_version"; then
-        streamer_compatibility_profile_ready "$installed_version" &&
-            runtime_compatibility_profile_ready "$installed_version" || return 1
+    if [[ -n $installed_version ]]; then
+        runtime_compatibility_profile_ready "$installed_version" || return 1
+        if hwencode_enabled; then
+            streamer_compatibility_profile_ready "$installed_version" ||
+                return 1
+        fi
     fi
     if hwdecode_enabled; then
         hwdecode_files_deployed || return 1
@@ -5488,35 +5516,13 @@ update_restart_ready() {
 }
 
 run_update_transaction() {
-    local latest=$1 expected_installer_sha actual_installer_sha
+    local latest=$1
     local snapshot bridge_state_snapshot installed_after
-    local profile_supported=false
-    local strict_adaptive_patch=false
-
-    if future_adaptive_patch_required "$latest"; then
-        strict_adaptive_patch=true
-    fi
-
-    if update_version_supported "$latest"; then
-        profile_supported=true
-        expected_installer_sha=$(update_profile_value "$latest" installer) ||
-            die "缺少 UU $latest 的安装包兼容哈希"
-    fi
 
     download_installer
     [[ -r $installer_version_file &&
         $(<"$installer_version_file") == "$latest" ]] ||
         die "官方安装包版本与更新检查结果不一致；现有客户端未作修改"
-    actual_installer_sha=$(file_sha256 "$installer") ||
-        die "无法计算已下载安装包的哈希"
-    if $profile_supported &&
-        [[ $actual_installer_sha != "$expected_installer_sha" ]]; then
-        write_update_status paused \
-            "$(registry_value "$installed_version_key" Version || printf unknown)" \
-            "$latest" \
-            "安装包 SHA-256 与兼容档案不匹配"
-        die "UU $latest 安装包已被重新发布或下载异常；已暂缓更新且未修改客户端"
-    fi
 
     snapshot=$(create_update_snapshot)
     bridge_state_snapshot=$(create_version_bridge_state_snapshot)
@@ -5526,11 +5532,9 @@ run_update_transaction() {
             restore_optional_wol_server_patch ||
                 die "更新前无法安全恢复 WOL 服务端补丁"
         fi
-        if ! $profile_supported; then
-            if hwdecode_enabled || streamer_bridge_ready; then
-                remove_hwdecode_bridge
-                printf '正在为最新版准备自动 NVDEC 档案，已先安全恢复官方解码文件。\n'
-            fi
+        if hwdecode_enabled || streamer_bridge_ready; then
+            remove_hwdecode_bridge
+            printf '正在为最新版准备语义补丁，已先安全恢复官方 streamer.dll。\n'
         fi
         prepare_prefix
         install_or_update_app
@@ -5541,24 +5545,14 @@ run_update_transaction() {
             die "更新后版本核验失败：${installed_after:-unknown}"
 
         ensure_streamer_compatibility_profile "$installed_after" ||
-            die "更新后无法自动生成 NVENC/竖屏语义档案"
+            activate_safe_streamer_fallback
         ensure_runtime_compatibility_profile "$installed_after" ||
             die "更新后输入/焦点/画面钩子的导入语义不再兼容"
 
         ensure_auto_hwencode
-        if $strict_adaptive_patch &&
-            [[ ${UU_REMOTE_DISABLE_AUTO_HWENCODE:-0} != 1 ]] &&
-            ! hwencode_disabled && hwencode_runtime_ready &&
-            hwencode_host_libraries_ready && ! hwencode_enabled; then
-            die "更新后 NVENC 自动补丁无法通过深层验证"
-        fi
 
         if wol_enabled; then
-            if $strict_adaptive_patch; then
-                deploy_optional_wol_server_patch required
-            else
-                deploy_optional_wol_server_patch
-            fi ||
+            deploy_optional_wol_server_patch optional ||
                 die "更新后 WOL 服务端兼容策略无法部署"
             write_wol_hook_config ||
                 die "更新后 WOL 物理网卡映射无法生成"
@@ -5567,12 +5561,8 @@ run_update_transaction() {
                 die "更新后 WOL 自适应档案状态无法刷新"
         fi
         apply_decoder_selection
-        if $strict_adaptive_patch && decoder_selection_wants_nvdec &&
-            { ! hwdecode_enabled || ! hwdecode_files_deployed; }; then
-            die "更新后 NVDEC 自动补丁无法通过官方解码探测"
-        fi
         ensure_streamer_compatibility_profile "$installed_after" ||
-            die "更新后最终 streamer.dll 无法通过 NVENC/竖屏档案复核"
+            activate_safe_streamer_fallback
         # Decoder policy can legitimately replace streamer.dll after the
         # early semantic check.  Re-derive the hash-bound contract from the
         # final committed bytes instead of accepting a stale pre-patch hash.
@@ -5596,23 +5586,17 @@ run_update_transaction() {
         fi
     ); then
         rm -f -- "$snapshot" "$bridge_state_snapshot"
-        if $profile_supported; then
+        if hwdecode_enabled; then
             write_update_status updated "$latest" "$latest" \
-                "客户端与版本绑定兼容桥均已更新并校验"
-            notify_status "UU 已更新到 $latest，兼容桥校验通过"
-            printf 'UU 已更新到 %s，所有已启用兼容桥均已重新部署并校验。\n' \
-                "$latest"
-        elif hwdecode_enabled; then
-            write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证；已启用的 WOL 自适应兼容层已重新生成并部署"
+                "已安装官方最新版；NVDEC 补丁已自动生成并通过真实解码验证；WOL 已按可证明语义或通用映射刷新"
             notify_status "UU 已更新到 $latest，NVDEC 自动补丁验证通过"
-            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁已自动验证；已启用的 WOL 自适应兼容层已重新生成并部署。\n' \
+            printf 'UU 已更新到官方最新版 %s；NVDEC 补丁已自动验证；WOL 已按可证明语义或通用映射刷新。\n' \
                 "$latest"
         else
             write_update_status updated "$latest" "$latest" \
-                "已安装官方最新版；已启用的 WOL 自适应兼容层已重新生成并部署，版本绑定的 NVDEC 补丁已安全停用"
+                "已安装官方最新版；运行时语义契约已重新生成并校验；可选 NVDEC/NVENC 不兼容时保持安全回退"
             notify_status "UU 已更新到 $latest，通用兼容层已重新部署"
-            printf 'UU 已更新到官方最新版 %s；已启用的 WOL 自适应兼容层已重新生成并部署，版本绑定的 NVDEC 补丁暂时停用。\n' \
+            printf 'UU 已更新到官方最新版 %s；运行时语义契约已重新生成并校验，可选硬件编解码未通过时保持安全回退。\n' \
                 "$latest"
         fi
         restart_client_after_update || true
@@ -5901,25 +5885,15 @@ installed_profile_version=$(
 )
 if [[ -n $installed_profile_version ]] &&
     ! ensure_streamer_compatibility_profile "$installed_profile_version"; then
-    if future_adaptive_patch_required "$installed_profile_version"; then
-        if native_wayland_capture_fallback_ready; then
-            activate_native_wayland_capture_fallback
-        else
-            die "当前 UU 版本无法自动生成 NVENC/竖屏补丁档案；已阻止不兼容版本启动"
-        fi
-    else
-        printf '警告：当前旧版 UU 无法生成 NVENC/竖屏语义档案；继续使用安全回退。\n' >&2
-    fi
+    activate_safe_streamer_fallback
 fi
 if [[ -n $installed_profile_version ]] &&
     ! ensure_runtime_compatibility_profile "$installed_profile_version"; then
-    if future_adaptive_patch_required "$installed_profile_version"; then
-        die "当前 UU 版本不满足输入/焦点/画面钩子语义；已阻止不兼容版本启动"
-    fi
-    printf '警告：当前旧版 UU 无法生成完整运行时契约；继续使用已验证的旧版回退。\n' >&2
+    die "当前 UU 版本不满足输入/焦点/画面钩子语义；已阻止不兼容版本启动"
 fi
 
-controller_runtime_module=$(runtime_profile_controller_module || printf 'Qt5Core.dll')
+controller_runtime_module=$(runtime_profile_controller_module) ||
+    die "运行时语义档案缺少控制端 Qt 核心模块；拒绝使用固定模块名回退"
 export UU_REMOTE_CONTROLLER_MODULE="$controller_runtime_module"
 
 if ! sync_linux_system_proxy; then

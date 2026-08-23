@@ -50,6 +50,9 @@ case ${UU_REMOTE_FAKE_CURL_FAILURE:-} in
     version-format)
         effective_url='https://a56.gdl.netease.com/UURemote_Setup_latest_gwqd.exe?test=1'
         ;;
+    redirect-http)
+        effective_url="http://a56.gdl.netease.com/UURemote_Setup_${latest_version}_0723104500_gwqd.exe?test=1"
+        ;;
     '')
         ;;
     *)
