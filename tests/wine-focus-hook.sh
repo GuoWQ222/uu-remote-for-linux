@@ -26,6 +26,14 @@ for command_name in wine wineboot wineserver "$compiler"; do
         exit 0
     }
 done
+wine_version=$(wine --version 2>/dev/null | sed -nE \
+    's/^wine-([0-9]+([.][0-9]+)*).*/\1/p')
+if [[ -z $wine_version ]] ||
+    ! dpkg --compare-versions "$wine_version" ge 11.1; then
+    printf 'SKIP Wine 主控焦点稳定器实测（Wine %s；要求 11.1+）\n' \
+        "${wine_version:-unknown}"
+    exit 0
+fi
 [[ -n ${DISPLAY:-} ]] || {
     printf 'SKIP Wine 主控焦点稳定器实测（DISPLAY 未设置）\n'
     exit 0
