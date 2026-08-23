@@ -1,31 +1,27 @@
-# Direct GitHub Release packages
+# Direct GitHub Release package
 
-Public releases contain two user-facing downloads and do not require an APT
-repository or archive key:
+Public releases contain one user-facing amd64 download and do not require an
+APT repository or archive key:
 
-- `uu-remote-for-linux-x11_VERSION_amd64.deb` is a complete standalone X11
-  package. It contains the shared runtime and does not replace Mutter.
-- `uu-remote-for-linux-wayland_VERSION_amd64.zip` is an offline bundle for
-  Ubuntu 24.04 Noble amd64 with GNOME Shell 46. It contains the shared runtime,
-  the Wayland profile, and the four verified Mutter repair packages.
+- `uu-remote-for-linux_VERSION_amd64.deb` contains both the X11 XTest path and
+  GNOME Wayland Portal/native three-buffer DMA-BUF path.
 
-The Wayland archive is installed after extraction with one normal transaction:
+Install it directly with one normal transaction:
 
 ```bash
-sudo apt install ./*.deb
+sudo apt install ./uu-remote-for-linux_VERSION_amd64.deb
 ```
 
-The archive contains `SHA256SUMS`; the builder verifies its exact inventory and
-reproducibility. No package maintainer script invokes APT or dpkg. Installing
-the Wayland bundle changes Mutter, so the user must log out and back in before
-the patched GNOME Shell library is active.
+The launcher selects the backend from the live user session, where DISPLAY,
+XDG_SESSION_TYPE, and Portal availability are reliable. The Debian maintainer
+scripts do not guess the session or install another package. The package does
+not replace or patch the desktop compositor, and no logout is required.
 
-Build both release assets with:
+Build the release asset with:
 
 ```bash
 make release-assets
 ```
 
-The generated shared runtime `.deb` remains an internal member of the Wayland
-ZIP. Only the standalone X11 `.deb` and Wayland `.zip` are intended as public
+Only the universal `.deb` and its checksum manifest are intended as public
 GitHub Release downloads.

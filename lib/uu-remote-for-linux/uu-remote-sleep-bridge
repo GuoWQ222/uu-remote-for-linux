@@ -6,6 +6,7 @@ readonly inhibitor_why="UU 防止电脑休眠已开启"
 readonly systemd_inhibit="${UU_REMOTE_SYSTEMD_INHIBIT_BIN:-systemd-inhibit}"
 readonly setsid_bin="${UU_REMOTE_SETSID_BIN:-setsid}"
 inhibitor_pid=""
+inhibitor_start_time=""
 
 usage() {
     cat <<'EOF'
@@ -116,13 +117,62 @@ log_message() {
     printf '[%(%FT%T%z)T] %s\n' -1 "$*" >>"$log_file"
 }
 
+process_group_and_start_time() {
+    local pid=$1 stat_payload remainder
+    local -a fields
+
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    stat_payload=$(<"/proc/$pid/stat") || return 1
+    # The comm field is parenthesized and may contain spaces.  Remove it
+    # before indexing the remaining fields: state is field 3, pgrp field 5,
+    # and starttime field 22 in proc_pid_stat(5).
+    [[ $stat_payload == *') '* ]] || return 1
+    remainder=${stat_payload##*) }
+    read -r -a fields <<<"$remainder"
+    ((${#fields[@]} >= 20)) || return 1
+    [[ ${fields[2]} =~ ^[1-9][0-9]*$ &&
+        ${fields[19]} =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s %s\n' "${fields[2]}" "${fields[19]}"
+}
+
+inhibitor_process_matches() {
+    local group start
+
+    [[ -n $inhibitor_pid && -n $inhibitor_start_time ]] || return 1
+    read -r group start < <(
+        process_group_and_start_time "$inhibitor_pid"
+    ) || return 1
+    [[ $group == "$inhibitor_pid" && $start == "$inhibitor_start_time" ]]
+}
+
+capture_inhibitor_identity() {
+    local attempt group start
+
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        if read -r group start < <(
+            process_group_and_start_time "$inhibitor_pid"
+        ) && [[ $group == "$inhibitor_pid" ]]; then
+            inhibitor_start_time=$start
+            return 0
+        fi
+        /bin/sleep 0.01
+    done
+    return 1
+}
+
 stop_inhibitor() {
     local log_file=$1 old_pid
 
     [[ -n $inhibitor_pid ]] || return 0
     old_pid=$inhibitor_pid
+    if inhibitor_process_matches; then
+        kill -TERM -- "-$old_pid" 2>/dev/null || true
+    else
+        log_message "$log_file" \
+            "休眠抑制器 PID 身份已变化；拒绝向复用的进程组发送信号"
+    fi
     inhibitor_pid=""
-    kill -TERM -- "-$old_pid" 2>/dev/null || true
+    inhibitor_start_time=""
     wait "$old_pid" 2>/dev/null || true
     log_message "$log_file" "已释放 Linux sleep:idle 抑制器"
 }
@@ -147,10 +197,20 @@ start_inhibitor() {
         /bin/sleep infinity \
         >>"$log_file" 2>&1 &
     inhibitor_pid=$!
-    sleep 0.1
-    if ! kill -0 "$inhibitor_pid" 2>/dev/null; then
+    if ! capture_inhibitor_identity; then
+        kill -TERM "$inhibitor_pid" 2>/dev/null || true
         wait "$inhibitor_pid" 2>/dev/null || true
         inhibitor_pid=""
+        inhibitor_start_time=""
+        log_message "$log_file" \
+            "休眠抑制器未进入可验证的独立进程组"
+        return 1
+    fi
+    sleep 0.1
+    if ! inhibitor_process_matches; then
+        wait "$inhibitor_pid" 2>/dev/null || true
+        inhibitor_pid=""
+        inhibitor_start_time=""
         log_message "$log_file" "systemd-logind 拒绝创建防休眠抑制器"
         return 1
     fi
@@ -180,8 +240,7 @@ watch_sleep_state() {
     while [[ -x $launcher ]]; do
         desired=$(prevent_sleep_state "$log_dir")
         if [[ $desired == enabled ]] && wine_server_running "$prefix"; then
-            if [[ -z $inhibitor_pid ]] ||
-                ! kill -0 "$inhibitor_pid" 2>/dev/null; then
+            if [[ -z $inhibitor_pid ]] || ! inhibitor_process_matches; then
                 stop_inhibitor "$log_file"
                 start_inhibitor "$log_file" || true
             fi
@@ -208,6 +267,23 @@ case $mode in
             exit 2
         }
         inhibitor_active
+        ;;
+    --self-test)
+        (($# == 1)) || {
+            usage >&2
+            exit 2
+        }
+        "$setsid_bin" /bin/sleep 5 &
+        inhibitor_pid=$!
+        capture_inhibitor_identity
+        inhibitor_process_matches
+        ((inhibitor_start_time += 1))
+        ! inhibitor_process_matches
+        kill -TERM -- "-$inhibitor_pid" 2>/dev/null || true
+        wait "$inhibitor_pid" 2>/dev/null || true
+        inhibitor_pid=""
+        inhibitor_start_time=""
+        printf '防休眠进程身份检查通过。\n'
         ;;
     watch)
         (($# == 6 || $# == 7)) || {

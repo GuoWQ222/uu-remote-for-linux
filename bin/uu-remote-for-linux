@@ -58,10 +58,10 @@ readonly update_blocker_source="$runtime_dir/uu-remote-update-blocker.exe"
 readonly update_compatibility_profiles="${UU_REMOTE_UPDATE_COMPATIBILITY_PROFILES:-$runtime_dir/update-compatibility.tsv}"
 readonly hwdecode_compatibility_profiles="${UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES:-$runtime_dir/hwdecode-compatibility.tsv}"
 readonly hwdecode_profiler="${UU_REMOTE_HWDECODE_PROFILER_BIN:-$runtime_dir/uu-remote-hwdecode-profiler}"
+readonly runtime_profiler="${UU_REMOTE_RUNTIME_PROFILER_BIN:-$runtime_dir/uu-remote-runtime-profiler}"
 readonly hwdecode_dxgi_probe_source="$runtime_dir/uu-remote-dxgi-probe.exe"
 readonly hwencode_policy="$runtime_dir/uu-remote-encoder-policy"
 readonly hwencode_probe_source="$runtime_dir/uu-remote-nvenc-d3d11-probe.exe"
-readonly mutter_fix_manager="/usr/bin/uu-remote-mutter-fix"
 
 detect_desktop_backend() {
     case ${UU_REMOTE_DESKTOP_BACKEND:-auto} in
@@ -215,6 +215,8 @@ readonly encoder_cache="$install_dir/config/streamer/encoder_codec_capability_ca
 readonly encoder_cache_backup="$data_dir/encoder-cache-before-hwencode.json"
 readonly streamer_profile_dir="$data_dir/streamer-profiles"
 readonly streamer_active_profile="$data_dir/streamer-compatibility.json"
+readonly runtime_profile_dir="$data_dir/runtime-profiles"
+readonly runtime_active_profile="$data_dir/runtime-compatibility.json"
 readonly adaptive_patch_baseline_version="4.38.0.9292"
 readonly hwencode_enabled_stamp="$data_dir/hwencode-enabled"
 readonly hwencode_disabled_stamp="$data_dir/hwencode-disabled"
@@ -429,10 +431,6 @@ usage() {
   --check-update       立即检查并安装网易官方最新版本
   --recover-update-snapshot
                        从最近一次完整回滚点恢复（不联网、不启动）
-  --mutter-fix-status  查看 GNOME Wayland 画面延迟修复状态
-  --install-mutter-fix 显式安装经过版本锁定的 Mutter 修复
-  --rollback-mutter-fix
-                       显式恢复随包保存的 Ubuntu 官方 Mutter
   --enable-hwdecode    启用 NVIDIA NVDEC→D3D11 实验兼容桥
   --disable-hwdecode   关闭兼容桥并移除本项目注入的 DLL
   --enable-hwencode    强制启用 NVIDIA NVENC/HEVC 被控端编码桥
@@ -461,9 +459,6 @@ update_check_requested=false
 automatic_update_check=false
 upstream_update_handoff=false
 recover_update_snapshot=false
-mutter_fix_status_requested=false
-install_mutter_fix=false
-rollback_mutter_fix=false
 stop_requested=false
 diagnose_requested=false
 enable_hwdecode=false
@@ -504,15 +499,6 @@ while (($# > 0)); do
         --recover-update-snapshot)
             recover_update_snapshot=true
             setup_only=true
-            ;;
-        --mutter-fix-status)
-            mutter_fix_status_requested=true
-            ;;
-        --install-mutter-fix)
-            install_mutter_fix=true
-            ;;
-        --rollback-mutter-fix)
-            rollback_mutter_fix=true
             ;;
         --auto-update-check)
             update_check_requested=true
@@ -617,8 +603,7 @@ fi
 if $autostart_launch && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested ||
-        $diagnose_requested || $mutter_fix_status_requested ||
-        $install_mutter_fix || $rollback_mutter_fix ||
+        $diagnose_requested ||
         $enable_hwdecode || $disable_hwdecode ||
         $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
@@ -634,8 +619,6 @@ fi
 if $restart_selected_decoder && {
     $setup_only || $repair || $refresh_installer || $update_check_requested ||
         $stop_requested || $diagnose_requested ||
-        $mutter_fix_status_requested || $install_mutter_fix ||
-        $rollback_mutter_fix ||
         $enable_hwdecode || $disable_hwdecode ||
         $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
@@ -649,8 +632,6 @@ if $restart_selected_decoder && {
 fi
 
 if $stop_requested || $diagnose_requested || $update_check_requested ||
-    $mutter_fix_status_requested || $install_mutter_fix ||
-    $rollback_mutter_fix ||
     $enable_hwdecode || $disable_hwdecode ||
     $enable_hwencode || $disable_hwencode ||
     $enable_wol || $disable_wol ||
@@ -675,12 +656,6 @@ $stop_requested && maintenance_action_count=$((maintenance_action_count + 1))
 $diagnose_requested && maintenance_action_count=$((maintenance_action_count + 1))
 $update_check_requested &&
     maintenance_action_count=$((maintenance_action_count + 1))
-$mutter_fix_status_requested &&
-    maintenance_action_count=$((maintenance_action_count + 1))
-$install_mutter_fix &&
-    maintenance_action_count=$((maintenance_action_count + 1))
-$rollback_mutter_fix &&
-    maintenance_action_count=$((maintenance_action_count + 1))
 $enable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_hwdecode && maintenance_action_count=$((maintenance_action_count + 1))
 $enable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
@@ -688,7 +663,7 @@ $disable_hwencode && maintenance_action_count=$((maintenance_action_count + 1))
 $enable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 $disable_wol && maintenance_action_count=$((maintenance_action_count + 1))
 if ((maintenance_action_count > 1)); then
-    die "--stop、--diagnose、更新检查、Mutter、硬件解码和远程开机维护选项不能组合"
+    die "--stop、--diagnose、更新检查、硬件解码和远程开机维护选项不能组合"
 fi
 
 maintenance_selection_count=0
@@ -705,8 +680,6 @@ if ((maintenance_selection_count > 0)) &&
     { $stop_requested || $diagnose_requested || $enable_hwdecode ||
         $disable_hwdecode || $enable_hwencode || $disable_hwencode ||
         $enable_wol || $disable_wol ||
-        $mutter_fix_status_requested || $install_mutter_fix ||
-        $rollback_mutter_fix ||
         $update_check_requested; }; then
     die "解码设备选择选项不能和其他维护选项组合"
 fi
@@ -716,19 +689,6 @@ if [[ -r $package_version_file ]]; then
     package_version=$(<"$package_version_file")
 fi
 readonly package_version
-
-if $mutter_fix_status_requested || $install_mutter_fix ||
-    $rollback_mutter_fix; then
-    [[ -x $mutter_fix_manager ]] ||
-        die "Mutter 修复管理器只随系统级 UU Remote .deb 提供：$mutter_fix_manager"
-    if $mutter_fix_status_requested; then
-        exec "$mutter_fix_manager" status
-    elif $install_mutter_fix; then
-        exec "$mutter_fix_manager" install
-    else
-        exec "$mutter_fix_manager" rollback
-    fi
-fi
 
 if $list_decoders_requested; then
     [[ -x $decoder_selector ]] ||
@@ -1672,6 +1632,25 @@ future_adaptive_patch_required() {
     version_greater "$version" "$adaptive_patch_baseline_version"
 }
 
+native_wayland_capture_fallback_ready() {
+    [[ $desktop_backend == wayland-xwayland &&
+        -x $input_bridge &&
+        -x $runtime_dir/uu-remote-pipewire-capture &&
+        -x $runtime_dir/uu-remote-pipewire-cursor ]]
+}
+
+activate_native_wayland_capture_fallback() {
+    # Native DMA-BUF capture does not depend on the optional streamer patches.
+    # Remove all project-owned NVENC state before allowing this safe path; the
+    # strict input/focus/frame import check still runs immediately afterward.
+    remove_hwencode_bridge
+    printf '%s\n' "$package_version" >"${hwencode_disabled_stamp}.tmp"
+    mv -f "${hwencode_disabled_stamp}.tmp" "$hwencode_disabled_stamp"
+    rm -f -- "$hwencode_failed_stamp"
+    printf '%s\n' \
+        '警告：当前 UU 的 NVENC/竖屏可选补丁尚未兼容；Wayland 将使用原生 DMA-BUF + OpenH264 安全模式。' >&2
+}
+
 streamer_profile_command() {
     local command=$1 streamer=$2 version=$3 profile=$4
     local -a arguments
@@ -1731,6 +1710,64 @@ streamer_compatibility_profile_ready() {
     streamer_profile_command match-streamer-profile \
         "$streamer_dll" "$version" "$streamer_active_profile" \
         >/dev/null 2>&1
+}
+
+ensure_runtime_compatibility_profile() {
+    local version=$1 server_sha controller_sha streamer_sha archive temp
+
+    [[ -x $runtime_profiler && -f $server && -f $client_image &&
+        -f $streamer_dll ]] || return 1
+    [[ $version =~ ^[0-9]+([.][0-9]+){2,3}$ ]] || return 1
+    server_sha=$(file_sha256 "$server") || return 1
+    controller_sha=$(file_sha256 "$client_image") || return 1
+    streamer_sha=$(file_sha256 "$streamer_dll") || return 1
+    mkdir -p "$runtime_profile_dir"
+    archive="$runtime_profile_dir/${version}-${server_sha}-${controller_sha}-${streamer_sha}.json"
+
+    if ! "$runtime_profiler" match \
+        "$install_dir" "$version" "$archive" --strict \
+        >>"$setup_log" 2>&1; then
+        rm -f -- "$archive"
+        "$runtime_profiler" derive \
+            "$install_dir" "$version" "$archive" --strict \
+            >>"$setup_log" 2>&1 || return 1
+        "$runtime_profiler" verify \
+            "$install_dir" "$version" "$archive" --strict \
+            >>"$setup_log" 2>&1 || {
+            rm -f -- "$archive"
+            return 1
+        }
+    fi
+
+    temp=$(mktemp "$data_dir/.runtime-compatibility.XXXXXX") || return 1
+    install -m0600 "$archive" "$temp" || {
+        rm -f -- "$temp"
+        return 1
+    }
+    mv -f "$temp" "$runtime_active_profile" || {
+        rm -f -- "$temp"
+        return 1
+    }
+    "$runtime_profiler" match \
+        "$install_dir" "$version" "$runtime_active_profile" --strict \
+        >>"$setup_log" 2>&1 || return 1
+    printf '已为 UU %s 自动生成并校验输入/焦点/画面运行时契约。\n' \
+        "$version"
+}
+
+runtime_compatibility_profile_ready() {
+    local version=$1
+
+    [[ -x $runtime_profiler && -r $runtime_active_profile ]] || return 1
+    "$runtime_profiler" match \
+        "$install_dir" "$version" "$runtime_active_profile" --strict \
+        >/dev/null 2>&1
+}
+
+runtime_profile_controller_module() {
+    [[ -x $runtime_profiler && -r $runtime_active_profile ]] || return 1
+    "$runtime_profiler" get \
+        "$runtime_active_profile" controller_runtime_module 2>/dev/null
 }
 
 decoder_selection_wants_nvdec() {
@@ -2118,7 +2155,7 @@ native_cursor_status_label() {
 }
 
 wayland_capture_status_label() {
-    local state="" bridge_state="" frames=""
+    local state="" bridge_state="" frames="" transport=""
 
     if [[ $desktop_backend != wayland-xwayland ]]; then
         printf 'X11 直接采集'
@@ -2132,14 +2169,21 @@ wayland_capture_status_label() {
         frames=$(sed -n \
             's/.*"capture_frames": \([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
+        transport=$(sed -n \
+            's/.*"capture_transport": "\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
         if [[ $bridge_state == error ]]; then
             printf '异常（详见输入桥日志）'
             return
         fi
         case $state in
             active)
-                printf '生效中（Portal → Win64 GDI；帧 %s）' \
-                    "${frames:-0}"
+                if [[ $transport == dmabuf-native ]]; then
+                    printf '生效中（原生 DMA-BUF 三缓冲 → Win64 GDI；帧 %s）' \
+                        "${frames:-0}"
+                else
+                    printf '异常（未使用原生 DMA-BUF）'
+                fi
                 ;;
             starting)
                 printf '启动中'
@@ -3824,35 +3868,6 @@ hwencode_last_session_label() {
     fi
 }
 
-mutter_fix_status_label() {
-    local status
-
-    if [[ ! -x $mutter_fix_manager ]]; then
-        printf '系统级 .deb 未提供'
-        return
-    fi
-    status=$($mutter_fix_manager status --field state 2>/dev/null || true)
-    case $status in
-        active) printf '已生效' ;;
-        installed-pending-logout) printf '已安装，等待注销登录' ;;
-        legacy-active|legacy-installed-pending-logout)
-            printf '诊断版已生效，可规范化'
-            ;;
-        rolled-back-pending-logout) printf '已回滚，等待注销登录' ;;
-        eligible) printf '可显式安装' ;;
-        superseded-or-unknown) printf '检测到更高或未知版本，未修改' ;;
-        payload-corrupt) printf '载荷校验失败' ;;
-        interrupted-known-partial)
-            printf 'Mutter 事务中断，需按文档从 TTY 人工恢复'
-            ;;
-        partial|recoverable-partial|installed-corrupt|unknown-build)
-            printf 'Mutter 状态异常，仅允许显式恢复'
-            ;;
-        unsupported-*) printf '当前系统不适用' ;;
-        *) printf '%s' "${status:-未知}" ;;
-    esac
-}
-
 print_diagnostics() {
     local os_name="unknown"
     local detected_wine="missing"
@@ -3913,7 +3928,6 @@ print_diagnostics() {
         "原生光标形状" "$(native_cursor_status_label)" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
-        "GNOME Wayland 延迟修复" "$(mutter_fix_status_label)" \
         "竖屏原画缩放" "$(portrait_original_quality_status_label)" \
         "自适应语义档案" "$(streamer_compatibility_profile_status_label)" \
         "Wayland 授权恢复" "$([[ -s $state_dir/wayland-portal-restore-token ]] && printf '已保存' || printf '尚未建立')" \
@@ -4707,7 +4721,9 @@ ensure_auto_hwencode() {
 
 finalize_hwencode_policy() {
     local attempt status=0 previous_hash="" current_hash="" stable=0
+    local before_hash="" after_hash=""
 
+    hwencode_policy_restart_required=false
     hwencode_enabled || return 0
     # GameViewerServer may regenerate this cache just after process startup
     # when DXVK exposes the real NVIDIA PCI ID.  Wait for the file to settle,
@@ -4726,8 +4742,14 @@ finalize_hwencode_policy() {
         fi
         sleep 0.2
     done
+    before_hash=$(file_sha256 "$encoder_cache" 2>/dev/null || true)
     apply_hwencode_policy || status=$?
     if ((status == 0)); then
+        after_hash=$(file_sha256 "$encoder_cache" 2>/dev/null || true)
+        if [[ -n $before_hash && -n $after_hash &&
+            $before_hash != "$after_hash" ]]; then
+            hwencode_policy_restart_required=true
+        fi
         printf 'UU 编码器能力缓存已切换为 NVIDIA NVENC 优先。\n'
         return 0
     fi
@@ -4739,6 +4761,43 @@ finalize_hwencode_policy() {
     notify_status "NVENC 能力缓存验证失败，已恢复 OpenH264"
     printf '警告：NVENC 能力缓存验证失败；已恢复 OpenH264 安全回退。\n' >&2
     return 1
+}
+
+restart_server_after_hwencode_policy() {
+    local attempt
+
+    $hwencode_policy_restart_required || return 0
+
+    # GameViewerServer can regenerate and consume its official capability
+    # cache during startup.  If the post-start policy pass had to replace that
+    # cache, the already-running process has selected an encoder from stale
+    # data.  Restart only this managed server unit after the atomic rewrite so
+    # its encoder factory observes the verified NVENC-only cache.  Do not
+    # restart an unchanged session on ordinary launcher invocations.
+    if systemd_user_available &&
+        systemctl --user restart \
+            "$server_runtime_unit.service" >/dev/null 2>&1; then
+        for ((attempt = 0; attempt < 60; attempt++)); do
+            wine_image_running "$server" && {
+                printf 'UU 服务端已在 NVENC 档案生效后串行重启。\n'
+                return 0
+            }
+            sleep 0.2
+        done
+        return 1
+    fi
+
+    env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" taskkill /F /IM GameViewerServer.exe 9>&- \
+            >>"$runtime_log" 2>&1 || true
+    for ((attempt = 0; attempt < 60; attempt++)); do
+        wine_image_running "$server" || break
+        sleep 0.1
+    done
+    ensure_wine_image_running "$server_runtime_unit" "$server" || return 1
+    printf 'UU 服务端已在 NVENC 档案生效后串行重启。\n'
 }
 
 configure_hwdecode_environment() {
@@ -5088,6 +5147,8 @@ version_bridge_state_names() {
         wol-generated.tsv
         streamer-compatibility.json
         streamer-profiles
+        runtime-compatibility.json
+        runtime-profiles
         decoder-cache-before-hwdecode.json
         hwencode-enabled
         hwencode-disabled
@@ -5412,7 +5473,8 @@ update_restart_ready() {
     )
     if [[ -n $installed_version ]] &&
         future_adaptive_patch_required "$installed_version"; then
-        streamer_compatibility_profile_ready "$installed_version" || return 1
+        streamer_compatibility_profile_ready "$installed_version" &&
+            runtime_compatibility_profile_ready "$installed_version" || return 1
     fi
     if hwdecode_enabled; then
         hwdecode_files_deployed || return 1
@@ -5480,6 +5542,8 @@ run_update_transaction() {
 
         ensure_streamer_compatibility_profile "$installed_after" ||
             die "更新后无法自动生成 NVENC/竖屏语义档案"
+        ensure_runtime_compatibility_profile "$installed_after" ||
+            die "更新后输入/焦点/画面钩子的导入语义不再兼容"
 
         ensure_auto_hwencode
         if $strict_adaptive_patch &&
@@ -5509,6 +5573,11 @@ run_update_transaction() {
         fi
         ensure_streamer_compatibility_profile "$installed_after" ||
             die "更新后最终 streamer.dll 无法通过 NVENC/竖屏档案复核"
+        # Decoder policy can legitimately replace streamer.dll after the
+        # early semantic check.  Re-derive the hash-bound contract from the
+        # final committed bytes instead of accepting a stale pre-patch hash.
+        ensure_runtime_compatibility_profile "$installed_after" ||
+            die "更新后最终输入/焦点/画面运行时契约复核失败"
 
         shim_ready || die "更新后 Event Log 兼容 DLL 核验失败"
         update_blocker_ready ||
@@ -5833,10 +5902,25 @@ installed_profile_version=$(
 if [[ -n $installed_profile_version ]] &&
     ! ensure_streamer_compatibility_profile "$installed_profile_version"; then
     if future_adaptive_patch_required "$installed_profile_version"; then
-        die "当前 UU 版本无法自动生成 NVENC/竖屏补丁档案；已阻止不兼容版本启动"
+        if native_wayland_capture_fallback_ready; then
+            activate_native_wayland_capture_fallback
+        else
+            die "当前 UU 版本无法自动生成 NVENC/竖屏补丁档案；已阻止不兼容版本启动"
+        fi
+    else
+        printf '警告：当前旧版 UU 无法生成 NVENC/竖屏语义档案；继续使用安全回退。\n' >&2
     fi
-    printf '警告：当前旧版 UU 无法生成 NVENC/竖屏语义档案；继续使用安全回退。\n' >&2
 fi
+if [[ -n $installed_profile_version ]] &&
+    ! ensure_runtime_compatibility_profile "$installed_profile_version"; then
+    if future_adaptive_patch_required "$installed_profile_version"; then
+        die "当前 UU 版本不满足输入/焦点/画面钩子语义；已阻止不兼容版本启动"
+    fi
+    printf '警告：当前旧版 UU 无法生成完整运行时契约；继续使用已验证的旧版回退。\n' >&2
+fi
+
+controller_runtime_module=$(runtime_profile_controller_module || printf 'Qt5Core.dll')
+export UU_REMOTE_CONTROLLER_MODULE="$controller_runtime_module"
 
 if ! sync_linux_system_proxy; then
     printf '警告：Linux 系统代理未能同步到 Wine，详见 %s\n' \
@@ -5945,6 +6029,7 @@ start_systemd_wine_image() {
     for variable in \
         WINEDLLOVERRIDES WINEDLLPATH DXVK_LOG_LEVEL DXVK_CONFIG_FILE \
         UU_REMOTE_CUDA_DEVICE UU_REMOTE_NVENC_ADAPTER_LUID \
+        UU_REMOTE_CONTROLLER_MODULE \
         DISPLAY WAYLAND_DISPLAY XAUTHORITY; do
         if [[ -v $variable ]]; then
             command+=("--setenv=$variable=${!variable}")
@@ -6007,12 +6092,13 @@ start_input_injector() {
 }
 
 start_focus_injector() {
-    local wine_path
+    local wine_path controller_module
 
     [[ ${UU_REMOTE_DISABLE_FOCUS_STABILIZER:-0} != 1 ]] || return 0
     [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
     [[ -n ${DISPLAY:-} ]] || return 0
     input_hook_ready || return 1
+    controller_module=$(runtime_profile_controller_module) || return 1
     if systemd_user_available; then
         if runtime_unit_active "$focus_injector_runtime_unit"; then
             return 0
@@ -6024,7 +6110,7 @@ start_focus_injector() {
             "$input_injector" \
             --watch-module \
             GameViewer.exe \
-            Qt5Core.dll \
+            "$controller_module" \
             "$input_hook_windows"
         return
     fi
@@ -6038,7 +6124,7 @@ start_focus_injector() {
             -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
             -u ALL_PROXY -u NO_PROXY \
             "$wine_path" "$input_injector" \
-            --watch-module GameViewer.exe Qt5Core.dll \
+            --watch-module GameViewer.exe "$controller_module" \
             "$input_hook_windows" 9>&- </dev/null \
             >>"$runtime_log" 2>&1 &
     )
@@ -6068,8 +6154,12 @@ ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
     die "GameViewerHealthd.exe 未能启动"
 ensure_wine_image_running "$server_runtime_unit" "$server" ||
     die "GameViewerServer.exe 未能启动"
+hwencode_policy_restart_required=false
 if ! finalize_hwencode_policy; then
     printf '当前被控会话将使用 UU 的安全软件编码回退。\n' >&2
+elif ! restart_server_after_hwencode_policy; then
+    printf '警告：NVENC 档案已写入，但服务端未能按新档案重启。\n' >&2
+    printf '当前会话可能继续使用启动时选择的软件编码器。\n' >&2
 elif ! start_hwencode_policy_watcher; then
     printf '警告：NVENC 档案监视器未启动，UU 重新探测后可能恢复软件编码。\n' >&2
 fi

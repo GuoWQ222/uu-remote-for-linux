@@ -255,6 +255,7 @@ for _ in {1..100}; do
     sleep 0.02
 done
 grep -q '"hook_pid": [1-9]' "$state_dir/input-bridge-status.json"
+grep -q '"rejected": 0' "$state_dir/input-bridge-status.json"
 grep -q '^motion 32768 16384 1 1$' "$trace"
 grep -q '^motion-target 2000 640$' "$trace"
 grep -q '^motion 32768 16384 1 0$' "$trace"
@@ -277,7 +278,7 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=54'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=55'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 grep -A12 -F '[capture]' "$frame_status" | grep -Eq 'direct_copy_calls=[1-9]'

@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Generate a hash-bound contract for UU binaries patched at runtime.
+
+The native hook deliberately patches APIs by import name rather than by RVA.
+This profiler moves those assumptions into the update transaction: a new UU
+version is accepted only when every required import still exists and the Qt
+event-loop module can be identified unambiguously.  No unknown machine code is
+modified while deriving this profile.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+
+PROFILE_FORMAT = 1
+VERSION_RE = re.compile(r"^[0-9]+(?:[.][0-9]+){2,3}$")
+QT_CORE_RE = re.compile(r"^Qt[0-9]+Core[.]dll$", re.IGNORECASE)
+
+
+class ProfileError(ValueError):
+    """A binary cannot be proven compatible with the runtime hook."""
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"错误：{message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_c_string(data: bytes, offset: int, label: str) -> str:
+    if offset < 0 or offset >= len(data):
+        raise ProfileError(f"{label} 字符串偏移越界")
+    end = data.find(b"\0", offset, min(len(data), offset + 4096))
+    if end < 0:
+        raise ProfileError(f"{label} 字符串未终止或过长")
+    try:
+        return data[offset:end].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProfileError(f"{label} 不是 ASCII") from error
+
+
+class PEImage:
+    """Small fail-closed PE32+ import parser with explicit bounds checks."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            self.data = path.read_bytes()
+        except OSError as error:
+            raise ProfileError(f"无法读取 {path.name}：{error}") from error
+        self.sections: list[tuple[int, int, int, int]] = []
+        self.imports: dict[str, set[str]] = {}
+        self._parse()
+
+    def u16(self, offset: int) -> int:
+        if offset < 0 or offset > len(self.data) - 2:
+            raise ProfileError("PE 16 位字段越界")
+        return struct.unpack_from("<H", self.data, offset)[0]
+
+    def u32(self, offset: int) -> int:
+        if offset < 0 or offset > len(self.data) - 4:
+            raise ProfileError("PE 32 位字段越界")
+        return struct.unpack_from("<I", self.data, offset)[0]
+
+    def u64(self, offset: int) -> int:
+        if offset < 0 or offset > len(self.data) - 8:
+            raise ProfileError("PE 64 位字段越界")
+        return struct.unpack_from("<Q", self.data, offset)[0]
+
+    def rva_to_offset(self, rva: int, size: int = 1) -> int:
+        if rva < 0 or size < 0:
+            raise ProfileError("PE RVA 为负数")
+        for virtual_address, virtual_size, raw_offset, raw_size in self.sections:
+            span = max(virtual_size, raw_size)
+            if virtual_address <= rva and rva - virtual_address <= span:
+                delta = rva - virtual_address
+                if size <= raw_size and delta <= raw_size - size:
+                    return raw_offset + delta
+                break
+        raise ProfileError(f"PE RVA 0x{rva:x} 不在可读取节内")
+
+    def _parse(self) -> None:
+        data = self.data
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            raise ProfileError("缺少有效 MZ 文件头")
+        pe_offset = self.u32(0x3C)
+        if pe_offset > len(data) - 24 or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+            raise ProfileError("缺少有效 PE 文件头")
+        machine = self.u16(pe_offset + 4)
+        section_count = self.u16(pe_offset + 6)
+        optional_size = self.u16(pe_offset + 20)
+        optional = pe_offset + 24
+        if machine != 0x8664 or self.u16(optional) != 0x20B:
+            raise ProfileError("仅支持官方 Win64 PE32+ 文件")
+        if not 1 <= section_count <= 96:
+            raise ProfileError(f"PE 节数量无效：{section_count}")
+        if optional_size < 120 or optional > len(data) - optional_size:
+            raise ProfileError("PE 可选头越界")
+        section_table = optional + optional_size
+        if section_count > (len(data) - section_table) // 40:
+            raise ProfileError("PE 节表越界")
+        for index in range(section_count):
+            entry = section_table + index * 40
+            virtual_size = self.u32(entry + 8)
+            virtual_address = self.u32(entry + 12)
+            raw_size = self.u32(entry + 16)
+            raw_offset = self.u32(entry + 20)
+            if raw_offset > len(data) or raw_size > len(data) - raw_offset:
+                raise ProfileError("PE 节原始范围越界")
+            self.sections.append(
+                (virtual_address, virtual_size, raw_offset, raw_size)
+            )
+        directory_count = self.u32(optional + 108)
+        if directory_count <= 1:
+            raise ProfileError("PE 缺少导入目录")
+        import_rva = self.u32(optional + 112 + 8)
+        import_size = self.u32(optional + 112 + 12)
+        if not import_rva or import_size < 20:
+            raise ProfileError("PE 导入目录为空")
+        import_offset = self.rva_to_offset(import_rva, min(import_size, 20))
+        descriptor_limit = min(import_size // 20, 4096)
+        terminated = False
+        for index in range(descriptor_limit):
+            descriptor = import_offset + index * 20
+            if descriptor > len(data) - 20:
+                raise ProfileError("PE 导入描述符越界")
+            original_first_thunk = self.u32(descriptor)
+            name_rva = self.u32(descriptor + 12)
+            first_thunk = self.u32(descriptor + 16)
+            if not any(data[descriptor : descriptor + 20]):
+                terminated = True
+                break
+            if not name_rva or not first_thunk:
+                raise ProfileError("PE 导入描述符缺少名称或 IAT")
+            dll_name = read_c_string(
+                data, self.rva_to_offset(name_rva), "导入 DLL"
+            ).upper()
+            if dll_name in self.imports:
+                raise ProfileError(f"PE 导入 DLL 重复：{dll_name}")
+            thunk_rva = original_first_thunk or first_thunk
+            thunk_offset = self.rva_to_offset(thunk_rva, 8)
+            functions: set[str] = set()
+            thunk_terminated = False
+            for thunk_index in range(65536):
+                current = thunk_offset + thunk_index * 8
+                value = self.u64(current)
+                if value == 0:
+                    thunk_terminated = True
+                    break
+                if value & (1 << 63):
+                    continue
+                name_offset = self.rva_to_offset(value, 3)
+                function = read_c_string(data, name_offset + 2, "导入函数")
+                if function in functions:
+                    raise ProfileError(
+                        f"{dll_name} 导入函数重复：{function}"
+                    )
+                functions.add(function)
+            if not thunk_terminated:
+                raise ProfileError(f"{dll_name} 导入 thunk 未终止")
+            self.imports[dll_name] = functions
+        if not terminated:
+            raise ProfileError("PE 导入描述符未终止")
+
+    def require(self, dll_name: str, functions: set[str]) -> None:
+        actual = self.imports.get(dll_name.upper())
+        if actual is None:
+            raise ProfileError(f"{self.path.name} 不再导入 {dll_name}")
+        missing = sorted(functions - actual)
+        if missing:
+            raise ProfileError(
+                f"{self.path.name} 的 {dll_name} 缺少：{', '.join(missing)}"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
+
+
+def file_record(image: PEImage) -> dict[str, object]:
+    return {
+        "name": image.path.name,
+        "size": len(image.data),
+        "sha256": image.sha256,
+    }
+
+
+def derive_contract(
+    install_dir: Path, version: str, output: Path | None = None
+) -> dict[str, object]:
+    if not VERSION_RE.fullmatch(version):
+        raise ProfileError(f"UU 版本格式无效：{version}")
+    bin_dir = install_dir / "bin"
+    server = PEImage(bin_dir / "GameViewerServer.exe")
+    controller = PEImage(bin_dir / "GameViewer.exe")
+    streamer = PEImage(bin_dir / "streamer.dll")
+
+    server.require("USER32.dll", {"SendInput", "GetKeyState", "GetCursorPos"})
+    server.require(
+        "IPHLPAPI.DLL", {"GetAdaptersAddresses", "GetAdaptersInfo", "GetIfTable2"}
+    )
+    if "STREAMER.DLL" not in server.imports:
+        raise ProfileError("GameViewerServer.exe 不再导入 streamer.dll")
+    streamer.require("USER32.dll", {"SendInput", "GetCursorInfo"})
+    streamer.require("GDI32.dll", {"BitBlt", "StretchBlt"})
+    streamer.require("DXGI.dll", {"CreateDXGIFactory1"})
+    controller.require(
+        "USER32.dll",
+        {"DispatchMessageW", "SetWindowsHookExW", "UnhookWindowsHookEx"},
+    )
+
+    qt_candidates = sorted(
+        name for name in controller.imports if QT_CORE_RE.fullmatch(name)
+    )
+    if len(qt_candidates) != 1:
+        raise ProfileError(
+            "GameViewer.exe 的 Qt Core 模块候选不唯一："
+            + (", ".join(qt_candidates) or "无")
+        )
+    qt_path = bin_dir / qt_candidates[0]
+    if not qt_path.is_file():
+        # Preserve the on-disk spelling on case-sensitive filesystems.
+        matches = [
+            item
+            for item in bin_dir.iterdir()
+            if item.is_file() and item.name.upper() == qt_candidates[0]
+        ]
+        if len(matches) != 1:
+            raise ProfileError(f"找不到唯一 Qt Core 文件：{qt_candidates[0]}")
+        qt_path = matches[0]
+    qt_core = PEImage(qt_path)
+    qt_core.require(
+        "USER32.dll",
+        {
+            "DispatchMessageW",
+            "PeekMessageW",
+            "MsgWaitForMultipleObjectsEx",
+            "PostMessageW",
+        },
+    )
+
+    contract: dict[str, object] = {
+        "format": PROFILE_FORMAT,
+        "uu_version": version,
+        "files": {
+            "server": file_record(server),
+            "controller": file_record(controller),
+            "streamer": file_record(streamer),
+            "controller_runtime": file_record(qt_core),
+        },
+        "controller_runtime_module": qt_core.path.name,
+        "capabilities": {
+            "input_iat": True,
+            "focus_iat": True,
+            "frame_iat": True,
+            "cursor_iat": True,
+            "wol_iat": True,
+        },
+    }
+    if output is not None:
+        atomic_write_json(output, contract)
+    return contract
+
+
+def atomic_write_json(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def verify_contract(install_dir: Path, version: str, profile: Path) -> dict[str, object]:
+    try:
+        saved = json.loads(profile.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProfileError(f"无法读取运行时兼容档案：{error}") from error
+    current = derive_contract(install_dir, version)
+    if saved != current:
+        raise ProfileError("运行时兼容档案与当前 UU 二进制或导入语义不匹配")
+    return current
+
+
+def profile_value(profile: Path, key: str) -> str:
+    if key != "controller_runtime_module":
+        raise ProfileError(f"不允许读取未知档案字段：{key}")
+    try:
+        saved = json.loads(profile.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProfileError(f"无法读取运行时兼容档案：{error}") from error
+    value = saved.get(key) if isinstance(saved, dict) else None
+    if not isinstance(value, str) or not QT_CORE_RE.fullmatch(value):
+        raise ProfileError(f"运行时兼容档案字段无效：{key}")
+    print(value)
+    return value
+
+
+def main(argv: list[str]) -> None:
+    try:
+        if len(argv) == 6 and argv[1] in {"derive", "verify", "match"}:
+            install_dir = Path(argv[2])
+            version = argv[3]
+            profile = Path(argv[4])
+            # Reserved final argument makes accidental old call signatures fail.
+            if argv[5] != "--strict":
+                raise ProfileError(f"未知参数：{argv[5]}")
+            if argv[1] == "derive":
+                contract = derive_contract(install_dir, version, profile)
+            else:
+                contract = verify_contract(install_dir, version, profile)
+            print(
+                "RUNTIME_PROFILE_OK"
+                f"\tversion={version}"
+                f"\tcontroller_module={contract['controller_runtime_module']}"
+            )
+            return
+        if len(argv) == 4 and argv[1] == "get":
+            profile_value(Path(argv[2]), argv[3])
+            return
+        raise ProfileError(
+            "用法：uu-remote-runtime-profiler derive|verify|match "
+            "INSTALL_DIR UU_VERSION PROFILE --strict；"
+            "或 get PROFILE controller_runtime_module"
+        )
+    except ProfileError as error:
+        fail(str(error))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

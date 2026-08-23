@@ -39,7 +39,7 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 54u
+#define HOOK_VERSION 55u
 #define LOCK_STATE_CONFIRM_TIMEOUT_MS 2000u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 2u
@@ -207,6 +207,7 @@ static CHAR focus_status_path[MAX_PATH];
 static CHAR focus_show_request_path[MAX_PATH];
 static CHAR controller_restart_request_path[MAX_PATH];
 static WCHAR controller_root_path[MAX_PATH];
+static WCHAR controller_runtime_module[MAX_PATH] = L"Qt5Core.dll";
 static enum hook_process_kind process_kind;
 static INIT_ONCE winsock_once = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE wol_config_once = INIT_ONCE_STATIC_INIT;
@@ -215,6 +216,7 @@ static SOCKET bridge_socket = INVALID_SOCKET;
 static struct sockaddr_in bridge_address;
 static unsigned char bridge_token[16];
 static volatile LONG sequence_number;
+static volatile LONG input_send_test_delay_once;
 static ULONGLONG endpoint_checked_at;
 static BOOL endpoint_valid;
 static BOOL force_cursor_visible;
@@ -678,23 +680,44 @@ static void initialize_header(
     CopyMemory(header->token, bridge_token, sizeof(header->token));
 }
 
+/* endpoint_lock serializes the endpoint snapshot, sequence and UDP send. */
+static BOOL send_input_packet_locked(
+    void *packet,
+    uint8_t kind,
+    uint16_t size
+) {
+    int sent;
+
+    if (
+        !packet || !endpoint_valid || bridge_socket == INVALID_SOCKET ||
+        size < sizeof(struct packet_header)
+    ) {
+        return FALSE;
+    }
+    initialize_header((struct packet_header *)packet, kind, size);
+    if (InterlockedCompareExchange(&input_send_test_delay_once, 0, 1) == 1) {
+        Sleep(25);
+    }
+    sent = sendto(
+        bridge_socket,
+        (const char *)packet,
+        size,
+        0,
+        (const struct sockaddr *)&bridge_address,
+        sizeof(bridge_address)
+    );
+    return sent == (int)size;
+}
+
 static void send_hello(void) {
     struct hello_packet packet;
     if (!endpoint_valid || bridge_socket == INVALID_SOCKET) {
         return;
     }
     ZeroMemory(&packet, sizeof(packet));
-    initialize_header(&packet.header, UUIP_HELLO, sizeof(packet));
     packet.pid = GetCurrentProcessId();
     packet.hook_version = HOOK_VERSION;
-    sendto(
-        bridge_socket,
-        (const char *)&packet,
-        sizeof(packet),
-        0,
-        (const struct sockaddr *)&bridge_address,
-        sizeof(bridge_address)
-    );
+    send_input_packet_locked(&packet, UUIP_HELLO, sizeof(packet));
 }
 
 static void clear_tracked_cursor(void) {
@@ -1111,45 +1134,154 @@ static BOOL actual_cursor_to_screen_local(
 
 static BOOL forward_mouse(const MOUSEINPUT *input) {
     struct mouse_packet packet;
-    int sent;
+    BOOL sent;
+
     ZeroMemory(&packet, sizeof(packet));
-    initialize_header(&packet.header, UUIP_MOUSE, sizeof(packet));
     packet.dx = input->dx;
     packet.dy = input->dy;
     packet.mouse_data = input->mouseData;
     packet.flags = input->dwFlags;
     packet.time = input->time;
     packet.extra_info = (uint64_t)input->dwExtraInfo;
-    sent = sendto(
-        bridge_socket,
-        (const char *)&packet,
-        sizeof(packet),
-        0,
-        (const struct sockaddr *)&bridge_address,
-        sizeof(bridge_address)
-    );
-    return sent == (int)sizeof(packet);
+    AcquireSRWLockExclusive(&endpoint_lock);
+    sent = send_input_packet_locked(&packet, UUIP_MOUSE, sizeof(packet));
+    ReleaseSRWLockExclusive(&endpoint_lock);
+    return sent;
 }
 
 static BOOL forward_keyboard(const KEYBDINPUT *input) {
     struct keyboard_packet packet;
-    int sent;
+    BOOL sent;
+
     ZeroMemory(&packet, sizeof(packet));
-    initialize_header(&packet.header, UUIP_KEYBOARD, sizeof(packet));
     packet.virtual_key = input->wVk;
     packet.scan_code = input->wScan;
     packet.flags = input->dwFlags;
     packet.time = input->time;
     packet.extra_info = (uint64_t)input->dwExtraInfo;
-    sent = sendto(
-        bridge_socket,
-        (const char *)&packet,
-        sizeof(packet),
-        0,
-        (const struct sockaddr *)&bridge_address,
-        sizeof(bridge_address)
+    AcquireSRWLockExclusive(&endpoint_lock);
+    sent = send_input_packet_locked(&packet, UUIP_KEYBOARD, sizeof(packet));
+    ReleaseSRWLockExclusive(&endpoint_lock);
+    return sent;
+}
+
+static UINT fallback_send_input_suffix(
+    send_input_fn fallback,
+    UINT count,
+    LPINPUT inputs,
+    int input_size,
+    UINT forwarded
+) {
+    UINT remaining;
+    UINT inserted;
+
+    if (forwarded >= count) {
+        return count;
+    }
+    if (!fallback || !inputs) {
+        return forwarded;
+    }
+    remaining = count - forwarded;
+    inserted = fallback(
+        remaining, inputs + forwarded, input_size
     );
-    return sent == (int)sizeof(packet);
+    if (inserted > remaining) {
+        inserted = remaining;
+    }
+    return forwarded + inserted;
+}
+
+static LPINPUT input_fallback_test_expected;
+static volatile LONG input_fallback_test_calls;
+
+static UINT WINAPI input_fallback_test_original(
+    UINT count,
+    LPINPUT inputs,
+    int input_size
+) {
+    if (
+        inputs != input_fallback_test_expected ||
+        count != 2u || input_size != (int)sizeof(INPUT)
+    ) {
+        return 0u;
+    }
+    InterlockedIncrement(&input_fallback_test_calls);
+    return count;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteInputFallbackSelfTest(void) {
+    INPUT inputs[3];
+    UINT result;
+
+    ZeroMemory(inputs, sizeof(inputs));
+    input_fallback_test_expected = &inputs[1];
+    InterlockedExchange(&input_fallback_test_calls, 0);
+    result = fallback_send_input_suffix(
+        input_fallback_test_original,
+        3u,
+        inputs,
+        sizeof(INPUT),
+        1u
+    );
+    if (
+        result != 3u ||
+        InterlockedCompareExchange(&input_fallback_test_calls, 0, 0) != 1
+    ) {
+        return 0u;
+    }
+    result = fallback_send_input_suffix(
+        input_fallback_test_original,
+        3u,
+        inputs,
+        sizeof(INPUT),
+        3u
+    );
+    return result == 3u &&
+        InterlockedCompareExchange(&input_fallback_test_calls, 0, 0) == 1
+        ? 1u : 0u;
+}
+
+static DWORD WINAPI input_sequence_test_worker(void *parameter) {
+    volatile LONG *successes = (volatile LONG *)parameter;
+    MOUSEINPUT input;
+
+    ZeroMemory(&input, sizeof(input));
+    if (forward_mouse(&input)) {
+        InterlockedIncrement(successes);
+    }
+    return 0u;
+}
+
+__declspec(dllexport) DWORD WINAPI UURemoteInputSequenceSelfTest(void) {
+    HANDLE workers[2] = {NULL, NULL};
+    volatile LONG successes = 0;
+    SIZE_T index;
+    BOOL ready = TRUE;
+
+    if (!refresh_endpoint()) {
+        return 0u;
+    }
+    InterlockedExchange(&input_send_test_delay_once, 1);
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        workers[index] = CreateThread(
+            NULL, 0, input_sequence_test_worker, (void *)&successes, 0, NULL
+        );
+        if (!workers[index]) {
+            ready = FALSE;
+            break;
+        }
+    }
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        if (workers[index]) {
+            if (WaitForSingleObject(workers[index], 5000) != WAIT_OBJECT_0) {
+                ready = FALSE;
+            }
+            CloseHandle(workers[index]);
+        }
+    }
+    InterlockedExchange(&input_send_test_delay_once, 0);
+    return ready && InterlockedCompareExchange(&successes, 0, 0) == 2
+        ? 1u : 0u;
 }
 
 static LONG lock_key_bit(const KEYBDINPUT *input) {
@@ -1248,25 +1380,37 @@ static UINT WINAPI hooked_send_input(
     for (index = 0; index < count; ++index) {
         if (inputs[index].type == INPUT_MOUSE) {
             if (!forward_mouse(&inputs[index].mi)) {
-                return original_send_input
-                    ? original_send_input(count, inputs, input_size)
-                    : index;
+                return fallback_send_input_suffix(
+                    original_send_input,
+                    count,
+                    inputs,
+                    input_size,
+                    index
+                );
             }
             track_mouse_position(&inputs[index].mi);
         } else if (inputs[index].type == INPUT_KEYBOARD) {
             LONG lock_bit = lock_key_bit(&inputs[index].ki);
             if (!forward_keyboard(&inputs[index].ki)) {
-                return original_send_input
-                    ? original_send_input(count, inputs, input_size)
-                    : index;
+                return fallback_send_input_suffix(
+                    original_send_input,
+                    count,
+                    inputs,
+                    input_size,
+                    index
+                );
             }
             if (lock_bit && !(inputs[index].ki.dwFlags & KEYEVENTF_KEYUP)) {
                 toggle_native_lock_state(lock_bit);
             }
         } else {
-            return original_send_input
-                ? original_send_input(count, inputs, input_size)
-                : index;
+            return fallback_send_input_suffix(
+                original_send_input,
+                count,
+                inputs,
+                input_size,
+                index
+            );
         }
     }
     return count;
@@ -3751,6 +3895,232 @@ static NETIO_STATUS WINAPI hooked_get_if_table2(PMIB_IF_TABLE2 *table) {
     return result;
 }
 
+struct loaded_pe_image {
+    unsigned char *base;
+    SIZE_T size;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *sections;
+    WORD section_count;
+};
+
+static BOOL allocation_span_accessible(
+    const void *allocation_base,
+    const void *address,
+    SIZE_T size
+) {
+    uintptr_t allocation = (uintptr_t)allocation_base;
+    uintptr_t current = (uintptr_t)address;
+    uintptr_t end;
+
+    if (!allocation_base || !address || size > UINTPTR_MAX - current) {
+        return FALSE;
+    }
+    end = current + size;
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION memory;
+        uintptr_t region_end;
+
+        if (
+            VirtualQuery((const void *)current, &memory, sizeof(memory)) !=
+                sizeof(memory) ||
+            memory.AllocationBase != (void *)allocation ||
+            memory.State != MEM_COMMIT ||
+            (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0u ||
+            memory.RegionSize > UINTPTR_MAX - (uintptr_t)memory.BaseAddress
+        ) {
+            return FALSE;
+        }
+        region_end = (uintptr_t)memory.BaseAddress + memory.RegionSize;
+        if (region_end <= current) {
+            return FALSE;
+        }
+        current = region_end < end ? region_end : end;
+    }
+    return TRUE;
+}
+
+static BOOL loaded_pe_rva_span(
+    const struct loaded_pe_image *image,
+    DWORD rva,
+    SIZE_T size,
+    void **address
+) {
+    if (
+        !image || !image->base || rva > image->size ||
+        size > image->size - rva ||
+        !allocation_span_accessible(
+            image->base, image->base + rva, size
+        )
+    ) {
+        return FALSE;
+    }
+    if (address) {
+        *address = image->base + rva;
+    }
+    return TRUE;
+}
+
+static BOOL parse_loaded_pe_image(
+    HMODULE module,
+    struct loaded_pe_image *image
+) {
+    unsigned char *base = (unsigned char *)module;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *sections;
+    SIZE_T header_size;
+    WORD section_count;
+    WORD optional_size;
+    WORD index;
+
+    if (!module || !image) {
+        return FALSE;
+    }
+    ZeroMemory(image, sizeof(*image));
+    if (!allocation_span_accessible(base, base, sizeof(*dos))) {
+        return FALSE;
+    }
+    dos = (IMAGE_DOS_HEADER *)base;
+    if (
+        dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        dos->e_lfanew > 1024 * 1024
+    ) {
+        return FALSE;
+    }
+    if (!allocation_span_accessible(
+            base,
+            base + dos->e_lfanew,
+            sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
+        )) {
+        return FALSE;
+    }
+    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    section_count = nt->FileHeader.NumberOfSections;
+    optional_size = nt->FileHeader.SizeOfOptionalHeader;
+    if (
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        section_count == 0u || section_count > 96u ||
+        optional_size < sizeof(IMAGE_OPTIONAL_HEADER64)
+    ) {
+        return FALSE;
+    }
+    header_size = (SIZE_T)dos->e_lfanew + sizeof(DWORD) +
+        sizeof(IMAGE_FILE_HEADER) + optional_size;
+    if (
+        header_size < (SIZE_T)dos->e_lfanew ||
+        section_count > (SIZE_MAX - header_size) / sizeof(*sections)
+    ) {
+        return FALSE;
+    }
+    header_size += section_count * sizeof(*sections);
+    if (!allocation_span_accessible(base, base, header_size)) {
+        return FALSE;
+    }
+    if (
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->OptionalHeader.SizeOfImage < header_size
+    ) {
+        return FALSE;
+    }
+    image->base = base;
+    image->size = nt->OptionalHeader.SizeOfImage;
+    image->nt = nt;
+    image->sections = IMAGE_FIRST_SECTION(nt);
+    image->section_count = section_count;
+    sections = image->sections;
+    for (index = 0u; index < section_count; ++index) {
+        SIZE_T span = sections[index].Misc.VirtualSize;
+        DWORD rva = sections[index].VirtualAddress;
+
+        if (span < sections[index].SizeOfRawData) {
+            span = sections[index].SizeOfRawData;
+        }
+        if (span && !loaded_pe_rva_span(image, rva, span, NULL)) {
+            ZeroMemory(image, sizeof(*image));
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL loaded_pe_find_section(
+    const struct loaded_pe_image *image,
+    const char *name,
+    const IMAGE_SECTION_HEADER **section,
+    unsigned char **start,
+    SIZE_T *span
+) {
+    SIZE_T name_length;
+    WORD index;
+
+    if (!image || !name || !section || !start || !span) {
+        return FALSE;
+    }
+    name_length = strlen(name);
+    if (!name_length || name_length > IMAGE_SIZEOF_SHORT_NAME) {
+        return FALSE;
+    }
+    for (index = 0u; index < image->section_count; ++index) {
+        const IMAGE_SECTION_HEADER *candidate = &image->sections[index];
+        SIZE_T candidate_span;
+
+        if (memcmp(candidate->Name, name, name_length) != 0) {
+            continue;
+        }
+        if (
+            name_length < IMAGE_SIZEOF_SHORT_NAME &&
+            candidate->Name[name_length] != '\0'
+        ) {
+            continue;
+        }
+        candidate_span = candidate->Misc.VirtualSize;
+        if (candidate_span < candidate->SizeOfRawData) {
+            candidate_span = candidate->SizeOfRawData;
+        }
+        if (!loaded_pe_rva_span(
+                image,
+                candidate->VirtualAddress,
+                candidate_span,
+                (void **)start
+            )) {
+            return FALSE;
+        }
+        *section = candidate;
+        *span = candidate_span;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL loaded_pe_cstring(
+    const struct loaded_pe_image *image,
+    DWORD rva,
+    SIZE_T maximum,
+    const char **value
+) {
+    SIZE_T available;
+    SIZE_T length;
+    const char *text;
+
+    if (!image || !value || rva >= image->size) {
+        return FALSE;
+    }
+    available = image->size - rva;
+    if (available > maximum) {
+        available = maximum;
+    }
+    for (length = 0u; length < available; ++length) {
+        if (!loaded_pe_rva_span(image, rva, length + 1u, (void **)&text)) {
+            return FALSE;
+        }
+        if (!text[length]) {
+            *value = text;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static BOOL patch_import(
     HMODULE module,
     const char *dll_name,
@@ -3758,65 +4128,140 @@ static BOOL patch_import(
     void *replacement,
     void **original
 ) {
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
-    IMAGE_NT_HEADERS64 *nt;
+    struct loaded_pe_image image;
+    static const IMAGE_IMPORT_DESCRIPTOR zero_descriptor;
     IMAGE_DATA_DIRECTORY directory;
-    IMAGE_IMPORT_DESCRIPTOR *descriptor;
+    SIZE_T descriptor_count;
+    SIZE_T descriptor_index;
 
-    if (!module || dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !dll_name || !function_name || !replacement || !original ||
+        !parse_loaded_pe_image(module, &image)
     ) {
         return FALSE;
     }
-    directory = nt->OptionalHeader.DataDirectory[
-        IMAGE_DIRECTORY_ENTRY_IMPORT
-    ];
-    if (!directory.VirtualAddress) {
+    if (
+        image.nt->OptionalHeader.NumberOfRvaAndSizes <=
+            IMAGE_DIRECTORY_ENTRY_IMPORT
+    ) {
         return FALSE;
     }
-    descriptor = (IMAGE_IMPORT_DESCRIPTOR *)(
-        base + directory.VirtualAddress
-    );
-    for (; descriptor->Name; ++descriptor) {
+    directory = image.nt->OptionalHeader.DataDirectory[
+        IMAGE_DIRECTORY_ENTRY_IMPORT
+    ];
+    if (
+        !directory.VirtualAddress ||
+        directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
+        !loaded_pe_rva_span(
+            &image, directory.VirtualAddress, directory.Size, NULL
+        )
+    ) {
+        return FALSE;
+    }
+    descriptor_count = directory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    for (descriptor_index = 0u;
+         descriptor_index < descriptor_count;
+         ++descriptor_index) {
+        IMAGE_IMPORT_DESCRIPTOR *descriptor;
         IMAGE_THUNK_DATA64 *names;
         IMAGE_THUNK_DATA64 *addresses;
         size_t index;
-        const char *imported_dll = (const char *)(base + descriptor->Name);
+        const char *imported_dll;
+
+        if (!loaded_pe_rva_span(
+                &image,
+                directory.VirtualAddress +
+                    (DWORD)(descriptor_index * sizeof(*descriptor)),
+                sizeof(*descriptor),
+                (void **)&descriptor
+            )) {
+            return FALSE;
+        }
+        if (memcmp(descriptor, &zero_descriptor, sizeof(*descriptor)) == 0) {
+            return FALSE;
+        }
+        if (!descriptor->Name) {
+            return FALSE;
+        }
+        if (!loaded_pe_cstring(
+                &image, descriptor->Name, 4096u, &imported_dll
+            )) {
+            return FALSE;
+        }
         if (lstrcmpiA(imported_dll, dll_name) != 0) {
             continue;
         }
-        if (!descriptor->OriginalFirstThunk) {
+        if (!descriptor->OriginalFirstThunk || !descriptor->FirstThunk) {
             return FALSE;
         }
-        names = (IMAGE_THUNK_DATA64 *)(
-            base + descriptor->OriginalFirstThunk
-        );
-        addresses = (IMAGE_THUNK_DATA64 *)(
-            base + descriptor->FirstThunk
-        );
-        for (index = 0; names[index].u1.AddressOfData; ++index) {
-            IMAGE_IMPORT_BY_NAME *imported_name;
+        for (index = 0u; index < 65536u; ++index) {
             DWORD old_protection;
             void *previous;
-            if (IMAGE_SNAP_BY_ORDINAL64(names[index].u1.Ordinal)) {
+            ULONGLONG name_rva;
+
+            if (
+                index > (UINT32_MAX - descriptor->OriginalFirstThunk) /
+                    sizeof(*names) ||
+                index > (UINT32_MAX - descriptor->FirstThunk) /
+                    sizeof(*addresses) ||
+                !loaded_pe_rva_span(
+                    &image,
+                    descriptor->OriginalFirstThunk +
+                        (DWORD)(index * sizeof(*names)),
+                    sizeof(*names),
+                    (void **)&names
+                ) ||
+                !loaded_pe_rva_span(
+                    &image,
+                    descriptor->FirstThunk +
+                        (DWORD)(index * sizeof(*addresses)),
+                    sizeof(*addresses),
+                    (void **)&addresses
+                )
+            ) {
+                return FALSE;
+            }
+            if (!names->u1.AddressOfData) {
+                return FALSE;
+            }
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
                 continue;
             }
-            imported_name = (IMAGE_IMPORT_BY_NAME *)(
-                base + names[index].u1.AddressOfData
-            );
-            if (lstrcmpA((const char *)imported_name->Name, function_name)) {
+            name_rva = names->u1.AddressOfData;
+            if (
+                name_rva > UINT32_MAX ||
+                !loaded_pe_rva_span(
+                    &image, (DWORD)name_rva, sizeof(WORD),
+                    NULL
+                )
+            ) {
+                return FALSE;
+            }
+            {
+                const char *imported_function;
+                if (!loaded_pe_cstring(
+                        &image,
+                        (DWORD)name_rva + (DWORD)sizeof(WORD),
+                        4096u,
+                        &imported_function
+                    )) {
+                    return FALSE;
+                }
+                if (lstrcmpA(imported_function, function_name)) {
+                    continue;
+                }
+            }
+            if (!allocation_span_accessible(
+                    image.base,
+                    &addresses->u1.Function,
+                    sizeof(addresses->u1.Function)
+                )) {
                 continue;
             }
             if (
                 !VirtualProtect(
-                    &addresses[index].u1.Function,
-                    sizeof(addresses[index].u1.Function),
+                    &addresses->u1.Function,
+                    sizeof(addresses->u1.Function),
                     PAGE_READWRITE,
                     &old_protection
                 )
@@ -3824,25 +4269,26 @@ static BOOL patch_import(
                 return FALSE;
             }
             previous = InterlockedExchangePointer(
-                (void *volatile *)&addresses[index].u1.Function,
+                (void *volatile *)&addresses->u1.Function,
                 replacement
             );
             VirtualProtect(
-                &addresses[index].u1.Function,
-                sizeof(addresses[index].u1.Function),
+                &addresses->u1.Function,
+                sizeof(addresses->u1.Function),
                 old_protection,
                 &old_protection
             );
             FlushInstructionCache(
                 GetCurrentProcess(),
-                &addresses[index].u1.Function,
-                sizeof(addresses[index].u1.Function)
+                &addresses->u1.Function,
+                sizeof(addresses->u1.Function)
             );
             if (previous != replacement) {
                 *original = previous;
             }
             return TRUE;
         }
+        return FALSE;
     }
     return FALSE;
 }
@@ -3861,20 +4307,23 @@ static BOOL address_in_image_section(
     const void *address,
     SIZE_T size
 ) {
-    const unsigned char *start;
+    uintptr_t start;
+    uintptr_t value;
     SIZE_T span;
-    const unsigned char *value = (const unsigned char *)address;
 
     if (!base || !section || !address) {
         return FALSE;
     }
-    start = base + section->VirtualAddress;
+    if (section->VirtualAddress > UINTPTR_MAX - (uintptr_t)base) {
+        return FALSE;
+    }
+    start = (uintptr_t)base + section->VirtualAddress;
+    value = (uintptr_t)address;
     span = section->Misc.VirtualSize;
     if (span < section->SizeOfRawData) {
         span = section->SizeOfRawData;
     }
-    return value >= start && size <= span &&
-        (SIZE_T)(value - start) <= span - size;
+    return value >= start && size <= span && value - start <= span - size;
 }
 
 static DWORD WINAPI hooked_frame_adapter_id(void *frame) {
@@ -4237,41 +4686,16 @@ static BOOL executable_patch_image_identity(
     DWORD *timestamp,
     DWORD *image_size
 ) {
-    IMAGE_DOS_HEADER dos_header;
-    IMAGE_NT_HEADERS64 nt_headers;
-    SIZE_T read_size;
+    struct loaded_pe_image image;
 
     if (
-        !ReadProcessMemory(
-            GetCurrentProcess(),
-            allocation_base,
-            &dos_header,
-            sizeof(dos_header),
-            &read_size
-        ) ||
-        read_size != sizeof(dos_header) ||
-        dos_header.e_magic != IMAGE_DOS_SIGNATURE ||
-        dos_header.e_lfanew <= 0 ||
-        dos_header.e_lfanew > 1024 * 1024
+        !timestamp || !image_size ||
+        !parse_loaded_pe_image((HMODULE)allocation_base, &image)
     ) {
         return FALSE;
     }
-    if (
-        !ReadProcessMemory(
-            GetCurrentProcess(),
-            (unsigned char *)allocation_base + dos_header.e_lfanew,
-            &nt_headers,
-            sizeof(nt_headers),
-            &read_size
-        ) ||
-        read_size != sizeof(nt_headers) ||
-        nt_headers.Signature != IMAGE_NT_SIGNATURE ||
-        nt_headers.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
-    ) {
-        return FALSE;
-    }
-    *timestamp = nt_headers.FileHeader.TimeDateStamp;
-    *image_size = nt_headers.OptionalHeader.SizeOfImage;
+    *timestamp = image.nt->FileHeader.TimeDateStamp;
+    *image_size = image.nt->OptionalHeader.SizeOfImage;
     return TRUE;
 }
 
@@ -4580,12 +5004,17 @@ failed:
 static BOOL executable_patch_range_is_idle(
     const struct executable_patch_thread *threads,
     SIZE_T count,
-    const void *function
+    const void *function,
+    SIZE_T size
 ) {
     const uintptr_t start = (uintptr_t)function;
-    const uintptr_t end = start + EXECUTABLE_PATCH_SIZE;
+    const uintptr_t end = start + size;
     SIZE_T index;
 
+    if (!function || !size || size > UINTPTR_MAX - start) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     for (index = 0u; index < count; ++index) {
         CONTEXT context;
 
@@ -4659,7 +5088,7 @@ static BOOL patch_executable_entry(void *function, void *replacement) {
             goto cleanup;
         }
         if (!executable_patch_range_is_idle(
-                threads, thread_count, function
+                threads, thread_count, function, sizeof(jump)
             )) {
             resume_executable_patch_threads(threads, thread_count);
             Sleep(1);
@@ -4710,6 +5139,162 @@ cleanup:
     return success;
 }
 
+/*
+ * Machine-code compatibility fields may be reached after the module has
+ * already started capture threads.  Updating several displacement bytes with
+ * plain stores exposes a partially patched instruction sequence.  Apply the
+ * complete field set while every other process thread is suspended outside
+ * the matched semantic pattern, then restore the original page protection.
+ */
+static BOOL patch_executable_byte_fields(
+    unsigned char *base,
+    SIZE_T span,
+    const SIZE_T *offsets,
+    const unsigned char *original_fields,
+    const unsigned char *patched_fields,
+    SIZE_T field_count,
+    volatile LONG *patch_counter
+) {
+    struct executable_patch_thread threads[EXECUTABLE_PATCH_MAX_THREADS];
+    SIZE_T thread_count = 0u;
+    SIZE_T first_offset;
+    SIZE_T last_offset;
+    SIZE_T index;
+    unsigned int attempt;
+    DWORD old_protection = 0;
+    DWORD ignored_protection;
+    DWORD failure_error = ERROR_SUCCESS;
+    LONG changes = 0;
+    BOOL threads_suspended = FALSE;
+    BOOL protection_changed = FALSE;
+    BOOL success = FALSE;
+
+    if (
+        !base || !span || !offsets || !original_fields || !patched_fields ||
+        !field_count
+    ) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    first_offset = offsets[0];
+    last_offset = offsets[field_count - 1u];
+    if (first_offset >= span || last_offset >= span) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    for (index = 0u; index < field_count; ++index) {
+        if (
+            offsets[index] >= span ||
+            (index && offsets[index] <= offsets[index - 1u])
+        ) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+
+    AcquireSRWLockExclusive(&executable_patch_lock);
+    for (index = 0u; index < field_count; ++index) {
+        unsigned char current = base[offsets[index]];
+
+        if (
+            current != original_fields[index] &&
+            current != patched_fields[index]
+        ) {
+            failure_error = ERROR_REVISION_MISMATCH;
+            goto cleanup;
+        }
+        if (current != patched_fields[index]) {
+            ++changes;
+        }
+    }
+    if (!changes) {
+        success = TRUE;
+        goto cleanup;
+    }
+
+    for (attempt = 0u; attempt < EXECUTABLE_PATCH_MAX_ATTEMPTS; ++attempt) {
+        if (!suspend_executable_patch_threads(threads, &thread_count)) {
+            failure_error = GetLastError();
+            goto cleanup;
+        }
+        threads_suspended = TRUE;
+        if (!executable_patch_range_is_idle(
+                threads, thread_count, base, span
+            )) {
+            resume_executable_patch_threads(threads, thread_count);
+            threads_suspended = FALSE;
+            Sleep(1);
+            continue;
+        }
+        for (index = 0u; index < field_count; ++index) {
+            unsigned char current = base[offsets[index]];
+
+            if (
+                current != original_fields[index] &&
+                current != patched_fields[index]
+            ) {
+                failure_error = ERROR_REVISION_MISMATCH;
+                goto cleanup;
+            }
+        }
+        if (!VirtualProtect(
+                base + first_offset,
+                last_offset - first_offset + 1u,
+                PAGE_EXECUTE_READWRITE,
+                &old_protection
+            )) {
+            failure_error = GetLastError();
+            goto cleanup;
+        }
+        protection_changed = TRUE;
+        for (index = 0u; index < field_count; ++index) {
+            base[offsets[index]] = patched_fields[index];
+        }
+        FlushInstructionCache(
+            GetCurrentProcess(), base + first_offset,
+            last_offset - first_offset + 1u
+        );
+        if (!VirtualProtect(
+                base + first_offset,
+                last_offset - first_offset + 1u,
+                old_protection,
+                &ignored_protection
+            )) {
+            failure_error = GetLastError();
+            goto cleanup;
+        }
+        protection_changed = FALSE;
+        resume_executable_patch_threads(threads, thread_count);
+        threads_suspended = FALSE;
+        if (patch_counter) {
+            InterlockedExchangeAdd(patch_counter, changes);
+        }
+        success = TRUE;
+        break;
+    }
+    if (!success && failure_error == ERROR_SUCCESS) {
+        failure_error = ERROR_BUSY;
+    }
+
+cleanup:
+    if (protection_changed) {
+        VirtualProtect(
+            base + first_offset,
+            last_offset - first_offset + 1u,
+            old_protection,
+            &ignored_protection
+        );
+    }
+    if (threads_suspended) {
+        resume_executable_patch_threads(threads, thread_count);
+    }
+    ReleaseSRWLockExclusive(&executable_patch_lock);
+    if (!success) {
+        SetLastError(failure_error);
+    }
+    return success;
+}
+
 static BOOL patch_frame_adapter_accessor(void *function) {
     return patch_executable_entry(
         function, (void *)hooked_wrapper_frame_adapter_id
@@ -4739,50 +5324,33 @@ static BOOL patch_streamer_portrait_scale_limit(HMODULE module) {
         0x89, 0x93, 0xc8, 0x00, 0x00, 0x00
     };
     const SIZE_T height_source_offset = 21u;
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS64 *nt;
-    IMAGE_SECTION_HEADER *sections;
-    IMAGE_SECTION_HEADER *text = NULL;
+    const SIZE_T field_offsets[] = {height_source_offset};
+    const unsigned char original_fields[] = {0x34u};
+    const unsigned char patched_fields[] = {0x30u};
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
     unsigned char *candidate = NULL;
     unsigned int candidate_count = 0;
-    unsigned int section_index;
     SIZE_T index;
-    DWORD old_protection;
 
     if (streamer_portrait_scale_limit_hooked) {
         return TRUE;
     }
-    if (!base) {
-        return FALSE;
-    }
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < sizeof(scale_copy_pattern)
     ) {
         return FALSE;
     }
-    sections = IMAGE_FIRST_SECTION(nt);
-    for (section_index = 0;
-         section_index < nt->FileHeader.NumberOfSections;
-         ++section_index) {
-        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
-            text = &sections[section_index];
-            break;
-        }
-    }
-    if (!text || text->Misc.VirtualSize < sizeof(scale_copy_pattern)) {
-        return FALSE;
-    }
     for (index = 0;
-         index + sizeof(scale_copy_pattern) <= text->Misc.VirtualSize;
+         index + sizeof(scale_copy_pattern) <= text_span;
          ++index) {
-        unsigned char *current = base + text->VirtualAddress + index;
+        unsigned char *current = text_start + index;
         if (
             !bytes_equal(
                 current, scale_copy_pattern, height_source_offset
@@ -4806,29 +5374,20 @@ static BOOL patch_streamer_portrait_scale_limit(HMODULE module) {
     if (candidate_count != 1u || !candidate) {
         return FALSE;
     }
-    if (candidate[height_source_offset] == 0x34u) {
-        if (!VirtualProtect(
-                candidate + height_source_offset,
-                1u,
-                PAGE_EXECUTE_READWRITE,
-                &old_protection
-            )) {
-            return FALSE;
-        }
-        candidate[height_source_offset] = 0x30u;
-        VirtualProtect(
-            candidate + height_source_offset,
-            1u,
-            old_protection,
-            &old_protection
-        );
-        FlushInstructionCache(
-            GetCurrentProcess(), candidate + height_source_offset, 1u
-        );
-        InterlockedIncrement(&frame_portrait_scale_limit_patches);
+    if (!patch_executable_byte_fields(
+            candidate,
+            sizeof(scale_copy_pattern),
+            field_offsets,
+            original_fields,
+            patched_fields,
+            sizeof(field_offsets) / sizeof(field_offsets[0]),
+            &frame_portrait_scale_limit_patches
+        )) {
+        return FALSE;
     }
-    streamer_portrait_scale_limit_hooked = TRUE;
-    return TRUE;
+    streamer_portrait_scale_limit_hooked =
+        candidate[height_source_offset] == patched_fields[0];
+    return streamer_portrait_scale_limit_hooked;
 }
 
 /*
@@ -4846,50 +5405,33 @@ static BOOL patch_streamer_portrait_capture_limit(HMODULE module) {
         0x89, 0x86, 0x28, 0x01, 0x00, 0x00
     };
     const SIZE_T height_source_offset = 16u;
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS64 *nt;
-    IMAGE_SECTION_HEADER *sections;
-    IMAGE_SECTION_HEADER *text = NULL;
+    const SIZE_T field_offsets[] = {height_source_offset};
+    const unsigned char original_fields[] = {0xc4u};
+    const unsigned char patched_fields[] = {0xc0u};
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
     unsigned char *candidate = NULL;
     unsigned int candidate_count = 0;
-    unsigned int section_index;
     SIZE_T index;
-    DWORD old_protection;
 
     if (streamer_portrait_capture_limit_hooked) {
         return TRUE;
     }
-    if (!base) {
-        return FALSE;
-    }
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < sizeof(capture_copy_pattern)
     ) {
         return FALSE;
     }
-    sections = IMAGE_FIRST_SECTION(nt);
-    for (section_index = 0;
-         section_index < nt->FileHeader.NumberOfSections;
-         ++section_index) {
-        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
-            text = &sections[section_index];
-            break;
-        }
-    }
-    if (!text || text->Misc.VirtualSize < sizeof(capture_copy_pattern)) {
-        return FALSE;
-    }
     for (index = 0;
-         index + sizeof(capture_copy_pattern) <= text->Misc.VirtualSize;
+         index + sizeof(capture_copy_pattern) <= text_span;
          ++index) {
-        unsigned char *current = base + text->VirtualAddress + index;
+        unsigned char *current = text_start + index;
         if (
             !bytes_equal(
                 current, capture_copy_pattern, height_source_offset
@@ -4913,29 +5455,20 @@ static BOOL patch_streamer_portrait_capture_limit(HMODULE module) {
     if (candidate_count != 1u || !candidate) {
         return FALSE;
     }
-    if (candidate[height_source_offset] == 0xc4u) {
-        if (!VirtualProtect(
-                candidate + height_source_offset,
-                1u,
-                PAGE_EXECUTE_READWRITE,
-                &old_protection
-            )) {
-            return FALSE;
-        }
-        candidate[height_source_offset] = 0xc0u;
-        VirtualProtect(
-            candidate + height_source_offset,
-            1u,
-            old_protection,
-            &old_protection
-        );
-        FlushInstructionCache(
-            GetCurrentProcess(), candidate + height_source_offset, 1u
-        );
-        InterlockedIncrement(&frame_portrait_capture_limit_patches);
+    if (!patch_executable_byte_fields(
+            candidate,
+            sizeof(capture_copy_pattern),
+            field_offsets,
+            original_fields,
+            patched_fields,
+            sizeof(field_offsets) / sizeof(field_offsets[0]),
+            &frame_portrait_capture_limit_patches
+        )) {
+        return FALSE;
     }
-    streamer_portrait_capture_limit_hooked = TRUE;
-    return TRUE;
+    streamer_portrait_capture_limit_hooked =
+        candidate[height_source_offset] == patched_fields[0];
+    return streamer_portrait_capture_limit_hooked;
 }
 
 /*
@@ -4960,50 +5493,35 @@ static BOOL patch_streamer_portrait_update_limit(HMODULE module) {
     };
     const SIZE_T compare_height_offset = 9u;
     const SIZE_T apply_height_offset = 50u;
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS64 *nt;
-    IMAGE_SECTION_HEADER *sections;
-    IMAGE_SECTION_HEADER *text = NULL;
+    const SIZE_T field_offsets[] = {
+        compare_height_offset, apply_height_offset
+    };
+    const unsigned char original_fields[] = {0xc4u, 0xc4u};
+    const unsigned char patched_fields[] = {0xc0u, 0xc0u};
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
     unsigned char *candidate = NULL;
     unsigned int candidate_count = 0;
-    unsigned int section_index;
     SIZE_T index;
-    DWORD old_protection;
 
     if (streamer_portrait_update_limit_hooked) {
         return TRUE;
     }
-    if (!base) {
-        return FALSE;
-    }
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < sizeof(update_pattern)
     ) {
         return FALSE;
     }
-    sections = IMAGE_FIRST_SECTION(nt);
-    for (section_index = 0;
-         section_index < nt->FileHeader.NumberOfSections;
-         ++section_index) {
-        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
-            text = &sections[section_index];
-            break;
-        }
-    }
-    if (!text || text->Misc.VirtualSize < sizeof(update_pattern)) {
-        return FALSE;
-    }
     for (index = 0;
-         index + sizeof(update_pattern) <= text->Misc.VirtualSize;
+         index + sizeof(update_pattern) <= text_span;
          ++index) {
-        unsigned char *current = base + text->VirtualAddress + index;
+        unsigned char *current = text_start + index;
         if (
             !bytes_equal(current, update_pattern, compare_height_offset) ||
             !bytes_equal(
@@ -5032,37 +5550,16 @@ static BOOL patch_streamer_portrait_update_limit(HMODULE module) {
     if (candidate_count != 1u || !candidate) {
         return FALSE;
     }
-    if (
-        candidate[compare_height_offset] == 0xc4u ||
-        candidate[apply_height_offset] == 0xc4u
-    ) {
-        if (!VirtualProtect(
-                candidate + compare_height_offset,
-                apply_height_offset - compare_height_offset + 1u,
-                PAGE_EXECUTE_READWRITE,
-                &old_protection
-            )) {
-            return FALSE;
-        }
-        if (candidate[compare_height_offset] == 0xc4u) {
-            candidate[compare_height_offset] = 0xc0u;
-            InterlockedIncrement(&frame_portrait_update_limit_patches);
-        }
-        if (candidate[apply_height_offset] == 0xc4u) {
-            candidate[apply_height_offset] = 0xc0u;
-            InterlockedIncrement(&frame_portrait_update_limit_patches);
-        }
-        VirtualProtect(
-            candidate + compare_height_offset,
-            apply_height_offset - compare_height_offset + 1u,
-            old_protection,
-            &old_protection
-        );
-        FlushInstructionCache(
-            GetCurrentProcess(),
-            candidate + compare_height_offset,
-            apply_height_offset - compare_height_offset + 1u
-        );
+    if (!patch_executable_byte_fields(
+            candidate,
+            sizeof(update_pattern),
+            field_offsets,
+            original_fields,
+            patched_fields,
+            sizeof(field_offsets) / sizeof(field_offsets[0]),
+            &frame_portrait_update_limit_patches
+        )) {
+        return FALSE;
     }
     streamer_portrait_update_limit_hooked =
         candidate[compare_height_offset] == 0xc0u &&
@@ -5111,53 +5608,33 @@ static BOOL patch_streamer_portrait_scaler(HMODULE module) {
     static const unsigned char patched_fields[] = {
         0x90u, 0x88u, 0x90u, 0x88u
     };
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS64 *nt;
-    IMAGE_SECTION_HEADER *sections;
-    IMAGE_SECTION_HEADER *text = NULL;
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
     unsigned char *candidate = NULL;
     unsigned int candidate_count = 0;
-    unsigned int section_index;
     SIZE_T index;
     SIZE_T field_index;
     SIZE_T segment_start;
     BOOL matches;
-    DWORD old_protection;
 
     if (streamer_portrait_scaler_hooked) {
         return TRUE;
     }
-    if (!base) {
-        return FALSE;
-    }
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < sizeof(scaler_pattern)
     ) {
         return FALSE;
     }
-    sections = IMAGE_FIRST_SECTION(nt);
-    for (section_index = 0;
-         section_index < nt->FileHeader.NumberOfSections;
-         ++section_index) {
-        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
-            text = &sections[section_index];
-            break;
-        }
-    }
-    if (!text || text->Misc.VirtualSize < sizeof(scaler_pattern)) {
-        return FALSE;
-    }
     for (index = 0;
-         index + sizeof(scaler_pattern) <= text->Misc.VirtualSize;
+         index + sizeof(scaler_pattern) <= text_span;
          ++index) {
-        unsigned char *current = base + text->VirtualAddress + index;
+        unsigned char *current = text_start + index;
         matches = TRUE;
         segment_start = 0u;
         for (field_index = 0;
@@ -5197,51 +5674,16 @@ static BOOL patch_streamer_portrait_scaler(HMODULE module) {
     if (candidate_count != 1u || !candidate) {
         return FALSE;
     }
-    matches = TRUE;
-    for (field_index = 0;
-         field_index < sizeof(field_offsets) / sizeof(field_offsets[0]);
-         ++field_index) {
-        if (candidate[field_offsets[field_index]] != patched_fields[field_index]) {
-            matches = FALSE;
-            break;
-        }
-    }
-    if (!matches) {
-        SIZE_T first_offset = field_offsets[0];
-        SIZE_T last_offset = field_offsets[
-            sizeof(field_offsets) / sizeof(field_offsets[0]) - 1u
-        ];
-        if (!VirtualProtect(
-                candidate + first_offset,
-                last_offset - first_offset + 1u,
-                PAGE_EXECUTE_READWRITE,
-                &old_protection
-            )) {
-            return FALSE;
-        }
-        for (field_index = 0;
-             field_index < sizeof(field_offsets) / sizeof(field_offsets[0]);
-             ++field_index) {
-            if (
-                candidate[field_offsets[field_index]] ==
-                original_fields[field_index]
-            ) {
-                candidate[field_offsets[field_index]] =
-                    patched_fields[field_index];
-                InterlockedIncrement(&frame_portrait_scaler_patches);
-            }
-        }
-        VirtualProtect(
-            candidate + first_offset,
-            last_offset - first_offset + 1u,
-            old_protection,
-            &old_protection
-        );
-        FlushInstructionCache(
-            GetCurrentProcess(),
-            candidate + first_offset,
-            last_offset - first_offset + 1u
-        );
+    if (!patch_executable_byte_fields(
+            candidate,
+            sizeof(scaler_pattern),
+            field_offsets,
+            original_fields,
+            patched_fields,
+            sizeof(field_offsets) / sizeof(field_offsets[0]),
+            &frame_portrait_scaler_patches
+        )) {
+        return FALSE;
     }
     streamer_portrait_scaler_hooked = TRUE;
     for (field_index = 0;
@@ -5270,12 +5712,13 @@ static BOOL address_in_image(
     const void *address,
     SIZE_T size
 ) {
-    const unsigned char *value = (const unsigned char *)address;
+    uintptr_t start = (uintptr_t)base;
+    uintptr_t value = (uintptr_t)address;
 
-    if (!base || !address || size > image_size || value < base) {
+    if (!base || !address || size > image_size || value < start) {
         return FALSE;
     }
-    return (SIZE_T)(value - base) <= image_size - size;
+    return value - start <= image_size - size;
 }
 
 static void **streamer_frame_vtable_start(
@@ -5447,6 +5890,7 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
         0x0f, 0x95, 0xc0, 0xc3
     };
     static const unsigned char returns_zero[] = {0x33, 0xc0, 0xc3};
+    static const unsigned char returns_false_byte[] = {0x32, 0xc0, 0xc3};
     static const unsigned char base_adapter_getter_code[] = {
         0x8b, 0x41, 0x44, 0xc3
     };
@@ -5457,12 +5901,15 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
     static const unsigned char encoder_path_adapter_call[] = {
         0x48, 0x8b, 0x00, 0xff, 0x50, 0x30
     };
-    unsigned char *base = (unsigned char *)module;
-    IMAGE_DOS_HEADER *dos;
+    struct loaded_pe_image image;
+    unsigned char *base;
     IMAGE_NT_HEADERS64 *nt;
-    IMAGE_SECTION_HEADER *sections;
-    IMAGE_SECTION_HEADER *text = NULL;
-    IMAGE_SECTION_HEADER *rdata = NULL;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    const IMAGE_SECTION_HEADER *rdata = NULL;
+    unsigned char *text_start = NULL;
+    unsigned char *rdata_start = NULL;
+    SIZE_T text_span = 0u;
+    SIZE_T rdata_span = 0u;
     void **candidate_slot = NULL;
     void **base_slots[16];
     void **wrapper_slot = NULL;
@@ -5485,39 +5932,24 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
     if (streamer_frame_adapter_hooked) {
         return TRUE;
     }
-    if (!base) {
-        return FALSE;
-    }
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return FALSE;
-    }
-    nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     if (
-        nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        !loaded_pe_find_section(
+            &image, ".rdata", &rdata, &rdata_start, &rdata_span
+        ) ||
+        text_span < 23u
     ) {
         return FALSE;
     }
-    sections = IMAGE_FIRST_SECTION(nt);
-    for (section_index = 0;
-         section_index < nt->FileHeader.NumberOfSections;
-         ++section_index) {
-        if (memcmp(sections[section_index].Name, ".text", 5) == 0) {
-            text = &sections[section_index];
-        } else if (
-            memcmp(sections[section_index].Name, ".rdata", 6) == 0
-        ) {
-            rdata = &sections[section_index];
-        }
-    }
-    if (!text || !rdata || text->Misc.VirtualSize < 23u) {
-        return FALSE;
-    }
+    base = image.base;
+    nt = image.nt;
     for (index = 0;
-         index + sizeof(base_adapter_getter_code) <= text->Misc.VirtualSize;
+         index + sizeof(base_adapter_getter_code) <= text_span;
          ++index) {
-        unsigned char *function = base + text->VirtualAddress + index;
+        unsigned char *function = text_start + index;
         if (bytes_equal(
                 function,
                 base_adapter_getter_code,
@@ -5531,9 +5963,9 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
         return FALSE;
     }
     for (index = 0;
-         index + 96u <= text->Misc.VirtualSize;
+         index + 96u <= text_span;
          ++index) {
-        unsigned char *function = base + text->VirtualAddress + index;
+        unsigned char *function = text_start + index;
         SIZE_T method_offset;
 
         if (!bytes_equal(
@@ -5557,8 +5989,8 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
             }
         }
     }
-    for (index = 0; index + 23u <= text->Misc.VirtualSize; ++index) {
-        unsigned char *instruction = base + text->VirtualAddress + index;
+    for (index = 0; index + 23u <= text_span; ++index) {
+        unsigned char *instruction = text_start + index;
         int32_t displacement;
         void **vtable;
 
@@ -5584,30 +6016,40 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
             !address_in_image_section(base, text, vtable[1], 6u) ||
             !address_in_image_section(base, text, vtable[2], 3u) ||
             !address_in_image_section(base, text, vtable[3], 12u) ||
-            !address_in_image_section(base, text, vtable[5], 3u) ||
-            vtable[4] != vtable[5] ||
             !bytes_equal(vtable[1], returns_true_dword, 6u) ||
             !bytes_equal(vtable[2], returns_true_byte, 3u) ||
-            !bytes_equal(vtable[3], has_cursor, 12u) ||
-            !bytes_equal(vtable[5], returns_zero, 3u)
+            !bytes_equal(vtable[3], has_cursor, 12u)
         ) {
             continue;
         }
-        candidate_slot = &vtable[5];
+        if (
+            address_in_image_section(base, text, vtable[5], 3u) &&
+            vtable[4] == vtable[5] &&
+            bytes_equal(vtable[5], returns_zero, 3u)
+        ) {
+            candidate_slot = &vtable[5];
+        } else if (
+            address_in_image_section(base, text, vtable[4], 3u) &&
+            address_in_image_section(base, text, vtable[5], 3u) &&
+            address_in_image_section(base, text, vtable[6], 3u) &&
+            bytes_equal(vtable[4], returns_zero, 3u) &&
+            bytes_equal(vtable[5], returns_false_byte, 3u) &&
+            bytes_equal(vtable[6], returns_zero, 3u)
+        ) {
+            candidate_slot = &vtable[6];
+        } else {
+            continue;
+        }
         ++candidate_count;
     }
     if (candidate_count != 1u || !candidate_slot) {
         return FALSE;
     }
     {
-        SIZE_T rdata_span = rdata->Misc.VirtualSize;
-        if (rdata_span < rdata->SizeOfRawData) {
-            rdata_span = rdata->SizeOfRawData;
-        }
         for (index = 0u;
              index + 2u * sizeof(void *) <= rdata_span;
              index += sizeof(void *)) {
-            void **slot = (void **)(base + rdata->VirtualAddress + index);
+            void **slot = (void **)(rdata_start + index);
             BOOL preceding_are_text = TRUE;
             unsigned int method_index;
 
@@ -8605,7 +9047,7 @@ static BOOL WINAPI hooked_unhook_windows_hook_ex(HHOOK hook) {
 
 static void patch_controller_focus_imports(void) {
     HMODULE main_module = GetModuleHandleW(NULL);
-    HMODULE qt_core = GetModuleHandleW(L"Qt5Core.dll");
+    HMODULE qt_core = GetModuleHandleW(controller_runtime_module);
 
     if (!controller_dispatch_hooked) {
         controller_dispatch_hooked = patch_import(
@@ -8878,6 +9320,29 @@ static BOOL patch_streamer_imports(void) {
     return ready;
 }
 
+static void initialize_runtime_module_names(void) {
+    WCHAR value[MAX_PATH];
+    DWORD length;
+    DWORD index;
+
+    length = GetEnvironmentVariableW(
+        L"UU_REMOTE_CONTROLLER_MODULE", value, MAX_PATH
+    );
+    if (!length || length >= MAX_PATH) {
+        return;
+    }
+    for (index = 0; index < length; ++index) {
+        if (value[index] == L'\\' || value[index] == L'/' ||
+            value[index] == L':') {
+            return;
+        }
+    }
+    if (length < 5u || lstrcmpiW(value + length - 4u, L".dll") != 0) {
+        return;
+    }
+    lstrcpynW(controller_runtime_module, value, MAX_PATH);
+}
+
 static enum hook_process_kind identify_process(void) {
     WCHAR process_path[MAX_PATH];
     WCHAR *name;
@@ -8898,7 +9363,7 @@ static enum hook_process_kind identify_process(void) {
          * name. Only the real Qt controller loads Qt5Core.dll; requiring it
          * prevents the focus hook from attaching to that outer launcher.
          */
-        if (!GetModuleHandleW(L"Qt5Core.dll")) {
+        if (!GetModuleHandleW(controller_runtime_module)) {
             return HOOK_PROCESS_NONE;
         }
         lstrcpynW(controller_root_path, process_path, MAX_PATH);
@@ -9112,6 +9577,76 @@ __declspec(dllexport) DWORD WINAPI UURemoteFrameHookStatus(void) {
 
 __declspec(dllexport) DWORD WINAPI UURemoteFocusHookStatus(void) {
     return controller_focus_hook_status();
+}
+
+__declspec(dllexport) DWORD WINAPI UURemotePEBoundsSelfTest(void) {
+    const SIZE_T allocation_size = 0x4000u;
+    unsigned char *storage = (unsigned char *)VirtualAlloc(
+        NULL,
+        allocation_size,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE
+    );
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_SECTION_HEADER *section;
+    struct loaded_pe_image image;
+    LONG original_lfanew;
+    void *previous = (void *)(uintptr_t)0x1234u;
+    DWORD result = 0u;
+
+    if (!storage) {
+        return 0u;
+    }
+    dos = (IMAGE_DOS_HEADER *)storage;
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x100;
+    nt = (IMAGE_NT_HEADERS64 *)(storage + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 1u;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(nt->OptionalHeader);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.SizeOfImage = 0x3000u;
+    nt->OptionalHeader.SizeOfHeaders = 0x400u;
+    nt->OptionalHeader.NumberOfRvaAndSizes =
+        IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    section = IMAGE_FIRST_SECTION(nt);
+    CopyMemory(section->Name, ".text", 5u);
+    section->VirtualAddress = 0x1000u;
+    section->Misc.VirtualSize = 0x100u;
+    section->Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+
+    if (!parse_loaded_pe_image((HMODULE)storage, &image)) {
+        goto done;
+    }
+    section->Misc.VirtualSize = 0x3000u;
+    if (parse_loaded_pe_image((HMODULE)storage, &image)) {
+        goto done;
+    }
+    section->Misc.VirtualSize = 0x100u;
+    original_lfanew = dos->e_lfanew;
+    dos->e_lfanew = LONG_MAX;
+    if (
+        parse_loaded_pe_image((HMODULE)storage, &image) ||
+        patch_import(
+            (HMODULE)storage,
+            "USER32.dll",
+            "SendInput",
+            (void *)hooked_send_input,
+            &previous
+        ) ||
+        previous != (void *)(uintptr_t)0x1234u
+    ) {
+        dos->e_lfanew = original_lfanew;
+        goto done;
+    }
+    dos->e_lfanew = original_lfanew;
+    result = 1u;
+
+done:
+    VirtualFree(storage, 0u, MEM_RELEASE);
+    return result;
 }
 
 __declspec(dllexport) DWORD WINAPI UURemoteFrameBoundsSelfTest(void) {
@@ -9394,6 +9929,81 @@ static DWORD WINAPI executable_patch_test_worker(void *parameter) {
     return 0u;
 }
 
+static BOOL executable_byte_patch_self_test(void) {
+    static const unsigned char original_code[EXECUTABLE_PATCH_SIZE] = {
+        0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+    static const SIZE_T field_offsets[] = {1u};
+    static const unsigned char original_fields[] = {0x07u};
+    static const unsigned char patched_fields[] = {0x2au};
+    typedef DWORD(WINAPI *test_function_fn)(void);
+    struct executable_patch_test_state state;
+    HANDLE workers[4] = {NULL, NULL, NULL, NULL};
+    DWORD old_protection;
+    test_function_fn function;
+    volatile LONG patch_count = 0;
+    SIZE_T index;
+    BOOL result = FALSE;
+
+    ZeroMemory(&state, sizeof(state));
+    state.function = VirtualAlloc(
+        NULL,
+        EXECUTABLE_PATCH_SIZE,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+    if (!state.function) {
+        return FALSE;
+    }
+    CopyMemory(state.function, original_code, sizeof(original_code));
+    if (!VirtualProtect(
+            state.function,
+            EXECUTABLE_PATCH_SIZE,
+            PAGE_EXECUTE_READ,
+            &old_protection
+        )) {
+        goto cleanup;
+    }
+    CopyMemory(&function, &state.function, sizeof(function));
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        workers[index] = CreateThread(
+            NULL, 0, executable_patch_test_worker, &state, 0, NULL
+        );
+        if (!workers[index]) {
+            goto cleanup;
+        }
+    }
+    Sleep(10);
+    if (!patch_executable_byte_fields(
+            (unsigned char *)state.function,
+            EXECUTABLE_PATCH_SIZE,
+            field_offsets,
+            original_fields,
+            patched_fields,
+            sizeof(field_offsets) / sizeof(field_offsets[0]),
+            &patch_count
+        )) {
+        goto cleanup;
+    }
+    Sleep(10);
+    result =
+        function() == 42u &&
+        InterlockedCompareExchange(&patch_count, 0, 0) == 1 &&
+        InterlockedCompareExchange(&state.invalid_results, 0, 0) == 0;
+
+cleanup:
+    InterlockedExchange(&state.stop, 1);
+    for (index = 0u; index < sizeof(workers) / sizeof(workers[0]); ++index) {
+        if (workers[index]) {
+            WaitForSingleObject(workers[index], 5000);
+            CloseHandle(workers[index]);
+        }
+    }
+    VirtualFree(state.function, 0, MEM_RELEASE);
+    return result;
+}
+
 __declspec(dllexport) DWORD WINAPI UURemoteExecutablePatchSelfTest(void) {
     static const unsigned char original_code[EXECUTABLE_PATCH_SIZE] = {
         0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3,
@@ -9410,6 +10020,9 @@ __declspec(dllexport) DWORD WINAPI UURemoteExecutablePatchSelfTest(void) {
     DWORD result = 0u;
     LONG redirects_before;
 
+    if (!executable_byte_patch_self_test()) {
+        return 0u;
+    }
     ZeroMemory(&state, sizeof(state));
     state.function = VirtualAlloc(
         NULL,
@@ -9657,6 +10270,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     }
     hook_module = instance;
     DisableThreadLibraryCalls(instance);
+    initialize_runtime_module_names();
     process_kind = identify_process();
     if (process_kind == HOOK_PROCESS_NONE) {
         return TRUE;

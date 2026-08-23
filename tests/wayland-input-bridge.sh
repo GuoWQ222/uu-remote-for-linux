@@ -4,6 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 readonly bridge="$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+readonly capture_source="$project_root/src/uu-remote-pipewire-capture.c"
 
 test_root=$(mktemp -d)
 bridge_pid=
@@ -35,12 +36,29 @@ export UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK=2
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO=1
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
 
+grep -q '#define UUDC_PIPEWIRE_BUFFERS 3' "$capture_source"
+grep -q '#define UUDC_STAGE_SLOTS 3u' "$capture_source"
+grep -q 'SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)' "$capture_source"
+/usr/bin/python3 - "$capture_source" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+process = source.split("static void on_process(void *userdata)", 1)[1]
+process = process.split("static void on_state_changed(", 1)[0]
+assert process.rindex("pw_stream_queue_buffer(application->stream, latest);") < (
+    process.index("notification.magic = UUDC_NOTIFICATION_MAGIC;")
+)
+PY
+
 /usr/bin/python3 - "$bridge" <<'PY'
 import importlib.machinery
 import importlib.util
+import mmap
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 path = sys.argv[1]
@@ -53,6 +71,11 @@ assert module.CAPTURE_PRIMARY_STREAM_RATE == 60
 assert module.CAPTURE_SECONDARY_STREAM_RATE == 30
 assert module.CAPTURE_MAX_STREAM_RATE == 60
 assert module.CAPTURE_MOTION_COPY_RATIO_DENOMINATOR == 32
+assert module.CAPTURE_PIPEWIRE_BUFFERS == 3
+assert module.CAPTURE_TRANSPORT_DMABUF == "dmabuf-native"
+assert not hasattr(module, "CAPTURE_TRANSPORT_MEMFD")
+assert module.CAPTURE_NATIVE_STAGE_SLOTS == 3
+assert module.CAPTURE_NATIVE_NOTIFICATION.size == 24
 assert module.capture_stream_rate(77, 77) == 60
 assert module.capture_stream_rate(78, 77) == 30
 assert module.capture_backfill_indexes([4, 7], [5, 7], 0) == []
@@ -65,17 +88,19 @@ except ValueError:
 else:
     raise AssertionError("mismatched capture generations were accepted")
 source_text = Path(path).read_text(encoding="utf-8")
-assert 'source.set_property("always-copy", True)' in source_text
-assert 'source.set_property("always-copy", False)' not in source_text
-assert '"identity", f"corrupt-frame-guard-{index}"' in source_text
-assert (
-    '"drop-buffer-flags", self.Gst.BufferFlags.CORRUPTED'
-    in source_text
-)
-assert 'sink.set_property("processing-deadline", 0)' in source_text
-assert 'sink.set_property("enable-last-sample", False)' in source_text
-assert 'sink.set_property("wait-on-eos", False)' in source_text
-assert '"video/x-raw,format=BGRA,"' in source_text
+assert "self._start_native_capture_pipeline()" in source_text
+assert "CAPTURE_NATIVE_STAGE_SLOTS" in source_text
+assert "os.write(release_fd, bytes((slot,)))" in source_text
+assert "CAPTURE_TRANSPORT_MEMFD" not in source_text
+assert "pipewiresrc" not in source_text
+assert "GStreamer" not in source_text
+assert "_fallback_to_memfd" not in source_text
+start_bridge_text = source_text.split(
+    "    def _start_capture_bridge(self) -> None:", 1
+)[1].split("\n    def ensure_healthy", 1)[0]
+assert start_bridge_text.index(
+    "self._start_capture_pipeline()"
+) < start_bridge_text.index("self._start_cursor_bridge()")
 assert "advance_capture_deadline" not in source_text
 assert "if not eligible:" not in source_text
 assert 'if running and hasattr(backend, "ensure_healthy"):' in source_text
@@ -273,14 +298,6 @@ class FailingProcess:
         events.append(f"process-wait-{timeout}")
         return 0
 
-class FailingPipeline:
-    def set_state(self, state):
-        events.append("pipeline-stop")
-        raise RuntimeError("pipeline stop failed")
-
-    def get_state(self, timeout):
-        events.append("pipeline-wait")
-
 class FailingMap:
     def close(self):
         events.append("map-close")
@@ -310,11 +327,13 @@ backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
 backend.fake_trace = ""
 backend.capture_state = "active"
 backend.cursor_helper_process = FailingProcess()
-backend.capture_pipeline = FailingPipeline()
-backend.Gst = type(
-    "Gst", (), {"State": type("State", (), {"NULL": 0}), "SECOND": 1}
-)
-backend.capture_pipewire_fds = []
+backend.capture_fake_stop = threading.Event()
+backend.capture_native_processes = []
+backend.capture_native_threads = []
+backend.capture_native_notify_fds = []
+backend.capture_native_release_fds = []
+backend.capture_native_maps = []
+backend.capture_native_stage_fds = []
 backend.capture_map = FailingMap()
 backend.frame_path = FixturePath("frame-unlink", fail=True)
 backend.capture_backing_path = FixturePath("backing-unlink")
@@ -332,20 +351,17 @@ backend.close()
 assert {
     "process-terminate",
     "process-wait-2",
-    "pipeline-stop",
-    "pipeline-wait",
     "map-close",
     "frame-unlink",
     "backing-unlink",
     "portal-close",
     "x11-close",
 }.issubset(events)
-assert len(backend.cleanup_errors) == 6, backend.cleanup_errors
+assert len(backend.cleanup_errors) == 5, backend.cleanup_errors
 assert backend.capture_map is not None
 
 backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
 backend.fake_trace = ""
-backend.capture_pipeline = object()
 backend.capture_callback_error = "node=7 fixture callback failure"
 try:
     backend.ensure_healthy()
@@ -444,18 +460,10 @@ with tempfile.TemporaryDirectory() as directory:
 
 health_events = []
 
-class HealthyBus:
-    def pop_filtered(self, _types):
-        health_events.append("bus")
+class HealthyCaptureProcess:
+    def poll(self):
+        health_events.append("capture")
         return None
-
-class HealthyPipeline:
-    def get_bus(self):
-        return HealthyBus()
-
-    def get_state(self, _timeout):
-        health_events.append("state")
-        return (1, 2, 0)
 
 class DeadCursorProcess:
     def poll(self):
@@ -466,110 +474,81 @@ health_backend = module.WaylandPortalBackend.__new__(
     module.WaylandPortalBackend
 )
 health_backend.fake_trace = ""
-health_backend.capture_pipeline = HealthyPipeline()
 health_backend.capture_callback_error = ""
+health_backend.capture_transport = module.CAPTURE_TRANSPORT_DMABUF
+health_backend.streams = [{"node": 77}]
+health_backend.capture_native_processes = [HealthyCaptureProcess()]
 health_backend.cursor_helper_process = DeadCursorProcess()
-health_backend.Gst = type(
-    "Gst",
-    (),
-    {
-        "MessageType": type("MessageType", (), {"ERROR": 1, "EOS": 2}),
-        "StateChangeReturn": type("StateChangeReturn", (), {"FAILURE": 0}),
-        "State": type("State", (), {"PAUSED": 1, "PLAYING": 2}),
-    },
-)
 health_backend._restart_cursor_bridge = (
     lambda returncode: health_events.append(("restart", returncode))
 )
 health_backend.ensure_healthy()
-assert health_events == ["bus", "state", "cursor", ("restart", -11)]
-PY
+assert health_events == ["capture", "cursor", ("restart", -11)]
 
-# Mutter emits cursor-only PipeWire buffers with no pixels and the CORRUPTED
-# flag. GstVideoFilter allocates a full output buffer before mapping the empty
-# input, so without an early guard a transform can forward unwritten pool
-# memory as an apparent full frame.
-/usr/bin/python3 - <<'PY'
-import gi
+dead_backend = module.WaylandPortalBackend.__new__(
+    module.WaylandPortalBackend
+)
+dead_backend.fake_trace = ""
+dead_backend.capture_callback_error = ""
+dead_backend.capture_transport = "inactive"
+try:
+    dead_backend.ensure_healthy()
+except RuntimeError as error:
+    assert "DMA-BUF" in str(error)
+else:
+    raise AssertionError("missing native DMA-BUF transport was accepted")
 
-gi.require_version("Gst", "1.0")
-from gi.repository import Gst
+# Native helper notifications expose an independent staging slot. The Python
+# reader must process it once and release that exact slot back to the helper.
+native_backend = module.WaylandPortalBackend.__new__(
+    module.WaylandPortalBackend
+)
+native_backend.capture_state = "active"
+native_backend.capture_callback_error = ""
+native_seen = []
 
-Gst.init(None)
-WIDTH = 64
-HEIGHT = 32
-FRAME_BYTES = WIDTH * HEIGHT * 4
-DURATION = Gst.SECOND // 60
-
-
-def run_pipeline(guard: bool):
-    guard_text = (
-        "identity drop-buffer-flags=corrupted ! " if guard else ""
+def consume_native(source, stride, pts, stream_index, stream):
+    native_seen.append(
+        (stream_index, stream["node"], stride, pts, bytes(source))
     )
-    pipeline = Gst.parse_launch(
-        "appsrc name=src format=time "
-        # Force a real GstVideoFilter conversion so the fixture also covers
-        # compositors whose native packed-four-byte format differs from BGRA.
-        'caps="video/x-raw,format=RGBA,width=64,height=32,framerate=60/1" ! '
-        f"{guard_text}"
-        "videoconvert ! videoscale ! "
-        "video/x-raw,format=BGRA,width=64,height=32 ! "
-        "appsink name=sink sync=false max-buffers=10 drop=false"
-    )
-    source = pipeline.get_by_name("src")
-    sink = pipeline.get_by_name("sink")
-    assert (
-        pipeline.set_state(Gst.State.PLAYING)
-        != Gst.StateChangeReturn.FAILURE
-    )
-    try:
-        for index, value in enumerate((0x11, None, 0x77)):
-            if value is None:
-                buffer = Gst.Buffer.new()
-                buffer.set_flags(Gst.BufferFlags.CORRUPTED)
-            else:
-                pixels = bytes((value, value, value, 0xFF)) * WIDTH * HEIGHT
-                buffer = Gst.Buffer.new_allocate(None, len(pixels), None)
-                assert buffer.fill(0, pixels) == len(pixels)
-            buffer.pts = index * DURATION
-            buffer.duration = DURATION
-            assert source.emit("push-buffer", buffer) == Gst.FlowReturn.OK
-        assert source.emit("end-of-stream") == Gst.FlowReturn.OK
+    return True
 
-        outputs = []
-        for _ in range(4):
-            sample = sink.emit("try-pull-sample", Gst.SECOND)
-            if sample is None:
-                break
-            buffer = sample.get_buffer()
-            mapped, info = buffer.map(Gst.MapFlags.READ)
-            assert mapped
-            try:
-                outputs.append(
-                    (
-                        len(info.data),
-                        buffer.has_flags(Gst.BufferFlags.CORRUPTED),
-                        bytes(info.data[:3]),
-                    )
-                )
-            finally:
-                buffer.unmap(info)
-        return outputs
-    finally:
-        pipeline.set_state(Gst.State.NULL)
-
-
-unguarded = run_pipeline(False)
-assert len(unguarded) == 3, unguarded
-assert unguarded[0] == (FRAME_BYTES, False, b"\x11\x11\x11"), unguarded
-assert unguarded[1][0] == FRAME_BYTES and unguarded[1][1], unguarded
-assert unguarded[2] == (FRAME_BYTES, False, b"\x77\x77\x77"), unguarded
-
-guarded = run_pipeline(True)
-assert guarded == [
-    (FRAME_BYTES, False, b"\x11\x11\x11"),
-    (FRAME_BYTES, False, b"\x77\x77\x77"),
-], guarded
+native_backend.capture_write_stream = consume_native
+native_stream = {"node": 88, "width": 2, "height": 1}
+native_stage = mmap.mmap(-1, 24)
+native_stage[8:16] = b"staging!"
+notify_read, notify_write = os.pipe()
+release_read, release_write = os.pipe()
+native_thread = threading.Thread(
+    target=native_backend._native_capture_reader,
+    args=(
+        0,
+        native_stream,
+        native_stage,
+        notify_read,
+        release_write,
+    ),
+)
+native_thread.start()
+os.write(
+    notify_write,
+    module.CAPTURE_NATIVE_NOTIFICATION.pack(
+        module.CAPTURE_NATIVE_NOTIFICATION_MAGIC,
+        1,
+        9,
+        8,
+        123456,
+    ),
+)
+os.close(notify_write)
+native_thread.join(timeout=2)
+assert not native_thread.is_alive()
+assert native_seen == [(0, 88, 8, 123456, b"staging!")]
+assert os.read(release_read, 1) == b"\x01"
+assert native_backend.capture_callback_error == ""
+for descriptor in (notify_read, release_read, release_write):
+    os.close(descriptor)
+native_stage.close()
 PY
 
 [[ $("$bridge" check) == wayland-portal ]]
@@ -627,6 +606,8 @@ send(2, 10, struct.pack("<iiIIIQ", 0, 32768, 0, 0xC001, 0, 0))
 # packets exercise the same KEYEVENTF_SCANCODE path used by SendInput.
 send(3, 11, struct.pack("<HHIIQ", 0x14, 0x3A, 0x0008, 0, 0))
 send(3, 12, struct.pack("<HHIIQ", 0x14, 0x3A, 0x000A, 0, 0))
+# A delayed duplicate Caps down must not toggle the desktop a second time.
+send(3, 11, struct.pack("<HHIIQ", 0x14, 0x3A, 0x0008, 0, 0))
 send(3, 13, struct.pack("<HHIIQ", 0x90, 0x45, 0x0008, 0, 0))
 send(3, 14, struct.pack("<HHIIQ", 0x90, 0x45, 0x000A, 0, 0))
 send(3, 15, struct.pack("<HHIIQ", 0x91, 0x46, 0x0008, 0, 0))
@@ -679,6 +660,14 @@ grep -q '"portal_stream": 77' \
     "$state_dir/input-bridge-status.json"
 grep -q '"capture_state": "active"' \
     "$state_dir/input-bridge-status.json"
+grep -q '"capture_transport": "dmabuf-native"' \
+    "$state_dir/input-bridge-status.json"
+[[ $(grep -o '"transport": "dmabuf-native"' \
+    "$state_dir/input-bridge-status.json" | wc -l) -eq 2 ]]
+[[ $(grep -o '"pipewire_buffers": 3' \
+    "$state_dir/input-bridge-status.json" | wc -l) -eq 2 ]]
+[[ $(grep -o '"staging_buffers": 3' \
+    "$state_dir/input-bridge-status.json" | wc -l) -eq 2 ]]
 grep -q '"lock_key_packets": 6' \
     "$state_dir/input-bridge-status.json"
 grep -q '"last_lock_sequence": 16' \

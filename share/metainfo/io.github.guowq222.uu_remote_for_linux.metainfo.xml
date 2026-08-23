@@ -25,6 +25,45 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.42" date="2026-08-23">
+      <description>
+        <p>Unify X11 and GNOME Wayland into one complete Debian package whose launcher selects the appropriate input and capture backend from the live user session.</p>
+      </description>
+    </release>
+    <release version="1.1.41" date="2026-08-23">
+      <description>
+        <p>Replace the two-package Wayland ZIP with one complete, directly installable Wayland Debian package while preserving strict Noble and GNOME 46 dependency gates.</p>
+      </description>
+    </release>
+    <release version="1.1.40" date="2026-08-23">
+      <description>
+        <p>Adapt the semantic NVENC hook to both verified RawVideoFrame vtable layouts, including the slot shift in UU 4.38.3.9325.</p>
+        <p>Serially restart only GameViewerServer when its startup regenerates the encoder cache before the verified NVENC policy is applied.</p>
+      </description>
+    </release>
+    <release version="1.1.39" date="2026-08-23">
+      <description>
+        <p>Restore startup on newer UU streamer layouts by using native Wayland DMA-BUF with a verified OpenH264 fallback while retaining strict runtime import checks.</p>
+      </description>
+    </release>
+    <release version="1.1.38" date="2026-08-23">
+      <description>
+        <p>Make native three-buffer PipeWire DMA-BUF capture the only Wayland video transport and fail closed when it is unavailable.</p>
+        <p>Remove all custom Mutter packages, patches, privileged management code, and related runtime dependencies; the Wayland ZIP now contains only two Debian packages and requires no logout.</p>
+      </description>
+    </release>
+    <release version="1.1.37" date="2026-08-23">
+      <description>
+        <p>Complete native DMA-BUF capture on GNOME 46 and NVIDIA by enumerating EGL modifiers and handling PipeWire's two-stage modifier fixation protocol.</p>
+        <p>Keep both producer and staging pools at three buffers and return compositor buffers before notifying the Python frame consumer.</p>
+      </description>
+    </release>
+    <release version="1.1.36" date="2026-08-23">
+      <description>
+        <p>Add semantic, hash-bound automatic compatibility profiles for future official UU updates and fail-closed rollback for unknown binary layouts.</p>
+        <p>Harden PE bounds, executable patch atomicity, input ordering and replay checks, injector timeouts, desktop command timeouts, and process identity handling.</p>
+      </description>
+    </release>
     <release version="1.1.35" date="2026-08-23">
       <description>
         <p>Replace the signed Pages repository bootstrap with a standalone X11 Debian package and a keyless Wayland offline ZIP installed through one APT transaction.</p>

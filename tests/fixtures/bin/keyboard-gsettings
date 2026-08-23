@@ -4,6 +4,10 @@ set -euo pipefail
 readonly root="${UU_REMOTE_KEYBOARD_GSETTINGS_ROOT:?}"
 readonly trace="${UU_REMOTE_KEYBOARD_GSETTINGS_TRACE:-$root/trace.log}"
 
+if [[ -n ${UU_REMOTE_KEYBOARD_GSETTINGS_HANG:-} ]]; then
+    exec sleep 30
+fi
+
 mode=${1:-}
 schema=${2:-}
 key=${3:-}

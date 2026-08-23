@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define INJECTOR_VERSION 4u
+#define INJECTOR_VERSION 5u
 #define WATCH_INTERVAL_MS 500u
 #define PRELOAD_MODULE_WAIT_MS 10000u
 #define DIRECT_INJECTION_WAIT_MS 10000u
@@ -311,23 +311,68 @@ struct remote_operation {
     enum remote_operation_kind kind;
     BOOL success;
     DWORD error;
+    volatile LONG completed;
 };
+
+struct remote_retry_guard {
+    BOOL waiting_for_module;
+    uintptr_t blocked_module;
+};
+
+static void remote_retry_guard_timeout(
+    struct remote_retry_guard *guard,
+    uintptr_t observed_module
+) {
+    guard->waiting_for_module = observed_module == 0;
+    guard->blocked_module = observed_module;
+}
+
+static void remote_retry_guard_reset(struct remote_retry_guard *guard) {
+    ZeroMemory(guard, sizeof(*guard));
+}
+
+static BOOL remote_retry_guard_allows(
+    struct remote_retry_guard *guard,
+    uintptr_t current_module
+) {
+    if (guard->waiting_for_module) {
+        if (!current_module) {
+            return FALSE;
+        }
+        guard->waiting_for_module = FALSE;
+        return TRUE;
+    }
+    if (guard->blocked_module) {
+        if (current_module == guard->blocked_module) {
+            return FALSE;
+        }
+        guard->blocked_module = 0;
+    }
+    return TRUE;
+}
 
 static DWORD WINAPI remote_operation_worker(void *context) {
     struct remote_operation *operation = context;
 
     if (operation->kind == REMOTE_OPERATION_INITIALIZE) {
         operation->success = initialize_remote_hook(
-            operation->pid, operation->dll_path, FALSE, INFINITE
+            operation->pid,
+            operation->dll_path,
+            FALSE,
+            DIRECT_INJECTION_WAIT_MS
         );
     } else {
         operation->success = inject_library(
-            operation->pid, operation->dll_path, FALSE, INFINITE
+            operation->pid,
+            operation->dll_path,
+            FALSE,
+            DIRECT_INJECTION_WAIT_MS
         );
     }
     operation->error = operation->success
         ? ERROR_SUCCESS
         : GetLastError();
+    InterlockedExchange(&operation->completed, 1);
     return 0;
 }
 
@@ -373,7 +418,10 @@ static BOOL poll_remote_operation(
         return FALSE;
     }
     wait_result = WaitForSingleObject(operation->worker, 0);
-    if (wait_result != WAIT_OBJECT_0) {
+    if (
+        wait_result != WAIT_OBJECT_0 &&
+        InterlockedCompareExchange(&operation->completed, 0, 0) == 0
+    ) {
         return FALSE;
     }
     *success = operation->success;
@@ -382,6 +430,53 @@ static BOOL poll_remote_operation(
     HeapFree(GetProcessHeap(), 0, operation);
     *operation_pointer = NULL;
     return TRUE;
+}
+
+static int remote_operation_self_test(void) {
+    struct remote_operation *operation = HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*operation)
+    );
+    BOOL success = TRUE;
+    DWORD error = ERROR_SUCCESS;
+    struct remote_retry_guard guard;
+
+    if (!operation) {
+        return 1;
+    }
+    /*
+     * Model a worker that published completion after its wait handle became
+     * unusable.  Polling must consume the completion marker and release the
+     * slot, otherwise every later injection is permanently suppressed.
+     */
+    operation->worker = INVALID_HANDLE_VALUE;
+    operation->success = FALSE;
+    operation->error = ERROR_TIMEOUT;
+    InterlockedExchange(&operation->completed, 1);
+    if (
+        !poll_remote_operation(&operation, &success, &error) || operation ||
+        success || error != ERROR_TIMEOUT
+    ) {
+        if (operation) {
+            HeapFree(GetProcessHeap(), 0, operation);
+        }
+        return 1;
+    }
+    remote_retry_guard_reset(&guard);
+    remote_retry_guard_timeout(&guard, 0);
+    if (
+        remote_retry_guard_allows(&guard, 0) ||
+        !remote_retry_guard_allows(&guard, 0x1000u)
+    ) {
+        return 1;
+    }
+    remote_retry_guard_timeout(&guard, 0x1000u);
+    if (
+        remote_retry_guard_allows(&guard, 0x1000u) ||
+        !remote_retry_guard_allows(&guard, 0x2000u)
+    ) {
+        return 1;
+    }
+    return 0;
 }
 
 static int inject_once(const WCHAR *image_name, const WCHAR *dll_path) {
@@ -413,6 +508,12 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
     enum remote_operation_kind operation_kind = REMOTE_OPERATION_INJECT;
     DWORD operation_pid = 0;
     uintptr_t operation_streamer = 0;
+    uintptr_t operation_hook_module = 0;
+    struct remote_retry_guard injection_retry;
+    struct remote_retry_guard streamer_retry;
+
+    remote_retry_guard_reset(&injection_retry);
+    remote_retry_guard_reset(&streamer_retry);
 
     for (;;) {
         DWORD pid = find_process(image_name);
@@ -428,6 +529,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                 if (operation_kind == REMOTE_OPERATION_INJECT) {
                     last_injected = operation_success;
                     if (operation_success) {
+                        remote_retry_guard_reset(&injection_retry);
                         initialized_streamer = 0;
                         wprintf(
                             L"injected pid=%lu\n",
@@ -435,6 +537,11 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                         );
                         fflush(stdout);
                     } else {
+                        if (operation_error == ERROR_TIMEOUT) {
+                            remote_retry_guard_timeout(
+                                &injection_retry, operation_hook_module
+                            );
+                        }
                         fwprintf(
                             stderr,
                             L"inject-retry pid=%lu error=%lu\n",
@@ -444,6 +551,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                         fflush(stderr);
                     }
                 } else if (operation_success) {
+                    remote_retry_guard_reset(&streamer_retry);
                     initialized_streamer = operation_streamer;
                     wprintf(
                         L"streamer-initialized pid=%lu\n",
@@ -451,6 +559,11 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                     );
                     fflush(stdout);
                 } else {
+                    if (operation_error == ERROR_TIMEOUT) {
+                        remote_retry_guard_timeout(
+                            &streamer_retry, operation_streamer
+                        );
+                    }
                     fwprintf(
                         stderr,
                         L"streamer-initialize-retry pid=%lu error=%lu\n",
@@ -462,11 +575,14 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
             }
             operation_pid = 0;
             operation_streamer = 0;
+            operation_hook_module = 0;
         }
         if (!pid) {
             last_pid = 0;
             last_injected = FALSE;
             initialized_streamer = 0;
+            remote_retry_guard_reset(&injection_retry);
+            remote_retry_guard_reset(&streamer_retry);
             Sleep(WATCH_INTERVAL_MS);
             continue;
         }
@@ -474,14 +590,23 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
             last_pid = pid;
             last_injected = FALSE;
             initialized_streamer = 0;
+            remote_retry_guard_reset(&injection_retry);
+            remote_retry_guard_reset(&streamer_retry);
         }
+        {
+            uintptr_t hook_module = 0;
+            BOOL hook_present = remote_module_info(
+                pid, L"uu-remote-input-hook.dll", &hook_module
+            );
+
         if (
             !operation &&
             (
                 !last_injected ||
-                !remote_module_info(
-                    pid, L"uu-remote-input-hook.dll", NULL
-                )
+                !hook_present
+            ) &&
+            remote_retry_guard_allows(
+                &injection_retry, hook_present ? hook_module : 0
             )
         ) {
             operation = start_remote_operation(
@@ -491,6 +616,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                 operation_kind = REMOTE_OPERATION_INJECT;
                 operation_pid = pid;
                 operation_streamer = 0;
+                operation_hook_module = hook_present ? hook_module : 0;
             } else {
                 fwprintf(
                     stderr,
@@ -501,6 +627,7 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                 fflush(stderr);
             }
         }
+        }
         if (last_injected && !operation) {
             uintptr_t streamer_module = 0;
 
@@ -508,7 +635,12 @@ static int watch_process(const WCHAR *image_name, const WCHAR *dll_path) {
                     pid, L"streamer.dll", &streamer_module
                 )) {
                 initialized_streamer = 0;
-            } else if (streamer_module != initialized_streamer) {
+            } else if (
+                streamer_module != initialized_streamer &&
+                remote_retry_guard_allows(
+                    &streamer_retry, streamer_module
+                )
+            ) {
                 operation = start_remote_operation(
                     pid, dll_path, REMOTE_OPERATION_INITIALIZE
                 );
@@ -543,6 +675,8 @@ static int watch_process_with_module(
         BOOL initialized;
         BOOL seen;
         struct remote_operation *operation;
+        uintptr_t operation_hook_module;
+        struct remote_retry_guard injection_retry;
     } watched[32];
     unsigned int watched_count = 0;
 
@@ -599,6 +733,9 @@ static int watch_process_with_module(
                         ) {
                             state->initialized = operation_success;
                             if (operation_success) {
+                                remote_retry_guard_reset(
+                                    &state->injection_retry
+                                );
                                 wprintf(
                                     L"injected pid=%lu module=%ls\n",
                                     (unsigned long)state->pid,
@@ -606,6 +743,12 @@ static int watch_process_with_module(
                                 );
                                 fflush(stdout);
                             } else {
+                                if (operation_error == ERROR_TIMEOUT) {
+                                    remote_retry_guard_timeout(
+                                        &state->injection_retry,
+                                        state->operation_hook_module
+                                    );
+                                }
                                 fwprintf(
                                     stderr,
                                     L"inject-retry pid=%lu module=%ls "
@@ -616,19 +759,27 @@ static int watch_process_with_module(
                                 );
                                 fflush(stderr);
                             }
+                            state->operation_hook_module = 0;
                         }
                     }
-                    if (
-                        state->initialized &&
-                        !remote_module_info(
+                    {
+                        uintptr_t hook_module = 0;
+                        BOOL hook_present = remote_module_info(
                             state->pid,
                             L"uu-remote-input-hook.dll",
-                            NULL
-                        )
-                    ) {
+                            &hook_module
+                        );
+
+                    if (state->initialized && !hook_present) {
                         state->initialized = FALSE;
                     }
-                    if (!state->initialized && !state->operation) {
+                    if (
+                        !state->initialized && !state->operation &&
+                        remote_retry_guard_allows(
+                            &state->injection_retry,
+                            hook_present ? hook_module : 0
+                        )
+                    ) {
                         state->operation = start_remote_operation(
                             state->pid,
                             dll_path,
@@ -644,7 +795,11 @@ static int watch_process_with_module(
                                 (unsigned long)GetLastError()
                             );
                             fflush(stderr);
+                        } else {
+                            state->operation_hook_module =
+                                hook_present ? hook_module : 0;
                         }
+                    }
                     }
                 } while (Process32NextW(snapshot, &entry));
             }
@@ -824,6 +979,12 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputInjectorVersion(void) {
 
 int wmain(int argument_count, WCHAR **arguments) {
     if (
+        argument_count == 2 &&
+        lstrcmpiW(arguments[1], L"--self-test") == 0
+    ) {
+        return remote_operation_self_test();
+    }
+    if (
         argument_count == 5 &&
         lstrcmpiW(arguments[1], L"--watch-module") == 0
     ) {
@@ -863,6 +1024,7 @@ int wmain(int argument_count, WCHAR **arguments) {
         L"--watch-module IMAGE_NAME REQUIRED_MODULE DLL_PATH\n"
         L"       uu-remote-input-injector.exe "
         L"(--launch|--launch-and-wait) DLL_PATH APPLICATION_PATH\n"
+        L"       uu-remote-input-injector.exe --self-test\n"
     );
     return 64;
 }

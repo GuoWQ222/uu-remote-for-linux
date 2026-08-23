@@ -393,7 +393,7 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
     rdata_rva, rdata_virtual_size, _, rdata_raw_size = rdata
     text_size = min(text_virtual_size, text_raw_size)
     text_end = text_offset + text_size
-    candidates: list[tuple[int, int]] = []
+    candidates: list[tuple[int, int, int]] = []
     prefix = bytes.fromhex("e80000000090488d05")
     suffix = bytes.fromhex("4989074989b7a8000000")
 
@@ -424,25 +424,38 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
                     :size
                 ]
 
-            valid = (
-                entries[4] == entries[5]
-                and function_bytes(entries[1], 6) == bytes.fromhex("b801000000c3")
+            common_valid = (
+                function_bytes(entries[1], 6) == bytes.fromhex("b801000000c3")
                 and function_bytes(entries[2], 3) == bytes.fromhex("b001c3")
                 and function_bytes(entries[3], 12)
                 == bytes.fromhex("4883b9a8000000000f95c0c3")
-                and function_bytes(entries[5], 3) == bytes.fromhex("33c0c3")
+            )
+            legacy_adapter_slot = (
+                entries[4] == entries[5]
+                and function_bytes(entries[5], 3)
+                == bytes.fromhex("33c0c3")
+            )
+            expanded_adapter_slot = (
+                function_bytes(entries[4], 3)
+                == bytes.fromhex("33c0c3")
+                and function_bytes(entries[5], 3)
+                == bytes.fromhex("32c0c3")
+                and function_bytes(entries[6], 3)
+                == bytes.fromhex("33c0c3")
             )
         except (ValueError, struct.error):
             continue
-        if valid:
-            candidates.append((vtable_rva, vtable_rva + 5 * 8))
+        if common_valid and legacy_adapter_slot:
+            candidates.append((vtable_rva, vtable_rva + 5 * 8, 5))
+        elif common_valid and expanded_adapter_slot:
+            candidates.append((vtable_rva, vtable_rva + 6 * 8, 6))
 
     if len(candidates) != 1:
         fail(
             "无法唯一定位 GDI 捕获帧的适配器 LUID 虚函数；"
             f"候选数={len(candidates)}"
         )
-    vtable_rva, slot_rva = candidates[0]
+    vtable_rva, slot_rva, gdi_adapter_slot_index = candidates[0]
 
     adapter_getter_pattern = bytes.fromhex("8b4144c3")
     adapter_getter_offsets: list[int] = []
@@ -1009,6 +1022,7 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
     profile: dict[str, object] = {
         "vtable_rva": vtable_rva,
         "slot_rva": slot_rva,
+        "gdi_adapter_slot_index": gdi_adapter_slot_index,
         "base_getter_rva": adapter_getter_rva,
         "base_slots": base_slots,
         "long_slots": long_slots,
@@ -1037,6 +1051,7 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
     line = (
         f"STREAMER_GDI_ADAPTER_OK\tvtable_rva=0x{vtable_rva:x}"
         f"\tslot_rva=0x{slot_rva:x}"
+        f"\tgdi_adapter_slot_index={gdi_adapter_slot_index}"
         f"\tbase_getter_rva=0x{adapter_getter_rva:x}"
         f"\tbase_slots={base_slots}"
         f"\tlong_slots={long_slots}"
@@ -1092,6 +1107,7 @@ def encoder_profile_ready(profile: dict[str, object]) -> bool:
         )
         and isinstance(profile.get("base_slots"), int)
         and profile["base_slots"] >= 1
+        and profile.get("gdi_adapter_slot_index") in {5, 6}
         and isinstance(profile.get("long_slots"), int)
         and profile["long_slots"] >= 1
         and isinstance(profile.get("wrapper_ctor_refs"), int)

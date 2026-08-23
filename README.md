@@ -47,35 +47,23 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
 
 **Tested environment:** Ubuntu 24.04 x86_64 · Wine 11.1+ · X11 or GNOME Wayland
 
-1. Download one session-specific asset from
+1. Download the universal Debian package from
    [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest).
    No repository or archive key is required.
 
-2. For X11, install the standalone package directly:
+2. Install it directly on either X11 or GNOME Wayland:
 
    ```bash
-   sudo apt install ./uu-remote-for-linux-x11_1.1.35_amd64.deb
+   sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
    ```
 
-   For Ubuntu 24.04 GNOME Wayland, download and extract the ZIP, then install
-   all six local Debian packages in one transaction:
-
-   ```bash
-   unzip uu-remote-for-linux-wayland_1.1.35_amd64.zip
-   cd uu-remote-for-linux-wayland_1.1.35_amd64
-   sha256sum --strict -c SHA256SUMS
-   sudo apt install ./*.deb
-   ```
-
-   These downloads distinguish **X11 and Wayland session backends**, not CPU
-   architectures; both currently target amd64. The Wayland ZIP contains the
-   shared runtime, Wayland profile, and four Mutter repair packages. The outer
-   shell starts APT once, so APT resolves, unpacks, and configures the complete
-   set in one transaction; no `postinst` launches nested APT. The standalone
-   X11 package does not replace Mutter. The repair is a minimum version, so a
-   later Ubuntu security revision can supersede it normally. Log out and back
-   in after the Wayland install so GNOME Shell loads the new library; the X11
-   install does not require that logout.
+   The package currently targets the **amd64 CPU architecture**. X11 and
+   Wayland are display-session backends, not CPU architectures; the launcher
+   detects the live session and selects XTest or Portal plus the bundled native
+   PipeWire/EGL DMA-BUF helper automatically. The Wayland capture path keeps
+   fixed three-buffer and three-staging pools. No compositor package is
+   replaced, patched, pinned, or downgraded. A logout is not required; restart
+   UU after upgrading an already running installation.
 
    After migrating from the old `1.1.34` signed repository, remove its unused
    bootstrap package if it is installed:
@@ -83,53 +71,6 @@ Ubuntu Wayland still has several stability issues. We will accelerate fixes in f
    ```bash
    sudo apt remove uu-remote-for-linux-archive-keyring
    ```
-3. The individual Mutter status, install, and rollback commands remain
-   available:
-
-   ```bash
-   /usr/bin/uu-remote-for-linux --mutter-fix-status
-   /usr/bin/uu-remote-for-linux --install-mutter-fix
-   ```
-
-   The manager accepts only the exact Noble amd64 Mutter 46.2 baseline and
-   rechecks all four packages, SHA256 digests, and the APT transaction plan.
-   Success means APT has both unpacked and configured all four packages; an
-   unpack-only result is an interrupted transaction that must be recovered
-   before logout. After first writing the repair, save your work and log out/in.
-   If the reported state is already `active`, another logout is unnecessary.
-   Installing or removing the shared `uu-remote-for-linux` runtime itself still
-   never replaces, pins, or rolls back Mutter. Only installing every local
-   package from the Wayland ZIP asks APT to install the repair dependencies.
-   Before removing UU, run `--rollback-mutter-fix` if desired. Verified
-   recovery packages remain under
-   `/var/lib/uu-remote-for-linux/mutter-fix/rollback/` so uninstalling the
-   wrapper cannot remove the rescue material.
-   If GNOME Wayland cannot start, recover from a TTY or SSH session with:
-
-   ```bash
-   sudo /usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root rollback
-   ```
-
-   The direct command below is an emergency path only when the manager reports
-   `interrupted-known-partial` and every one of the four installed versions is
-   one of the exact `.16`, `+0uuremote3`, or diagnostic `+uuremote3` versions.
-   This also covers that known state after UU itself has been removed. If any
-   package is `.17` or another unknown/newer version, do **not** run this
-   downgrade; finish the Ubuntu repository upgrade instead. The paths are
-   intentionally written out without a user-shell glob:
-
-   ```bash
-   sudo apt-get --allow-downgrades --reinstall --no-remove install \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common_46.2-1ubuntu0.24.04.16_all.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common-bin_46.2-1ubuntu0.24.04.16_amd64.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/libmutter-14-0_46.2-1ubuntu0.24.04.16_amd64.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/gir1.2-mutter-14_46.2-1ubuntu0.24.04.16_amd64.deb
-   ```
-
-   Log out and back in after recovery. If those cached files do not exist,
-   reinstall the matching UU `.deb` first; its maintainer scripts still do not
-   alter Mutter, but they restore the fixed-path recovery helper and payload.
-
 On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the isolated client and WebView2. Rejecting it leaves the client uninstalled.
 
 > [!TIP]
@@ -139,16 +80,12 @@ On first launch, accept NetEase's [official agreement](https://uuyc.163.com/cont
 <summary><strong>🧱 Install from source</strong></summary>
 
 ```bash
-sudo apt install python3-gi zenity gir1.2-gstreamer-1.0 \
-  gstreamer1.0-pipewire gstreamer1.0-plugins-base
+sudo apt install python3-gi zenity libpipewire-0.3-0 libegl1 libgles2
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
 ~/.local/bin/uu-remote-for-linux
 ```
-
-A user-writable source installation cannot safely provide a privileged Mutter
-manager. That feature is available only from the root-owned system `.deb`.
 
 </details>
 
@@ -173,7 +110,7 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 | Area | Backend | Status | Notes |
 |---|---|---:|---|
 | Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
-| Desktop | GNOME Wayland Portal | ✅ | XWayland UI; Portal input and PipeWire capture; Noble latency repair is explicit |
+| Desktop | GNOME Wayland Portal | ✅ | XWayland UI and Portal input; native three-buffer PipeWire DMA-BUF capture, with explicit failure instead of a hidden transport fallback |
 | Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |
 | Decode | NVIDIA NVDEC | 🧪 | Experimental; UU menu up to 4K/144 fps |
 | Encode | NVIDIA NVENC | ✅ | H.264/HEVC, enabled only after validation |
@@ -181,6 +118,10 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 
 > [!WARNING]
 > Wayland requires Portal permission. On a multi-monitor desktop, select all displays in the sharing dialog; the permission is then restored for later sessions. Login-manager and lock-screen capture are outside the logged-in Portal session; use X11 for unattended access before login.
+
+The exact version boundaries, semantic profilers, and update rollback
+transaction are documented in
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
 <a id="commands"></a>
 ## 🧰 Commands
@@ -195,9 +136,6 @@ uu-remote-for-linux --diagnose
 uu-remote-for-linux --repair
 uu-remote-for-linux --stop
 uu-remote-for-linux --check-update
-/usr/bin/uu-remote-for-linux --mutter-fix-status
-/usr/bin/uu-remote-for-linux --install-mutter-fix
-/usr/bin/uu-remote-for-linux --rollback-mutter-fix
 
 # Decoder
 uu-remote-for-linux --select-decoder
@@ -214,4 +152,4 @@ uu-remote-for-linux --disable-hwencode
 <a id="license"></a>
 ## 📄 License
 
-Original project code uses the [Zero-Clause BSD license](LICENSE). Optional components retain their own licenses; revisions, corresponding source, build notes, and checksums are listed in [NOTICE.md](NOTICE.md), [third_party/HWDECODE.md](third_party/HWDECODE.md), and [packaging/mutter/README.md](packaging/mutter/README.md).
+Original project code uses the [Zero-Clause BSD license](LICENSE). Optional components retain their own licenses; revisions, corresponding source, build notes, and checksums are listed in [NOTICE.md](NOTICE.md) and [third_party/HWDECODE.md](third_party/HWDECODE.md).

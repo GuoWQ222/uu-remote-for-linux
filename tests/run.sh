@@ -31,28 +31,17 @@ check "keyboard bridge Python syntax" /usr/bin/python3 -c \
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
-check "Mutter fix manager syntax" bash -n \
-    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix"
-check "Mutter root helper syntax" bash -n \
-    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root"
-check "serial Mutter installer template syntax" bash -n \
-    "$project_root/packaging/install-with-mutter-fix.sh.in"
 check "direct release asset builder syntax" bash -n \
     "$project_root/packaging/release/build-assets.sh"
 check "native frame helper self-test" /usr/bin/python3 -c \
     'import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); library.uu_frame_helper_self_test.restype = ctypes.c_uint32; raise SystemExit(0 if library.uu_frame_helper_self_test() == 1 else 1)' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
+check "PipeWire DMA-BUF capture self-test" \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
+    --self-test
 check "PipeWire cursor bridge self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     --self-test
-check "Mutter fix manager isolation" \
-    "$project_root/tests/mutter-fix-manager.sh"
-check "serial Mutter installer isolation" \
-    "$project_root/tests/serial-installer.sh"
-check "Mutter capture priority" \
-    "$project_root/packaging/mutter/test-capture-priority.sh"
-check "Mutter release bundle" \
-    "$project_root/packaging/mutter/verify-bundle.sh"
 check "direct release asset isolation" \
     "$project_root/tests/release-assets.sh"
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
@@ -61,6 +50,8 @@ check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
 check "NVDEC profiler self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     --self-test
+check "runtime compatibility profiler integration" \
+    "$project_root/tests/runtime-profiler.sh"
 check "NVENC encoder policy Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
@@ -106,6 +97,9 @@ check "WOL profiler fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/wol-profiler"
 check "NVDEC profiler fixture syntax" bash -n \
     "$project_root/tests/fixtures/bin/hwdecode-profiler"
+check "runtime profiler fixture Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/tests/fixtures/bin/runtime-profiler"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "DXGI probe builder syntax" bash -n \
@@ -120,6 +114,8 @@ check "input hook builder syntax" bash -n \
     "$project_root/scripts/build-input-hook.sh"
 check "native frame helper builder syntax" bash -n \
     "$project_root/scripts/build-frame-helper.sh"
+check "PipeWire DMA-BUF capture builder syntax" bash -n \
+    "$project_root/scripts/build-pipewire-capture.sh"
 check "PipeWire cursor builder syntax" bash -n \
     "$project_root/scripts/build-pipewire-cursor.sh"
 check "input injector concurrency policy" \
@@ -127,6 +123,8 @@ check "input injector concurrency policy" \
 check "PowerShell bridge builder syntax" bash -n \
     "$project_root/scripts/build-powershell-bridge.sh"
 check "user installer syntax" bash -n "$project_root/scripts/install-user.sh"
+check "source user install compatibility payload" \
+    "$project_root/tests/user-install.sh"
 check "shim builder syntax" bash -n "$project_root/scripts/build-wevtapi.sh"
 check "deb builder syntax" bash -n "$project_root/packaging/build-deb.sh"
 check "postinst syntax" bash -n "$project_root/packaging/debian/postinst"
@@ -191,15 +189,15 @@ check "keyboard bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 check "input bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
-check "Mutter fix manager exists" test -x \
-    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix"
-check "Mutter root helper exists" test -x \
-    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root"
 # The snippet intentionally defers "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "native frame helper is ELF" bash -c \
     'file "$1" | grep -q "ELF 64-bit LSB.*shared object.*x86-64"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
+# shellcheck disable=SC2016
+check "PipeWire DMA-BUF capture is ELF" bash -c \
+    'file "$1" | grep -q "ELF 64-bit LSB.*x86-64"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture"
 check "update compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/update-compatibility.tsv"
 check "WOL compatibility profiles exist" test -s \
@@ -208,6 +206,10 @@ check "NVDEC compatibility profiles exist" test -s \
     "$project_root/lib/uu-remote-for-linux/hwdecode-compatibility.tsv"
 check "NVDEC automatic profiler exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
+check "runtime compatibility profiler exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-runtime-profiler"
+check "compatibility contract document exists" test -s \
+    "$project_root/COMPATIBILITY.md"
 check "DXGI adapter probe exists" test -s \
     "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe"
 # shellcheck disable=SC2016
@@ -311,6 +313,10 @@ check "input hook exports executable-patch self-test" bash -c \
     'objdump -p "$1" | grep -q "UURemoteExecutablePatchSelfTest"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 # shellcheck disable=SC2016
+check "input hook exports partial-fallback self-test" bash -c \
+    'objdump -p "$1" | grep -q "UURemoteInputFallbackSelfTest"' _ \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
+# shellcheck disable=SC2016
 check "input hook exports WOL status" bash -c \
     'objdump -p "$1" | grep -q "UURemoteWolHookStatus"' _ \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
@@ -364,16 +370,10 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/scripts/build-update-blocker.sh" \
         "$project_root/scripts/build-input-hook.sh" \
         "$project_root/scripts/build-frame-helper.sh" \
+        "$project_root/scripts/build-pipewire-capture.sh" \
         "$project_root/scripts/build-pipewire-cursor.sh" \
         "$project_root/scripts/build-powershell-bridge.sh" \
-        "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix" \
-        "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root" \
-        "$project_root/packaging/install-with-mutter-fix.sh.in" \
         "$project_root/packaging/release/build-assets.sh" \
-        "$project_root/packaging/mutter/test-capture-priority.sh" \
-        "$project_root/packaging/mutter/verify-bundle.sh" \
-        "$project_root/tests/mutter-fix-manager.sh" \
-        "$project_root/tests/serial-installer.sh" \
         "$project_root/tests/release-assets.sh" \
         "$project_root/scripts/build-wevtapi.sh" \
         "$project_root/packaging/build-deb.sh" \
@@ -395,6 +395,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/wine-input-hook.sh" \
         "$project_root/tests/wine-focus-hook.sh" \
         "$project_root/tests/powershell-bridge.sh" \
+        "$project_root/tests/user-install.sh" \
         "$project_root/tests/run.sh" \
         "$project_root/tests/fixtures/bin/curl" \
         "$project_root/tests/fixtures/bin/autostart-wine" \

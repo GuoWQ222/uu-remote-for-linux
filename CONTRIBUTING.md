@@ -16,8 +16,7 @@ Thank you for improving UU Remote for Linux.
 
    ```bash
    make release-assets
-   dpkg-deb --info dist/uu-remote-for-linux-x11_*_amd64.deb
-   unzip -l dist/uu-remote-for-linux-wayland_*_amd64.zip
+   dpkg-deb --info dist/uu-remote-for-linux_*_amd64.deb
    (cd dist && sha256sum --strict -c SHA256SUMS)
    ```
 
@@ -52,18 +51,8 @@ make shim
 Hardware-decoding source, revisions, checksums, and build details are recorded
 in `third_party/HWDECODE.md`.
 
-The Ubuntu 24.04 Mutter capture repair, clean-source build requirements,
-payload verification, and rollback procedure are documented in
-`packaging/mutter/README.md`. Public Mutter binaries must come from the exact
-source package in a clean Noble build environment; local incremental hotfix
-packages are suitable for diagnosis only and must not be published. A release
-candidate must also pass the documented real APT install, legacy-normalization,
-and rollback gate in a disposable Noble environment; mock tests and
-`apt-get -s` alone are not release acceptance.
-
-New releases expose two direct downloads: a complete standalone X11 `.deb` and
-a GNOME Wayland ZIP containing the shared runtime, Wayland profile, and four
-verified Mutter packages. The extracted Wayland directory must install through
-one outer `apt install ./*.deb` transaction; no maintainer script may invoke
-APT or dpkg. Release checksums must cover both public assets, while the ZIP's
-internal `SHA256SUMS` must cover all six Debian packages.
+New releases expose one complete amd64 `.deb`. Its launcher selects X11 or
+GNOME Wayland from the live session, while the package carries the dependencies
+and native helpers required by both paths. Release checksums must cover the
+public asset. The package must not contain, depend on, replace, or configure a
+custom desktop compositor build.

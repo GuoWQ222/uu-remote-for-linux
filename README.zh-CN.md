@@ -49,76 +49,26 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 
 1. 从
    [GitHub Releases](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)
-   根据当前桌面会话下载一个发行资产。无需添加软件源或安装公钥。
+   下载统一的 Debian 安装包。无需添加软件源或安装公钥。
 
-2. X11 下载独立安装包后直接安装：
-
-   ```bash
-   sudo apt install ./uu-remote-for-linux-x11_1.1.35_amd64.deb
-   ```
-
-   Ubuntu 24.04 GNOME Wayland 下载 ZIP，解压后在其目录中一次性安装全部
-   6 个本地 Debian 包：
+2. 无论当前使用 X11 还是 GNOME Wayland，都直接安装同一个包：
 
    ```bash
-   unzip uu-remote-for-linux-wayland_1.1.35_amd64.zip
-   cd uu-remote-for-linux-wayland_1.1.35_amd64
-   sha256sum --strict -c SHA256SUMS
-   sudo apt install ./*.deb
+   sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
    ```
 
-   这里区分的是 **X11/Wayland 会话后端**，不是 CPU 架构；两项目前都只提供
-   amd64。Wayland ZIP 内含 UU 主包、Wayland 入口和四个 Mutter 修复包；外层
-   shell 只启动一次 APT，APT 在同一次求解、解包和配置事务中完成全部变更，任何
-   `postinst` 都不会嵌套启动第二个 APT。X11 独立包不会替换 Mutter。Wayland
-   依赖使用已验证修复版作为最小版本，不会阻止版本排序更高的 Ubuntu 官方安全
-   更新。Wayland 安装完成后必须注销并重新登录，让 GNOME Shell 加载新库；X11
-   安装无需为此注销。
+   安装包当前面向 **amd64 CPU 架构**。X11/Wayland 是显示会话后端，不是
+   CPU 架构；启动器会读取实际用户会话并自动选择 XTest，或 Portal 加自带的
+   PipeWire/EGL DMA-BUF 原生辅助进程。Wayland 路径的 PipeWire 与 staging
+   均固定三缓冲。
+   安装不会替换、修改、锁定或降级桌面合成器的软件包，也不需要注销；若升级时
+   UU 正在运行，安装后重启 UU 即可。
 
    从旧的 `1.1.34` 签名源迁移后，可移除不再使用的引导包：
 
    ```bash
    sudo apt remove uu-remote-for-linux-archive-keyring
    ```
-3. 如需单独检查、安装或回滚 Mutter，仍可使用：
-
-   ```bash
-   /usr/bin/uu-remote-for-linux --mutter-fix-status
-   /usr/bin/uu-remote-for-linux --install-mutter-fix
-   ```
-
-   管理器只接受精确匹配的 Noble amd64 Mutter 46.2 基线，会再次校验 4 个
-   软件包、SHA256 和 APT 变更计划。只有 APT 已经解包并配置完这 4 个包才算
-   成功；仅完成解包属于中断事务，必须先恢复，不能直接注销。首次写入修复后请
-   保存工作并注销，再重新登录；如果状态已经是 `active`，则无需再次注销。
-   安装或卸载基础运行时 `uu-remote-for-linux` 本身仍不会自动替换、锁定或回滚
-   Mutter；只有安装 Wayland ZIP 中的全部本地包才会由 APT 安装修复依赖。
-   如需卸载 UU，请先在仍有管理器时按需运行
-   `--rollback-mutter-fix`；已缓存的官方恢复包会保留在
-   `/var/lib/uu-remote-for-linux/mutter-fix/rollback/`，避免卸载后失去救援材料。
-   如果 GNOME Wayland 无法登录，可从 TTY 或 SSH 执行：
-
-   ```bash
-   sudo /usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root rollback
-   ```
-
-   下面的直接命令只用于管理器明确报告 `interrupted-known-partial`，且 4 个包
-   的版本全部严格属于官方 `.16`、正式 `+0uuremote3` 或诊断版
-   `+uuremote3` 的紧急恢复；UU 已卸载但仍满足这组条件时也可使用。如果任一包
-   已是 `.17` 或其他未知/更高版本，**不要**用下面的命令降级，应从 Ubuntu
-   软件源完成升级。下面故意写出 4 个固定路径，不使用普通用户无法展开的通配符：
-
-   ```bash
-   sudo apt-get --allow-downgrades --reinstall --no-remove install \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common_46.2-1ubuntu0.24.04.16_all.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/mutter-common-bin_46.2-1ubuntu0.24.04.16_amd64.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/libmutter-14-0_46.2-1ubuntu0.24.04.16_amd64.deb \
-     /var/lib/uu-remote-for-linux/mutter-fix/rollback/gir1.2-mutter-14_46.2-1ubuntu0.24.04.16_amd64.deb
-   ```
-
-   恢复后请注销并重新登录。如果缓存文件不存在，可先重新安装同版本 UU `.deb`；
-   它的维护脚本仍不会改动 Mutter，只会恢复固定路径的管理器与离线载荷。
-
 首次启动时，接受网易[官方协议](https://uuyc.163.com/contact/20240402/40294_1146065.html)即可安装独立客户端与 WebView2；拒绝后不会安装客户端。
 
 > [!TIP]
@@ -128,16 +78,12 @@ Ubuntu Wayland 目前仍有若干稳定性问题，将在后续版本中加快�
 <summary><strong>🧱 从源码安装</strong></summary>
 
 ```bash
-sudo apt install python3-gi zenity gir1.2-gstreamer-1.0 \
-  gstreamer1.0-pipewire gstreamer1.0-plugins-base
+sudo apt install python3-gi zenity libpipewire-0.3-0 libegl1 libgles2
 git clone https://github.com/GuoWQ222/uu-remote-for-linux.git
 cd uu-remote-for-linux
 ./scripts/install-user.sh
 ~/.local/bin/uu-remote-for-linux
 ```
-
-用户目录可写，因而源码用户安装不会提供可提权的 Mutter 管理器；该功能只随
-root 所有的正式系统 `.deb` 提供。
 
 </details>
 
@@ -162,7 +108,7 @@ root 所有的正式系统 `.deb` 提供。
 | 范围 | 后端 | 状态 | 说明 |
 |---|---|---:|---|
 | 桌面 | X11 + XTest | ✅ | 原生输入与现有 UU 采集路径 |
-| 桌面 | GNOME Wayland Portal | ✅ | XWayland 界面、Portal 输入与 PipeWire 采集；Noble 低延迟修复需显式启用 |
+| 桌面 | GNOME Wayland Portal | ✅ | XWayland 界面、Portal 输入；PipeWire DMA-BUF 原生三缓冲采集，不可用时明确失败而不静默切换传输 |
 | 解码 | CPU / OpenH264 | ✅ | 安全回退，最高 1080p/60 fps |
 | 解码 | NVIDIA NVDEC | 🧪 | 实验性；UU 菜单最高 4K/144 fps |
 | 编码 | NVIDIA NVENC | ✅ | H.264/HEVC，验证通过后启用 |
@@ -170,6 +116,9 @@ root 所有的正式系统 `.deb` 提供。
 
 > [!WARNING]
 > Wayland 必须授权 Portal。多屏环境首次弹出共享对话框时请选择全部显示器，后续会复用该授权。登录管理器和锁屏不属于已登录用户的 Portal 会话；登录前无人值守控制请使用 X11。
+
+所有补丁的精确版本边界、语义 profiler 与升级回滚事务详见
+[兼容规范](COMPATIBILITY.md)。
 
 <a id="commands"></a>
 ## 🧰 常用命令
@@ -184,9 +133,6 @@ uu-remote-for-linux --diagnose
 uu-remote-for-linux --repair
 uu-remote-for-linux --stop
 uu-remote-for-linux --check-update
-/usr/bin/uu-remote-for-linux --mutter-fix-status
-/usr/bin/uu-remote-for-linux --install-mutter-fix
-/usr/bin/uu-remote-for-linux --rollback-mutter-fix
 
 # 解码器
 uu-remote-for-linux --select-decoder
@@ -203,4 +149,4 @@ uu-remote-for-linux --disable-hwencode
 <a id="license"></a>
 ## 📄 许可证
 
-本项目原创代码采用[零条款 BSD 许可证](LICENSE)。可选组件保留各自许可证；修订版本、对应源码、构建说明与校验和见 [NOTICE.md](NOTICE.md)、[third_party/HWDECODE.md](third_party/HWDECODE.md) 和 [packaging/mutter/README.md](packaging/mutter/README.md)。
+本项目原创代码采用[零条款 BSD 许可证](LICENSE)。可选组件保留各自许可证；修订版本、对应源码、构建说明与校验和见 [NOTICE.md](NOTICE.md) 和 [third_party/HWDECODE.md](third_party/HWDECODE.md)。

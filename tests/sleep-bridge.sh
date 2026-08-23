@@ -69,6 +69,7 @@ trace_has() {
 }
 
 test "$("$bridge" state "$log_dir")" = unknown
+test "$("$bridge" --self-test)" = '防休眠进程身份检查通过。'
 write_log "$log_dir/log_1.txt" 2147483648
 test "$("$bridge" state "$log_dir")" = disabled
 printf '%s\n' \

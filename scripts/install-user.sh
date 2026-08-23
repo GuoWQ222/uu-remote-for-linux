@@ -30,6 +30,7 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-profiler" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-runtime-profiler" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-update-blocker.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-dxgi-probe.exe" &&
@@ -40,6 +41,7 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
@@ -76,6 +78,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" 
     "$runtime_target/uu-remote-update-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     "$runtime_target/uu-remote-hwdecode-profiler"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-runtime-profiler" \
+    "$runtime_target/uu-remote-runtime-profiler"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
     "$runtime_target/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
@@ -85,6 +89,9 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" \
     "$runtime_target/uu-remote-frame-helper.so"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
+    "$runtime_target/uu-remote-pipewire-capture"
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     "$runtime_target/uu-remote-pipewire-cursor"

@@ -112,6 +112,7 @@ case ${1:-} in
     *UURemote_Setup.exe)
         install -Dm0644 /dev/null "$install_dir/GameViewer.exe"
         install -Dm0644 /dev/null "$install_dir/bin/GameViewer.exe"
+        install -Dm0644 /dev/null "$install_dir/bin/Qt5Core.dll"
         install -Dm0644 /dev/null "$install_dir/bin/GameViewerServer.exe"
         install -Dm0644 /dev/null "$install_dir/bin/GameViewerHealthd.exe"
         install -Dm0644 /dev/null "$install_dir/bin/StreamerCodecDetector.exe"
@@ -173,11 +174,20 @@ with open(path, "w+b") as stream:
         0x1210: bytes.fromhex("b001c3"),
         0x1220: bytes.fromhex("4883b9a8000000000f95c0c3"),
         0x1230: bytes.fromhex("33c0c3"),
+        0x1238: bytes.fromhex("32c0c3"),
         0x1240: bytes.fromhex("8b4144c3"),
     }
     for rva, code in functions.items():
         put(text_raw + rva - text_rva, code)
-    entries = [0, 0x1200, 0x1210, 0x1220, 0x1230, 0x1230, 0]
+    if os.environ.get("UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT") == "1":
+        # UU 4.38.3 inserted a boolean virtual method immediately before the
+        # adapter LUID method.  The semantic adapter slot therefore moved
+        # from +0x28 to +0x30 without changing the encoder call chain.
+        entries = [
+            0, 0x1200, 0x1210, 0x1220, 0x1230, 0x1238, 0x1230,
+        ]
+    else:
+        entries = [0, 0x1200, 0x1210, 0x1220, 0x1230, 0x1230, 0]
     put(
         rdata_raw + vtable_rva - rdata_rva,
         struct.pack("<7Q", *(image_base + rva if rva else 0 for rva in entries)),
@@ -474,6 +484,15 @@ PY
                 printf 'PROXY_ENV_LEAK=%s\n' "$proxy_variable" >>"$trace_file"
             fi
         done
+        if [[ ${UU_REMOTE_FAKE_SERVER_REGENERATE_ENCODER_CACHE:-0} == 1 &&
+            ! -e "$install_dir/bin/.server-regenerated-encoder-cache" ]]; then
+            printf '%s\n' \
+                '{"version":2,"gpu_fingerprint":"regenerated","encoder_capabilities":[{"video_codec":1,"adapter_id":0,"device_id":0,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":6,"chroma_sampling":1,"bit_depth":8},{"video_codec":1,"adapter_id":1012,"device_id":8578,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":33,"chroma_sampling":1,"bit_depth":8},{"video_codec":2,"adapter_id":1012,"device_id":8578,"width":3840,"height":2160,"frame_rate":-1,"codec_impl":33,"chroma_sampling":1,"bit_depth":8}]}' \
+                >"$install_dir/config/streamer/encoder_codec_capability_cache.json"
+            install -Dm0644 /dev/null \
+                "$install_dir/bin/.server-regenerated-encoder-cache"
+            printf 'SERVER_REGENERATED_ENCODER_CACHE\n' >>"$trace_file"
+        fi
         install -Dm0644 /dev/null "$install_dir/bin/.server-running"
         printf 'SERVER\n' >>"$trace_file"
         exit 0

@@ -143,4 +143,17 @@ assert_originals
 
 grep -q '已释放 Linux Super+Space 并固定物理键盘输入源' "$log"
 grep -q '已恢复 Linux 原快捷键和输入源' "$log"
+
+# A stuck settings backend must not strand the focus watcher forever while
+# desktop shortcuts are overridden.  The production timeout is deliberately
+# fixed rather than environment-configurable.
+SECONDS=0
+if UU_REMOTE_KEYBOARD_GSETTINGS_HANG=1 "$bridge" check; then
+    printf '卡住的 gsettings 被错误接受。\n' >&2
+    exit 1
+fi
+((SECONDS < 7)) || {
+    printf 'gsettings 故障未在预期时间内终止。\n' >&2
+    exit 1
+}
 printf '键盘桥物理输入源接管、焦点迟滞、恢复和崩溃恢复检查通过。\n'

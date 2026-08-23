@@ -26,8 +26,6 @@ readonly arch="amd64"
 readonly artifact_name="uu-remote-for-linux"
 readonly output_dir="$project_root/dist"
 readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
-readonly mutter_profile_dir="$project_root/third_party/mutter/ubuntu-24.04-amd64/uuremote3"
-readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu0.24.04.16-uuremote3"
 
 [[ -r "$project_root/lib/uu-remote-for-linux/wevtapi.dll" ]] || {
     printf '缺少预构建的 wevtapi.dll；请先运行 make shim。\n' >&2
@@ -48,12 +46,12 @@ readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-wol-profiler" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-runtime-profiler" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
-    -x "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix" &&
-    -x "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
@@ -67,24 +65,12 @@ readonly mutter_source_dir="$project_root/third_party/mutter/source/46.2-1ubuntu
     printf '缺少原生托盘、解码设备选择器、NVDEC 探测器或系统设置/更新兼容桥。\n' >&2
     exit 1
 }
-[[ -x "$project_root/packaging/mutter/verify-bundle.sh" &&
-    -d $mutter_profile_dir && -d $mutter_source_dir ]] || {
-    printf '缺少经过校验的 Mutter 修复载荷或对应源码。\n' >&2
-    exit 1
-}
-"$project_root/packaging/mutter/verify-bundle.sh"
-
 stage_dir=$(mktemp -d)
 trap 'rm -rf -- "$stage_dir"' EXIT
 chmod 0755 "$stage_dir"
 
 install -Dm0755 "$project_root/bin/uu-remote-for-linux" \
     "$stage_dir/usr/bin/uu-remote-for-linux"
-install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix" \
-    "$stage_dir/usr/bin/uu-remote-mutter-fix"
-install -Dm0755 \
-    "$project_root/lib/uu-remote-for-linux/uu-remote-mutter-fix-root" \
-    "$stage_dir/usr/libexec/uu-remote-for-linux/uu-remote-mutter-fix-root"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/wevtapi.dll" \
     "$stage_dir/usr/lib/uu-remote-for-linux/wevtapi.dll"
 install -Dm0644 "$project_root/lib/uu-remote-for-linux/package-version" \
@@ -112,6 +98,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-update-bridge" 
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-update-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-hwdecode-profiler"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-runtime-profiler" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-runtime-profiler"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
@@ -121,6 +109,9 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture"
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-pipewire-cursor"
@@ -154,15 +145,14 @@ install -Dm0644 \
 install -Dm0644 \
     "$project_root/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml" \
     "$stage_dir/usr/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
-install -Dm0644 \
-    "$project_root/packaging/debian/io.github.guowq222.uu_remote_for_linux.mutter.policy" \
-    "$stage_dir/usr/share/polkit-1/actions/io.github.guowq222.uu_remote_for_linux.mutter.policy"
 install -Dm0644 "$project_root/README.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/README.md"
 install -Dm0644 "$project_root/README.zh-CN.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/README.zh-CN.md"
 install -Dm0644 "$project_root/NOTICE.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/NOTICE.md"
+install -Dm0644 "$project_root/COMPATIBILITY.md" \
+    "$stage_dir/usr/share/doc/uu-remote-for-linux/COMPATIBILITY.md"
 install -Dm0644 "$project_root/LICENSE" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/copyright"
 install -Dm0644 "$project_root/third_party/HWDECODE.md" \
@@ -171,19 +161,6 @@ install -Dm0644 "$project_root/third_party/sources/nvcuda-uu-remote-v0.8.tar.xz"
     "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvcuda-uu-remote-v0.8.tar.xz"
 install -Dm0644 "$project_root/third_party/sources/nvenc-nvcuvid-v0.5.tar.xz" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvenc-nvcuvid-v0.5.tar.xz"
-
-mkdir -p "$stage_dir/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3"
-cp -a "$mutter_profile_dir/." \
-    "$stage_dir/usr/lib/uu-remote-for-linux/mutter/ubuntu-24.04-amd64/uuremote3/"
-find "$stage_dir/usr/lib/uu-remote-for-linux/mutter" -type d -exec chmod 0755 {} +
-find "$stage_dir/usr/lib/uu-remote-for-linux/mutter" -type f -exec chmod 0644 {} +
-mkdir -p "$stage_dir/usr/share/doc/uu-remote-for-linux/source/mutter"
-cp -a "$mutter_source_dir/." \
-    "$stage_dir/usr/share/doc/uu-remote-for-linux/source/mutter/"
-find "$stage_dir/usr/share/doc/uu-remote-for-linux/source/mutter" \
-    -type d -exec chmod 0755 {} +
-find "$stage_dir/usr/share/doc/uu-remote-for-linux/source/mutter" \
-    -type f -exec chmod 0644 {} +
 
 mkdir -p "$stage_dir/DEBIAN"
 installed_size=$(du -sk "$stage_dir/usr" | awk '{print $1}')

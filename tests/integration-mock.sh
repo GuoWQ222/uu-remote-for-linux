@@ -15,6 +15,7 @@ export XDG_STATE_HOME="$test_root/state"
 export XDG_CACHE_HOME="$test_root/cache"
 export XDG_CONFIG_HOME="$test_root/config"
 export UU_REMOTE_RUNTIME_DIR="$project_root/lib/uu-remote-for-linux"
+export UU_REMOTE_RUNTIME_PROFILER_BIN="$fixture_bin/runtime-profiler"
 export UU_REMOTE_FAKE_TRACE="$test_root/fake-tools.log"
 export UU_REMOTE_HWDECODE_ASSUME_HOST_READY=1
 export UU_REMOTE_HWENCODE_ASSUME_HOST_READY=1
@@ -289,6 +290,7 @@ grep -q 'base_slots=1' "$state_dir/setup.log"
 grep -q 'long_slots=4' "$state_dir/setup.log"
 grep -q 'wrapper_vtable_rva=0x3280' "$state_dir/setup.log"
 grep -q 'wrapper_slot_rva=0x3298' "$state_dir/setup.log"
+grep -q 'gdi_adapter_slot_index=5' "$state_dir/setup.log"
 grep -q 'wrapper_ctor_refs=1' "$state_dir/setup.log"
 grep -q 'wrapper_rtti=none' "$state_dir/setup.log"
 grep -q 'encoder_accessor_rva=0x1400' "$state_dir/setup.log"
@@ -826,8 +828,12 @@ grep -q '^HWDECODE_CODEC_PROBE$' "$UU_REMOTE_FAKE_TRACE"
 # must restore the last fully compatible client instead of accepting a partial
 # feature downgrade.
 UU_REMOTE_DISABLE_AUTO_HWENCODE=0 "$launcher" --enable-hwencode
+systemd_server_restarts_before=$(grep -c \
+    'SYSTEMCTL --user restart uu-remote-for-linux-server.service' \
+    "$UU_REMOTE_FAKE_TRACE" || true)
 UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
 UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT=1 \
+UU_REMOTE_FAKE_SERVER_REGENERATE_ENCODER_CACHE=1 \
 UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
 UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
 UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
@@ -835,6 +841,33 @@ UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
 UU_REMOTE_FAKE_LATEST_VERSION=4.39.0.9400 \
 UU_REMOTE_FAKE_INSTALLER_VERSION=4.39.0.9400 \
     "$launcher" --check-update
+rm -f -- \
+    "$install_dir/bin/.server-running" \
+    "$install_dir/bin/.server-regenerated-encoder-cache"
+UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+UU_REMOTE_FAKE_SERVER_REGENERATE_ENCODER_CACHE=1 \
+UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    "$launcher" >"$test_root/future-adaptive-launch.out"
+systemd_server_restarts_after=$(grep -c \
+    'SYSTEMCTL --user restart uu-remote-for-linux-server.service' \
+    "$UU_REMOTE_FAKE_TRACE" || true)
+test "$systemd_server_restarts_after" -eq \
+    "$((systemd_server_restarts_before + 1))"
+grep -q '^SERVER_REGENERATED_ENCODER_CACHE$' "$UU_REMOTE_FAKE_TRACE"
+grep -q 'UU 服务端已在 NVENC 档案生效后串行重启' \
+    "$test_root/future-adaptive-launch.out"
+UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    "$launcher" >/dev/null
+test "$(grep -c \
+    'SYSTEMCTL --user restart uu-remote-for-linux-server.service' \
+    "$UU_REMOTE_FAKE_TRACE")" -eq "$systemd_server_restarts_after"
 "$launcher" --diagnose >"$test_root/future-adaptive-diagnose.txt"
 grep -q 'UU 版本.*4.39.0.9400' "$test_root/future-adaptive-diagnose.txt"
 grep -q '自适应语义档案.*完整（UU 4.39.0.9400；NVENC/竖屏）' \
@@ -855,6 +888,37 @@ awk -F '\t' '$1 == "4.39.0.9400" { found = 1 } END { exit !found }' \
     "$XDG_DATA_HOME/uu-remote-for-linux/streamer-compatibility.json" \
     --require-portrait \
     >/dev/null
+grep -q '"gdi_adapter_slot_index": 6' \
+    "$XDG_DATA_HOME/uu-remote-for-linux/streamer-compatibility.json"
+"$fixture_bin/runtime-profiler" verify \
+    "$install_dir" 4.39.0.9400 \
+    "$XDG_DATA_HOME/uu-remote-for-linux/runtime-compatibility.json" \
+    --strict >/dev/null
+
+# Even when the encoder, decoder and WOL semantic profilers all accept a
+# future build, a missing input/focus/frame import contract must abort the
+# transaction and restore the last complete version.
+if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
+    UU_REMOTE_FAKE_STREAMER_FUTURE_COMPAT=1 \
+    UU_REMOTE_FAKE_RUNTIME_INCOMPATIBLE=1 \
+    UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
+    UU_REMOTE_HWDECODE_PROFILER_BIN="$fixture_bin/hwdecode-profiler" \
+    UU_REMOTE_WOL_COMPATIBILITY_PROFILES="$empty_wol_profiles" \
+    UU_REMOTE_WOL_PROFILER_BIN="$fixture_bin/wol-profiler" \
+    UU_REMOTE_FAKE_LATEST_VERSION=4.40.0.9500 \
+    UU_REMOTE_FAKE_INSTALLER_VERSION=4.40.0.9500 \
+        "$launcher" --check-update \
+        >"$test_root/runtime-incompatible.out" \
+        2>"$test_root/runtime-incompatible.err"; then
+    printf '运行时导入契约不兼容的未来版本被意外接受。\n' >&2
+    exit 1
+fi
+grep -q '输入/焦点/画面钩子的导入语义不再兼容' \
+    "$test_root/runtime-incompatible.err"
+"$fixture_bin/runtime-profiler" verify \
+    "$install_dir" 4.39.0.9400 \
+    "$XDG_DATA_HOME/uu-remote-for-linux/runtime-compatibility.json" \
+    --strict >/dev/null
 
 if UU_REMOTE_DISABLE_AUTO_HWENCODE=0 \
     UU_REMOTE_HWDECODE_COMPATIBILITY_PROFILES="$empty_hwdecode_profiles" \
@@ -902,6 +966,24 @@ grep -q '更新回滚快照无法完整解压；当前安装保持不变' \
 test -f "$install_dir/GameViewer.exe"
 test -f "$install_dir/bin/GameViewer.exe"
 test "$(<"$install_dir/bin/.installed-version")" = 4.41.0.9600
+
+# Missing optional streamer patch points may degrade only the native Wayland
+# path.  It must restore OpenH264, clear stale NVENC state, and still launch;
+# X11 and runtime-import failures retain their fail-closed behavior.
+printf 'stale\n' >"$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
+client_count_before_dmabuf_fallback=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_DISABLE_AUTO_HWENCODE=1 \
+XDG_SESSION_TYPE=wayland \
+WAYLAND_DISPLAY=wayland-test-0 \
+    "$launcher" \
+    >"$test_root/dmabuf-fallback.out" \
+    2>"$test_root/dmabuf-fallback.err"
+grep -q '原生 DMA-BUF + OpenH264 安全模式' \
+    "$test_root/dmabuf-fallback.err"
+test ! -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-enabled"
+test -e "$XDG_DATA_HOME/uu-remote-for-linux/hwencode-disabled"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
+    "$((client_count_before_dmabuf_fallback + 1))"
 
 "$launcher" --stop
 grep -q '^WINESERVER -k$' "$UU_REMOTE_FAKE_TRACE"

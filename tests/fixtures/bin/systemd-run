@@ -7,6 +7,12 @@ if [[ ${UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC:-0} == 1 ]]; then
     exit 0
 fi
 
+# Real systemd-run returns after dispatching this long-lived watcher.  Running
+# it synchronously in the fixture would block the integration test forever.
+if [[ $* == *"uu-remote-encoder-policy watch"* ]]; then
+    exit 0
+fi
+
 workdir=
 declare -a environment=()
 while (($# > 0)); do

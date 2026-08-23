@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def contract(root: Path, version: str) -> dict:
+    bin_dir = root / "bin"
+    files = {}
+    for key, name in {
+        "server": "GameViewerServer.exe",
+        "controller": "GameViewer.exe",
+        "streamer": "streamer.dll",
+        "controller_runtime": "Qt5Core.dll",
+    }.items():
+        path = bin_dir / name
+        data = path.read_bytes()
+        files[key] = {
+            "name": name,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    return {
+        "format": 1,
+        "uu_version": version,
+        "files": files,
+        "controller_runtime_module": "Qt5Core.dll",
+        "capabilities": {
+            "input_iat": True,
+            "focus_iat": True,
+            "frame_iat": True,
+            "cursor_iat": True,
+            "wol_iat": True,
+        },
+    }
+
+
+if len(sys.argv) == 4 and sys.argv[1] == "get":
+    saved = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+    if sys.argv[3] != "controller_runtime_module":
+        raise SystemExit(1)
+    print(saved[sys.argv[3]])
+    raise SystemExit(0)
+if len(sys.argv) != 6 or sys.argv[1] not in {"derive", "verify", "match"}:
+    raise SystemExit(64)
+if sys.argv[5] != "--strict":
+    raise SystemExit(64)
+if os.environ.get("UU_REMOTE_FAKE_RUNTIME_INCOMPATIBLE") == "1":
+    print("mock runtime import contract is incompatible", file=sys.stderr)
+    raise SystemExit(1)
+root = Path(sys.argv[2])
+version = sys.argv[3]
+profile = Path(sys.argv[4])
+current = contract(root, version)
+if sys.argv[1] == "derive":
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(json.dumps(current, sort_keys=True) + "\n", encoding="utf-8")
+else:
+    try:
+        saved = json.loads(profile.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit(1)
+    if saved != current:
+        raise SystemExit(1)
+print(f"RUNTIME_PROFILE_OK\tversion={version}\tcontroller_module=Qt5Core.dll")

@@ -2,6 +2,103 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.42] - 2026-08-23
+
+- Unify the X11 and GNOME Wayland downloads into one complete
+  `uu-remote-for-linux` amd64 Debian package. The launcher selects the XTest or
+  Portal/DMA-BUF backend from the actual user session at runtime instead of
+  relying on an installation-time session guess.
+- Make `xdg-desktop-portal-gnome` an explicit dependency so the universal
+  package is complete for the supported GNOME Wayland path. Remove generated
+  X11/Wayland wrapper artifacts and publish one checksum-bound package.
+
+## [1.1.41] - 2026-08-23
+
+- Replace the two-package Wayland ZIP with one directly installable
+  `uu-remote-for-linux-wayland` Debian package. The package now contains the
+  complete shared runtime, native three-buffer DMA-BUF capture, input bridges,
+  and NVIDIA compatibility components while retaining strict Ubuntu 24.04,
+  GNOME 46, and Portal dependency gates.
+- Keep the standalone X11 package unchanged. Both public session packages are
+  now ordinary single-file downloads installable with one `apt install`
+  command; no extraction, repository key, compositor package, or logout is
+  required.
+
+## [1.1.40] - 2026-08-23
+
+- Adapt the NVENC/portrait semantic profiler and Wine input hook to both
+  verified `streamer.dll` RawVideoFrame vtable layouts. The newer UU
+  4.38.3.9325 layout inserts a boolean-return virtual method and moves the GDI
+  adapter query from slot 5 to slot 6; the rule now derives the slot from the
+  complete unique method sequence instead of relying on one fixed index.
+- Detect when `GameViewerServer.exe` regenerates its encoder capability cache
+  after startup. If the post-start NVENC policy materially changes that cache,
+  restart only the server once, after the verified profile is in place, so the
+  running process cannot retain an earlier OpenH264 selection. An unchanged
+  cache never triggers a restart.
+- Add old/new-layout fixtures, cache-regeneration and stable-cache restart
+  regressions, plus live validation that the current server maps both the
+  bundled NVENC bridge and NVIDIA encode library without post-init OpenH264
+  output.
+
+## [1.1.39] - 2026-08-23
+
+- Keep native Wayland DMA-BUF capture available when a newer upstream
+  `streamer.dll` no longer exposes the optional NVENC/portrait patch points.
+  The launcher removes project-owned NVENC state, restores OpenH264, and still
+  requires the strict runtime import contract before starting.
+- Preserve fail-closed behavior on X11, when native DMA-BUF helpers are
+  missing, or when input/focus/frame imports cannot be verified.
+
+## [1.1.38] - 2026-08-23
+
+- Make native three-buffer PipeWire DMA-BUF capture the only Wayland video
+  transport. Remove the GStreamer/MemFd video fallback so an unavailable or
+  failed DMA-BUF helper is reported explicitly instead of silently changing
+  capture semantics.
+- Remove the version-locked Mutter patch manager, Polkit action, patched and
+  rollback system packages, corresponding source payload, and installer code.
+  The Wayland release ZIP now contains only the shared runtime and Wayland
+  profile; installing or upgrading UU no longer replaces compositor packages
+  and does not require logout.
+- Remove GStreamer, APT, and procps dependencies that existed only for the old
+  fallback and Mutter package manager, while preserving native cursor metadata,
+  multi-monitor composition, lock-key synchronization, and three-slot staging.
+
+## [1.1.37] - 2026-08-23
+
+- Complete native DMA-BUF negotiation with GNOME 46 and NVIDIA: enumerate
+  importable EGL modifiers per DRM format, honor PipeWire's two-stage
+  Choice-to-fixed modifier handshake, and unwrap fixed `Choice(None)` PODs.
+  This keeps both monitors on the native three-buffer/three-staging-slot path
+  instead of falling back to MemFd on PipeWire 1.0.5.
+- Preserve the producer-return-before-consumer-notify ordering and the guarded
+  MemFd fallback. Live validation on the GTX 1660 Ti confirmed two active
+  native helpers, continuous frame delivery, zero fallback, and zero corrupt,
+  map-failure, or short-frame drops.
+
+## [1.1.36] - 2026-08-23
+
+- Prefer native PipeWire DMA-BUF capture on GNOME Wayland. A dedicated
+  PipeWire/EGL helper imports compositor buffers on the matching DRM device,
+  reads each frame into one of three independent staging slots, and returns
+  the producer buffer before Python frame analysis. Both the producer and
+  staging queues retain a fixed three-buffer contract; failed DMA-BUF/EGL
+  negotiation falls back to the guarded MemFd copy path and records why.
+- Add a fail-closed runtime compatibility profiler that automatically discovers
+  the controller's Qt Core module and binds input, focus, capture, cursor, WOL,
+  NVDEC, NVENC, and portrait adaptations to unique PE semantics and final-file
+  hashes during every official UU update. Unknown layouts now roll back instead
+  of receiving a version-specific blind patch.
+- Harden loaded-PE bounds, executable field patching, input sequence ordering,
+  authenticated UDP replay handling, partial `SendInput` fallback, asynchronous
+  injector timeout generations, keyboard settings timeouts, sleep-inhibitor PID
+  reuse, and source-install compatibility payloads. Add focused regressions for
+  every repaired high- or medium-risk path.
+- Document the compatibility boundary for every adaptation. The Ubuntu Noble
+  Mutter 46.2 repair remains an exact platform package and is deliberately not
+  auto-applied to a new Mutter or Ubuntu baseline.
+
 ## [1.1.35] - 2026-08-23
 
 - Replace the GitHub Pages/keyring bootstrap with two direct Release downloads:

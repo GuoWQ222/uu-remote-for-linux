@@ -41,6 +41,7 @@ inject = compact(function_body("inject_library"))
 worker = compact(function_body("remote_operation_worker"))
 start = compact(function_body("start_remote_operation"))
 poll = compact(function_body("poll_remote_operation"))
+retry = compact(function_body("remote_retry_guard_allows"))
 
 assert "INFINITE" not in watch
 assert "INFINITE" not in watch_module
@@ -50,14 +51,34 @@ assert "poll_remote_operation(&operation,&operation_success,&operation_error)" i
 assert "start_remote_operation(state->pid,dll_path,REMOTE_OPERATION_INJECT)" in watch_module
 assert "poll_remote_operation(&state->operation,&operation_success,&operation_error)" in watch_module
 assert "if(watched[index].operation){++index;continue;}" in watch_module
-assert "inject_library(operation->pid,operation->dll_path,FALSE,INFINITE)" in worker
-assert "initialize_remote_hook(operation->pid,operation->dll_path,FALSE,INFINITE)" in worker
+assert "INFINITE" not in worker
+assert "DIRECT_INJECTION_WAIT_MS" in worker
+assert "InterlockedExchange(&operation->completed,1)" in worker
 assert "CreateThread(NULL,0,remote_operation_worker,operation,0,NULL)" in start
 assert "WaitForSingleObject(operation->worker,0)" in poll
+assert "InterlockedCompareExchange(&operation->completed,0,0)" in poll
 assert "*operation_pointer=NULL" in poll
+assert "guard->waiting_for_module" in retry
+assert "current_module==guard->blocked_module" in retry
+assert "remote_retry_guard_timeout(&injection_retry,operation_hook_module)" in watch
+assert "remote_retry_guard_timeout(&streamer_retry,operation_streamer)" in watch
+assert "remote_retry_guard_allows(&injection_retry" in watch
+assert "remote_retry_guard_allows(&streamer_retry" in watch
+assert "remote_retry_guard_timeout(&state->injection_retry,state->operation_hook_module)" in watch_module
+assert "remote_retry_guard_allows(&state->injection_retry" in watch_module
 assert "DIRECT_INJECTION_WAIT_MS" in inject_once
 assert "DIRECT_INJECTION_WAIT_MS" in launch
 assert "WaitForSingleObject(thread,wait_timeout)" in initialize
 assert "WaitForSingleObject(thread,wait_timeout)" in inject
 print("PASS input injector single-outstanding-operation policy")
 PY
+
+test_root=$(mktemp -d)
+trap 'rm -rf -- "$test_root"' EXIT
+env \
+    WINEPREFIX="$test_root/wineprefix" \
+    WINEDEBUG=-all \
+    timeout 30s wine \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
+    --self-test
+printf 'PASS input injector failed-wait completion cleanup\n'

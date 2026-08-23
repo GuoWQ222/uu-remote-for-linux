@@ -1,11 +1,10 @@
 /*
  * Extract Wayland cursor bitmaps from an XDG ScreenCast PipeWire stream.
  *
- * GStreamer's pipewiresrc negotiates SPA_META_Cursor but currently converts
- * it to a position-only ROI, discarding spa_meta_bitmap.  This sidecar opens
- * the same restricted Portal remote, consumes only metadata, and publishes
- * the compositor-selected cursor in the UUCI file format understood by the
- * Wine capture hook.
+ * This sidecar opens the same restricted Portal remote as the video capture
+ * helper, consumes SPA_META_Cursor directly, and publishes the compositor-
+ * selected bitmap in the UUCI file format understood by the Wine capture
+ * hook.  It does not retain video buffers or introduce another media stack.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -610,13 +609,11 @@ static void on_param_changed(
         SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_buffers,
         /*
-         * This metadata consumer is the first link attached to Mutter's
-         * output, so its default fixes the shared producer pool size.  With
-         * only two buffers, the cursor and pixel consumers can transiently
-         * hold the whole pool and make Mutter drop the only clean frame for
-         * a damage-driven update.  Keep two as the compatibility minimum,
-         * but prefer a third slot so the newest full frame can still be
-         * recorded while the previous two are being returned.
+         * The pixel consumer normally links first and fixes a three-buffer
+         * DMA-BUF pool.  Mirror that contract here so a sidecar reconnect or
+         * standalone diagnostic cannot negotiate it back to two buffers.
+         * With only two buffers, consumers can transiently hold the whole
+         * pool and make Mutter drop the only clean damage-driven frame.
          */
         SPA_POD_CHOICE_RANGE_Int(
             UUCI_DEFAULT_PIPEWIRE_BUFFERS,

@@ -45,6 +45,13 @@ namespace = runpy.run_path(
 map_absolute_point = namespace["map_absolute_point"]
 x11_selected_monitor = namespace["x11_selected_monitor"]
 WaylandPortalBackend = namespace["WaylandPortalBackend"]
+sequence_is_newer = namespace["sequence_is_newer"]
+
+assert sequence_is_newer(1, 0)
+assert not sequence_is_newer(0, 0)
+assert not sequence_is_newer(7, 8)
+assert sequence_is_newer(0, 0xFFFFFFFF)
+assert not sequence_is_newer(0x80000000, 0)
 
 # The streamed landscape monitor starts after a 1440-pixel-wide portrait
 # monitor. Absolute Windows input must stay inside that streamed rectangle.
@@ -188,8 +195,20 @@ send(2, 5, struct.pack("<iiIIIQ", 0, 0, 0, 0x0002, 0, 0))
 send(2, 6, struct.pack("<iiIIIQ", 0, 0, 0, 0x0004, 0, 0))
 send(3, 7, struct.pack("<HHIIQ", 0x41, 0x1E, 0x0008, 0, 0))
 send(3, 8, struct.pack("<HHIIQ", 0x41, 0x1E, 0x000A, 0, 0))
+# Replayed and stale datagrams from the authenticated peer must not be injected.
+send(3, 8, struct.pack("<HHIIQ", 0x41, 0x1E, 0x000A, 0, 0))
+send(3, 7, struct.pack("<HHIIQ", 0x41, 0x1E, 0x0008, 0, 0))
 # A stuck mouse press must be released by the daemon watchdog.
 send(2, 9, struct.pack("<iiIIIQ", 0, 0, 0, 0x0002, 0, 0))
+# Possessing the token is not enough to inject from a socket that never sent
+# HELLO.  This also proves that the accepted source port is part of the session.
+foreign = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+payload = struct.pack("<HHIIQ", 0x41, 0x1E, 0x0008, 0, 0)
+foreign.sendto(
+    header.pack(magic, 1, 3, header.size + len(payload), 10, token) + payload,
+    address,
+)
+foreign.close()
 time.sleep(0.4)
 PY
 
@@ -207,8 +226,8 @@ grep -q '^motion 32768 32768 1 1$' "$trace"
 grep -q '^motion-target 2000 1280$' "$trace"
 grep -q '^button 1 1$' "$trace"
 grep -q '^button 1 0$' "$trace"
-grep -q '^keycode 38 1$' "$trace"
-grep -q '^keycode 38 0$' "$trace"
+[[ $(grep -c '^keycode 38 1$' "$trace") == 1 ]]
+[[ $(grep -c '^keycode 38 0$' "$trace") == 1 ]]
 grep -q '"hook_pid": 4242' "$state_dir/input-bridge-status.json"
 grep -q '"hook_version": 8' "$state_dir/input-bridge-status.json"
 grep -q '"mouse_packets": 5' "$state_dir/input-bridge-status.json"
@@ -218,7 +237,7 @@ grep -q '"keyboard_packets": 2' "$state_dir/input-bridge-status.json"
 grep -q '"cursor_state": "active"' "$state_dir/input-bridge-status.json"
 grep -q '"cursor_width": 4' "$state_dir/input-bridge-status.json"
 grep -q '"cursor_height": 4' "$state_dir/input-bridge-status.json"
-grep -q '"rejected": 1' "$state_dir/input-bridge-status.json"
+grep -q '"rejected": 4' "$state_dir/input-bridge-status.json"
 grep -q 'GameViewerServer 输入钩子已连接（PID 4242，v8）' "$log"
 grep -q '绝对鼠标坐标域：selected-monitor（flags=0x8001）' "$log"
 grep -q '绝对鼠标坐标域：virtual-desktop（flags=0xc001）' "$log"

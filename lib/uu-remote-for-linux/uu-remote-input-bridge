@@ -4,7 +4,9 @@
 The Windows hook writes compact, versioned UDP datagrams to a random loopback
 port.  The endpoint file is readable only by the current user and contains a
 fresh 128-bit token for each daemon lifetime. Valid mouse and keyboard events
-are injected through XTest on X11 or the RemoteDesktop portal on Wayland.
+are injected through XTest on X11 or the RemoteDesktop portal on Wayland.  A
+successful HELLO binds the sender address, and unsigned 32-bit sequence
+numbers reject stale or replayed input before it can reach either backend.
 """
 
 from __future__ import annotations
@@ -72,7 +74,7 @@ KEY_UP = 0x0002
 KEY_UNICODE = 0x0004
 KEY_SCANCODE = 0x0008
 
-STATE_VERSION = 7
+STATE_VERSION = 8
 DEFAULT_RELEASE_TIMEOUT = 15.0
 X11_MONITOR_REFRESH_SECONDS = 2.0
 CURSOR_POLL_SECONDS = 1.0 / 60.0
@@ -92,6 +94,11 @@ PORTAL_CURSOR_METADATA = 4
 PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
 CAPTURE_START_TIMEOUT_SECONDS = 10
+CAPTURE_PIPEWIRE_BUFFERS = 3
+CAPTURE_TRANSPORT_DMABUF = "dmabuf-native"
+CAPTURE_NATIVE_STAGE_SLOTS = 3
+CAPTURE_NATIVE_NOTIFICATION_MAGIC = 0x43445555
+CAPTURE_NATIVE_NOTIFICATION = struct.Struct("<IIIIQ")
 CAPTURE_MAX_STREAMS = 16
 CAPTURE_PRIMARY_STREAM_RATE = 60
 CAPTURE_SECONDARY_STREAM_RATE = 30
@@ -948,6 +955,16 @@ class WaylandPortalBackend:
                 "uu-remote-pipewire-cursor"
             )
         )
+        capture_helper_override = os.environ.get(
+            "UU_REMOTE_PIPEWIRE_CAPTURE_HELPER", ""
+        ).strip()
+        self.capture_helper_path = (
+            Path(capture_helper_override)
+            if capture_helper_override
+            else Path(__file__).resolve().with_name(
+                "uu-remote-pipewire-capture"
+            )
+        )
         frame_helper_path = Path(__file__).resolve().with_name(
             "uu-remote-frame-helper.so"
         )
@@ -977,8 +994,15 @@ class WaylandPortalBackend:
         self.frame_origin_x = 0
         self.frame_origin_y = 0
         self.capture_state = "inactive"
-        self.capture_pipeline = None
-        self.capture_pipewire_fds: list[int] = []
+        self.capture_native_processes: list[subprocess.Popen] = []
+        self.capture_native_threads: list[threading.Thread] = []
+        self.capture_native_maps: list[mmap.mmap] = []
+        self.capture_native_stage_fds: list[int] = []
+        self.capture_native_notify_fds: list[int] = []
+        self.capture_native_release_fds: list[int] = []
+        self.capture_fake_stop = threading.Event()
+        self.capture_transport = "inactive"
+        self.capture_write_stream = None
         self.capture_frames = 0
         self.capture_output_hash = 0
         self.capture_output_hash_changes = 0
@@ -1281,17 +1305,13 @@ class WaylandPortalBackend:
         try:
             import gi
 
-            gi.require_version("Gst", "1.0")
-            from gi.repository import Gio, GLib, Gst
+            from gi.repository import Gio, GLib
         except (ImportError, ValueError) as error:
-            raise RuntimeError(
-                "Wayland 输入/画面桥需要 python3-gi 与 GStreamer GI"
-            ) from error
-        Gst.init(None)
-        return Gio, GLib, Gst
+            raise RuntimeError("Wayland 输入/画面桥需要 python3-gi") from error
+        return Gio, GLib
 
     def _load_gio(self) -> None:
-        self.Gio, self.GLib, self.Gst = self._load_gio_modules()
+        self.Gio, self.GLib = self._load_gio_modules()
 
     @classmethod
     def check_environment(cls) -> None:
@@ -1300,24 +1320,7 @@ class WaylandPortalBackend:
             return
         if not os.environ.get("WAYLAND_DISPLAY"):
             raise RuntimeError("WAYLAND_DISPLAY 未设置")
-        Gio, GLib, Gst = cls._load_gio_modules()
-        missing = [
-            name
-            for name in (
-                "pipewiresrc",
-                "identity",
-                "queue",
-                "videoconvert",
-                "videoscale",
-                "capsfilter",
-                "appsink",
-            )
-            if Gst.ElementFactory.find(name) is None
-        ]
-        if missing:
-            raise RuntimeError(
-                "Wayland 画面桥缺少 GStreamer 元件：" + ", ".join(missing)
-            )
+        Gio, GLib = cls._load_gio_modules()
         helper_override = os.environ.get(
             "UU_REMOTE_PIPEWIRE_CURSOR_HELPER", ""
         ).strip()
@@ -1331,6 +1334,23 @@ class WaylandPortalBackend:
         if not helper.is_file() or not os.access(helper, os.X_OK):
             raise RuntimeError(
                 f"Wayland 动态光标桥缺失或不可执行：{helper}"
+            )
+        capture_override = os.environ.get(
+            "UU_REMOTE_PIPEWIRE_CAPTURE_HELPER", ""
+        ).strip()
+        capture_helper = (
+            Path(capture_override)
+            if capture_override
+            else Path(__file__).resolve().with_name(
+                "uu-remote-pipewire-capture"
+            )
+        )
+        if not capture_helper.is_file() or not os.access(
+            capture_helper, os.X_OK
+        ):
+            raise RuntimeError(
+                "Wayland 原生 DMA-BUF 捕获辅助进程缺失或不可执行："
+                f"{capture_helper}"
             )
         connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         value = connection.call_sync(
@@ -1505,8 +1525,8 @@ class WaylandPortalBackend:
             "types": self.GLib.Variant("u", PORTAL_SOURCE_MONITOR),
             "multiple": self.GLib.Variant("b", True),
             # Keep the cursor out of the video and request its authoritative
-            # compositor bitmap separately.  pipewiresrc 1.0.5 discards that
-            # bitmap, so the native sidecar publishes it to the Wine hook.
+            # compositor bitmap separately.  The native cursor sidecar
+            # publishes that metadata to the Wine hook.
             "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_METADATA),
         }
         if restore_token:
@@ -1696,6 +1716,369 @@ class WaylandPortalBackend:
         except OSError:
             pass
 
+    def _native_capture_reader(
+        self,
+        stream_index: int,
+        stream,
+        stage_map: mmap.mmap,
+        notify_fd: int,
+        release_fd: int,
+    ) -> None:
+        """Consume helper staging slots without retaining a PipeWire buffer."""
+        pending = bytearray()
+        frame_size = int(stream["width"]) * int(stream["height"]) * 4
+        try:
+            while True:
+                chunk = os.read(notify_fd, 4096)
+                if not chunk:
+                    return
+                pending.extend(chunk)
+                while len(pending) >= CAPTURE_NATIVE_NOTIFICATION.size:
+                    raw = bytes(pending[:CAPTURE_NATIVE_NOTIFICATION.size])
+                    del pending[:CAPTURE_NATIVE_NOTIFICATION.size]
+                    magic, slot, _sequence, source_stride, pts = (
+                        CAPTURE_NATIVE_NOTIFICATION.unpack(raw)
+                    )
+                    if (
+                        magic != CAPTURE_NATIVE_NOTIFICATION_MAGIC
+                        or slot >= CAPTURE_NATIVE_STAGE_SLOTS
+                        or source_stride < int(stream["width"]) * 4
+                    ):
+                        raise RuntimeError(
+                            "原生 DMA-BUF 捕获辅助进程返回了无效通知"
+                        )
+                    offset = slot * frame_size
+                    source = memoryview(stage_map)[offset:offset + frame_size]
+                    try:
+                        accepted = self.capture_write_stream(
+                            source, source_stride, pts, stream_index, stream
+                        )
+                        if not accepted:
+                            raise RuntimeError(
+                                "原生 DMA-BUF staging 帧处理失败"
+                            )
+                    finally:
+                        source.release()
+                        os.write(release_fd, bytes((slot,)))
+        except OSError as error:
+            if self.capture_state not in ("closing", "stopped"):
+                self.capture_callback_error = (
+                    f"node={stream['node']} native pipe: {error}"
+                )
+        except Exception as error:
+            self.capture_callback_error = (
+                f"node={stream['node']} native reader "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _start_fake_capture_pipeline(self) -> None:
+        """Drive the native frame path with an isolated synthetic source."""
+        self.capture_fake_stop.clear()
+
+        def produce(stream_index: int, stream) -> None:
+            width = int(stream["width"])
+            height = int(stream["height"])
+            stride = width * 4
+            frame = bytearray(stride * height)
+            sequence = 0
+            while not self.capture_fake_stop.is_set():
+                sequence = (sequence + 1) & 0xFF
+                frame[0:4] = bytes((sequence, stream_index, 0x55, 0xFF))
+                try:
+                    if not self.capture_write_stream(
+                        memoryview(frame),
+                        stride,
+                        time.monotonic_ns(),
+                        stream_index,
+                        stream,
+                    ):
+                        raise RuntimeError("测试 DMA-BUF 帧处理失败")
+                except Exception as error:
+                    self.capture_callback_error = (
+                        f"node={stream['node']} fake native reader "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    return
+                self.capture_fake_stop.wait(
+                    1.0 / capture_stream_rate(
+                        int(stream["node"]), self.stream_node
+                    )
+                )
+
+        for index, stream in enumerate(self.streams):
+            thread = threading.Thread(
+                target=produce,
+                args=(index, stream),
+                name=f"uu-dmabuf-fake-{stream['node']}",
+                daemon=True,
+            )
+            self.capture_native_threads.append(thread)
+            thread.start()
+
+    def _start_native_capture_pipeline(self) -> None:
+        if not self.capture_helper_path.is_file() or not os.access(
+            self.capture_helper_path, os.X_OK
+        ):
+            raise RuntimeError(
+                f"缺少原生 DMA-BUF 捕获辅助进程：{self.capture_helper_path}"
+            )
+        helper_log_path = self.state_dir / "pipewire-capture.log"
+        for index, stream in enumerate(self.streams):
+            width = int(stream["width"])
+            height = int(stream["height"])
+            frame_size = width * height * 4
+            stage_size = frame_size * CAPTURE_NATIVE_STAGE_SLOTS
+            stage_fd = os.memfd_create(
+                f"uu-remote-dmabuf-stage-{index}",
+                os.MFD_CLOEXEC,
+            )
+            os.ftruncate(stage_fd, stage_size)
+            stage_map = mmap.mmap(
+                stage_fd,
+                stage_size,
+                access=mmap.ACCESS_READ,
+            )
+            notify_read, notify_write = os.pipe()
+            release_read, release_write = os.pipe()
+            remote_fd = self._open_pipewire_remote()
+            log_descriptor = os.open(
+                helper_log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                process = subprocess.Popen(
+                    (
+                        str(self.capture_helper_path),
+                        str(remote_fd),
+                        str(stream["node"]),
+                        str(width),
+                        str(height),
+                        str(stage_fd),
+                        str(notify_write),
+                        str(release_read),
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log_descriptor,
+                    close_fds=True,
+                    pass_fds=(
+                        remote_fd,
+                        stage_fd,
+                        notify_write,
+                        release_read,
+                    ),
+                )
+            except Exception:
+                stage_map.close()
+                for descriptor in (
+                    stage_fd,
+                    notify_read,
+                    notify_write,
+                    release_read,
+                    release_write,
+                    remote_fd,
+                ):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                os.close(log_descriptor)
+            os.close(remote_fd)
+            os.close(notify_write)
+            os.close(release_read)
+            self.capture_native_processes.append(process)
+            self.capture_native_maps.append(stage_map)
+            self.capture_native_stage_fds.append(stage_fd)
+            self.capture_native_notify_fds.append(notify_read)
+            self.capture_native_release_fds.append(release_write)
+            thread = threading.Thread(
+                target=self._native_capture_reader,
+                args=(
+                    index,
+                    stream,
+                    stage_map,
+                    notify_read,
+                    release_write,
+                ),
+                name=f"uu-dmabuf-{stream['node']}",
+                daemon=True,
+            )
+            self.capture_native_threads.append(thread)
+            thread.start()
+
+    def _stop_capture_pipeline(self) -> None:
+        """Stop the native video transport and release every staging slot."""
+        self.capture_state = "closing"
+        self.capture_fake_stop.set()
+        processes = list(getattr(self, "capture_native_processes", []))
+        self.capture_native_processes = []
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        errors: list[str] = []
+        threads = list(getattr(self, "capture_native_threads", []))
+        self.capture_native_threads = []
+        for thread in threads:
+            thread.join(timeout=2)
+            if thread.is_alive():
+                errors.append(f"等待原生捕获线程 {thread.name} 超时")
+        for collection in (
+            getattr(self, "capture_native_notify_fds", []),
+            getattr(self, "capture_native_release_fds", []),
+        ):
+            descriptors = list(collection)
+            collection.clear()
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        mappings = list(getattr(self, "capture_native_maps", []))
+        self.capture_native_maps = []
+        for stage_map in mappings:
+            try:
+                stage_map.close()
+            except (BufferError, OSError) as error:
+                errors.append(f"关闭 DMA-BUF staging：{error}")
+        descriptors = list(getattr(self, "capture_native_stage_fds", []))
+        self.capture_native_stage_fds = []
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def _reset_capture_attempt(
+        self, preserve_sequence: bool = False
+    ) -> None:
+        """Reset frame history before starting native DMA-BUF capture."""
+        for frame_filter in self.capture_frame_filters:
+            self.frame_helper.destroy_filter(frame_filter)
+        self.capture_frame_filters = [
+            self.frame_helper.create_filter(
+                int(stream["width"]) * 4,
+                int(stream["height"]),
+            )
+            for stream in self.streams
+        ]
+        previous_sequence = self.capture_frames
+        previous_active = previous_sequence % FRAME_BUFFERS
+        if not preserve_sequence:
+            self.capture_frames = 0
+        self.capture_output_hash = 0
+        if not preserve_sequence:
+            self.capture_output_hash_changes = 0
+        self.capture_callback_error = ""
+        self.capture_stream_stats = [
+            {
+                "node": int(stream["node"]),
+                "target_fps": capture_stream_rate(
+                    int(stream["node"]), self.stream_node
+                ),
+                "effective_fps": capture_stream_rate(
+                    int(stream["node"]), self.stream_node
+                ),
+                "deduplicate": 1,
+                "transport": CAPTURE_TRANSPORT_DMABUF,
+                "pipewire_buffers": CAPTURE_PIPEWIRE_BUFFERS,
+                "staging_buffers": CAPTURE_NATIVE_STAGE_SLOTS,
+                "samples": 0,
+                "frames": 0,
+                "hash": 0,
+                "hash_changes": 0,
+                "duplicates": 0,
+                "corrupted_frames_dropped": 0,
+                "map_failures_dropped": 0,
+                "short_frames_dropped": 0,
+                "pts": 0,
+                "last_ns": 0,
+                "published_hash": 0,
+                "published_frames": 0,
+                "source_copies": 0,
+                "backfill_copies": 0,
+                "native_updates": 0,
+                "compared_bytes": 0,
+                "copy_bytes": 0,
+                "source_changed_bytes": 0,
+                "changed_rows": 0,
+                "changed_blocks": 0,
+                "temporal_deferred_blocks": 0,
+                "temporal_suppressed_blocks": 0,
+                "temporal_published_blocks": 0,
+                "motion_bypasses": 0,
+                "last_copy_bytes": 0,
+                "max_copy_bytes": 0,
+                "motion_events": 0,
+                "motion_limit_until_ns": 0,
+                "last_duration_ns": 0,
+                "max_duration_ns": 0,
+                "last_publish_ns": 0,
+                "last_checked_ns": 0,
+                "next_check_ns": 0,
+            }
+            for stream in self.streams
+        ]
+        self.capture_buffer_generations = [
+            [0 for _stream in self.streams]
+            for _buffer in range(FRAME_BUFFERS)
+        ]
+        if preserve_sequence and previous_sequence:
+            self.capture_buffer_generations[previous_active] = [
+                1 for _stream in self.streams
+            ]
+        elif self.capture_map is not None:
+            struct.pack_into("<I", self.capture_map, 32, 0)
+            struct.pack_into("<I", self.capture_map, 36, 0)
+
+    def _start_capture_pipeline(self) -> None:
+        self._reset_capture_attempt()
+        if self.capture_write_stream is None:
+            raise RuntimeError("Wayland 画面回调尚未初始化")
+        if self.fake_video:
+            self._start_fake_capture_pipeline()
+        else:
+            self._start_native_capture_pipeline()
+        deadline = time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS
+        while (
+            any(int(stats["frames"]) == 0 for stats in self.capture_stream_stats)
+            and time.monotonic() < deadline
+        ):
+            stopped = [
+                process.returncode
+                for process in self.capture_native_processes
+                if process.poll() is not None
+            ]
+            if stopped:
+                raise RuntimeError(
+                    "原生 DMA-BUF 捕获辅助进程提前退出："
+                    + ",".join(str(value) for value in stopped)
+                )
+            if self.capture_callback_error:
+                raise RuntimeError(self.capture_callback_error)
+            time.sleep(0.02)
+        missing = [
+            str(stats["node"])
+            for stats in self.capture_stream_stats
+            if int(stats["frames"]) == 0
+        ]
+        if missing:
+            raise RuntimeError(
+                "Wayland Portal 在 10 秒内未产生全部屏幕画面帧："
+                + ",".join(missing)
+            )
+        self.capture_transport = CAPTURE_TRANSPORT_DMABUF
+
     def _start_capture_bridge(self) -> None:
         self.capture_state = "starting"
         stride = self.canvas_width * 4
@@ -1743,427 +2126,214 @@ class WaylandPortalBackend:
             self.frame_origin_x,
             self.frame_origin_y,
         )
-        self.capture_frame_filters = [
-            self.frame_helper.create_filter(
-                int(stream["width"]) * 4,
-                int(stream["height"]),
-            )
-            for stream in self.streams
-        ]
-        self.capture_pipeline = self.Gst.Pipeline.new("wayland-capture")
-        if self.capture_pipeline is None:
-            raise RuntimeError("无法创建 Wayland 画面桥 GStreamer 管线")
-
-        self.capture_stream_stats = [
-            {
-                "node": int(stream["node"]),
-                "target_fps": capture_stream_rate(
-                    int(stream["node"]), self.stream_node
-                ),
-                "effective_fps": capture_stream_rate(
-                    int(stream["node"]), self.stream_node
-                ),
-                "deduplicate": 1,
-                "samples": 0,
-                "frames": 0,
-                "hash": 0,
-                "hash_changes": 0,
-                "duplicates": 0,
-                "corrupted_frames_dropped": 0,
-                "map_failures_dropped": 0,
-                "short_frames_dropped": 0,
-                "pts": 0,
-                "last_ns": 0,
-                "published_hash": 0,
-                "published_frames": 0,
-                "source_copies": 0,
-                "backfill_copies": 0,
-                "native_updates": 0,
-                "compared_bytes": 0,
-                "copy_bytes": 0,
-                "source_changed_bytes": 0,
-                "changed_rows": 0,
-                "changed_blocks": 0,
-                "temporal_deferred_blocks": 0,
-                "temporal_suppressed_blocks": 0,
-                "temporal_published_blocks": 0,
-                "motion_bypasses": 0,
-                "last_copy_bytes": 0,
-                "max_copy_bytes": 0,
-                "motion_events": 0,
-                "motion_limit_until_ns": 0,
-                "last_duration_ns": 0,
-                "max_duration_ns": 0,
-                "last_publish_ns": 0,
-                "last_checked_ns": 0,
-                "next_check_ns": 0,
-            }
-            for stream in self.streams
-        ]
-        self.capture_buffer_generations = [
-            [0 for _stream in self.streams]
-            for _buffer in range(FRAME_BUFFERS)
-        ]
-
-        def write_stream_frame(appsink, stream_index: int, stream) -> int:
-            sample = appsink.emit("pull-sample")
-            if sample is None or self.capture_map is None:
-                return self.Gst.FlowReturn.ERROR
-            buffer = sample.get_buffer()
+        def write_stream_frame(
+            source_view,
+            source_stride: int,
+            pts: int,
+            stream_index: int,
+            stream,
+        ) -> bool:
+            if self.capture_map is None:
+                return False
             now_ns = time.monotonic_ns()
             with self.capture_lock:
                 stats = self.capture_stream_stats[stream_index]
                 stats["samples"] += 1
-                if buffer.has_flags(self.Gst.BufferFlags.CORRUPTED):
-                    stats["corrupted_frames_dropped"] += 1
-                    return self.Gst.FlowReturn.OK
-                # Portal screen-cast streams are damage-driven and may not
-                # produce another clean frame after a short-lived UI change.
-                # Never discard a valid sample based on a fixed-rate deadline:
-                # doing so can permanently lose the only IME commit frame.
-                # The one-buffer leaky queue and appsink already provide
-                # latest-wins backpressure without dropping the frame that has
-                # reached this callback.
                 stats["effective_fps"] = int(stats["target_fps"])
                 stats["last_checked_ns"] = now_ns
-            mapped, info = buffer.map(self.Gst.MapFlags.READ)
-            if not mapped:
+            width = int(stream["width"])
+            height = int(stream["height"])
+            row_bytes = width * 4
+            if source_stride < row_bytes or len(source_view) < source_stride * height:
                 with self.capture_lock:
                     self.capture_stream_stats[stream_index][
-                        "map_failures_dropped"
+                        "short_frames_dropped"
                     ] += 1
-                return self.Gst.FlowReturn.OK
-            try:
-                width = int(stream["width"])
-                height = int(stream["height"])
-                row_bytes = width * 4
-                source_stride = len(info.data) // height
-                if source_stride < row_bytes:
-                    with self.capture_lock:
-                        self.capture_stream_stats[stream_index][
-                            "short_frames_dropped"
-                        ] += 1
-                    return self.Gst.FlowReturn.OK
-                source_view = memoryview(info.data)
-                with self.capture_lock:
-                    stats = self.capture_stream_stats[stream_index]
-                    first_frame = int(stats["frames"]) == 0
-                    stats["frames"] += 1
-                    stats["pts"] = int(buffer.pts)
-                    stats["last_ns"] = now_ns
-                    previous_active = struct.unpack_from(
-                        "<I", self.capture_map, 32
-                    )[0]
-                    sequence = self.capture_frames + 1
-                    active = sequence % FRAME_BUFFERS
-                    destination = (
-                        FRAME_HEADER.size
-                        + active * self.capture_frame_size
-                    )
-                    previous = (
-                        FRAME_HEADER.size
-                        + previous_active * self.capture_frame_size
-                    )
-                    destination_x = int(stream["x"]) * 4
-                    destination_y = int(stream["y"])
-                    stream_offset = destination_y * stride + destination_x
-                    changed, native_stats = self.frame_helper.update(
-                        self.capture_frame_filters[stream_index],
-                        self.capture_map,
-                        destination + stream_offset,
-                        previous + stream_offset,
-                        stride,
-                        source_view,
-                        source_stride,
-                        row_bytes,
-                        height,
-                        first_frame,
-                    )
-                    stats["native_updates"] += 1
-                    stats["compared_bytes"] += int(
-                        native_stats.compared_bytes
-                    )
-                    stats["copy_bytes"] += int(native_stats.copied_bytes)
-                    stats["source_changed_bytes"] += int(
-                        native_stats.source_changed_bytes
-                    )
-                    stats["changed_rows"] += int(native_stats.changed_rows)
-                    stats["changed_blocks"] += int(
-                        native_stats.changed_blocks
-                    )
-                    stats["temporal_deferred_blocks"] += int(
-                        native_stats.temporal_deferred_blocks
-                    )
-                    stats["temporal_suppressed_blocks"] += int(
-                        native_stats.temporal_suppressed_blocks
-                    )
-                    stats["temporal_published_blocks"] += int(
-                        native_stats.temporal_published_blocks
-                    )
-                    stats["motion_bypasses"] += int(
-                        native_stats.motion_bypass
-                    )
-                    copied_bytes = int(native_stats.copied_bytes)
-                    stats["last_copy_bytes"] = copied_bytes
-                    stats["max_copy_bytes"] = max(
-                        int(stats["max_copy_bytes"]), copied_bytes
-                    )
-                    if not changed:
-                        stats["duplicates"] += 1
-                        duration_ns = time.monotonic_ns() - now_ns
-                        stats["last_duration_ns"] = duration_ns
-                        stats["max_duration_ns"] = max(
-                            int(stats["max_duration_ns"]), duration_ns
-                        )
-                        return self.Gst.FlowReturn.OK
-                    value = (int(stats["published_hash"]) + 1) & 0xFFFFFFFF
-                    if value == 0:
-                        value = 1
-                    stats["hash"] = value
-                    if not first_frame:
-                        stats["hash_changes"] += 1
-
-                    def copy_canvas_region(
-                        target: int, source: int, stale_stream
-                    ) -> None:
-                        stale_x = int(stale_stream["x"]) * 4
-                        stale_y = int(stale_stream["y"])
-                        stale_row_bytes = int(stale_stream["width"]) * 4
-                        stale_offset = stale_y * stride + stale_x
-                        self.frame_helper.copy(
-                            self.capture_map,
-                            target + stale_offset,
-                            source + stale_offset,
-                            stride,
-                            stale_row_bytes,
-                            int(stale_stream["height"]),
-                        )
-
-                    # Compose only the inactive buffer.  It normally needs
-                    # one source-region copy; monitor generations identify an
-                    # occasional stale sibling region to backfill from the
-                    # currently published buffer.  Updating the old buffer
-                    # after publication doubled memory traffic and delayed
-                    # delivery of the next compositor sample under motion.
-                    target_generations = self.capture_buffer_generations[
-                        active
-                    ]
-                    current_generations = self.capture_buffer_generations[
-                        previous_active
-                    ]
-                    backfills = capture_backfill_indexes(
-                        target_generations,
-                        current_generations,
-                        stream_index,
-                    )
-                    for stale_index in backfills:
-                        stale_stream = self.streams[stale_index]
-                        copy_canvas_region(
-                            destination, previous, stale_stream
-                        )
-                        target_generations[stale_index] = (
-                            current_generations[stale_index]
-                        )
-                        stats["backfill_copies"] += 1
-                        stats["copy_bytes"] += (
-                            int(stale_stream["width"])
-                            * int(stale_stream["height"])
-                            * 4
-                        )
-                    target_generations[stream_index] = (
-                        current_generations[stream_index] + 1
-                    )
-                    stats["source_copies"] += 1
-                    stats["published_hash"] = value
-                    stats["published_frames"] += 1
-                    stats["last_publish_ns"] = now_ns
-                    output_hash = 0
-                    for output_stats in self.capture_stream_stats:
-                        output_hash = zlib.crc32(
-                            struct.pack(
-                                "<II",
-                                int(output_stats["node"]),
-                                int(output_stats["published_hash"]),
-                            ),
-                            output_hash,
-                        )
-                    output_hash &= 0xFFFFFFFF
-                    if (
-                        self.capture_output_hash
-                        and self.capture_output_hash != output_hash
-                    ):
-                        self.capture_output_hash_changes += 1
-                    self.capture_output_hash = output_hash
-                    struct.pack_into("<I", self.capture_map, 32, active)
-                    struct.pack_into("<I", self.capture_map, 36, sequence)
-                    self.capture_frames = sequence
+                return True
+            with self.capture_lock:
+                stats = self.capture_stream_stats[stream_index]
+                first_frame = int(stats["frames"]) == 0
+                stats["frames"] += 1
+                stats["pts"] = int(pts)
+                stats["last_ns"] = now_ns
+                previous_active = struct.unpack_from(
+                    "<I", self.capture_map, 32
+                )[0]
+                sequence = self.capture_frames + 1
+                active = sequence % FRAME_BUFFERS
+                destination = FRAME_HEADER.size + active * self.capture_frame_size
+                previous = FRAME_HEADER.size + previous_active * self.capture_frame_size
+                destination_x = int(stream["x"]) * 4
+                destination_y = int(stream["y"])
+                stream_offset = destination_y * stride + destination_x
+                changed, native_stats = self.frame_helper.update(
+                    self.capture_frame_filters[stream_index],
+                    self.capture_map,
+                    destination + stream_offset,
+                    previous + stream_offset,
+                    stride,
+                    source_view,
+                    source_stride,
+                    row_bytes,
+                    height,
+                    first_frame,
+                )
+                stats["native_updates"] += 1
+                stats["compared_bytes"] += int(native_stats.compared_bytes)
+                stats["copy_bytes"] += int(native_stats.copied_bytes)
+                stats["source_changed_bytes"] += int(
+                    native_stats.source_changed_bytes
+                )
+                stats["changed_rows"] += int(native_stats.changed_rows)
+                stats["changed_blocks"] += int(native_stats.changed_blocks)
+                stats["temporal_deferred_blocks"] += int(
+                    native_stats.temporal_deferred_blocks
+                )
+                stats["temporal_suppressed_blocks"] += int(
+                    native_stats.temporal_suppressed_blocks
+                )
+                stats["temporal_published_blocks"] += int(
+                    native_stats.temporal_published_blocks
+                )
+                stats["motion_bypasses"] += int(native_stats.motion_bypass)
+                copied_bytes = int(native_stats.copied_bytes)
+                stats["last_copy_bytes"] = copied_bytes
+                stats["max_copy_bytes"] = max(
+                    int(stats["max_copy_bytes"]), copied_bytes
+                )
+                if not changed:
+                    stats["duplicates"] += 1
                     duration_ns = time.monotonic_ns() - now_ns
                     stats["last_duration_ns"] = duration_ns
                     stats["max_duration_ns"] = max(
                         int(stats["max_duration_ns"]), duration_ns
                     )
-            finally:
-                buffer.unmap(info)
-            return self.Gst.FlowReturn.OK
+                    return True
+                value = (int(stats["published_hash"]) + 1) & 0xFFFFFFFF
+                if value == 0:
+                    value = 1
+                stats["hash"] = value
+                if not first_frame:
+                    stats["hash_changes"] += 1
 
-        def write_stream(appsink, stream_index: int, stream) -> int:
+                def copy_canvas_region(
+                    target: int, source: int, stale_stream
+                ) -> None:
+                    stale_x = int(stale_stream["x"]) * 4
+                    stale_y = int(stale_stream["y"])
+                    stale_row_bytes = int(stale_stream["width"]) * 4
+                    stale_offset = stale_y * stride + stale_x
+                    self.frame_helper.copy(
+                        self.capture_map,
+                        target + stale_offset,
+                        source + stale_offset,
+                        stride,
+                        stale_row_bytes,
+                        int(stale_stream["height"]),
+                    )
+
+                target_generations = self.capture_buffer_generations[active]
+                current_generations = self.capture_buffer_generations[
+                    previous_active
+                ]
+                backfills = capture_backfill_indexes(
+                    target_generations,
+                    current_generations,
+                    stream_index,
+                )
+                for stale_index in backfills:
+                    stale_stream = self.streams[stale_index]
+                    copy_canvas_region(destination, previous, stale_stream)
+                    target_generations[stale_index] = current_generations[
+                        stale_index
+                    ]
+                    stats["backfill_copies"] += 1
+                    stats["copy_bytes"] += (
+                        int(stale_stream["width"])
+                        * int(stale_stream["height"])
+                        * 4
+                    )
+                target_generations[stream_index] = (
+                    current_generations[stream_index] + 1
+                )
+                stats["source_copies"] += 1
+                stats["published_hash"] = value
+                stats["published_frames"] += 1
+                stats["last_publish_ns"] = now_ns
+                output_hash = 0
+                for output_stats in self.capture_stream_stats:
+                    output_hash = zlib.crc32(
+                        struct.pack(
+                            "<II",
+                            int(output_stats["node"]),
+                            int(output_stats["published_hash"]),
+                        ),
+                        output_hash,
+                    )
+                output_hash &= 0xFFFFFFFF
+                if self.capture_output_hash and self.capture_output_hash != output_hash:
+                    self.capture_output_hash_changes += 1
+                self.capture_output_hash = output_hash
+                struct.pack_into("<I", self.capture_map, 32, active)
+                struct.pack_into("<I", self.capture_map, 36, sequence)
+                self.capture_frames = sequence
+                duration_ns = time.monotonic_ns() - now_ns
+                stats["last_duration_ns"] = duration_ns
+                stats["max_duration_ns"] = max(
+                    int(stats["max_duration_ns"]), duration_ns
+                )
+            return True
+
+        def write_stream(
+            source_view,
+            source_stride: int,
+            pts: int,
+            stream_index: int,
+            stream,
+        ) -> bool:
             try:
-                return write_stream_frame(appsink, stream_index, stream)
+                return write_stream_frame(
+                    source_view, source_stride, pts, stream_index, stream
+                )
             except Exception as error:
                 self.capture_callback_error = (
                     f"node={stream['node']} {type(error).__name__}: {error}"
                 )
-                return self.Gst.FlowReturn.ERROR
-
-        for index, stream in enumerate(self.streams):
-            if self.fake_video:
-                source = self.Gst.ElementFactory.make(
-                    "videotestsrc", f"portal-source-{index}"
-                )
-                if source is not None:
-                    source.set_property("is-live", True)
-                    source.set_property("pattern", index % 24)
-            else:
-                descriptor = self._open_pipewire_remote()
-                self.capture_pipewire_fds.append(descriptor)
-                source = self.Gst.ElementFactory.make(
-                    "pipewiresrc", f"portal-source-{index}"
-                )
-                if source is not None:
-                    source.set_property("fd", descriptor)
-                    source.set_property("path", str(stream["node"]))
-                    source.set_property("do-timestamp", True)
-                    # Keep PipeWire's rotating pool out of the Python callback.
-                    # The guard immediately downstream separately discards
-                    # Mutter cursor-only buffers marked CORRUPTED before a
-                    # transform can turn their empty payload into an apparent
-                    # full video frame.
-                    source.set_property("always-copy", True)
-            queue = self.Gst.ElementFactory.make(
-                "queue", f"frame-queue-{index}"
-            )
-            corrupt_guard = self.Gst.ElementFactory.make(
-                "identity", f"corrupt-frame-guard-{index}"
-            )
-            convert = self.Gst.ElementFactory.make(
-                "videoconvert", f"stream-convert-{index}"
-            )
-            scale = self.Gst.ElementFactory.make(
-                "videoscale", f"frame-scale-{index}"
-            )
-            stream_caps = self.Gst.ElementFactory.make(
-                "capsfilter", f"stream-caps-{index}"
-            )
-            sink = self.Gst.ElementFactory.make(
-                "appsink", f"capture-sink-{index}"
-            )
-            stream_elements = (
-                source,
-                corrupt_guard,
-                queue,
-                convert,
-                scale,
-                stream_caps,
-                sink,
-            )
-            if any(element is None for element in stream_elements):
-                raise RuntimeError("无法创建 Wayland 多屏画面源管线")
-            queue.set_property("max-size-buffers", 1)
-            queue.set_property("leaky", 2)
-            corrupt_guard.set_property(
-                "drop-buffer-flags", self.Gst.BufferFlags.CORRUPTED
-            )
-            scale.set_property("add-borders", False)
-            caps_text = (
-                "video/x-raw,format=BGRA,"
-                f"width={stream['width']},height={stream['height']},"
-            )
-            caps_text += "pixel-aspect-ratio=1/1"
-            stream_caps.set_property(
-                "caps", self.Gst.Caps.from_string(caps_text)
-            )
-            sink.set_property("sync", False)
-            sink.set_property("emit-signals", True)
-            sink.set_property("max-buffers", 1)
-            sink.set_property("drop", True)
-            # This is a latest-frame transport, not a clock-synchronized media
-            # sink.  BaseSink's default 20 ms processing deadline needlessly
-            # inflates the pipeline latency query and its retained last sample
-            # keeps one full 15 MB frame alive.
-            sink.set_property("processing-deadline", 0)
-            sink.set_property("enable-last-sample", False)
-            sink.set_property("wait-on-eos", False)
-            for element in stream_elements:
-                self.capture_pipeline.add(element)
-            for first, second in zip(
-                stream_elements, stream_elements[1:]
-            ):
-                if not first.link(second):
-                    raise RuntimeError(
-                        "无法连接 Wayland 多屏画面源 "
-                        f"{first.name} → {second.name}"
-                    )
-            sink.connect("new-sample", write_stream, index, stream)
+                return False
+        self.capture_write_stream = write_stream
+        # Video owns the first link so it fixes the producer at a three-buffer
+        # DMA-BUF pool.  The metadata-only cursor consumer joins afterwards;
+        # starting it first would fix the shared output to MemFd instead.
+        self._start_capture_pipeline()
         self._start_cursor_bridge()
-        if self.capture_pipeline.set_state(
-            self.Gst.State.PLAYING
-        ) == self.Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Wayland 画面桥无法进入 PLAYING 状态")
-        bus = self.capture_pipeline.get_bus()
-        deadline = time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS
-        while (
-            any(int(stats["frames"]) == 0 for stats in self.capture_stream_stats)
-            and time.monotonic() < deadline
-        ):
-            message = bus.timed_pop_filtered(
-                200 * self.Gst.MSECOND,
-                self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS,
-            )
-            if message is not None:
-                if message.type == self.Gst.MessageType.ERROR:
-                    error, debug = message.parse_error()
-                    raise RuntimeError(
-                        f"Wayland 画面桥 GStreamer 错误：{error}（{debug}）"
-                    )
-                raise RuntimeError("Wayland Portal 屏幕流意外结束")
-        missing = [
-            str(stats["node"])
-            for stats in self.capture_stream_stats
-            if int(stats["frames"]) == 0
-        ]
-        if missing:
-            raise RuntimeError(
-                "Wayland Portal 在 10 秒内未产生全部屏幕画面帧："
-                + ",".join(missing)
-            )
-        self.ensure_healthy()
         self.capture_state = "active"
 
     def ensure_healthy(self) -> None:
         if self.fake_trace:
             return
-        if self.capture_pipeline is None:
-            raise RuntimeError("Wayland PipeWire 画面转发未启动")
         if self.capture_callback_error:
             raise RuntimeError(
-                "Wayland 共享帧回调失败：" + self.capture_callback_error
+                "Wayland 原生 DMA-BUF 共享帧回调失败："
+                + self.capture_callback_error
             )
-        message = self.capture_pipeline.get_bus().pop_filtered(
-            self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS
-        )
-        if message is not None:
-            if message.type == self.Gst.MessageType.ERROR:
-                error, debug = message.parse_error()
-                raise RuntimeError(
-                    f"Wayland 画面桥 GStreamer 错误：{error}（{debug}）"
+        transport_error = ""
+        if self.capture_transport != CAPTURE_TRANSPORT_DMABUF:
+            transport_error = "Wayland 原生 DMA-BUF 捕获未启动"
+        elif len(self.capture_native_processes) != len(self.streams):
+            transport_error = "原生 DMA-BUF 捕获辅助进程数量不完整"
+        else:
+            stopped = [
+                f"{process.pid}:{process.returncode}"
+                for process in self.capture_native_processes
+                if process.poll() is not None
+            ]
+            if stopped:
+                transport_error = (
+                    "原生 DMA-BUF 捕获辅助进程已停止："
+                    + ",".join(stopped)
                 )
-            raise RuntimeError("Wayland Portal 屏幕流已结束")
-        state_result, state, _pending = self.capture_pipeline.get_state(0)
-        if state_result == self.Gst.StateChangeReturn.FAILURE or state not in (
-            self.Gst.State.PAUSED,
-            self.Gst.State.PLAYING,
-        ):
-            raise RuntimeError("Wayland PipeWire 画面转发已停止")
+        if transport_error:
+            raise RuntimeError(transport_error)
         process = self.cursor_helper_process
         if process is None:
             raise RuntimeError("Wayland PipeWire 动态光标桥未启动")
@@ -2259,17 +2429,9 @@ class WaylandPortalBackend:
                     )
                 except Exception as error:
                     errors.append(f"等待光标桥退出: {error}")
-        if self.capture_pipeline is not None:
-            pipeline = self.capture_pipeline
-            self.capture_pipeline = None
-            cleanup(
-                "停止画面管线",
-                lambda: pipeline.set_state(self.Gst.State.NULL),
-            )
-            cleanup(
-                "等待画面管线停止",
-                lambda: pipeline.get_state(5 * self.Gst.SECOND),
-            )
+        cleanup("停止画面管线", self._stop_capture_pipeline)
+        self.capture_write_stream = None
+        self.capture_transport = "stopped"
         frame_filters = list(getattr(self, "capture_frame_filters", []))
         self.capture_frame_filters = []
         for frame_filter in frame_filters:
@@ -2277,13 +2439,6 @@ class WaylandPortalBackend:
                 "释放瞬态帧过滤器",
                 lambda frame_filter=frame_filter:
                     self.frame_helper.destroy_filter(frame_filter),
-            )
-        descriptors = list(self.capture_pipewire_fds)
-        self.capture_pipewire_fds.clear()
-        for descriptor in descriptors:
-            cleanup(
-                f"关闭 PipeWire FD {descriptor}",
-                lambda descriptor=descriptor: os.close(descriptor),
             )
         if self.capture_map is not None:
             capture_map = self.capture_map
@@ -3035,7 +3190,8 @@ def write_status(
     capture_frames: int = 0,
     capture_output_hash: int = 0,
     capture_output_hash_changes: int = 0,
-    capture_streams: list[dict[str, int]] | None = None,
+    capture_transport: str = "inactive",
+    capture_streams: list[dict[str, Any]] | None = None,
     absolute_target: tuple[int, int, int, int] | None = None,
     absolute_target_source: str = "",
     cursor_state: str = "inactive",
@@ -3101,6 +3257,7 @@ def write_status(
             "capture_frames": capture_frames,
             "capture_output_hash": capture_output_hash,
             "capture_output_hash_changes": capture_output_hash_changes,
+            "capture_transport": capture_transport,
             "capture_streams": capture_streams or [],
             "absolute_target": (
                 list(absolute_target) if absolute_target is not None else None
@@ -3169,6 +3326,12 @@ def parse_packet(data: bytes, token: bytes):
     raise ValueError("数据包类型或载荷长度无效")
 
 
+def sequence_is_newer(sequence: int, previous: int) -> bool:
+    """Compare wrapping unsigned 32-bit protocol sequence numbers."""
+    delta = (sequence - previous) & 0xFFFFFFFF
+    return 0 < delta < 0x80000000
+
+
 def remove_owned_endpoint(endpoint: Path, token: bytes) -> None:
     try:
         content = endpoint.read_text(encoding="ascii")
@@ -3206,6 +3369,8 @@ def watch(
     rejected = 0
     hook_pid = 0
     hook_version = 0
+    peer_address: tuple[str, int] | None = None
+    last_sequence: int | None = None
     mouse_packets = 0
     mouse_moves = 0
     mouse_buttons = 0
@@ -3266,6 +3431,10 @@ def watch(
             capture_output_hash_changes=int(
                 getattr(backend, "capture_output_hash_changes", 0)
                 if backend is not None else 0
+            ),
+            capture_transport=str(
+                getattr(backend, "capture_transport", "inactive")
+                if backend is not None else "inactive"
             ),
             capture_streams=[
                 dict(stats)
@@ -3543,7 +3712,18 @@ def watch(
                 try:
                     kind, sequence, payload = parse_packet(data, token)
                     if kind == PACKET_HELLO:
-                        hook_pid, hook_version = payload
+                        candidate_pid, candidate_version = payload
+                        if (
+                            peer_address == address
+                            and hook_pid == candidate_pid
+                            and last_sequence is not None
+                            and not sequence_is_newer(sequence, last_sequence)
+                        ):
+                            raise ValueError("重复或过期的握手数据包")
+                        peer_address = address
+                        last_sequence = sequence
+                        hook_pid = candidate_pid
+                        hook_version = candidate_version
                         if hook_version < MINIMUM_HOOK_VERSION:
                             logger.write(
                                 "GameViewerServer 输入钩子版本过旧"
@@ -3555,7 +3735,13 @@ def watch(
                                 "GameViewerServer 输入钩子已连接"
                                 f"（PID {hook_pid}，v{hook_version}）"
                             )
-                    elif kind == PACKET_MOUSE:
+                    else:
+                        if peer_address != address or last_sequence is None:
+                            raise PermissionError("输入数据包不属于已握手的发送端")
+                        if not sequence_is_newer(sequence, last_sequence):
+                            raise ValueError("重复或过期的输入数据包")
+                        last_sequence = sequence
+                    if kind == PACKET_MOUSE:
                         if hook_version < MINIMUM_HOOK_VERSION:
                             raise ValueError("输入钩子版本过旧或尚未握手")
                         dx, dy, mouse_data, flags, _timestamp, _extra = payload
