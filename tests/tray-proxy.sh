@@ -408,9 +408,25 @@ with tempfile.TemporaryDirectory() as prefix:
     environment["WINEPREFIX"] = prefix
     child = subprocess.Popen(["sleep", "5"], env=environment)
     try:
-        assert namespace["process_matches_prefix"](
-            child.pid, namespace["canonical_path"](prefix)
-        )
+        # A freshly exec'd process can briefly expose an empty /proc/PID/environ
+        # even though Popen has returned.  The tray scans periodically, so the
+        # test must wait for the same eventually-consistent kernel view instead
+        # of treating the first read as synchronous.
+        expected_prefix = namespace["canonical_path"](prefix)
+        prefix_visible_deadline = time.monotonic() + 1.0
+        prefix_visible = False
+        while child.poll() is None:
+            prefix_visible = namespace["process_matches_prefix"](
+                child.pid, expected_prefix
+            )
+            if prefix_visible or time.monotonic() >= prefix_visible_deadline:
+                break
+            time.sleep(0.01)
+        assert prefix_visible, {
+            "poll": child.poll(),
+            "environment": namespace["process_environment"](child.pid),
+            "arguments": namespace["process_arguments"](child.pid),
+        }
         assert not namespace["process_matches_prefix"](
             child.pid, namespace["canonical_path"](prefix + "-other")
         )
