@@ -656,6 +656,46 @@ grep -q '自动更新已暂缓，保留 4.33.0.8000' \
 printf '4.34.0.8979\n' >"$install_dir/bin/.installed-version"
 
 "$launcher" --diagnose | grep -q '4.34.0.8979'
+frame_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=5151' \
+    'version=55' \
+    'status_bits=12' \
+    '[capture]' \
+    'calls=0' \
+    'rendered=0' \
+    >"$frame_status"
+XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
+    "$launcher" --diagnose >"$test_root/wayland-idle-frame-hook.txt"
+grep -q 'Wayland GDI 画面钩子.*已安装（v55；等待远控采集）' \
+    "$test_root/wayland-idle-frame-hook.txt"
+printf '%s\r\n' \
+    '[hook]' \
+    'pid=5151' \
+    'version=55' \
+    'status_bits=12' \
+    '[capture]' \
+    'calls=1' \
+    'rendered=0' \
+    >"$frame_status"
+XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
+    "$launcher" --diagnose >"$test_root/wayland-failed-frame-hook.txt"
+grep -q 'Wayland GDI 画面钩子.*未安装/不完整' \
+    "$test_root/wayland-failed-frame-hook.txt"
+printf '%s\n' \
+    '{"state":"stopped","capture_state":"active","capture_transport":"stopped","cursor_state":"metadata-inactive"}' \
+    >"$state_dir/input-bridge-status.json"
+XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
+    "$launcher" --diagnose >"$test_root/wayland-stopped-bridge.txt"
+grep -q '原生光标形状.*已停止' \
+    "$test_root/wayland-stopped-bridge.txt"
+grep -q 'Wayland 画面桥.*已停止' \
+    "$test_root/wayland-stopped-bridge.txt"
+grep -q 'Wayland GDI 画面钩子.*就绪（待应用启动）' \
+    "$test_root/wayland-stopped-bridge.txt"
+rm -f -- "$state_dir/input-bridge-status.json"
+rm -f -- "$frame_status"
 "$launcher"
 grep -q '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE"
 grep -q '^SERVER$' "$UU_REMOTE_FAKE_TRACE"

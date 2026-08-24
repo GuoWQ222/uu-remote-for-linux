@@ -32,6 +32,7 @@ export WAYLAND_DISPLAY=wayland-test-0
 export XDG_RUNTIME_DIR="$runtime_dir"
 export UU_REMOTE_DESKTOP_BACKEND=wayland-xwayland
 export UU_REMOTE_WAYLAND_PORTAL_FAKE_TRACE="$trace"
+export UU_REMOTE_WAYLAND_CURSOR_MODE=metadata
 export UU_REMOTE_INPUT_BRIDGE_FAKE_LOCK_MASK=2
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO=1
 export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
@@ -76,6 +77,16 @@ assert module.CAPTURE_TRANSPORT_DMABUF == "dmabuf-native"
 assert not hasattr(module, "CAPTURE_TRANSPORT_MEMFD")
 assert module.CAPTURE_NATIVE_STAGE_SLOTS == 3
 assert module.CAPTURE_NATIVE_NOTIFICATION.size == 24
+assert module.PORTAL_CURSOR_EMBEDDED == 2
+assert module.PORTAL_CURSOR_METADATA == 4
+assert module.selected_portal_cursor_mode() == module.PORTAL_CURSOR_METADATA
+original_cursor_mode = module.os.environ.pop(
+    "UU_REMOTE_WAYLAND_CURSOR_MODE"
+)
+try:
+    assert module.selected_portal_cursor_mode() == module.PORTAL_CURSOR_METADATA
+finally:
+    module.os.environ["UU_REMOTE_WAYLAND_CURSOR_MODE"] = original_cursor_mode
 assert module.capture_stream_rate(77, 77) == 60
 assert module.capture_stream_rate(78, 77) == 30
 assert module.capture_backfill_indexes([4, 7], [5, 7], 0) == []
@@ -99,8 +110,8 @@ start_bridge_text = source_text.split(
     "    def _start_capture_bridge(self) -> None:", 1
 )[1].split("\n    def ensure_healthy", 1)[0]
 assert start_bridge_text.index(
-    "self._start_capture_pipeline()"
-) < start_bridge_text.index("self._start_cursor_bridge()")
+    "self._start_cursor_bridge()"
+) < start_bridge_text.index("self._start_capture_pipeline()")
 assert "advance_capture_deadline" not in source_text
 assert "if not eligible:" not in source_text
 assert 'if running and hasattr(backend, "ensure_healthy"):' in source_text
@@ -484,6 +495,19 @@ health_backend._restart_cursor_bridge = (
 )
 health_backend.ensure_healthy()
 assert health_events == ["capture", "cursor", ("restart", -11)]
+
+embedded_backend = module.WaylandPortalBackend.__new__(
+    module.WaylandPortalBackend
+)
+embedded_backend.fake_trace = ""
+embedded_backend.portal_cursor_mode = module.PORTAL_CURSOR_EMBEDDED
+embedded_backend.capture_callback_error = ""
+embedded_backend.capture_transport = module.CAPTURE_TRANSPORT_DMABUF
+embedded_backend.streams = [{"node": 77}]
+embedded_backend.capture_native_processes = [HealthyCaptureProcess()]
+embedded_backend.cursor_helper_process = None
+assert embedded_backend.cursor_state == "embedded"
+embedded_backend.ensure_healthy()
 
 dead_backend = module.WaylandPortalBackend.__new__(
     module.WaylandPortalBackend

@@ -22,6 +22,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <drm_fourcc.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <pipewire/pipewire.h>
 #include <spa/buffer/buffer.h>
 #include <spa/buffer/meta.h>
@@ -41,6 +44,7 @@
 #define UUCI_DEFAULT_PIPEWIRE_BUFFERS 3
 #define UUCI_MIN_PIPEWIRE_BUFFERS 2
 #define UUCI_MAX_PIPEWIRE_BUFFERS 4
+#define UUCI_MAX_MODIFIERS 64u
 #define UUCI_META_SIZE(width, height) \
     (sizeof(struct spa_meta_cursor) + \
      sizeof(struct spa_meta_bitmap) + (width) * (height) * 4u)
@@ -88,6 +92,12 @@ struct cursor_event {
 
 struct application;
 
+struct modifier_set {
+    uint32_t drm_format;
+    uint64_t values[UUCI_MAX_MODIFIERS];
+    uint32_t count;
+};
+
 struct stream_data {
     struct application *application;
     struct pw_stream *stream;
@@ -97,6 +107,7 @@ struct stream_data {
     uint32_t height;
     struct cursor_snapshot cursor;
     bool has_cursor;
+    bool streaming;
 };
 
 struct application {
@@ -111,8 +122,256 @@ struct application {
     uint64_t last_hash;
     uint32_t updates;
     uint32_t diagnostics;
+    uint64_t buffers;
+    uint64_t missing_meta;
+    uint64_t inactive_meta;
+    uint64_t outside_stream;
+    uint64_t missing_bitmap;
+    int ready_fd;
+    uint32_t streaming_count;
+    bool ready_sent;
     bool failed;
+    EGLDisplay egl_display;
+    PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dma_buf_modifiers;
+    struct modifier_set modifier_sets[2];
+    char egl_device[PATH_MAX];
 };
+
+static bool has_extension(const char *extensions, const char *needle)
+{
+    const char *position = extensions;
+    size_t length = strlen(needle);
+
+    if (!extensions || !needle[0] || strchr(needle, ' ')) {
+        return false;
+    }
+    while ((position = strstr(position, needle))) {
+        if ((position == extensions || position[-1] == ' ') &&
+            (position[length] == '\0' || position[length] == ' ')) {
+            return true;
+        }
+        position += length;
+    }
+    return false;
+}
+
+static bool is_nvidia_render_node(const char *path)
+{
+    const char *name;
+    char vendor_path[PATH_MAX];
+    char vendor[32];
+    FILE *handle;
+
+    if (!path || !path[0]) {
+        return false;
+    }
+    name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    if (snprintf(
+            vendor_path,
+            sizeof(vendor_path),
+            "/sys/class/drm/%s/device/vendor",
+            name
+        ) < 0) {
+        return false;
+    }
+    handle = fopen(vendor_path, "r");
+    if (!handle) {
+        return false;
+    }
+    vendor[0] = '\0';
+    if (!fgets(vendor, sizeof(vendor), handle)) {
+        fclose(handle);
+        return false;
+    }
+    fclose(handle);
+    return strncmp(vendor, "0x10de", 6) == 0;
+}
+
+static EGLDisplay choose_egl_display(struct application *application)
+{
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
+    PFNEGLQUERYDEVICESEXTPROC query_devices;
+    PFNEGLQUERYDEVICESTRINGEXTPROC query_device_string;
+    EGLDeviceEXT devices[16];
+    EGLint count = 0;
+    EGLint index;
+    EGLDeviceEXT selected = EGL_NO_DEVICE_EXT;
+    const char *selected_path = NULL;
+
+    get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+        eglGetProcAddress("eglGetPlatformDisplayEXT");
+    query_devices = (PFNEGLQUERYDEVICESEXTPROC)
+        eglGetProcAddress("eglQueryDevicesEXT");
+    query_device_string = (PFNEGLQUERYDEVICESTRINGEXTPROC)
+        eglGetProcAddress("eglQueryDeviceStringEXT");
+    if (get_platform_display && query_devices && query_device_string &&
+        query_devices(16, devices, &count)) {
+        for (index = 0; index < count; ++index) {
+            const char *path = query_device_string(
+                devices[index],
+                EGL_DRM_RENDER_NODE_FILE_EXT
+            );
+
+            if (!path) {
+                path = query_device_string(
+                    devices[index],
+                    EGL_DRM_DEVICE_FILE_EXT
+                );
+            }
+            if (!selected && path) {
+                selected = devices[index];
+                selected_path = path;
+            }
+            if (is_nvidia_render_node(path)) {
+                selected = devices[index];
+                selected_path = path;
+                break;
+            }
+        }
+        if (selected) {
+            if (selected_path) {
+                snprintf(
+                    application->egl_device,
+                    sizeof(application->egl_device),
+                    "%s",
+                    selected_path
+                );
+            }
+            return get_platform_display(
+                EGL_PLATFORM_DEVICE_EXT,
+                selected,
+                NULL
+            );
+        }
+    }
+    if (get_platform_display) {
+        snprintf(
+            application->egl_device,
+            sizeof(application->egl_device),
+            "%s",
+            "surfaceless-default"
+        );
+        return get_platform_display(
+            EGL_PLATFORM_SURFACELESS_MESA,
+            EGL_DEFAULT_DISPLAY,
+            NULL
+        );
+    }
+    snprintf(
+        application->egl_device,
+        sizeof(application->egl_device),
+        "%s",
+        "egl-default"
+    );
+    return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+}
+
+static void add_modifier(struct modifier_set *set, uint64_t modifier)
+{
+    uint32_t index;
+
+    for (index = 0; index < set->count; ++index) {
+        if (set->values[index] == modifier) {
+            return;
+        }
+    }
+    if (set->count < UUCI_MAX_MODIFIERS) {
+        set->values[set->count++] = modifier;
+    }
+}
+
+static void query_importable_modifiers(
+    struct application *application,
+    struct modifier_set *set,
+    uint32_t drm_format
+)
+{
+    EGLuint64KHR modifiers[UUCI_MAX_MODIFIERS];
+    EGLBoolean external_only[UUCI_MAX_MODIFIERS];
+    EGLint available = 0;
+    EGLint returned = 0;
+    EGLint index;
+
+    memset(set, 0, sizeof(*set));
+    set->drm_format = drm_format;
+    if (application->query_dma_buf_modifiers &&
+        application->query_dma_buf_modifiers(
+            application->egl_display,
+            (EGLint)drm_format,
+            0,
+            NULL,
+            NULL,
+            &available
+        ) && available > 0 &&
+        application->query_dma_buf_modifiers(
+            application->egl_display,
+            (EGLint)drm_format,
+            SPA_MIN(available, (EGLint)UUCI_MAX_MODIFIERS),
+            modifiers,
+            external_only,
+            &returned
+        )) {
+        returned = SPA_MIN(returned, (EGLint)UUCI_MAX_MODIFIERS);
+        for (index = 0; index < returned; ++index) {
+            if (external_only[index] == EGL_FALSE) {
+                add_modifier(set, (uint64_t)modifiers[index]);
+            }
+        }
+    }
+    add_modifier(set, DRM_FORMAT_MOD_INVALID);
+    fprintf(
+        stderr,
+        "cursor bridge DRM format 0x%08" PRIx32
+        " importable modifiers=%" PRIu32 "\n",
+        drm_format,
+        set->count
+    );
+}
+
+static bool initialize_modifier_query(struct application *application)
+{
+    const char *extensions;
+    EGLint major = 0;
+    EGLint minor = 0;
+
+    application->egl_display = choose_egl_display(application);
+    if (application->egl_display == EGL_NO_DISPLAY ||
+        !eglInitialize(application->egl_display, &major, &minor)) {
+        fprintf(stderr, "unable to initialize cursor EGL display\n");
+        return false;
+    }
+    extensions = eglQueryString(application->egl_display, EGL_EXTENSIONS);
+    if (!has_extension(extensions, "EGL_EXT_image_dma_buf_import_modifiers")) {
+        fprintf(stderr, "cursor EGL modifier query is unavailable\n");
+        return false;
+    }
+    application->query_dma_buf_modifiers =
+        (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)
+        eglGetProcAddress("eglQueryDmaBufModifiersEXT");
+    if (!application->query_dma_buf_modifiers) {
+        fprintf(stderr, "cursor EGL modifier entry point is unavailable\n");
+        return false;
+    }
+    query_importable_modifiers(
+        application,
+        &application->modifier_sets[0],
+        DRM_FORMAT_ARGB8888
+    );
+    query_importable_modifiers(
+        application,
+        &application->modifier_sets[1],
+        DRM_FORMAT_XRGB8888
+    );
+    fprintf(
+        stderr,
+        "cursor bridge EGL %d.%d device=%s\n",
+        major,
+        minor,
+        application->egl_device
+    );
+    return true;
+}
 
 static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size)
 {
@@ -449,21 +708,57 @@ static void process_cursor_meta(
     const struct spa_buffer *buffer
 )
 {
+    struct application *application = stream_data->application;
     struct cursor_event event;
     struct spa_meta *meta;
+    bool log_observation;
     int result;
 
+    application->buffers += 1u;
+    log_observation = application->buffers <= 5u ||
+        application->buffers % 300u == 0u;
     meta = spa_buffer_find_meta(buffer, SPA_META_Cursor);
+    if (!meta) {
+        application->missing_meta += 1u;
+        if (log_observation) {
+            fprintf(
+                stderr,
+                "cursor-meta buffers=%" PRIu64 " node=%" PRIu32
+                " status=missing missing=%" PRIu64 "\n",
+                application->buffers,
+                stream_data->node,
+                application->missing_meta
+            );
+            fflush(stderr);
+        }
+        return;
+    }
     result = extract_cursor(meta, &event);
     if (result <= 0) {
+        if (result == 0) {
+            application->inactive_meta += 1u;
+            if (log_observation) {
+                fprintf(
+                    stderr,
+                    "cursor-meta buffers=%" PRIu64 " node=%" PRIu32
+                    " status=inactive inactive=%" PRIu64
+                    " meta-size=%" PRIu32 "\n",
+                    application->buffers,
+                    stream_data->node,
+                    application->inactive_meta,
+                    meta->size
+                );
+                fflush(stderr);
+            }
+        }
         if (
             result < 0 && result != -ENOTSUP &&
-            should_log_cursor_diagnostic(stream_data->application)
+            should_log_cursor_diagnostic(application)
         ) {
             fprintf(
                 stderr,
                 "invalid cursor metadata count=%" PRIu32 ": %s\n",
-                stream_data->application->diagnostics,
+                application->diagnostics,
                 strerror(-result)
             );
         }
@@ -476,27 +771,59 @@ static void process_cursor_meta(
         event.snapshot.pixels = NULL;
     }
     if (!cursor_inside_stream(stream_data, &event)) {
+        application->outside_stream += 1u;
+        if (log_observation) {
+            fprintf(
+                stderr,
+                "cursor-meta buffers=%" PRIu64 " node=%" PRIu32
+                " status=outside position=%" PRId32 ",%" PRId32
+                " outside=%" PRIu64 " bitmap=%u cached=%u\n",
+                application->buffers,
+                stream_data->node,
+                event.position_x,
+                event.position_y,
+                application->outside_stream,
+                event.has_bitmap ? 1u : 0u,
+                stream_data->has_cursor ? 1u : 0u
+            );
+            fflush(stderr);
+        }
         free(event.snapshot.pixels);
         return;
     }
     if (!stream_data->has_cursor) {
+        application->missing_bitmap += 1u;
+        if (log_observation) {
+            fprintf(
+                stderr,
+                "cursor-meta buffers=%" PRIu64 " node=%" PRIu32
+                " status=no-bitmap position=%" PRId32 ",%" PRId32
+                " no-bitmap=%" PRIu64 "\n",
+                application->buffers,
+                stream_data->node,
+                event.position_x,
+                event.position_y,
+                application->missing_bitmap
+            );
+            fflush(stderr);
+        }
         free(event.snapshot.pixels);
         return;
     }
     result = publish_snapshot(
-        stream_data->application,
+        application,
         stream_data,
         &event
     );
     free(event.snapshot.pixels);
     if (
         result < 0 &&
-        should_log_cursor_diagnostic(stream_data->application)
+        should_log_cursor_diagnostic(application)
     ) {
         fprintf(
             stderr,
             "cursor publication failed count=%" PRIu32 ": %s\n",
-            stream_data->application->diagnostics,
+            application->diagnostics,
             strerror(-result)
         );
     }
@@ -539,6 +866,34 @@ static void on_state_changed(
 )
 {
     struct stream_data *stream_data = userdata;
+    struct application *application = stream_data->application;
+
+    if (state == PW_STREAM_STATE_STREAMING && !stream_data->streaming) {
+        stream_data->streaming = true;
+        application->streaming_count += 1u;
+        if (
+            !application->ready_sent &&
+            application->streaming_count == application->n_streams
+        ) {
+            ssize_t written = write(application->ready_fd, "R", 1u);
+
+            if (written != 1) {
+                fprintf(stderr, "unable to publish cursor bridge readiness\n");
+                application->failed = true;
+                pw_main_loop_quit(application->loop);
+                return;
+            }
+            close(application->ready_fd);
+            application->ready_fd = -1;
+            application->ready_sent = true;
+            fprintf(
+                stderr,
+                "cursor-dmabuf-ready streams=%" PRIu32 "\n",
+                application->n_streams
+            );
+            fflush(stderr);
+        }
+    }
 
     if (!stream_state_is_terminal(old, state)) {
         return;
@@ -570,13 +925,13 @@ static void on_param_changed(
 {
     struct stream_data *stream_data = userdata;
     struct spa_video_info_raw raw;
+    const struct spa_pod_prop *modifier_property;
     uint8_t buffer[1024];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(
         buffer,
         sizeof(buffer)
     );
     const struct spa_pod *params[2];
-    uint32_t data_types;
     uint32_t width;
     uint32_t height;
     uint64_t image_size;
@@ -586,7 +941,16 @@ static void on_param_changed(
         return;
     }
     memset(&raw, 0, sizeof(raw));
-    if (spa_format_video_raw_parse(param, &raw) < 0) {
+    if (
+        spa_format_video_raw_parse(param, &raw) < 0 ||
+        (raw.format != SPA_VIDEO_FORMAT_BGRA &&
+         raw.format != SPA_VIDEO_FORMAT_BGRx)
+    ) {
+        pw_stream_set_error(
+            stream_data->stream,
+            -EINVAL,
+            "unsupported cursor DMA-BUF format"
+        );
         return;
     }
     width = raw.size.width ? raw.size.width : stream_data->width;
@@ -600,9 +964,22 @@ static void on_param_changed(
         );
         return;
     }
-    data_types = (1u << SPA_DATA_MemPtr) |
-        (1u << SPA_DATA_MemFd) |
-        (1u << SPA_DATA_DmaBuf);
+    modifier_property = spa_pod_find_prop(
+        param,
+        NULL,
+        SPA_FORMAT_VIDEO_modifier
+    );
+    if (!modifier_property) {
+        pw_stream_set_error(
+            stream_data->stream,
+            -EINVAL,
+            "cursor stream did not negotiate a DMA-BUF modifier"
+        );
+        return;
+    }
+    if (modifier_property->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) {
+        return;
+    }
     params[0] = spa_pod_builder_add_object(
         &builder,
         SPA_TYPE_OBJECT_ParamBuffers,
@@ -627,7 +1004,7 @@ static void on_param_changed(
         SPA_PARAM_BUFFERS_stride,
         SPA_POD_Int((int32_t)(width * 4u)),
         SPA_PARAM_BUFFERS_dataType,
-        SPA_POD_CHOICE_FLAGS_Int(data_types)
+        SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)
     );
     params[1] = spa_pod_builder_add_object(
         &builder,
@@ -687,16 +1064,68 @@ static const struct pw_core_events core_events = {
     .error = on_core_error,
 };
 
+static const struct spa_pod *build_cursor_format(
+    struct spa_pod_builder *builder,
+    enum spa_video_format format,
+    const struct modifier_set *modifiers,
+    const struct spa_rectangle *size
+)
+{
+    struct spa_pod_frame format_frame;
+    struct spa_pod_frame modifier_frame;
+    uint32_t index;
+
+    spa_pod_builder_push_object(
+        builder,
+        &format_frame,
+        SPA_TYPE_OBJECT_Format,
+        SPA_PARAM_EnumFormat
+    );
+    spa_pod_builder_add(
+        builder,
+        SPA_FORMAT_mediaType,
+        SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype,
+        SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format,
+        SPA_POD_Id(format),
+        0
+    );
+    spa_pod_builder_prop(
+        builder,
+        SPA_FORMAT_VIDEO_modifier,
+        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE
+    );
+    spa_pod_builder_push_choice(
+        builder,
+        &modifier_frame,
+        SPA_CHOICE_Enum,
+        0
+    );
+    spa_pod_builder_long(builder, modifiers->values[0]);
+    for (index = 0; index < modifiers->count; ++index) {
+        spa_pod_builder_long(builder, modifiers->values[index]);
+    }
+    spa_pod_builder_pop(builder, &modifier_frame);
+    spa_pod_builder_add(
+        builder,
+        SPA_FORMAT_VIDEO_size,
+        SPA_POD_Rectangle(size),
+        0
+    );
+    return spa_pod_builder_pop(builder, &format_frame);
+}
+
 static int connect_stream(struct stream_data *stream_data)
 {
     struct application *application = stream_data->application;
     struct pw_properties *properties;
-    uint8_t buffer[1024];
+    uint8_t buffer[2048];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(
         buffer,
         sizeof(buffer)
     );
-    const struct spa_pod *params[1];
+    const struct spa_pod *params[2];
     struct spa_rectangle size = SPA_RECTANGLE(
         stream_data->width,
         stream_data->height
@@ -726,36 +1155,25 @@ static int connect_stream(struct stream_data *stream_data)
         &stream_events,
         stream_data
     );
-    params[0] = spa_pod_builder_add_object(
+    params[0] = build_cursor_format(
         &builder,
-        SPA_TYPE_OBJECT_Format,
-        SPA_PARAM_EnumFormat,
-        SPA_FORMAT_mediaType,
-        SPA_POD_Id(SPA_MEDIA_TYPE_video),
-        SPA_FORMAT_mediaSubtype,
-        SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        SPA_FORMAT_VIDEO_format,
-        SPA_POD_CHOICE_ENUM_Id(
-            8,
-            SPA_VIDEO_FORMAT_BGRx,
-            SPA_VIDEO_FORMAT_BGRA,
-            SPA_VIDEO_FORMAT_RGBx,
-            SPA_VIDEO_FORMAT_RGBA,
-            SPA_VIDEO_FORMAT_xRGB,
-            SPA_VIDEO_FORMAT_ARGB,
-            SPA_VIDEO_FORMAT_xBGR,
-            SPA_VIDEO_FORMAT_ABGR
-        ),
-        SPA_FORMAT_VIDEO_size,
-        SPA_POD_Rectangle(&size)
+        SPA_VIDEO_FORMAT_BGRA,
+        &application->modifier_sets[0],
+        &size
+    );
+    params[1] = build_cursor_format(
+        &builder,
+        SPA_VIDEO_FORMAT_BGRx,
+        &application->modifier_sets[1],
+        &size
     );
     result = pw_stream_connect(
         stream_data->stream,
         PW_DIRECTION_INPUT,
         stream_data->node,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
+        PW_STREAM_FLAG_AUTOCONNECT,
         params,
-        1
+        2
     );
     return result;
 }
@@ -896,15 +1314,18 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
     }
-    if (argc < 6 || (argc - 3) % 3 != 0) {
+    if (argc < 7 || (argc - 4) % 3 != 0) {
         fprintf(
             stderr,
-            "usage: %s OUTPUT FD NODE WIDTH HEIGHT [NODE WIDTH HEIGHT ...]\n",
+            "usage: %s OUTPUT FD READY_FD NODE WIDTH HEIGHT "
+            "[NODE WIDTH HEIGHT ...]\n",
             argv[0]
         );
         return 2;
     }
     memset(&application, 0, sizeof(application));
+    application.ready_fd = -1;
+    application.egl_display = EGL_NO_DISPLAY;
     application.output_path = argv[1];
     errno = 0;
     descriptor = strtol(argv[2], &end, 10);
@@ -915,7 +1336,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "invalid PipeWire descriptor\n");
         return 2;
     }
-    application.n_streams = (uint32_t)((argc - 3) / 3);
+    errno = 0;
+    end = NULL;
+    application.ready_fd = (int)strtol(argv[3], &end, 10);
+    if (
+        errno != 0 || !end || *end != '\0' || application.ready_fd < 0
+    ) {
+        fprintf(stderr, "invalid cursor readiness descriptor\n");
+        return 2;
+    }
+    application.n_streams = (uint32_t)((argc - 4) / 3);
     if (
         application.n_streams == 0 ||
         application.n_streams > UUCI_MAX_STREAMS
@@ -927,15 +1357,18 @@ int main(int argc, char **argv)
         struct stream_data *stream_data = &application.streams[index];
         stream_data->application = &application;
         if (
-            !parse_unsigned(argv[3 + index * 3], &stream_data->node) ||
-            !parse_unsigned(argv[4 + index * 3], &stream_data->width) ||
-            !parse_unsigned(argv[5 + index * 3], &stream_data->height)
+            !parse_unsigned(argv[4 + index * 3], &stream_data->node) ||
+            !parse_unsigned(argv[5 + index * 3], &stream_data->width) ||
+            !parse_unsigned(argv[6 + index * 3], &stream_data->height)
         ) {
             fprintf(stderr, "invalid PipeWire stream descriptor\n");
             return 2;
         }
     }
 
+    if (!initialize_modifier_query(&application)) {
+        goto cleanup;
+    }
     pw_init(&argc, &argv);
     application.loop = pw_main_loop_new(NULL);
     if (!application.loop) {
@@ -1010,6 +1443,9 @@ int main(int argc, char **argv)
     result = application.failed ? 1 : 0;
 
 cleanup:
+    if (application.ready_fd >= 0) {
+        close(application.ready_fd);
+    }
     for (index = 0; index < (int)application.n_streams; ++index) {
         free(application.streams[index].cursor.pixels);
         if (application.streams[index].stream) {
@@ -1026,5 +1462,8 @@ cleanup:
         pw_main_loop_destroy(application.loop);
     }
     pw_deinit();
+    if (application.egl_display != EGL_NO_DISPLAY) {
+        eglTerminate(application.egl_display);
+    }
     return result;
 }

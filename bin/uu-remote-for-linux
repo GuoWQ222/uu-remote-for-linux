@@ -1926,7 +1926,7 @@ input_bridge_process_active() {
     local pid="" cmdline=""
 
     [[ -r $input_bridge_status ]] || return 1
-    pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+    pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] || return 1
     cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
@@ -1949,15 +1949,15 @@ input_bridge_status_label() {
     elif [[ ! -r $input_bridge_status ]]; then
         printf '就绪（待应用启动）'
     else
-        state=$(sed -n 's/.*"state": "\([^"]*\)".*/\1/p' \
+        state=$(sed -n 's/.*"state":[[:space:]]*"\([^"]*\)".*/\1/p' \
             "$input_bridge_status" | head -n1)
-        hook_pid=$(sed -n 's/.*"hook_pid": \([0-9][0-9]*\).*/\1/p' \
+        hook_pid=$(sed -n 's/.*"hook_pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
         hook_version=$(sed -n \
-            's/.*"hook_version": \([0-9][0-9]*\).*/\1/p' \
+            's/.*"hook_version":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
         backend=$(sed -n \
-            's/.*"backend": "\([^"]*\)".*/\1/p' \
+            's/.*"backend":[[:space:]]*"\([^"]*\)".*/\1/p' \
             "$input_bridge_status" | head -n1)
         if [[ $desktop_backend == wayland-xwayland &&
             $backend != wayland && $backend != wayland-portal ]]; then
@@ -2006,13 +2006,13 @@ input_bridge_event_label() {
         return
     }
     mouse_moves=$(sed -n \
-        's/.*"mouse_moves": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"mouse_moves":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     mouse_buttons=$(sed -n \
-        's/.*"mouse_buttons": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"mouse_buttons":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     keyboard_packets=$(sed -n \
-        's/.*"keyboard_packets": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"keyboard_packets":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     printf '移动 %s / 鼠标按钮 %s / 键盘 %s' \
         "${mouse_moves:-0}" "${mouse_buttons:-0}" \
@@ -2027,10 +2027,10 @@ input_bridge_target_label() {
         return
     }
     target=$(sed -n \
-        's/.*"absolute_target": \[\([^]]*\)\].*/\1/p' \
+        's/.*"absolute_target":[[:space:]]*\[\([^]]*\)\].*/\1/p' \
         "$input_bridge_status" | head -n1)
     source=$(sed -n \
-        's/.*"absolute_target_source": "\([^"]*\)".*/\1/p' \
+        's/.*"absolute_target_source":[[:space:]]*"\([^"]*\)".*/\1/p' \
         "$input_bridge_status" | head -n1)
     target=${target//,/ }
     read -r origin_x origin_y width height <<<"$target"
@@ -2045,7 +2045,7 @@ input_bridge_target_label() {
 }
 
 native_cursor_status_label() {
-    local bridge_state="" sequence="" width="" height=""
+    local input_state="" bridge_state="" sequence="" width="" height=""
     local hook_active="" calls="" updates="" fallbacks=""
     local returned_changes=""
 
@@ -2053,17 +2053,19 @@ native_cursor_status_label() {
         printf '就绪（待应用启动）'
         return
     fi
+    input_state=$(sed -n 's/.*"state":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$input_bridge_status" | head -n1)
     bridge_state=$(sed -n \
-        's/.*"cursor_state": "\([^"]*\)".*/\1/p' \
+        's/.*"cursor_state":[[:space:]]*"\([^"]*\)".*/\1/p' \
         "$input_bridge_status" | head -n1)
     sequence=$(sed -n \
-        's/.*"cursor_sequence": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"cursor_sequence":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     width=$(sed -n \
-        's/.*"cursor_width": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"cursor_width":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     height=$(sed -n \
-        's/.*"cursor_height": \([0-9][0-9]*\).*/\1/p' \
+        's/.*"cursor_height":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$input_bridge_status" | head -n1)
     if [[ -r $wayland_frame_hook_status ]]; then
         hook_active=$(ini_section_value \
@@ -2084,10 +2086,16 @@ native_cursor_status_label() {
                 "$wayland_frame_hook_status" cursor height)
         fi
     fi
-    if [[ $bridge_state == embedded ]]; then
+    if [[ $input_state == stopped ]]; then
+        printf '已停止'
+    elif [[ $bridge_state == embedded ]]; then
         printf '生效中（Wayland Portal 嵌入帧；UU 固定指针已抑制）'
     elif [[ $bridge_state != active ]]; then
-        printf 'X11 光标图像未建立'
+        if [[ $desktop_backend == wayland-xwayland ]]; then
+            printf 'Wayland Portal 光标元数据未建立'
+        else
+            printf 'X11 光标图像未建立'
+        fi
     elif [[ $hook_active == 1 ]]; then
         if [[ $desktop_backend == wayland-xwayland ]]; then
             printf '生效中（Wayland Portal 元数据 → HCURSOR；%sx%s；序列 %s；调用/更新/返回变化/回退 %s/%s/%s/%s）' \
@@ -2100,7 +2108,11 @@ native_cursor_status_label() {
                 "${calls:-0}" "${updates:-0}" "${fallbacks:-0}"
         fi
     else
-        printf 'X11 图像已发布，等待 Win64 光标钩子'
+        if [[ $desktop_backend == wayland-xwayland ]]; then
+            printf 'Wayland Portal 元数据已发布，等待 Win64 光标钩子'
+        else
+            printf 'X11 图像已发布，等待 Win64 光标钩子'
+        fi
     fi
 }
 
@@ -2112,18 +2124,22 @@ wayland_capture_status_label() {
     elif [[ ! -r $input_bridge_status ]]; then
         printf '就绪（待应用启动）'
     else
-        state=$(sed -n 's/.*"capture_state": "\([^"]*\)".*/\1/p' \
+        state=$(sed -n 's/.*"capture_state":[[:space:]]*"\([^"]*\)".*/\1/p' \
             "$input_bridge_status" | head -n1)
-        bridge_state=$(sed -n 's/.*"state": "\([^"]*\)".*/\1/p' \
+        bridge_state=$(sed -n 's/.*"state":[[:space:]]*"\([^"]*\)".*/\1/p' \
             "$input_bridge_status" | head -n1)
         frames=$(sed -n \
-            's/.*"capture_frames": \([0-9][0-9]*\).*/\1/p' \
+            's/.*"capture_frames":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
         transport=$(sed -n \
-            's/.*"capture_transport": "\([^"]*\)".*/\1/p' \
+            's/.*"capture_transport":[[:space:]]*"\([^"]*\)".*/\1/p' \
             "$input_bridge_status" | head -n1)
         if [[ $bridge_state == error ]]; then
             printf '异常（详见输入桥日志）'
+            return
+        fi
+        if [[ $bridge_state == stopped ]]; then
+            printf '已停止'
             return
         fi
         case $state in
@@ -2149,7 +2165,7 @@ wayland_capture_status_label() {
 }
 
 wayland_frame_hook_status_label() {
-    local version="" status_bits="" rendered="" calls=""
+    local bridge_state="" version="" status_bits="" rendered="" calls=""
 
     if [[ $desktop_backend != wayland-xwayland ]]; then
         printf 'X11 无需桥接'
@@ -2159,6 +2175,14 @@ wayland_frame_hook_status_label() {
         printf '就绪（待远控采集）'
         return
     fi
+    if [[ -r $input_bridge_status ]]; then
+        bridge_state=$(sed -n 's/.*"state":[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$input_bridge_status" | head -n1)
+        if [[ $bridge_state == stopped ]]; then
+            printf '就绪（待应用启动）'
+            return
+        fi
+    fi
     version=$(ini_section_value "$wayland_frame_hook_status" hook version)
     status_bits=$(ini_section_value \
         "$wayland_frame_hook_status" hook status_bits)
@@ -2166,12 +2190,22 @@ wayland_frame_hook_status_label() {
     rendered=$(ini_section_value \
         "$wayland_frame_hook_status" capture rendered)
     if [[ $version =~ ^[0-9]+$ && $version -ge 7 &&
-        $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 28) == 28 )); then
-        printf '完整（v%s；GDI %s/%s）' \
-            "$version" "${rendered:-0}" "${calls:-0}"
-    else
-        printf '未安装/不完整'
+        $status_bits =~ ^[0-9]+$ ]]; then
+        if (( (status_bits & 28) == 28 )); then
+            printf '完整（v%s；GDI %s/%s）' \
+                "$version" "${rendered:-0}" "${calls:-0}"
+            return
+        fi
+        # The streamer hooks are installed before the first remote capture.
+        # The shared frame is intentionally mapped lazily from the first GDI
+        # call, so status bits 4+8 with zero calls are a ready idle state rather
+        # than an incomplete installation.
+        if (( (status_bits & 12) == 12 )) && [[ ${calls:-0} == 0 ]]; then
+            printf '已安装（v%s；等待远控采集）' "$version"
+            return
+        fi
     fi
+    printf '未安装/不完整'
 }
 
 portrait_original_quality_status_label() {
@@ -2381,7 +2415,7 @@ stop_input_bridge_runtime() {
             "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
     if [[ -r $input_bridge_status ]]; then
-        pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+        pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$input_bridge_status" | head -n1)
     fi
     if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then
@@ -2875,7 +2909,7 @@ stop_managed_runtime_services() {
             "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
     if [[ -r $keyboard_bridge_status ]]; then
-        pid=$(sed -n 's/.*"pid": \([0-9][0-9]*\).*/\1/p' \
+        pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$keyboard_bridge_status" | head -n1)
     fi
     if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then

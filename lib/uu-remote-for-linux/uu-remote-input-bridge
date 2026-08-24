@@ -18,6 +18,7 @@ import hmac
 import json
 import mmap
 import os
+import select
 import secrets
 import signal
 import socket
@@ -90,10 +91,12 @@ PORTAL_SESSION = "org.freedesktop.portal.Session"
 PORTAL_DEVICE_KEYBOARD = 1
 PORTAL_DEVICE_POINTER = 2
 PORTAL_SOURCE_MONITOR = 1
+PORTAL_CURSOR_EMBEDDED = 2
 PORTAL_CURSOR_METADATA = 4
 PORTAL_PERSIST_APPLICATION = 2
 PORTAL_REQUEST_TIMEOUT_SECONDS = 180
 CAPTURE_START_TIMEOUT_SECONDS = 10
+CURSOR_START_TIMEOUT_SECONDS = 5
 CAPTURE_PIPEWIRE_BUFFERS = 3
 CAPTURE_TRANSPORT_DMABUF = "dmabuf-native"
 CAPTURE_NATIVE_STAGE_SLOTS = 3
@@ -937,6 +940,19 @@ class WaylandCaptureStartupError(RuntimeError):
     """Portal authorization succeeded, but its capture transport did not."""
 
 
+def selected_portal_cursor_mode() -> int:
+    name = os.environ.get(
+        "UU_REMOTE_WAYLAND_CURSOR_MODE", "metadata"
+    ).strip().casefold()
+    if name == "embedded":
+        return PORTAL_CURSOR_EMBEDDED
+    if name == "metadata":
+        return PORTAL_CURSOR_METADATA
+    raise RuntimeError(
+        "UU_REMOTE_WAYLAND_CURSOR_MODE 仅支持 embedded 或 metadata"
+    )
+
+
 class WaylandPortalBackend:
     """Wayland keyboard and pointer injection through XDG RemoteDesktop."""
 
@@ -944,6 +960,7 @@ class WaylandPortalBackend:
     def __init__(self, state_dir: Path, frame_path: Path) -> None:
         self.state_dir = state_dir
         self.frame_path = frame_path
+        self.portal_cursor_mode = selected_portal_cursor_mode()
         self.cursor_path = frame_path.with_name("uu-remote-native-cursor.bin")
         helper_override = os.environ.get(
             "UU_REMOTE_PIPEWIRE_CURSOR_HELPER", ""
@@ -1382,13 +1399,23 @@ class WaylandPortalBackend:
             None,
         )
         cursor_modes = int(value.unpack()[0])
-        if cursor_modes & PORTAL_CURSOR_METADATA == 0:
+        requested_cursor_mode = selected_portal_cursor_mode()
+        if cursor_modes & requested_cursor_mode == 0:
             raise RuntimeError(
-                "当前 ScreenCast Portal 不支持动态光标元数据"
+                "当前 ScreenCast Portal 不支持请求的光标模式："
+                + (
+                    "embedded"
+                    if requested_cursor_mode == PORTAL_CURSOR_EMBEDDED
+                    else "metadata"
+                )
             )
 
     @property
     def cursor_state(self) -> str:
+        if getattr(
+            self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
+        ) == PORTAL_CURSOR_EMBEDDED:
+            return "embedded"
         if self.fake_trace:
             return "metadata"
         process = self.cursor_helper_process
@@ -1524,10 +1551,14 @@ class WaylandPortalBackend:
             "handle_token": self.GLib.Variant("s", self._token("sources")),
             "types": self.GLib.Variant("u", PORTAL_SOURCE_MONITOR),
             "multiple": self.GLib.Variant("b", True),
-            # Keep the cursor out of the video and request its authoritative
-            # compositor bitmap separately.  The native cursor sidecar
-            # publishes that metadata to the Wine hook.
-            "cursor_mode": self.GLib.Variant("u", PORTAL_CURSOR_METADATA),
+            # Embedded mode is the reliable DMA-BUF path on GNOME 46: Mutter
+            # composites its authoritative cursor into the captured frame and
+            # the Wine hook replaces UU's local pointer with a transparent
+            # HCURSOR.  Metadata remains available as an explicit diagnostic
+            # mode for compositors that support it with a second consumer.
+            "cursor_mode": self.GLib.Variant(
+                "u", self.portal_cursor_mode
+            ),
         }
         if restore_token:
             device_options["restore_token"] = self.GLib.Variant(
@@ -1625,12 +1656,14 @@ class WaylandPortalBackend:
         if reset_cursor:
             self.cursor_path.unlink(missing_ok=True)
         descriptor = self._open_pipewire_remote()
+        ready_read, ready_write = os.pipe()
         log_descriptor: int | None = None
         try:
             command = [
                 str(self.cursor_helper_path),
                 str(self.cursor_path),
                 str(descriptor),
+                str(ready_write),
             ]
             for stream in self.streams:
                 command.extend(
@@ -1655,14 +1688,45 @@ class WaylandPortalBackend:
                 stdout=log_descriptor,
                 stderr=subprocess.STDOUT,
                 close_fds=True,
-                pass_fds=(descriptor,),
+                pass_fds=(descriptor, ready_write),
             )
+            os.close(ready_write)
+            ready_write = -1
+            poller = select.poll()
+            poller.register(ready_read, select.POLLIN | select.POLLHUP)
+            deadline = time.monotonic() + CURSOR_START_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                process = self.cursor_helper_process
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        "Wayland 动态光标桥在建立 DMA-BUF 连接前停止："
+                        + self._process_exit_detail(int(process.returncode))
+                    )
+                remaining_ms = max(
+                    1,
+                    int((deadline - time.monotonic()) * 1000),
+                )
+                if poller.poll(min(remaining_ms, 100)):
+                    if os.read(ready_read, 1) == b"R":
+                        break
+                    raise RuntimeError(
+                        "Wayland 动态光标桥未确认 DMA-BUF 连接"
+                    )
+            else:
+                raise RuntimeError(
+                    "Wayland 动态光标桥在 5 秒内未建立 DMA-BUF 连接"
+                )
         finally:
             try:
                 if log_descriptor is not None:
                     os.close(log_descriptor)
             finally:
-                os.close(descriptor)
+                for open_descriptor in (ready_read, ready_write, descriptor):
+                    if open_descriptor >= 0:
+                        try:
+                            os.close(open_descriptor)
+                        except OSError:
+                            pass
 
     @staticmethod
     def _process_exit_detail(returncode: int) -> str:
@@ -2301,11 +2365,17 @@ class WaylandPortalBackend:
                 )
                 return False
         self.capture_write_stream = write_stream
-        # Video owns the first link so it fixes the producer at a three-buffer
-        # DMA-BUF pool.  The metadata-only cursor consumer joins afterwards;
-        # starting it first would fix the shared output to MemFd instead.
+        # The cursor consumer deliberately owns the first link.  Its native
+        # helper now negotiates a three-buffer DMA-BUF pool and waits until all
+        # streams are active before video joins, so Mutter allocates both the
+        # cursor metadata and zero-copy buffers in the one shared producer.
+        if getattr(
+            self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
+        ) == PORTAL_CURSOR_METADATA:
+            self._start_cursor_bridge()
+        else:
+            self.cursor_path.unlink(missing_ok=True)
         self._start_capture_pipeline()
-        self._start_cursor_bridge()
         self.capture_state = "active"
 
     def ensure_healthy(self) -> None:
@@ -2334,6 +2404,10 @@ class WaylandPortalBackend:
                 )
         if transport_error:
             raise RuntimeError(transport_error)
+        if getattr(
+            self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
+        ) == PORTAL_CURSOR_EMBEDDED:
+            return
         process = self.cursor_helper_process
         if process is None:
             raise RuntimeError("Wayland PipeWire 动态光标桥未启动")
@@ -3579,11 +3653,13 @@ def watch(
                 native_lock_keys=current_lock_mask is not None,
                 lock_mask=current_lock_mask,
                 lock_generation=endpoint_lock_generation,
-                # X11 supplies cursor pixels through XFixes; Wayland metadata
-                # mode supplies the same UUCI file through the PipeWire
-                # sidecar.  UU therefore always renders exactly one native
-                # controller cursor and never traps a transparent pointer.
-                force_cursor=True,
+                # In metadata/X11 mode UU renders the supplied native cursor.
+                # In embedded Wayland mode Mutter already drew it into the
+                # frame, so the hook returns a transparent controller cursor.
+                force_cursor=(
+                    str(getattr(backend, "cursor_state", ""))
+                    != "embedded"
+                ),
                 # Portal pointer motion bypasses Wine's private cursor.  Feed
                 # the exact normalized input position back to UU instead of
                 # alternating between stale XWayland and tracked coordinates.

@@ -15,8 +15,8 @@ command -v pkg-config >/dev/null 2>&1 || {
     printf '缺少 pkg-config。\n' >&2
     exit 1
 }
-pkg-config --exists libpipewire-0.3 libspa-0.2 || {
-    printf '缺少 libpipewire-0.3-dev。\n' >&2
+pkg-config --exists libpipewire-0.3 libspa-0.2 egl libdrm || {
+    printf '缺少 PipeWire、EGL 或 DRM 开发文件。\n' >&2
     exit 1
 }
 
@@ -33,10 +33,10 @@ trap 'rm -rf -- "$temporary_dir"' EXIT
     -Werror \
     -Wl,--as-needed \
     -Wl,-z,relro,-z,now \
-    $(pkg-config --cflags libpipewire-0.3 libspa-0.2) \
+    $(pkg-config --cflags libpipewire-0.3 libspa-0.2 egl libdrm) \
     -o "$temporary" \
     "$source_file" \
-    $(pkg-config --libs libpipewire-0.3 libspa-0.2)
+    $(pkg-config --libs libpipewire-0.3 libspa-0.2 egl libdrm)
 strip --strip-unneeded --remove-section=.comment "$temporary"
 install -Dm0755 "$temporary" "$output_file"
 printf '%s\n' "$output_file"
