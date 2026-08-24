@@ -28,7 +28,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all wineboot -u \
+WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all \
+    WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d' wineboot -u \
     >/dev/null 2>&1
 install -Dm0644 "$bridge" "$app_dir/powershell.exe"
 install -Dm0644 "$project_root/tests/fixtures/wol-ready.ini" \

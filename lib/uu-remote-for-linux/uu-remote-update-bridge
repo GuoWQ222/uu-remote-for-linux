@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 用法：
   uu-remote-update-bridge setting-enabled SETTING_INI
-  uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL [REQUEST [STATUS [PACKAGE_VERSION]]]]
+  uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL [REQUEST [STATUS [PACKAGE_VERSION [INITIAL_DELAY]]]]]
 EOF
 }
 
@@ -116,11 +116,16 @@ watch_auto_update() {
     local request_file=${6:-}
     local status_file=${7:-}
     local package_version=${8:-unknown}
+    local initial_delay=${9:-0}
     local state=disabled previous_state=""
     local manual_consumed=false
 
     [[ $interval =~ ^[1-9][0-9]*$ ]] || {
         printf '无效的更新检查间隔：%s\n' "$interval" >&2
+        return 2
+    }
+    [[ $initial_delay =~ ^[0-9]+$ ]] || {
+        printf '无效的首次更新检查延迟：%s\n' "$initial_delay" >&2
         return 2
     }
     [[ $launcher == /* && -x $launcher ]] || {
@@ -146,6 +151,17 @@ watch_auto_update() {
 
     write_bridge_status "$status_file" "$package_version" active
     log_message "$log_file" "自动更新兼容桥开始监视 UU 设置"
+    # Let a graphical client finish its slowest cold-start path before the
+    # first automatic check can touch or stop the prefix for a transactional
+    # upgrade. A user-requested in-app update bypasses this grace period.
+    for ((remaining = initial_delay; remaining > 0; remaining--)); do
+        [[ -x $launcher ]] || break
+        if [[ -n $request_file &&
+            ( -e $request_file || -L $request_file ) ]]; then
+            break
+        fi
+        sleep 1
+    done
     while [[ -x $launcher ]]; do
         manual_consumed=false
         if [[ -n $request_file ]] &&
@@ -203,13 +219,13 @@ case $mode in
         auto_update_enabled "$2"
         ;;
     watch)
-        (($# >= 5 && $# <= 9)) || {
+        (($# >= 5 && $# <= 10)) || {
             usage >&2
             exit 2
         }
         watch_auto_update \
             "$2" "$3" "$4" "$5" "${6:-21600}" "${7:-}" \
-            "${8:-}" "${9:-unknown}"
+            "${8:-}" "${9:-unknown}" "${10:-0}"
         ;;
     -h|--help)
         usage

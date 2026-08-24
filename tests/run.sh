@@ -120,6 +120,8 @@ check "PipeWire cursor builder syntax" bash -n \
     "$project_root/scripts/build-pipewire-cursor.sh"
 check "input injector concurrency policy" \
     "$project_root/tests/input-injector-concurrency.sh"
+check "safe startup dependency order" \
+    bash "$project_root/tests/startup-order.sh"
 check "PowerShell bridge builder syntax" bash -n \
     "$project_root/scripts/build-powershell-bridge.sh"
 check "user installer syntax" bash -n "$project_root/scripts/install-user.sh"

@@ -74,10 +74,18 @@ print("PASS input injector single-outstanding-operation policy")
 PY
 
 test_root=$(mktemp -d)
-trap 'rm -rf -- "$test_root"' EXIT
+cleanup() {
+    WINEPREFIX="$test_root/wineprefix" WINEDEBUG=-all \
+        wineserver -k >/dev/null 2>&1 || true
+    WINEPREFIX="$test_root/wineprefix" WINEDEBUG=-all timeout 10s \
+        wineserver -w >/dev/null 2>&1 || true
+    rm -rf -- "$test_root"
+}
+trap cleanup EXIT
 env \
     WINEPREFIX="$test_root/wineprefix" \
     WINEDEBUG=-all \
+    'WINEDLLOVERRIDES=mscoree,mshtml=;winemenubuilder.exe=d' \
     timeout 30s wine \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" \
     --self-test

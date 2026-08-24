@@ -17,6 +17,7 @@ done
 test_root=$(mktemp -d)
 export WINEPREFIX="$test_root/prefix"
 export WINEDEBUG=-all
+export WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d'
 
 cleanup() {
     wineserver -k >/dev/null 2>&1 || true

@@ -38,7 +38,7 @@ install -m 0644 \
 export WINEPREFIX="$test_root/wineprefix"
 export WINEARCH=win64
 export WINEDLLPATH="$hwdecode/wine/x86_64-unix"
-export WINEDLLOVERRIDES='d3d11=n;dxgi=n;nvcuda=b'
+export WINEDLLOVERRIDES='d3d11=n;dxgi=n;nvcuda=b;mscoree,mshtml=;winemenubuilder.exe=d'
 export WINEDEBUG=-all
 export DXVK_LOG_LEVEL=none
 

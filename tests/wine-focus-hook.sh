@@ -68,6 +68,7 @@ prepare_wine_prefix() {
 
     for attempt in 1 2; do
         if WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all \
+            WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d' \
             timeout 30s wineboot -u >/dev/null 2>&1; then
             return 0
         else

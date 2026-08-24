@@ -92,9 +92,13 @@ chmod 0755 "$launcher"
 mkdir -p -- "${request_file%/*}"
 "$bridge" watch \
     "$setting" "$launcher" "$log_file" "$lock_file" 30 "$request_file" \
-    "$status_file" 1.1.15 &
+    "$status_file" 1.1.15 3 &
 watcher_pid=$!
 sleep 0.2
+delayed_count_before=$(grep -c -- '--auto-update-check' "$trace")
+sleep 0.2
+test "$(grep -c -- '--auto-update-check' "$trace")" -eq \
+    "$delayed_count_before"
 : >"$request_file"
 for _attempt in {1..50}; do
     grep -Fxq -- '--upstream-update-handoff' "$trace" && break

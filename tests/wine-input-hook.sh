@@ -8,7 +8,13 @@ readonly hook="$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll"
 readonly injector="$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe"
 readonly shim="$project_root/lib/uu-remote-for-linux/wevtapi.dll"
 readonly compiler="${UU_REMOTE_MINGW_CC:-x86_64-w64-mingw32-gcc}"
+readonly stress_iterations="${UU_REMOTE_WINE_HOOK_STRESS_ITERATIONS:-1}"
 compile_flags=()
+
+[[ $stress_iterations =~ ^[1-9][0-9]*$ ]] || {
+    printf '无效的 Wine 输入钩子压力轮数：%s\n' "$stress_iterations" >&2
+    exit 2
+}
 
 [[ -z ${UU_REMOTE_MINGW_INCLUDE_DIR:-} ]] ||
     compile_flags+=("-isystem" "$UU_REMOTE_MINGW_INCLUDE_DIR")
@@ -95,6 +101,8 @@ readonly streamer_probe="$prefix/drive_c/streamer.dll"
 readonly wol_status="$prefix/drive_c/uu-remote-wol-hook-status.ini"
 readonly frame_file="$prefix/drive_c/uu-remote-wayland-frame.bin"
 readonly frame_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
+readonly native_cursor="$prefix/drive_c/uu-remote-native-cursor.bin"
+readonly native_cursor_baseline="$test_root/native-cursor-baseline.bin"
 mkdir -p "$state_dir"
 export WINEDLLOVERRIDES='wevtapi=n'
 
@@ -104,6 +112,7 @@ prepare_wine_prefix() {
 
     for attempt in 1 2; do
         if WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all \
+            WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d' \
             timeout 30s wineboot -u >/dev/null 2>&1; then
             return 0
         else
@@ -227,33 +236,75 @@ for _ in {1..100}; do
     sleep 0.02
 done
 [[ -s $endpoint ]]
+[[ -s $native_cursor ]]
+cp -- "$native_cursor" "$native_cursor_baseline"
 
-WINEPREFIX="$prefix" WINEDEBUG=-all timeout 30s \
-    wine 'C:\GameViewerServer.exe' \
-    >"$test_root/server.log" 2>&1 &
-server_pid=$!
+# The production watcher must be safe to start before GameViewerServer.  This
+# is the fast-start ordering: the watcher observes an absent target without
+# exiting, then injects each new process generation as it appears.
 WINEPREFIX="$prefix" WINEDEBUG=-all \
     wine 'C:\uu-remote-input-injector.exe' \
     --watch GameViewerServer.exe 'C:\uu-remote-input-hook.dll' \
     >"$test_root/injector.log" 2>&1 &
 injector_pid=$!
-if wait "$server_pid"; then
-    :
-else
-    probe_status=$?
-    printf 'Wine 输入钩子探针失败：exit=%s\n' "$probe_status" >&2
-    exit "$probe_status"
+sleep 1
+kill -0 "$injector_pid"
+if grep -Eq 'inject-(failed|retry|start-retry)|streamer-initialize-retry' \
+    "$test_root/injector.log"; then
+    printf '输入注入监视器在目标进程出现前产生异常。\n' >&2
+    exit 1
 fi
-server_pid=
-for _ in {1..100}; do
-    grep -q '"hook_pid": [1-9]' \
-        "$state_dir/input-bridge-status.json" 2>/dev/null &&
-        grep -q '^flush$' "$trace" 2>/dev/null &&
-        grep -Fq 'preloaded=1' "$wol_status" 2>/dev/null &&
-        grep -Fq 'status_bits=15' "$wol_status" 2>/dev/null &&
-        break
-    sleep 0.02
+
+for ((stress_iteration = 1;
+    stress_iteration <= stress_iterations;
+    stress_iteration++)); do
+    # ProbeStreamerEmbeddedCursor deliberately disables the native cursor for
+    # its fallback assertion.  A real server restart receives a freshly
+    # generated endpoint; restore that generation boundary between stress
+    # iterations so the next process tests startup rather than fixture residue.
+    sed -i 's/^force_cursor=.*/force_cursor=1/' "$endpoint"
+    cp -- "$native_cursor_baseline" "$native_cursor"
+    WINEPREFIX="$prefix" WINEDEBUG=-all timeout 30s \
+        wine 'C:\GameViewerServer.exe' \
+        >"$test_root/server-${stress_iteration}.log" 2>&1 &
+    server_pid=$!
+    if wait "$server_pid"; then
+        :
+    else
+        probe_status=$?
+        printf 'Wine 输入钩子探针第 %s 轮失败：exit=%s\n' \
+            "$stress_iteration" "$probe_status" >&2
+        exit "$probe_status"
+    fi
+    server_pid=
+    for _ in {1..200}; do
+        injected_count=$(grep -Ec '^injected pid=[1-9][0-9]*' \
+            "$test_root/injector.log" 2>/dev/null || true)
+        initialized_count=$(grep -Ec \
+            '^streamer-initialized pid=[1-9][0-9]*' \
+            "$test_root/injector.log" 2>/dev/null || true)
+        if ((injected_count >= stress_iteration &&
+            initialized_count >= stress_iteration)) &&
+            grep -q '"hook_pid": [1-9]' \
+                "$state_dir/input-bridge-status.json" 2>/dev/null &&
+            grep -q '^flush$' "$trace" 2>/dev/null &&
+            grep -Fq 'preloaded=1' "$wol_status" 2>/dev/null &&
+            grep -Fq 'status_bits=15' "$wol_status" 2>/dev/null; then
+            break
+        fi
+        sleep 0.02
+    done
+    kill -0 "$injector_pid"
+    ((injected_count >= stress_iteration))
+    ((initialized_count >= stress_iteration))
+    if grep -Eq 'inject-(failed|retry|start-retry)|streamer-initialize-retry' \
+        "$test_root/injector.log"; then
+        printf '输入注入监视器第 %s 轮产生异常。\n' \
+            "$stress_iteration" >&2
+        exit 1
+    fi
 done
+
 grep -q '"hook_pid": [1-9]' "$state_dir/input-bridge-status.json"
 grep -q '"rejected": 0' "$state_dir/input-bridge-status.json"
 grep -q '^motion 32768 16384 1 1$' "$trace"
@@ -261,8 +312,11 @@ grep -q '^motion-target 2000 640$' "$trace"
 grep -q '^motion 32768 16384 1 0$' "$trace"
 grep -q '^motion-target 2720 360$' "$trace"
 grep -q '^flush$' "$trace"
-if [[ $(grep -c '^keycode 66 1$' "$trace" || true) -ne 2 ]] ||
-    [[ $(grep -c '^keycode 66 0$' "$trace" || true) -ne 2 ]]; then
+expected_caps_events=$((stress_iterations * 2))
+if [[ $(grep -c '^keycode 66 1$' "$trace" || true) -ne \
+        $expected_caps_events ]] ||
+    [[ $(grep -c '^keycode 66 0$' "$trace" || true) -ne \
+        $expected_caps_events ]]; then
     printf 'Caps Lock 没有按两组 down/up 转发到原生输入桥。\n' >&2
     exit 1
 fi
@@ -307,4 +361,5 @@ bridge_pid=
 kill "$injector_pid" 2>/dev/null || true
 wait "$injector_pid" 2>/dev/null || true
 injector_pid=
-printf 'Wine DLL 预加载、共享帧 GDI 截获、输入和 WOL 映射实测通过。\n'
+printf 'Wine DLL 预加载、共享帧 GDI 截获、输入和 WOL 映射连续 %s 轮实测通过。\n' \
+    "$stress_iterations"

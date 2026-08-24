@@ -182,6 +182,7 @@ readonly update_bridge_log="$state_dir/update-bridge.log"
 readonly update_bridge_lock="$state_dir/update-bridge.lock"
 readonly update_bridge_status="$state_dir/update-bridge-status"
 readonly update_bridge_interval="${UU_REMOTE_UPDATE_BRIDGE_INTERVAL:-21600}"
+readonly update_bridge_initial_delay="${UU_REMOTE_UPDATE_BRIDGE_INITIAL_DELAY:-60}"
 readonly update_status_file="$state_dir/update-status"
 readonly update_blocker_manifest="$data_dir/update-blocker-manifest"
 readonly update_original_archive="$data_dir/update-originals"
@@ -2633,6 +2634,7 @@ start_update_bridge() {
             "$upstream_update_request" \
             "$update_bridge_status" \
             "$package_version" \
+            "$update_bridge_initial_delay" \
             9>&-; then
             return
         fi
@@ -2647,6 +2649,7 @@ start_update_bridge() {
         "$upstream_update_request" \
         "$update_bridge_status" \
         "$package_version" \
+        "$update_bridge_initial_delay" \
         9>&- </dev/null >/dev/null 2>&1 &
 }
 
@@ -3921,7 +3924,8 @@ print_diagnostics() {
         "Linux 休眠抑制" "$(native_sleep_inhibition_active && printf '生效中' || printf '未生效')" \
         "防休眠兼容桥" "$([[ -x $sleep_bridge ]] && printf '就绪' || printf '缺失')" \
         "UU 内置更新开关" "$(uu_remote_auto_update_enabled && printf '开启' || printf '关闭')" \
-        "Linux 自动更新" "每次启动检查，运行期间每 ${update_bridge_interval} 秒检查" \
+        "Linux 自动更新" \
+        "图形启动延迟 ${update_bridge_initial_delay} 秒后台检查，运行期间每 ${update_bridge_interval} 秒检查" \
         "安全更新状态" "$(update_status_label)" \
         "自动更新兼容桥" "$(update_runtime_label)" \
         "官方更新器保护" "$(update_blocker_ready && printf '完整' || printf '未安装/不匹配')" \
@@ -5755,7 +5759,17 @@ if [[ ${UU_REMOTE_SKIP_STARTUP_UPDATE:-0} != 1 ]] &&
     [[ -z $decoder_direct_choice ]]; then
     startup_update_requested=true
 fi
-if $startup_update_requested; then
+defer_startup_update_to_watcher=false
+if [[ ${UU_REMOTE_DISABLE_UPDATE_WATCHER:-0} != 1 ]] &&
+    [[ -x $update_bridge ]]; then
+    # Graphical launches must not keep the main window behind a slow network
+    # request. The versioned update watcher starts below and performs the same
+    # transactional, fail-closed check after a short UI grace period. Explicit
+    # update commands do not reach this startup-only branch; disabling the
+    # watcher retains the synchronous fallback.
+    defer_startup_update_to_watcher=true
+fi
+if $startup_update_requested && ! $defer_startup_update_to_watcher; then
     if ! (
         UU_REMOTE_UPDATE_NO_RESTART=1 perform_update_check automatic
     ); then
@@ -5951,6 +5965,10 @@ service_running() {
 ensure_service_running() {
     local attempt
 
+    # Reading the installed version can start Wine's automatic services before
+    # the explicit runtime phase.  Do not issue a redundant start request when
+    # the SCM already reports the service as ready.
+    service_running && return
     run_logged env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
         -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
         -u ALL_PROXY -u NO_PROXY \
@@ -6104,15 +6122,24 @@ start_focus_injector() {
     )
 }
 
+input_hook_active() {
+    local status
+
+    [[ -r $input_bridge_status ]] || return 1
+    status=$(<"$input_bridge_status") || return 1
+    [[ $status == *'"state": "active"'* &&
+        $status =~ \"hook_pid\":[[:space:]]*([1-9][0-9]*) &&
+        $status =~ \"hook_version\":[[:space:]]*([1-9][0-9]*) ]]
+}
+
 wait_input_hook_active() {
-    local attempt state
+    local attempt
 
     [[ ${UU_REMOTE_DISABLE_INPUT_BRIDGE:-0} != 1 ]] || return 0
     [[ $desktop_backend == x11 || $desktop_backend == wayland-xwayland ]] || return 0
     [[ -n ${DISPLAY:-} ]] || return 0
     for ((attempt = 0; attempt < 60; attempt++)); do
-        state=$("$input_bridge" status "$state_dir" 2>/dev/null || true)
-        [[ $state == active ]] && return 0
+        input_hook_active && return 0
         sleep 0.1
     done
     return 1
@@ -6122,6 +6149,13 @@ if ! start_input_bridge; then
     printf '警告：被控端原生键鼠输入不可用，详见 %s\n' \
         "$input_bridge_log" >&2
 fi
+# Start the persistent watcher before GameViewerServer.  It safely waits for
+# an absent target and injects the first process generation as soon as Wine
+# exposes it, instead of making startup wait for a hook that cannot yet be
+# installed by this watcher.
+start_input_injector ||
+    printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
+        "$runtime_log" >&2
 ensure_service_running ||
     die "$service_name 未进入 RUNNING 状态，详见 $setup_log"
 ensure_wine_image_running "$healthd_runtime_unit" "$healthd" ||
@@ -6137,12 +6171,6 @@ elif ! restart_server_after_hwencode_policy; then
 elif ! start_hwencode_policy_watcher; then
     printf '警告：NVENC 档案监视器未启动，UU 重新探测后可能恢复软件编码。\n' >&2
 fi
-wait_input_hook_active ||
-    printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
-        "$input_bridge_log" >&2
-start_input_injector ||
-    printf '警告：Win64 输入钩子注入监视器未能启动，详见 %s\n' \
-        "$runtime_log" >&2
 start_focus_injector ||
     printf '警告：主控焦点稳定器未能启动，切换画质时可能闪烁。\n' >&2
 
@@ -6183,6 +6211,12 @@ fi
 if systemd_user_available; then
     start_systemd_client_launch "${client_args[@]}" ||
         die "无法创建持久的 UU 主界面服务，详见 $runtime_log"
+    # The input injector is a persistent watcher and does not gate the Qt
+    # controller. Confirm it only after dispatching the main window so an
+    # unusually slow server hook cannot add six seconds to visible startup.
+    wait_input_hook_active ||
+        printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
+            "$input_bridge_log" >&2
     exit 0
 fi
 exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \

@@ -471,7 +471,8 @@ test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
     "$expected_streamer_patched_sha"
 "$launcher" --diagnose | grep -q '硬解桥开关.*已启用'
 "$launcher" --diagnose | grep -q 'UU 内置更新开关.*开启'
-"$launcher" --diagnose | grep -q 'Linux 自动更新.*每次启动检查'
+"$launcher" --diagnose | grep -q \
+    'Linux 自动更新.*图形启动延迟 60 秒后台检查'
 "$launcher" --diagnose | grep -q '官方更新器保护.*完整'
 "$launcher" --diagnose | grep -q 'Win64 输入钩子.*完整'
 
@@ -817,9 +818,39 @@ grep -Fq \
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -gt \
     "$client_count_before_failed_startup_update"
 
-# A normal graphical launch checks the official version before starting. A
-# recognizable newer binary receives a freshly generated, hash-bound NVDEC
-# profile without waiting for a package release.
+# Neither login autostart nor a normal application-menu launch may wait for
+# the network. Their versioned background watcher receives a grace period so
+# the client is dispatched before an automatic update can acquire the prefix
+# transaction lock.
+for graphical_launch_arg in --autostart ''; do
+    curl_count_before_graphical_launch=$(grep -c '^CURL ' \
+        "$UU_REMOTE_FAKE_TRACE")
+    client_unit_count_before_graphical_launch=$(grep -c \
+        'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client ' \
+        "$UU_REMOTE_FAKE_TRACE")
+    if [[ -n $graphical_launch_arg ]]; then
+        graphical_launch_args=("$graphical_launch_arg")
+    else
+        graphical_launch_args=()
+    fi
+    UU_REMOTE_DISABLE_UPDATE_WATCHER=0 \
+    UU_REMOTE_FAKE_SYSTEMD_RUN_NOEXEC=1 \
+    UU_REMOTE_FAKE_CURL_FAILURE=dns \
+        "$launcher" "${graphical_launch_args[@]}"
+    test "$(grep -c '^CURL ' "$UU_REMOTE_FAKE_TRACE")" -eq \
+        "$curl_count_before_graphical_launch"
+    test "$(grep -c 'SYSTEMD_RUN .*--unit=uu-remote-for-linux-client ' \
+        "$UU_REMOTE_FAKE_TRACE")" -eq \
+        "$((client_unit_count_before_graphical_launch + 1))"
+    grep -q \
+        'SYSTEMD_RUN .*--unit=uu-remote-for-linux-update .* 1\.1\.42 60$' \
+        "$UU_REMOTE_FAKE_TRACE"
+done
+
+# With the background watcher disabled, a normal graphical launch retains the
+# synchronous compatibility fallback. A recognizable newer binary receives a
+# freshly generated, hash-bound NVDEC profile without waiting for a package
+# release.
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
 client_count_before_startup_update=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
 UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
