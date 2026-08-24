@@ -51,6 +51,19 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf -- "$tmp_dir"' EXIT
 dpkg-deb -x "$package" "$tmp_dir/package"
 dpkg-deb -e "$package" "$tmp_dir/control"
+expected_installed_size=$(
+    find "$tmp_dir/package/usr" -printf '%y\t%s\t%D:%i\t%n\n' | \
+        LC_ALL=C awk -F '\t' '
+            $1 == "f" || $1 == "l" {
+                if ($4 <= 1 || !seen[$3]++)
+                    total += int(($2 + 1023) / 1024)
+                next
+            }
+            { total += 1 }
+            END { print total }
+        '
+)
+[[ $(dpkg-deb -f "$package" Installed-Size) == "$expected_installed_size" ]]
 if find "$tmp_dir/package" -iname '*mutter*' -o -iname '*keyring*' | \
     grep -q .; then
     printf '通用安装包不应包含 Mutter 或 APT keyring 载荷。\n' >&2

@@ -178,7 +178,19 @@ install -Dm0644 "$project_root/third_party/sources/nvenc-nvcuvid-v0.5.tar.xz" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/source/nvenc-nvcuvid-v0.5.tar.xz"
 
 mkdir -p "$stage_dir/DEBIAN"
-installed_size=$(du -sk "$stage_dir/usr" | awk '{print $1}')
+# Match dpkg-gencontrol's content-based calculation instead of using du's
+# allocated blocks, which vary between ext4, overlayfs, and tmpfs builders.
+installed_size=$(
+    find "$stage_dir/usr" -printf '%y\t%s\t%D:%i\t%n\n' | LC_ALL=C awk -F '\t' '
+        $1 == "f" || $1 == "l" {
+            if ($4 <= 1 || !seen[$3]++)
+                total += int(($2 + 1023) / 1024)
+            next
+        }
+        { total += 1 }
+        END { print total }
+    '
+)
 sed \
     -e "s/@VERSION@/$version/g" \
     -e "s/@ARCH@/$arch/g" \
