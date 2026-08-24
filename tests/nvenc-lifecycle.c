@@ -115,7 +115,6 @@ static void *destroy_worker(void *unused)
     pthread_cond_broadcast(&test_condition);
     pthread_mutex_unlock(&test_mutex);
     uu_retire_destroyed_encoder(encoder);
-    uu_unlock_encoder(encoder);
     return NULL;
 }
 
@@ -233,7 +232,6 @@ int main(void)
     if (destroying_encoder != &replacement || !bridged)
         fail("replacement encoder could not be retired for churn test");
     uu_retire_destroyed_encoder(destroying_encoder);
-    uu_unlock_encoder(destroying_encoder);
     pthread_mutex_destroy(&replacement.mutex);
 
     for (index = 0; index < UU_NVENC_RETIRED_ENCODER_LIMIT + 5u; ++index)
@@ -249,7 +247,6 @@ int main(void)
         if (destroying_encoder != &churn[index] || !bridged)
             fail("churn encoder could not enter destruction");
         uu_retire_destroyed_encoder(destroying_encoder);
-        uu_unlock_encoder(destroying_encoder);
         pthread_mutex_destroy(&churn[index].mutex);
     }
     if (uu_retired_encoder_count != UU_NVENC_RETIRED_ENCODER_LIMIT)

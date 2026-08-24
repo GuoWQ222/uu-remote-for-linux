@@ -36,6 +36,8 @@ check "direct release asset builder syntax" bash -n \
 check "native frame helper self-test" /usr/bin/python3 -c \
     'import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); library.uu_frame_helper_self_test.restype = ctypes.c_uint32; raise SystemExit(0 if library.uu_frame_helper_self_test() == 1 else 1)' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
+check "native frame helper sanitized stress" \
+    "$project_root/tests/frame-helper-stress.sh"
 check "PipeWire DMA-BUF capture self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
     --self-test

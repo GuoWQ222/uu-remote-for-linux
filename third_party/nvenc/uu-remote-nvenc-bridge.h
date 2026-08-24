@@ -990,7 +990,6 @@ static NVENCSTATUS uu_destroy_encoder(void *encoder_handle)
     }
     uu_cuDevicePrimaryCtxRelease(encoder->cuda_device);
     uu_retire_destroyed_encoder(encoder);
-    pthread_mutex_unlock(&encoder->mutex);
     pthread_mutex_destroy(&encoder->mutex);
     encoder->magic = 0;
     HeapFree(GetProcessHeap(), 0, encoder);

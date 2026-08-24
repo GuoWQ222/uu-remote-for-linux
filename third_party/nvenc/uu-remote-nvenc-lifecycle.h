@@ -97,10 +97,16 @@ static struct uu_nvenc_encoder *uu_begin_encoder_destroy(
 
 static void uu_cancel_encoder_destroy(struct uu_nvenc_encoder *encoder)
 {
+    /*
+     * Destruction published encoder->destroying while holding the bridge
+     * mutex, so no new caller can acquire the encoder mutex.  Release the
+     * per-encoder lock before taking the bridge lock and keep one global lock
+     * order throughout the bridge: bridge -> encoder, never encoder -> bridge.
+     */
+    pthread_mutex_unlock(&encoder->mutex);
     pthread_mutex_lock(&uu_bridge_mutex);
     encoder->destroying = FALSE;
     pthread_mutex_unlock(&uu_bridge_mutex);
-    pthread_mutex_unlock(&encoder->mutex);
 }
 
 static void uu_retire_destroyed_encoder(struct uu_nvenc_encoder *encoder)
@@ -108,6 +114,13 @@ static void uu_retire_destroyed_encoder(struct uu_nvenc_encoder *encoder)
     struct uu_nvenc_encoder **cursor;
     unsigned int index;
 
+    /*
+     * The destroying tombstone prevents new users from taking encoder->mutex.
+     * Drop it before acquiring the bridge mutex to avoid the reverse of the
+     * lookup path's bridge -> encoder order.  The encoder remains registered
+     * and cannot be freed until this function removes it below.
+     */
+    pthread_mutex_unlock(&encoder->mutex);
     pthread_mutex_lock(&uu_bridge_mutex);
     for (cursor = &uu_encoders; *cursor; cursor = &(*cursor)->next)
         if (*cursor == encoder)
