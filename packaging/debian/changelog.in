@@ -1,0 +1,8 @@
+uu-remote-for-linux (@VERSION@) unstable; urgency=medium
+
+  * Keep graphical startup independent of network update latency.
+  * Generate UU compatibility profiles from current binary semantics.
+  * Ship one adaptive X11 and GNOME Wayland amd64 package.
+  * Add Debian policy metadata, checksums, ELF hardening, and documentation.
+
+ -- Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>  @DEBIAN_DATE@

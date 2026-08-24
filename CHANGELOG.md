@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [1.1.42] - 2026-08-23
 
+- Keep graphical startup independent of network update latency, start the
+  controller before waiting for the persistent input hook, and defer the first
+  automatic update check until the Wine cold-start window has passed. Bring the
+  Debian package in line with Lintian dependency, documentation, checksum,
+  permissions, stripping, and ELF hardening requirements.
 - Remove all shipped UU version/RVA/hash compatibility tables. NVDEC and WOL
   profiles are now derived from each installed official binary, hash-bound,
   and can migrate a legacy patched install only from its verified original

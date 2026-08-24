@@ -21,7 +21,9 @@ fi
     exit 1
 }
 export SOURCE_DATE_EPOCH=$build_source_date_epoch
-readonly release_date build_source_date_epoch
+debian_date=$(LC_ALL=C date -u -d "@$build_source_date_epoch" \
+    '+%a, %d %b %Y %H:%M:%S +0000')
+readonly release_date build_source_date_epoch debian_date
 readonly arch="amd64"
 readonly artifact_name="uu-remote-for-linux"
 readonly output_dir="$project_root/dist"
@@ -128,6 +130,13 @@ install -Dm0644 \
 mkdir -p "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode"
 cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
     "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode/"
+install -d "$stage_dir/usr/share/doc/uu-remote-for-linux/licenses"
+for license_file in "$project_root"/lib/uu-remote-for-linux/hwdecode/licenses/*; do
+    install -m0644 "$license_file" \
+        "$stage_dir/usr/share/doc/uu-remote-for-linux/licenses/${license_file##*/}"
+done
+rm -rf -- "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode/licenses"
+chmod 0644 "$stage_dir"/usr/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/*.so
 install -Dm0644 "$project_root/share/applications/uu-remote-for-linux.desktop" \
     "$stage_dir/usr/share/applications/uu-remote-for-linux.desktop"
 install -Dm0644 \
@@ -144,8 +153,23 @@ install -Dm0644 "$project_root/NOTICE.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/NOTICE.md"
 install -Dm0644 "$project_root/COMPATIBILITY.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/COMPATIBILITY.md"
-install -Dm0644 "$project_root/LICENSE" \
+install -Dm0644 "$project_root/packaging/debian/copyright" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/copyright"
+sed \
+    -e "s/@VERSION@/$version/g" \
+    -e "s/@DEBIAN_DATE@/$debian_date/g" \
+    "$project_root/packaging/debian/changelog.in" > \
+    "$stage_dir/usr/share/doc/uu-remote-for-linux/changelog"
+chmod 0644 "$stage_dir/usr/share/doc/uu-remote-for-linux/changelog"
+gzip -9n "$stage_dir/usr/share/doc/uu-remote-for-linux/changelog"
+install -d "$stage_dir/usr/share/man/man1"
+sed \
+    -e "s/@VERSION@/$version/g" \
+    -e "s/@RELEASE_DATE@/$release_date/g" \
+    "$project_root/share/man/man1/uu-remote-for-linux.1" > \
+    "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
+chmod 0644 "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
+gzip -9n "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
 install -Dm0644 "$project_root/third_party/HWDECODE.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/HWDECODE.md"
 install -Dm0644 "$project_root/third_party/sources/nvcuda-uu-remote-v0.8.tar.xz" \
@@ -164,6 +188,11 @@ install -Dm0755 "$project_root/packaging/debian/postinst" \
     "$stage_dir/DEBIAN/postinst"
 install -Dm0755 "$project_root/packaging/debian/postrm" \
     "$stage_dir/DEBIAN/postrm"
+(
+    cd "$stage_dir"
+    find usr -type f -print0 | LC_ALL=C sort -z | xargs -0 md5sum
+) >"$stage_dir/DEBIAN/md5sums"
+chmod 0644 "$stage_dir/DEBIAN/md5sums"
 
 # dpkg-deb only clamps mtimes newer than SOURCE_DATE_EPOCH. When a release is
 # prepared before its UTC midnight (for example, an Asia-local release date),

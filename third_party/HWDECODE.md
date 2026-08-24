@@ -67,14 +67,7 @@ The source uses Meson and Wine's `winegcc`. With Wine development headers,
 Meson, and Ninja available:
 
 ```bash
-tar -xf third_party/sources/nvcuda-uu-remote-v0.8.tar.xz
-meson setup \
-  --cross-file nvcuda-uu-remote-v0.8/build-wine64.txt \
-  --buildtype release \
-  -Dfakedll=true \
-  build-nvcuda \
-  nvcuda-uu-remote-v0.8
-ninja -C build-nvcuda
+./scripts/build-nvcuda-bridge.sh
 ```
 
 The resulting Unix relay is
@@ -119,5 +112,5 @@ The Win64 end-to-end probe additionally needs MinGW-w64 and
 ## Licenses
 
 The Wine CUDA/CUVID relays and this modification are
-LGPL-2.1-or-later. DXVK is under the zlib license. License texts are installed
-beside the runtime in `hwdecode/licenses/`.
+LGPL-2.1-or-later. DXVK is under the zlib license. Debian packages install the
+license texts under `/usr/share/doc/uu-remote-for-linux/licenses/`.

@@ -30,7 +30,7 @@ trap 'rm -rf -- "$temporary_dir"' EXIT
     -shared \
     -o "$temporary" \
     "$source_file"
-strip --strip-unneeded "$temporary"
+strip --strip-unneeded --remove-section=.comment "$temporary"
 install -Dm0755 "$temporary" "$output_file"
 /usr/bin/python3 - "$output_file" <<'PY'
 import ctypes

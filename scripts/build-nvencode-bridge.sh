@@ -25,18 +25,37 @@ meson setup \
     --cross-file "$source_root/build-wine64.txt" \
     --buildtype release \
     -Dfakedll=true \
+    -Dc_link_args="['-m64','-mwindows','-Wl,-z,relro,-z,now']" \
     --prefix=/usr \
     "$build_root/build" "$source_root"
 ninja -C "$build_root/build"
 DESTDIR="$build_root/stage" meson install -C "$build_root/build"
 
+for unix_relay in nvcuvid.dll.so nvencodeapi64.dll.so; do
+    strip --strip-unneeded --remove-section=.comment \
+        "$build_root/stage/usr/lib/wine/x86_64-unix/$unix_relay"
+    readelf -d \
+        "$build_root/stage/usr/lib/wine/x86_64-unix/$unix_relay" | \
+        grep -Eq 'BIND_NOW|FLAGS_1.*NOW' || {
+        printf '%s 缺少 BIND_NOW。\n' "$unix_relay" >&2
+        exit 1
+    }
+done
+install -Dm0644 \
+    "$build_root/stage/usr/lib/wine/x86_64-unix/nvcuvid.dll.so" \
+    "$destination/x86_64-unix/nvcuvid.dll.so"
 install -Dm0644 \
     "$build_root/stage/usr/lib/wine/x86_64-unix/nvencodeapi64.dll.so" \
     "$destination/x86_64-unix/nvencodeapi64.dll.so"
+install -Dm0644 \
+    "$build_root/stage/usr/lib/wine/x86_64-windows/nvcuvid.dll" \
+    "$destination/x86_64-windows/nvcuvid.dll"
 install -Dm0644 \
     "$build_root/stage/usr/lib/wine/x86_64-windows/nvencodeapi64.dll" \
     "$destination/x86_64-windows/nvencodeapi64.dll"
 
 sha256sum \
+    "$destination/x86_64-unix/nvcuvid.dll.so" \
     "$destination/x86_64-unix/nvencodeapi64.dll.so" \
+    "$destination/x86_64-windows/nvcuvid.dll" \
     "$destination/x86_64-windows/nvencodeapi64.dll"

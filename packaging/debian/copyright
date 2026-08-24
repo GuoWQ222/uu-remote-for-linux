@@ -1,0 +1,37 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: UU Remote for Linux
+Source: https://github.com/GuoWQ222/uu-remote-for-linux
+
+Files: *
+Copyright: 2026 Wenqi Guo
+License: 0BSD
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+ REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+ INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+ LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+ OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ PERFORMANCE OF THIS SOFTWARE.
+
+Files: share/icons/hicolor/256x256/apps/uu-remote-for-linux.png
+Copyright: NetEase, Inc.
+License: NetEase-proprietary
+ The application icon is extracted from the official GameViewer.exe and
+ remains the property of NetEase. It is distributed only for desktop
+ identification of the compatible NetEase UU Remote client.
+
+Files: lib/uu-remote-for-linux/hwdecode/dxvk/*
+Copyright: 2017-2026 Philip Rebohle and DXVK contributors
+License: Zlib
+ The complete license text is installed as
+ /usr/share/doc/uu-remote-for-linux/licenses/DXVK-Zlib.txt.
+
+Files: lib/uu-remote-for-linux/hwdecode/wine/* third_party/nvenc/*
+ third_party/sources/nvcuda-* third_party/sources/nvenc-*
+Copyright: 2018-2026 SveSop contributors and Wine project contributors
+License: LGPL-2.1-or-later
+ The complete relay license texts and corresponding modified source archives
+ are installed with the package documentation.

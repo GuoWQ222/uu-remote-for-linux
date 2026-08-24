@@ -34,6 +34,7 @@ jobs:
             libpipewire-0.3-0 \
             libx11-6 \
             libxml2-utils \
+            lintian \
             python3-gi \
             ripgrep \
             shellcheck \

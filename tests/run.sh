@@ -108,6 +108,8 @@ check "NVENC D3D11 probe builder syntax" bash -n \
     "$project_root/scripts/build-nvenc-d3d11-probe.sh"
 check "NVENC Wine bridge builder syntax" bash -n \
     "$project_root/scripts/build-nvencode-bridge.sh"
+check "nvcuda Wine bridge builder syntax" bash -n \
+    "$project_root/scripts/build-nvcuda-bridge.sh"
 check "update blocker builder syntax" bash -n \
     "$project_root/scripts/build-update-blocker.sh"
 check "input hook builder syntax" bash -n \

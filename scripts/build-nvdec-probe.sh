@@ -15,8 +15,10 @@ build_dir=$(mktemp -d)
 trap 'rm -rf -- "$build_dir"' EXIT
 
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+    -Wl,--as-needed -Wl,-z,relro,-z,now \
     "$source_file" -ldl -o "$build_dir/uu-remote-nvdec-probe"
-strip --strip-unneeded "$build_dir/uu-remote-nvdec-probe"
+strip --strip-unneeded --remove-section=.comment \
+    "$build_dir/uu-remote-nvdec-probe"
 install -Dm0755 "$build_dir/uu-remote-nvdec-probe" "$output_file"
 
 printf '%s\n' "$output_file"

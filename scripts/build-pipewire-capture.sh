@@ -33,13 +33,14 @@ trap 'rm -rf -- "$temporary_dir"' EXIT
     -Wextra \
     -Werror \
     -Wl,--as-needed \
+    -Wl,-z,relro,-z,now \
     $(pkg-config --cflags \
         libpipewire-0.3 libspa-0.2 libdrm egl glesv2) \
     -o "$temporary" \
     "$source_file" \
     $(pkg-config --libs \
         libpipewire-0.3 libspa-0.2 libdrm egl glesv2)
-strip --strip-unneeded "$temporary"
+strip --strip-unneeded --remove-section=.comment "$temporary"
 install -Dm0755 "$temporary" "$output_file"
 printf '%s\n' "$output_file"
 sha256sum "$output_file"

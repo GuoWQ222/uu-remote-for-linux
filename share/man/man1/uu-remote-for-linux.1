@@ -1,0 +1,49 @@
+.TH UU-REMOTE-FOR-LINUX 1 "@RELEASE_DATE@" "uu-remote-for-linux @VERSION@" "User Commands"
+.SH NAME
+uu-remote-for-linux \- run NetEase UU Remote through an isolated Wine prefix
+.SH SYNOPSIS
+.B uu-remote-for-linux
+.RI [ options ]
+.RI [ client-arguments ]
+.SH DESCRIPTION
+.B uu-remote-for-linux
+downloads the official NetEase UU Remote Windows client on first setup and
+runs it in an isolated Wine prefix with native Linux tray, input, update,
+multi-monitor, X11, and GNOME Wayland integration.
+.SH OPTIONS
+.TP
+.B --accept-eula
+Accept the NetEase UU Remote license and continue with first-time setup.
+.TP
+.B --setup-only
+Install or repair the Wine prefix without starting the client.
+.TP
+.B --check-update
+Check for and install the latest official client version immediately.
+.TP
+.B --show
+Show the main window of an already running client.
+.TP
+.B --stop
+Stop the isolated UU Remote Wine prefix and managed user services.
+.TP
+.B --diagnose
+Print read-only compatibility and runtime diagnostics.
+.TP
+.B --list-decoders
+List detected decoding devices and capabilities.
+.TP
+.B --help
+Show the complete command-line option list.
+.SH FILES
+.TP
+.I ~/.local/share/uu-remote-for-linux
+Wine prefix and persistent compatibility state.
+.TP
+.I ~/.local/state/uu-remote-for-linux
+Runtime status and diagnostic logs.
+.SH SEE ALSO
+.BR wine (1),
+.BR systemctl (1)
+.SH AUTHOR
+Wenqi Guo and contributors.
