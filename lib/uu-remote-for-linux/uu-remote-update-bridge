@@ -5,6 +5,7 @@ usage() {
     cat <<'EOF'
 用法：
   uu-remote-update-bridge setting-enabled SETTING_INI
+  uu-remote-update-bridge defer-client-check SETTING_INI LOCK
   uu-remote-update-bridge watch SETTING_INI LAUNCHER LOG LOCK [INTERVAL [REQUEST [STATUS [PACKAGE_VERSION [INITIAL_DELAY]]]]]
 EOF
 }
@@ -37,6 +38,106 @@ auto_update_enabled() {
         fi
     done <"$setting_file"
     return 1
+}
+
+defer_client_update_check() {
+    local setting_file=$1 lock_file=$2
+
+    [[ $setting_file == /* && $lock_file == /* ]] || {
+        printf '客户端设置和策略锁必须是绝对路径。\n' >&2
+        return 2
+    }
+    [[ -f $setting_file && ! -L $setting_file ]] || {
+        printf '客户端设置不是可安全更新的普通文件：%s\n' \
+            "$setting_file" >&2
+        return 1
+    }
+    mkdir -p -- "${lock_file%/*}"
+    exec 7>"$lock_file"
+    flock -w 5 7 || {
+        printf '等待客户端更新策略锁超时。\n' >&2
+        return 1
+    }
+
+    # Keep every unrelated setting byte-for-byte where practical, but make
+    # all settingCenter/AutoUpdate definitions unambiguously false.  The
+    # temporary file is fsynced and atomically renamed, so concurrent Linux
+    # launchers can never expose a truncated INI to the Windows client.
+    /usr/bin/python3 - "$setting_file" <<'PY'
+import os
+import re
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+
+path = Path(sys.argv[1])
+original = path.read_bytes()
+has_bom = original.startswith(b"\xef\xbb\xbf")
+payload = original[3:] if has_bom else original
+text = payload.decode("utf-8")
+newline = "\r\n" if text.count("\r\n") > text.count("\n") / 2 else "\n"
+had_final_newline = text.endswith(("\n", "\r"))
+lines = text.splitlines()
+section = ""
+settings_sections: list[int] = []
+settingcenter_key_found = False
+key_pattern = re.compile(r"^(\s*autoupdate\s*=\s*).*$", re.IGNORECASE)
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1].strip().casefold()
+        if section == "settingcenter":
+            settings_sections.append(index)
+        continue
+    if section in {"settingcenter", "global"} and key_pattern.match(line):
+        lines[index] = key_pattern.sub(r"\g<1>0", line)
+        if section == "settingcenter":
+            settingcenter_key_found = True
+
+if not settings_sections:
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.extend(("[settingCenter]", "AutoUpdate=0"))
+elif not settingcenter_key_found:
+    insert_at = len(lines)
+    first_section = settings_sections[0]
+    for index in range(first_section + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            insert_at = index
+            break
+    lines.insert(insert_at, "AutoUpdate=0")
+
+updated_text = newline.join(lines)
+if had_final_newline or updated_text:
+    updated_text += newline
+updated = (b"\xef\xbb\xbf" if has_bom else b"") + updated_text.encode("utf-8")
+if updated == original:
+    raise SystemExit(0)
+
+mode = stat.S_IMODE(path.stat().st_mode)
+fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(fd, "wb") as temporary:
+        temporary.write(updated)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    os.chmod(temporary_name, mode)
+    os.replace(temporary_name, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+PY
 }
 
 log_message() {
@@ -189,19 +290,17 @@ watch_auto_update() {
             fi
         fi
 
-        # React to a switch change quickly without hitting the release endpoint
-        # every few seconds.  One second slices also make TERM responsive.
+        # The in-app switch is diagnostic only because Linux owns this update
+        # policy.  A transition must not wake the network checker: the launcher
+        # intentionally changes AutoUpdate before showing the client, and an
+        # early transaction could otherwise race that foreground launch.
+        # One-second slices keep TERM and explicit handoff requests responsive.
         for ((remaining = interval; remaining > 0; remaining--)); do
             [[ -x $launcher ]] || break 2
             sleep 1
             if [[ -n $request_file &&
                 ( -e $request_file || -L $request_file ) ]]; then
                 break
-            fi
-            if auto_update_enabled "$setting_file"; then
-                [[ $state == enabled ]] || break
-            else
-                [[ $state == disabled ]] || break
             fi
         done
     done
@@ -217,6 +316,13 @@ case $mode in
             exit 2
         }
         auto_update_enabled "$2"
+        ;;
+    defer-client-check)
+        (($# == 3)) || {
+            usage >&2
+            exit 2
+        }
+        defer_client_update_check "$2" "$3"
         ;;
     watch)
         (($# >= 5 && $# <= 10)) || {

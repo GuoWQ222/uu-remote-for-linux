@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+state_path = Path(os.environ["UU_REMOTE_FAKE_VDISPLAY_STATE"])
+lock_path = state_path.with_suffix(".operation.lock")
+operation_log = state_path.with_suffix(".operations.log")
+
+
+def load() -> dict[str, object]:
+    value = json.loads(state_path.read_text())
+    value.setdefault("projection", "extend")
+    value.setdefault("physical_drift", False)
+    return value
+
+
+def save(value: dict[str, object]) -> None:
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value))
+    temporary.replace(state_path)
+
+
+def status(value: dict[str, object]) -> dict[str, object]:
+    mode = str(value["mode"])
+    width, height = (int(part) for part in mode.split("x"))
+    rotation = str(value["rotation"])
+    if rotation in {"left", "right"}:
+        width, height = height, width
+    active = bool(value["active"])
+    projection = str(value.get("projection", "extend"))
+    physical_drift = bool(value.get("physical_drift", False))
+    virtual_geometry = None
+    if active:
+        virtual_geometry = (
+            [2560, 1440, 1440, 0]
+            if projection == "duplicate"
+            else [width, height, 4000, 0]
+        )
+    outputs = [
+        {
+            "output": "HDMI-0",
+            "connected": True,
+            "primary": False,
+            "active": True,
+            "geometry": [1440, 2560, 0, 0],
+            "rotation": "left",
+            "current_mode": "2560x1440",
+            "current_rate": "74.97",
+            "modes": ["2560x1440"],
+            "mode_rates": {"2560x1440": ["74.97"]},
+        },
+        {
+            "output": "HDMI-1",
+            "connected": True,
+            "primary": True,
+            "active": True,
+            "geometry": [2560, 1440, 1440, 1080 if physical_drift else 0],
+            "rotation": "normal",
+            "current_mode": "2560x1440",
+            "current_rate": "59.95",
+            "modes": ["2560x1440"],
+            "mode_rates": {"2560x1440": ["59.95"]},
+        },
+        {
+            "output": "DP-0",
+            "connected": True,
+            "primary": False,
+            "active": active,
+            "geometry": virtual_geometry,
+            "rotation": rotation if active else None,
+            "current_mode": mode if active else None,
+            "current_rate": str(value.get("rate", "60")) if active else None,
+            "modes": ["1920x1080", "2560x1440", "1600x900", "1280x720"],
+            "mode_rates": {
+                "1920x1080": ["60"],
+                "2560x1440": ["59.95"],
+                "1600x900": ["60"],
+                "1280x720": ["60"],
+            },
+        },
+    ]
+    current_width = max(
+        item["geometry"][0] + item["geometry"][2]
+        for item in outputs
+        if item["active"]
+    )
+    current_height = max(
+        item["geometry"][1] + item["geometry"][3]
+        for item in outputs
+        if item["active"]
+    )
+    return {
+        "desktop": [current_width, current_height],
+        "maximum": [32767, 32767],
+        "outputs": outputs,
+        "xrandr": outputs[-1],
+        "nvidia": {
+            "output": "DP-0",
+            "dpy": "DFP-1",
+            "connected": True,
+            "enabled": active,
+        },
+        "system_xorg_installed": True,
+        "system_edid_installed": True,
+    }
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments[:2] == ["--output", "DP-0"]:
+        arguments = arguments[2:]
+    if not arguments:
+        return 2
+    command = arguments[0]
+    value = load()
+    if command == "status":
+        print(json.dumps(status(value)))
+        return 0
+    if command == "disable":
+        value["active"] = False
+    elif command == "restore-layout":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--layout-json", required=True)
+        options = parser.parse_args(arguments[1:])
+        layout = json.loads(options.layout_json)
+        if not isinstance(layout, list) or not layout:
+            return 2
+        value["active"] = False
+        value["physical_drift"] = False
+    elif command == "enable":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--mode", required=True)
+        parser.add_argument("--rate", required=True)
+        parser.add_argument("--rotate", required=True)
+        parser.add_argument("--projection", choices=("extend", "duplicate"), required=True)
+        options = parser.parse_args(arguments[1:])
+        value.update(
+            active=True,
+            mode=options.mode,
+            rate=options.rate,
+            rotation=options.rotate,
+            projection=options.projection,
+        )
+    else:
+        print(f"unsupported command: {command}", file=sys.stderr)
+        return 2
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("overlapping backend operation", file=sys.stderr)
+            return 9
+        time.sleep(float(os.environ.get("UU_REMOTE_FAKE_VDISPLAY_DELAY", "0.02")))
+        save(value)
+        with operation_log.open("a") as log:
+            log.write(
+                f"{command} {value['mode']} {value['rotation']} "
+                f"{value['projection']}\n"
+            )
+    print(json.dumps({"result": command}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

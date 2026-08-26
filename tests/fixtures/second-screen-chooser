@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -n ${UU_REMOTE_FAKE_SECOND_SCREEN_CHOICE_FILE:-} ]]
+choice=$(<"$UU_REMOTE_FAKE_SECOND_SCREEN_CHOICE_FILE")
+case $choice in
+    扩展|复制) printf '%s\n' "$choice" ;;
+    cancel) exit 1 ;;
+    *) exit 2 ;;
+esac

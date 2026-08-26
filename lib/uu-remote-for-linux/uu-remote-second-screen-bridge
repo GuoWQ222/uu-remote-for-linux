@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Authenticated Wine IDD requests to the native X11 display daemon.
+
+The injected Win64 hook sends a compact request to a random loopback UDP
+port.  A fresh 128-bit token is published in a prefix-local endpoint file for
+each bridge lifetime.  This process is the only component allowed to reach the
+per-user virtual-display Unix socket; Wine never receives that socket path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import secrets
+import signal
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+MAGIC = 0x53535555  # "UUSS" in little-endian byte order
+VERSION = 1
+COMMAND_CREATE = 1
+COMMAND_UPDATE = 2
+COMMAND_REMOVE = 3
+COMMAND_PING = 4
+COMMAND_PREPARE = 5
+VALID_COMMANDS = {
+    COMMAND_CREATE,
+    COMMAND_UPDATE,
+    COMMAND_REMOVE,
+    COMMAND_PING,
+    COMMAND_PREPARE,
+}
+ROTATIONS = {0: "normal", 1: "left", 2: "right", 3: "inverted"}
+HEADER = struct.Struct("<IBBHI16s")
+REQUEST = struct.Struct("<IBBHI16sIIII")
+RESPONSE = struct.Struct("<IBBHI16sII")
+MAX_DAEMON_RESPONSE = 64 * 1024
+DEFAULT_MODE = "1920x1080"
+DEFAULT_RATE = "60"
+VALID_PROJECTIONS = {"extend", "duplicate"}
+CHOOSER_TIMEOUT = 15
+
+COMMAND_NAMES = {
+    COMMAND_CREATE: "create",
+    COMMAND_UPDATE: "update",
+    COMMAND_REMOVE: "remove",
+    COMMAND_PING: "ping",
+    COMMAND_PREPARE: "prepare",
+}
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+def emit_event(event: str, **values: Any) -> None:
+    print(
+        json.dumps(
+            {
+                "event": event,
+                "time_unix": time.time(),
+                **values,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    atomic_write(
+        path,
+        (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(),
+    )
+
+
+def daemon_request(socket_path: Path, command: str, **values: Any) -> dict[str, Any]:
+    request = {
+        "version": 1,
+        "request_id": f"wine-{os.getpid()}-{time.monotonic_ns()}",
+        "command": command,
+        **values,
+    }
+    encoded = (json.dumps(request, separators=(",", ":")) + "\n").encode()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(8.0)
+    try:
+        client.connect(str(socket_path))
+        client.sendall(encoded)
+        chunks = bytearray()
+        while len(chunks) <= MAX_DAEMON_RESPONSE:
+            data = client.recv(4096)
+            if not data:
+                break
+            chunks.extend(data)
+            if b"\n" in data:
+                break
+    finally:
+        client.close()
+    if len(chunks) > MAX_DAEMON_RESPONSE or not chunks.endswith(b"\n"):
+        raise BridgeError("虚拟显示器守护进程响应为空、过长或不完整")
+    try:
+        response = json.loads(chunks)
+    except json.JSONDecodeError as error:
+        raise BridgeError(f"虚拟显示器守护进程响应不是 JSON：{error}") from error
+    if not isinstance(response, dict) or not response.get("ok"):
+        detail = response.get("error", "未知错误") if isinstance(response, dict) else "未知错误"
+        raise BridgeError(f"虚拟显示器守护进程拒绝请求：{detail}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise BridgeError("虚拟显示器守护进程响应缺少状态对象")
+    return result
+
+
+def primary_output(status: dict[str, Any]) -> dict[str, Any] | None:
+    backend = status.get("backend")
+    outputs = backend.get("outputs", []) if isinstance(backend, dict) else []
+    return next(
+        (
+            item
+            for item in outputs
+            if isinstance(item, dict)
+            and item.get("active")
+            and item.get("primary")
+            and item.get("output") != "DP-0"
+        ),
+        None,
+    )
+
+
+def choose_mode(
+    status: dict[str, Any], width: int, height: int, projection: str
+) -> str:
+    backend = status.get("backend")
+    xrandr = backend.get("xrandr") if isinstance(backend, dict) else None
+    modes = xrandr.get("modes", []) if isinstance(xrandr, dict) else []
+    modes = [mode for mode in modes if isinstance(mode, str)]
+    if projection == "duplicate":
+        primary = primary_output(status)
+        requested = primary.get("current_mode") if primary else None
+        if not isinstance(requested, str) or requested not in modes:
+            raise BridgeError("主显示器分辨率不能用于复制模式")
+        return requested
+    requested = f"{width}x{height}" if width and height else DEFAULT_MODE
+    if requested in modes:
+        return requested
+    desired = status.get("desired")
+    current = desired.get("mode") if isinstance(desired, dict) else None
+    if isinstance(current, str) and current in modes:
+        return current
+    if DEFAULT_MODE in modes:
+        return DEFAULT_MODE
+    if not modes:
+        raise BridgeError("虚拟显示器没有可用模式")
+    return modes[0]
+
+
+def choose_rate(status: dict[str, Any], mode: str, requested_millihz: int) -> str:
+    backend = status.get("backend")
+    xrandr = backend.get("xrandr") if isinstance(backend, dict) else None
+    mode_rates = xrandr.get("mode_rates", {}) if isinstance(xrandr, dict) else {}
+    raw_rates = mode_rates.get(mode, []) if isinstance(mode_rates, dict) else []
+    rates: list[tuple[float, str]] = []
+    for raw in raw_rates:
+        if not isinstance(raw, str):
+            continue
+        try:
+            numeric = float(raw)
+        except ValueError:
+            continue
+        if 30 <= numeric <= 240:
+            rates.append((numeric, raw))
+    requested = requested_millihz / 1000 if 30_000 <= requested_millihz <= 240_000 else 60.0
+    if not rates:
+        return DEFAULT_RATE
+    _numeric, selected = min(rates, key=lambda item: (abs(item[0] - requested), item[0]))
+    if abs(float(selected) - requested) > 0.01:
+        emit_event(
+            "rate_normalized",
+            mode=mode,
+            requested=f"{requested:g}",
+            selected=selected,
+        )
+    return selected
+
+
+def choose_projection() -> str:
+    forced = os.environ.get("UU_REMOTE_SECOND_SCREEN_MODE", "").strip().lower()
+    if forced:
+        if forced not in VALID_PROJECTIONS:
+            raise BridgeError(f"无效的预设投影模式：{forced}")
+        return forced
+    chooser = os.environ.get("UU_REMOTE_SECOND_SCREEN_CHOOSER", "zenity")
+    command = [
+        chooser,
+        "--list",
+        "--title=无线副屏显示方式",
+        "--text=请选择手机副屏的显示方式",
+        "--column=模式",
+        "--column=说明",
+        "扩展",
+        "将手机作为独立的扩展屏幕",
+        "复制",
+        "在手机上镜像当前主显示器",
+        "--print-column=1",
+        "--ok-label=确定",
+        "--cancel-label=取消",
+        "--width=520",
+        "--height=300",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=CHOOSER_TIMEOUT,
+        )
+    except FileNotFoundError as error:
+        raise BridgeError(f"找不到无线副屏模式选择器：{chooser}") from error
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError("无线副屏模式选择超时") from error
+    if result.returncode != 0:
+        raise BridgeError("用户取消了无线副屏模式选择")
+    selected = result.stdout.strip()
+    mapping = {"扩展": "extend", "复制": "duplicate"}
+    if selected not in mapping:
+        raise BridgeError(f"模式选择器返回了未知结果：{selected!r}")
+    return mapping[selected]
+
+
+class SecondScreenBridge:
+    def __init__(
+        self,
+        endpoint_path: Path,
+        status_path: Path,
+        daemon_socket: Path,
+        lock_path: Path,
+    ) -> None:
+        self.endpoint_path = endpoint_path
+        self.status_path = status_path
+        self.daemon_socket = daemon_socket
+        self.lock_path = lock_path
+        self.token = secrets.token_bytes(16)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.settimeout(1.0)
+        self.started = time.time()
+        self.requests = 0
+        self.accepted = 0
+        self.rejected = 0
+        self.last_command = "none"
+        self.projection_mode: str | None = None
+        self.pending_geometry: dict[str, str] | None = None
+        self.choice_requests = 0
+        self.last_error: str | None = None
+        self.last_sequence: dict[tuple[str, int], int] = {}
+        self.stopping = False
+
+    def publish_endpoint(self) -> None:
+        port = self.socket.getsockname()[1]
+        data = (
+            "[bridge]\n"
+            f"version={VERSION}\n"
+            f"pid={os.getpid()}\n"
+            f"port={port}\n"
+            f"token={self.token.hex()}\n"
+        ).encode()
+        atomic_write(self.endpoint_path, data)
+
+    def publish_status(self, state: str = "active") -> None:
+        atomic_json(
+            self.status_path,
+            {
+                "protocol_version": VERSION,
+                "pid": os.getpid(),
+                "state": state,
+                "endpoint": str(self.endpoint_path),
+                "daemon_socket": str(self.daemon_socket),
+                "requests": self.requests,
+                "accepted": self.accepted,
+                "rejected": self.rejected,
+                "last_command": self.last_command,
+                "projection_mode": self.projection_mode,
+                "pending_geometry": self.pending_geometry,
+                "choice_requests": self.choice_requests,
+                "last_error": self.last_error,
+                "started_unix": self.started,
+                "updated_unix": time.time(),
+            },
+        )
+
+    def response(self, command: int, sequence: int, ok: bool, error_code: int) -> bytes:
+        return RESPONSE.pack(
+            MAGIC,
+            VERSION,
+            command | 0x80,
+            RESPONSE.size,
+            sequence,
+            self.token,
+            int(ok),
+            error_code,
+        )
+
+    def apply(self, command: int, width: int, height: int, rate_millihz: int, rotation: int) -> None:
+        if command == COMMAND_PING:
+            daemon_request(self.daemon_socket, "ping")
+            self.last_command = "ping"
+            return
+        if command == COMMAND_REMOVE:
+            daemon_request(self.daemon_socket, "remove")
+            self.last_command = "remove"
+            self.projection_mode = None
+            self.pending_geometry = None
+            return
+        status = daemon_request(self.daemon_socket, "status")
+        desired = status.get("desired")
+        active = bool(isinstance(desired, dict) and desired.get("active"))
+        if command == COMMAND_PREPARE:
+            if active:
+                persisted = desired.get("projection") if isinstance(desired, dict) else None
+                if persisted not in VALID_PROJECTIONS:
+                    raise BridgeError("活动中的虚拟显示器缺少有效投影模式")
+                self.projection_mode = str(persisted)
+                self.pending_geometry = None
+                self.last_command = "prepare-active"
+                return
+            self.choice_requests += 1
+            emit_event("choice_started", choice_request=self.choice_requests)
+            projection = choose_projection()
+            # Fail before opening UU's device panel if the selected topology
+            # cannot be represented by the current XRandR outputs.
+            choose_mode(status, 0, 0, projection)
+            self.projection_mode = projection
+            self.pending_geometry = None
+            self.last_command = "prepare"
+            emit_event(
+                "choice_completed",
+                choice_request=self.choice_requests,
+                projection=projection,
+            )
+            return
+        if self.projection_mode is None and active and isinstance(desired, dict):
+            persisted = desired.get("projection")
+            if persisted in VALID_PROJECTIONS:
+                self.projection_mode = str(persisted)
+        if self.projection_mode is None:
+            raise BridgeError("无线副屏尚未在主控入口选择复制或扩展")
+        projection = self.projection_mode
+        mode = choose_mode(status, width, height, projection)
+        rate = choose_rate(status, mode, rate_millihz)
+        orientation = ROTATIONS.get(rotation, "normal")
+        if projection == "duplicate":
+            primary = primary_output(status)
+            if primary and primary.get("rotation") in ROTATIONS.values():
+                orientation = str(primary["rotation"])
+        geometry = {
+            "mode": mode,
+            "rate": rate,
+            "rotation": orientation,
+            "projection": projection,
+        }
+        if command == COMMAND_UPDATE and not active:
+            # UU sends UPDATE_MODES before PLUG_IN.  The Windows IDD contract
+            # only updates the device's pending mode table at this point; the
+            # monitor must remain absent until PLUG_IN.  Activating XRandR here
+            # makes UU see the UUR monitor in both its before/after snapshots,
+            # so it cannot identify the new screen and falls back to primary.
+            self.pending_geometry = geometry
+            self.last_command = "update-pending"
+            emit_event("update_deferred", **geometry)
+            return
+        if (
+            command == COMMAND_CREATE
+            and not active
+            and self.pending_geometry is not None
+            and self.pending_geometry.get("projection") == projection
+        ):
+            geometry = dict(self.pending_geometry)
+        daemon_command = "update" if command == COMMAND_UPDATE and active else "create"
+        daemon_request(
+            self.daemon_socket,
+            daemon_command,
+            **geometry,
+        )
+        if daemon_command == "create":
+            self.pending_geometry = None
+        self.last_command = daemon_command
+
+    def process(self, packet: bytes, address: tuple[str, int]) -> bytes | None:
+        started = time.monotonic()
+        self.requests += 1
+        if len(packet) != REQUEST.size or address[0] != "127.0.0.1":
+            self.rejected += 1
+            self.last_error = "请求长度或来源无效"
+            return None
+        magic, version, command, size, sequence, token, width, height, rate, rotation = REQUEST.unpack(packet)
+        if (
+            magic != MAGIC
+            or version != VERSION
+            or size != REQUEST.size
+            or command not in VALID_COMMANDS
+            or not secrets.compare_digest(token, self.token)
+        ):
+            self.rejected += 1
+            self.last_error = "协议头或令牌无效"
+            return None
+        previous = self.last_sequence.get(address, 0)
+        if sequence == 0 or (previous and sequence <= previous):
+            self.rejected += 1
+            self.last_error = "请求序列过期或重放"
+            return self.response(command, sequence, False, 2)
+        self.last_sequence[address] = sequence
+        command_name = COMMAND_NAMES[command]
+        emit_event(
+            "request_started",
+            command=command_name,
+            sequence=sequence,
+        )
+        try:
+            self.apply(command, width, height, rate, rotation)
+        except (BridgeError, OSError, TimeoutError) as error:
+            self.rejected += 1
+            self.last_error = str(error)
+            emit_event(
+                "request_failed",
+                command=command_name,
+                sequence=sequence,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                error=self.last_error,
+            )
+            return self.response(command, sequence, False, 3)
+        self.accepted += 1
+        self.last_error = None
+        emit_event(
+            "request_completed",
+            command=command_name,
+            sequence=sequence,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+            projection=self.projection_mode,
+        )
+        return self.response(command, sequence, True, 0)
+
+    def run(self) -> None:
+        self.publish_endpoint()
+        self.publish_status()
+        while not self.stopping:
+            try:
+                packet, address = self.socket.recvfrom(4096)
+            except TimeoutError:
+                self.publish_status()
+                continue
+            reply = self.process(packet, address)
+            if reply is not None:
+                self.socket.sendto(reply, address)
+            self.publish_status()
+        self.publish_status("stopped")
+
+
+def check(daemon_socket: Path) -> int:
+    try:
+        status = daemon_request(daemon_socket, "ping")
+    except (BridgeError, OSError, TimeoutError) as error:
+        print(f"无线副屏桥依赖检查失败：{error}", file=os.sys.stderr)
+        return 1
+    if status.get("protocol_version") != 1:
+        print("无线副屏桥不支持当前虚拟显示器协议", file=os.sys.stderr)
+        return 1
+    print("无线副屏桥依赖检查通过。")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="UU Remote Wine 无线副屏桥")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("daemon_socket", type=Path)
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("endpoint", type=Path)
+    watch_parser.add_argument("status", type=Path)
+    watch_parser.add_argument("daemon_socket", type=Path)
+    watch_parser.add_argument("lock", type=Path)
+    arguments = parser.parse_args()
+    if arguments.command == "check":
+        return check(arguments.daemon_socket)
+
+    arguments.lock.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(arguments.lock.parent, 0o700)
+    lock_handle = arguments.lock.open("a+")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("无线副屏桥已经在运行", file=os.sys.stderr)
+        return 1
+    bridge = SecondScreenBridge(
+        arguments.endpoint,
+        arguments.status,
+        arguments.daemon_socket,
+        arguments.lock,
+    )
+
+    def stop(_signum: int, _frame: Any) -> None:
+        bridge.stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        bridge.run()
+    finally:
+        bridge.socket.close()
+        try:
+            arguments.endpoint.unlink()
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

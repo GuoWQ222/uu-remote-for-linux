@@ -71,12 +71,20 @@ if find "$tmp_dir/package" -iname '*mutter*' -o -iname '*keyring*' | \
 fi
 [[ -x $tmp_dir/package/usr/bin/uu-remote-for-linux ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-input-bridge ]]
+[[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-second-screen-bridge ]]
+[[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-x11-virtual-display ]]
+[[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-virtual-displayd ]]
+[[ -x $tmp_dir/package/usr/bin/uu-remote-virtual-displayctl ]]
+[[ -r $tmp_dir/package/usr/lib/systemd/user/uu-remote-virtual-display.service ]]
+grep -Fq 'ExecStart=/usr/lib/uu-remote-for-linux/uu-remote-virtual-displayd' \
+    "$tmp_dir/package/usr/lib/systemd/user/uu-remote-virtual-display.service"
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-encoder-policy ]]
 [[ $(stat -c %a \
     "$tmp_dir/package/usr/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/nvcuda.dll.so") == 644 ]]
 [[ -r $tmp_dir/package/usr/share/doc/uu-remote-for-linux/changelog.gz ]]
 [[ -r $tmp_dir/package/usr/share/man/man1/uu-remote-for-linux.1.gz ]]
+[[ -r $tmp_dir/package/usr/share/man/man1/uu-remote-virtual-displayctl.1.gz ]]
 [[ -r $tmp_dir/package/usr/share/doc/uu-remote-for-linux/copyright ]]
 grep -Fq 'Copyright: 2026 Wenqi Guo' \
     "$tmp_dir/package/usr/share/doc/uu-remote-for-linux/copyright"

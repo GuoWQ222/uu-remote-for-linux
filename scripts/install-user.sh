@@ -5,7 +5,9 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 readonly user_prefix="${UU_REMOTE_USER_INSTALL_PREFIX:-$HOME/.local}"
 readonly launcher_target="$user_prefix/bin/uu-remote-for-linux"
+readonly virtual_display_control_target="$user_prefix/bin/uu-remote-virtual-displayctl"
 readonly runtime_target="$user_prefix/lib/uu-remote-for-linux"
+readonly virtual_display_unit_target="$user_prefix/share/systemd/user/uu-remote-virtual-display.service"
 readonly desktop_target="$user_prefix/share/applications/uu-remote-for-linux.desktop"
 readonly metainfo_target="$user_prefix/share/metainfo/io.github.guowq222.uu_remote_for_linux.metainfo.xml"
 readonly icon_target="$user_prefix/share/icons/hicolor/256x256/apps/uu-remote-for-linux.png"
@@ -37,6 +39,10 @@ readonly legacy_icon_target="$user_prefix/share/icons/hicolor/scalable/apps/uu-r
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-nvenc-d3d11-probe.exe" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd" &&
+    -x "$project_root/bin/uu-remote-virtual-displayctl" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
@@ -83,6 +89,23 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge
     "$runtime_target/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$runtime_target/uu-remote-input-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge" \
+    "$runtime_target/uu-remote-second-screen-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display" \
+    "$runtime_target/uu-remote-x11-virtual-display"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd" \
+    "$runtime_target/uu-remote-virtual-displayd"
+install -Dm0755 "$project_root/bin/uu-remote-virtual-displayctl" \
+    "$virtual_display_control_target"
+mkdir -p "${virtual_display_unit_target%/*}"
+sed \
+    -e "s|@LIBDIR@|$runtime_target|g" \
+    "$project_root/share/systemd/user/uu-remote-virtual-display.service.in" > \
+    "$virtual_display_unit_target"
+chmod 0644 "$virtual_display_unit_target"
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" \
     "$runtime_target/uu-remote-frame-helper.so"

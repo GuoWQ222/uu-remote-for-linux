@@ -52,6 +52,10 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd" &&
+    -x "$project_root/bin/uu-remote-virtual-displayctl" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
@@ -105,6 +109,24 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-input-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-second-screen-bridge"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-x11-virtual-display"
+install -Dm0755 \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-virtual-displayd"
+install -Dm0755 "$project_root/bin/uu-remote-virtual-displayctl" \
+    "$stage_dir/usr/bin/uu-remote-virtual-displayctl"
+install -d "$stage_dir/usr/lib/systemd/user"
+sed \
+    -e 's|@LIBDIR@|/usr/lib/uu-remote-for-linux|g' \
+    "$project_root/share/systemd/user/uu-remote-virtual-display.service.in" > \
+    "$stage_dir/usr/lib/systemd/user/uu-remote-virtual-display.service"
+chmod 0644 \
+    "$stage_dir/usr/lib/systemd/user/uu-remote-virtual-display.service"
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-frame-helper.so"
@@ -170,6 +192,13 @@ sed \
     "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
 chmod 0644 "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
 gzip -9n "$stage_dir/usr/share/man/man1/uu-remote-for-linux.1"
+sed \
+    -e "s/@VERSION@/$version/g" \
+    -e "s/@RELEASE_DATE@/$release_date/g" \
+    "$project_root/share/man/man1/uu-remote-virtual-displayctl.1" > \
+    "$stage_dir/usr/share/man/man1/uu-remote-virtual-displayctl.1"
+chmod 0644 "$stage_dir/usr/share/man/man1/uu-remote-virtual-displayctl.1"
+gzip -9n "$stage_dir/usr/share/man/man1/uu-remote-virtual-displayctl.1"
 install -Dm0644 "$project_root/third_party/HWDECODE.md" \
     "$stage_dir/usr/share/doc/uu-remote-for-linux/HWDECODE.md"
 install -Dm0644 "$project_root/third_party/sources/nvcuda-uu-remote-v0.8.tar.xz" \

@@ -31,6 +31,20 @@ check "keyboard bridge Python syntax" /usr/bin/python3 -c \
 check "input bridge Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "second-screen bridge Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge"
+check "X11 virtual display manager Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display"
+check "virtual display daemon Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd"
+check "virtual display control Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/bin/uu-remote-virtual-displayctl"
+check "virtual display daemon self-test" \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd" --self-test
 check "direct release asset builder syntax" bash -n \
     "$project_root/packaging/release/build-assets.sh"
 check "native frame helper self-test" /usr/bin/python3 -c \
@@ -102,6 +116,13 @@ check "NVDEC profiler fixture syntax" bash -n \
 check "runtime profiler fixture Python syntax" /usr/bin/python3 -c \
     'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
     "$project_root/tests/fixtures/bin/runtime-profiler"
+check "X11 virtual display xrandr fixture syntax" bash -n \
+    "$project_root/tests/fixtures/x11-virtual-display-xrandr"
+check "X11 virtual display NVIDIA fixture syntax" bash -n \
+    "$project_root/tests/fixtures/x11-virtual-display-nvidia-settings"
+check "virtual display manager fixture Python syntax" /usr/bin/python3 -c \
+    'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' \
+    "$project_root/tests/fixtures/virtual-display-manager"
 check "NVDEC probe builder syntax" bash -n \
     "$project_root/scripts/build-nvdec-probe.sh"
 check "DXGI probe builder syntax" bash -n \
@@ -163,8 +184,18 @@ check "Wine WinHTTP system proxy" \
 check "WOL bridge integration" "$project_root/tests/wol-bridge.sh"
 check "Wine WOL PowerShell bridge" "$project_root/tests/powershell-bridge.sh"
 check "update bridge integration" "$project_root/tests/update-bridge.sh"
+check "async update startup fault and concurrency stress" \
+    bash "$project_root/tests/update-startup-stress.sh"
 check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
+check "wireless second-screen bridge protocol" \
+    "$project_root/tests/second-screen-bridge.sh"
+check "installed UU wireless second-screen binary contract" \
+    "$project_root/tests/second-screen-binary-contract.sh"
+check "X11 NVIDIA virtual display stage 0/1" \
+    "$project_root/tests/x11-virtual-display.sh"
+check "X11 virtual display daemon state machine" \
+    "$project_root/tests/virtual-display-daemon.sh"
 check "Wayland portal input bridge integration" \
     "$project_root/tests/wayland-input-bridge.sh"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
@@ -195,6 +226,16 @@ check "keyboard bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
 check "input bridge exists" test -x \
     "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge"
+check "second-screen bridge exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-second-screen-bridge"
+check "X11 virtual display manager exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-x11-virtual-display"
+check "virtual display daemon exists" test -x \
+    "$project_root/lib/uu-remote-for-linux/uu-remote-virtual-displayd"
+check "virtual display control exists" test -x \
+    "$project_root/bin/uu-remote-virtual-displayctl"
+check "virtual display systemd template exists" test -s \
+    "$project_root/share/systemd/user/uu-remote-virtual-display.service.in"
 # The snippet intentionally defers "$1" expansion to the nested shell.
 # shellcheck disable=SC2016
 check "native frame helper is ELF" bash -c \
@@ -393,8 +434,15 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/tests/system-proxy-wine.sh" \
         "$project_root/tests/wol-bridge.sh" \
         "$project_root/tests/update-bridge.sh" \
+        "$project_root/tests/update-startup-stress.sh" \
         "$project_root/tests/keyboard-bridge.sh" \
         "$project_root/tests/input-bridge.sh" \
+        "$project_root/tests/second-screen-bridge.sh" \
+        "$project_root/tests/second-screen-binary-contract.sh" \
+        "$project_root/tests/x11-virtual-display.sh" \
+        "$project_root/tests/virtual-display-daemon.sh" \
+        "$project_root/tests/fixtures/x11-virtual-display-xrandr" \
+        "$project_root/tests/fixtures/x11-virtual-display-nvidia-settings" \
         "$project_root/tests/wayland-input-bridge.sh" \
         "$project_root/tests/input-injector-concurrency.sh" \
         "$project_root/tests/nvenc-lifecycle.sh" \

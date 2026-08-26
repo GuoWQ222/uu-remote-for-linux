@@ -2,7 +2,53 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.42] - 2026-08-23
+## [1.1.42] - 2026-08-26
+
+- Add the X11 wireless-second-screen compatibility path. A fail-closed Win64
+  hook enables the controller entry only after an authenticated native bridge
+  is reachable, maps the current server's unique virtual-display driver-open
+  semantics and three IDD IOCTLs to the Linux display daemon, and never loads
+  a Windows kernel driver under Wine. The loopback protocol uses a per-process
+  128-bit token, replay rejection, bounded waits, and exact request sizes.
+  Add create/update/remove, concurrency, package, binary-contract, and live
+  XRandR lifecycle validation while preserving physical monitor geometry.
+  Prompt for Duplicate or Extend when a wireless display is selected;
+  Duplicate dynamically mirrors the current XRandR primary output instead of
+  binding to a named connector, while Extend creates an independent display.
+  Move that prompt to the controller entry before its device panel opens, keep
+  all server IOCTL requests non-interactive with an 8-second hard timeout, and
+  reject CREATE/UPDATE without an explicit fresh choice. This prevents an
+  UPDATE-first request from silently reusing stale state or blocking UU for up
+  to two minutes when no chooser is visible. Preserve the IDD lifecycle when
+  UU legitimately sends `UPDATE_MODES` before `PLUG_IN`: cache the pending
+  geometry without activating XRandR, then create DP-0 only for `PLUG_IN`.
+  This keeps the UUR monitor absent from UU's pre-insert snapshot so Extend
+  selects the newly added virtual display instead of falling back to primary.
+  Identify Wine's `UUR0001` monitor as `GameViewer Virtual Display Adapter`
+  inside GameViewerServer only. Wine otherwise labels every XRandR output with
+  the physical NVIDIA adapter name, causing UU's post-insert identity check to
+  return error 503, report an abnormal virtual-screen driver, and remove the
+  successfully created DP-0 display before capture starts.
+  Wait for that adapter to become active in the same server process before the
+  emulated CREATE IOCTL returns. Normalize UU's requested refresh rate to a
+  mode actually advertised by the virtual EDID (for example 144 to 60 Hz).
+  Make active-session topology monitoring fully read-only: the old recovery
+  loop raced transient UU mode/rotation/active-state changes with repeated
+  XRandR writes and could freeze the desktop before UU removed the device.
+  Preserve the native X11 topology while UU stages its exact
+  `ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)` batch; Wine
+  otherwise detaches the newly enabled DP-0 and UU reports an abnormal virtual
+  display driver. The compatibility is process-local and active only between
+  the emulated CREATE and REMOVE IOCTLs. Save the complete physical layout
+  before CREATE and restore its
+  modes, rates, rotations, coordinates, inactive outputs, and primary output
+  atomically after REMOVE, daemon shutdown, or a failed creation rollback.
+- Move the official controller's synchronous startup/idle release check to the
+  existing Linux background update bridge. The launcher atomically disables
+  only the foreground `AutoUpdate` gate before starting the client, keeps the
+  last safe update status locally, and retains the delayed transactional
+  checker with compatibility validation and rollback. Add offline, slow-DNS,
+  update-available, and concurrent-launch stress coverage.
 
 - Keep graphical startup independent of network update latency, start the
   controller before waiting for the persistent input hook, and defer the first

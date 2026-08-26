@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly state_file='@STATE@'
+state=$(<"$state_file")
+
+if [[ $* == *dpys* ]]; then
+    virtual_suffix=''
+    if [[ $state == connected-off ]]; then
+        virtual_suffix=' (connected)'
+    elif [[ $state == connected-on ]]; then
+        virtual_suffix=' (connected, enabled)'
+    fi
+    printf '%s\n' \
+        '6 Display Devices on test:99' \
+        '' \
+        '    [0] test:99[dpy:0] (HDMI-0) (connected, enabled)' \
+        '      Has the following names:' \
+        '        DFP' \
+        '        DFP-0' \
+        '        HDMI-0' \
+        ''
+    printf '    [1] test:99[dpy:1] (DP-0)%s\n' "$virtual_suffix"
+    printf '%s\n' \
+        '      Has the following names:' \
+        '        DFP' \
+        '        DFP-1' \
+        '        DP-0' \
+        '' \
+        '    [2] test:99[dpy:2] (DP-1)' \
+        '      Has the following names:' \
+        '        DFP' \
+        '        DFP-2' \
+        '        DP-1' \
+        '' \
+        '    [3] test:99[dpy:3] (HDMI-1) (connected, enabled)' \
+        '      Has the following names:' \
+        '        DFP' \
+        '        DFP-3' \
+        '        HDMI-1' \
+        ''
+    exit 0
+fi
+
+if [[ $* == *CurrentMetaMode* ]]; then
+    printf '%s\n' 'Attribute CurrentMetaMode: HDMI-0 +0+0, HDMI-1 +1440+0'
+    exit 0
+fi
+
+printf '不支持的 nvidia-settings 测试参数：%s\n' "$*" >&2
+exit 2

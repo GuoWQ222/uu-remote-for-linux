@@ -30,8 +30,9 @@
 
 | | Capability | What you get |
 |---|---|---|
-| 🖥️ | Official client | Wine-based environment, graphical interface, and automatic updates |
+| 🖥️ | Official client | Wine-based environment, graphical interface, and safe background updates that do not block startup |
 | 🖱️ | Native control | Supports X11/Wayland, dual monitors, and primary-display switching |
+| 📱 | Wireless second screen | Choose to mirror the current primary display or extend the desktop on X11 |
 | 🎬 | Hardware video | Supports CPU/OpenH264, NVIDIA NVDEC, and NVENC H.264/HEVC |
 | 🧭 | Linux desktop | Native tray and all UU Remote settings |
 
@@ -78,6 +79,13 @@ Right-click the native tray icon:
 
 Controlled-display choices follow hot-plug, rotation, and layout changes automatically. Viewer windows move automatically only after selecting a managed layout.
 
+On X11, clicking the wireless-second-screen entry first opens a **Duplicate / Extend** chooser and opens the device list only after a mode is selected. Duplicate follows whichever physical output is currently primary; Extend creates an independent display to the right of the existing desktop.
+The bridge selects the nearest refresh rate actually advertised by the virtual
+output. While connected, the native X11 topology is authoritative and the
+daemon observes it without racing UU with background XRandR writes. When the
+phone disconnects or setup fails, the exact pre-connection physical layout is
+restored automatically.
+
 <a id="compatibility"></a>
 ## 🎛️ Compatibility
 
@@ -87,6 +95,7 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 | CPU | amd64 / x86_64 | ✅ | Architecture of the published Debian package |
 | Runtime | Wine 11.1+ | ✅ | Required Wine version |
 | Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
+| Wireless second screen | X11 virtual-display bridge | 🧪 | Duplicate-current-primary and independent-extend modes are supported; Wayland remains disabled |
 | Desktop | GNOME Wayland Portal | ✅ | XWayland UI and Portal input; native three-buffer PipeWire DMA-BUF capture, with explicit failure instead of a hidden transport fallback |
 | Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |
 | Decode | NVIDIA NVDEC | 🧪 | Experimental; UU menu up to 4K/144 fps |

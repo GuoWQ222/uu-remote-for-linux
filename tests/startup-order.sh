@@ -31,6 +31,7 @@ def function_body(name: str) -> str:
 runtime = source[source.index("if ! start_input_bridge") :]
 ordered_calls = [
     "start_input_bridge",
+    "start_second_screen_bridge",
     "start_input_injector",
     "ensure_service_running",
     'ensure_wine_image_running "$healthd_runtime_unit"',
@@ -63,6 +64,13 @@ assert "UU_REMOTE_DISABLE_UPDATE_WATCHER" in defer_condition
 assert '[[ -x $update_bridge ]]' in defer
 assert '"$update_bridge_initial_delay"' in source
 assert 'UU_REMOTE_UPDATE_BRIDGE_INITIAL_DELAY:-60' in source
+assert source.index("defer_official_startup_update_check") < source.index(
+    'start_systemd_client_launch "${client_args[@]}"'
+)
+defer_client_check = function_body("defer_official_startup_update_check")
+assert 'defer-client-check' in defer_client_check
+assert "client_update_policy_lock" in defer_client_check
+assert "UU_REMOTE_DISABLE_UPDATE_WATCHER" in defer_client_check
 
 print("PASS safe startup dependency order")
 PY

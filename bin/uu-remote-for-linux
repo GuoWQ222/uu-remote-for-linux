@@ -46,6 +46,8 @@ readonly sleep_bridge="$runtime_dir/uu-remote-sleep-bridge"
 readonly system_proxy_bridge="${UU_REMOTE_SYSTEM_PROXY_BRIDGE_BIN:-$runtime_dir/uu-remote-system-proxy-bridge}"
 readonly keyboard_bridge="$runtime_dir/uu-remote-keyboard-bridge"
 readonly input_bridge="$runtime_dir/uu-remote-input-bridge"
+readonly second_screen_bridge="$runtime_dir/uu-remote-second-screen-bridge"
+readonly virtual_display_control="${UU_REMOTE_VDISPLAY_CONTROL:-$script_dir/uu-remote-virtual-displayctl}"
 readonly input_hook_source="$runtime_dir/uu-remote-input-hook.dll"
 readonly input_injector_source="$runtime_dir/uu-remote-input-injector.exe"
 readonly powershell_bridge_source="$runtime_dir/uu-remote-powershell-bridge.exe"
@@ -158,6 +160,13 @@ readonly keyboard_bridge_interval="${UU_REMOTE_KEYBOARD_BRIDGE_INTERVAL:-0.15}"
 readonly input_bridge_log="$state_dir/input-bridge.log"
 readonly input_bridge_lock="$state_dir/input-bridge.lock"
 readonly input_bridge_status="$state_dir/input-bridge-status.json"
+readonly second_screen_bridge_log="$state_dir/second-screen-bridge.log"
+readonly second_screen_bridge_lock="$state_dir/second-screen-bridge.lock"
+readonly second_screen_bridge_status="$state_dir/second-screen-bridge-status.json"
+readonly second_screen_bridge_endpoint="$prefix/drive_c/uu-remote-second-screen-bridge.ini"
+readonly second_screen_controller_hook_status="$prefix/drive_c/uu-remote-second-screen-controller-status.ini"
+readonly second_screen_server_hook_status="$prefix/drive_c/uu-remote-second-screen-server-status.ini"
+readonly virtual_display_socket="${UU_REMOTE_VDISPLAY_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$EUID}/$app_id/virtual-display.sock}"
 readonly wayland_frame_hook_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 readonly controller_focus_hook_status="$prefix/drive_c/uu-remote-focus-hook-status.ini"
 readonly controller_home_show_request="$prefix/drive_c/uu-remote-home-show.request"
@@ -181,6 +190,7 @@ readonly client_setting_file="$local_appdata/setting.ini"
 readonly update_bridge_log="$state_dir/update-bridge.log"
 readonly update_bridge_lock="$state_dir/update-bridge.lock"
 readonly update_bridge_status="$state_dir/update-bridge-status"
+readonly client_update_policy_lock="$state_dir/client-update-policy.lock"
 readonly update_bridge_interval="${UU_REMOTE_UPDATE_BRIDGE_INTERVAL:-21600}"
 readonly update_bridge_initial_delay="${UU_REMOTE_UPDATE_BRIDGE_INITIAL_DELAY:-60}"
 readonly update_status_file="$state_dir/update-status"
@@ -254,6 +264,7 @@ readonly client_runtime_unit="${app_id}-client"
 readonly update_runtime_unit="${app_id}-update"
 readonly keyboard_runtime_unit="${app_id}-keyboard"
 readonly input_runtime_unit="${app_id}-input"
+readonly second_screen_runtime_unit="${app_id}-second-screen"
 readonly input_injector_runtime_unit="${app_id}-input-injector"
 readonly focus_injector_runtime_unit="${app_id}-focus-injector"
 readonly hwencode_policy_runtime_unit="${app_id}-hwencode-policy"
@@ -1114,6 +1125,26 @@ uu_remote_auto_update_enabled() {
         "$update_bridge" setting-enabled "$client_setting_file"
 }
 
+defer_official_startup_update_check() {
+    [[ ${UU_REMOTE_DISABLE_UPDATE_WATCHER:-0} != 1 ]] || return 0
+    [[ ${UU_REMOTE_ALLOW_UPSTREAM_STARTUP_UPDATE:-0} != 1 ]] || return 0
+    [[ -x $update_bridge && -f $client_setting_file ]] || return 1
+    "$update_bridge" defer-client-check \
+        "$client_setting_file" "$client_update_policy_lock"
+}
+
+startup_update_policy_label() {
+    if [[ ${UU_REMOTE_DISABLE_UPDATE_WATCHER:-0} == 1 ]]; then
+        printf '官方同步检查（Linux 后台桥已禁用）'
+    elif [[ ${UU_REMOTE_ALLOW_UPSTREAM_STARTUP_UPDATE:-0} == 1 ]]; then
+        printf '官方同步检查（显式兼容开关）'
+    elif uu_remote_auto_update_enabled; then
+        printf '待移交（下次正常启动自动处理）'
+    else
+        printf '已移交 Linux 后台（前台仅使用本地状态）'
+    fi
+}
+
 wine_version() {
     local output
 
@@ -1934,6 +1965,107 @@ input_bridge_process_active() {
         $cmdline == *"$input_bridge_endpoint"* ]]
 }
 
+second_screen_bridge_process_active() {
+    local pid="" cmdline=""
+
+    [[ -r $second_screen_bridge_status ]] || return 1
+    pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$second_screen_bridge_status" | head -n1)
+    [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] || return 1
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ $cmdline == *"$second_screen_bridge"* &&
+        $cmdline == *"$second_screen_bridge_endpoint"* &&
+        $cmdline == *"$virtual_display_socket"* ]]
+}
+
+second_screen_bridge_status_label() {
+    local state="" accepted="" rejected="" last_command=""
+
+    if [[ $desktop_backend != x11 ]]; then
+        printf '仅支持 X11 会话'
+    elif [[ ! -x $second_screen_bridge ]]; then
+        printf '运行库缺失'
+    elif ! second_screen_bridge_process_active ||
+        [[ ! -s $second_screen_bridge_endpoint ]]; then
+        printf '就绪（待应用启动）'
+    else
+        state=$(sed -n 's/.*"state":[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$second_screen_bridge_status" | head -n1)
+        accepted=$(sed -n 's/.*"accepted":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "$second_screen_bridge_status" | head -n1)
+        rejected=$(sed -n 's/.*"rejected":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "$second_screen_bridge_status" | head -n1)
+        last_command=$(sed -n 's/.*"last_command":[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$second_screen_bridge_status" | head -n1)
+        if [[ $state == active ]]; then
+            printf '生效中（请求成功/拒绝 %s/%s；最近 %s）' \
+                "${accepted:-0}" "${rejected:-0}" "${last_command:-none}"
+        else
+            printf '%s' "${state:-状态未知}"
+        fi
+    fi
+}
+
+second_screen_hook_status_label() {
+    local status_file=$1 role=$2
+    local version="" status_bits="" candidates="" patches=""
+    local requests="" successes="" failures="" identity_rewrites=""
+    local active_rewrites="" settle_successes="" settle_timeouts=""
+
+    if [[ $desktop_backend != x11 ]]; then
+        printf '仅支持 X11 会话'
+        return
+    fi
+    if [[ ! -r $status_file ]]; then
+        printf '就绪（待应用启动）'
+        return
+    fi
+    version=$(ini_section_value "$status_file" hook version)
+    status_bits=$(ini_section_value "$status_file" hook status_bits)
+    requests=$(ini_section_value "$status_file" bridge requests)
+    successes=$(ini_section_value "$status_file" bridge successes)
+    failures=$(ini_section_value "$status_file" bridge failures)
+    if [[ $role == controller ]]; then
+        candidates=$(ini_section_value \
+            "$status_file" controller candidates)
+        patches=$(ini_section_value "$status_file" controller patches)
+        if [[ $version =~ ^[0-9]+$ && $version -ge 59 &&
+            $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 3) == 3 )); then
+            printf '入口已启用（v%s；语义候选/改写字节 %s/%s；桥 %s/%s）' \
+                "$version" "${candidates:-0}" "${patches:-0}" \
+                "${successes:-0}" "${failures:-0}"
+        else
+            printf '未启用/不完整（v%s；候选 %s；桥 %s/%s）' \
+                "${version:-unknown}" "${candidates:-0}" \
+                "${successes:-0}" "${failures:-0}"
+        fi
+    else
+        candidates=$(ini_section_value \
+            "$status_file" server driver_open_candidates)
+        patches=$(ini_section_value "$status_file" server driver_open_patches)
+        identity_rewrites=$(ini_section_value \
+            "$status_file" server display_identity_rewrites)
+        active_rewrites=$(ini_section_value \
+            "$status_file" server display_identity_active_rewrites)
+        settle_successes=$(ini_section_value \
+            "$status_file" server display_settle_successes)
+        settle_timeouts=$(ini_section_value \
+            "$status_file" server display_settle_timeouts)
+        if [[ $version =~ ^[0-9]+$ && $version -ge 61 &&
+            $status_bits =~ ^[0-9]+$ ]] && (( (status_bits & 45) == 45 )); then
+            printf '驱动兼容层已启用（v%s；语义候选/补丁 %s/%s；虚拟身份改写 %s/%s；适配器就绪/超时 %s/%s；请求 %s，成功/失败 %s/%s）' \
+                "$version" "${candidates:-0}" "${patches:-0}" \
+                "${active_rewrites:-0}" "${identity_rewrites:-0}" \
+                "${settle_successes:-0}" "${settle_timeouts:-0}" \
+                "${requests:-0}" "${successes:-0}" "${failures:-0}"
+        else
+            printf '未启用/不完整（v%s；候选 %s；桥 %s/%s）' \
+                "${version:-unknown}" "${candidates:-0}" \
+                "${successes:-0}" "${failures:-0}"
+        fi
+    fi
+}
+
 input_bridge_status_label() {
     local state="" hook_pid="" hook_version="" backend=""
 
@@ -2434,6 +2566,140 @@ stop_input_bridge_runtime() {
     fi
 }
 
+stop_second_screen_bridge_runtime() {
+    local pid="" cmdline=""
+
+    if systemd_user_available; then
+        systemctl --user stop \
+            "$second_screen_runtime_unit.service" >/dev/null 2>&1 || true
+        systemctl --user reset-failed \
+            "$second_screen_runtime_unit.service" >/dev/null 2>&1 || true
+    fi
+    if [[ -r $second_screen_bridge_status ]]; then
+        pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "$second_screen_bridge_status" | head -n1)
+    fi
+    if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+        if [[ $cmdline == *"$second_screen_bridge"* &&
+            $cmdline == *"$second_screen_bridge_endpoint"* ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+            for _ in {1..50}; do
+                kill -0 "$pid" >/dev/null 2>&1 || break
+                sleep 0.02
+            done
+        fi
+    fi
+    if ! second_screen_bridge_process_active; then
+        rm -f -- "$second_screen_bridge_endpoint"
+    fi
+}
+
+start_second_screen_bridge() {
+    local variable attempt load_state=""
+    local systemd_launched=false
+    local -a command
+
+    [[ ${UU_REMOTE_DISABLE_SECOND_SCREEN_BRIDGE:-0} != 1 ]] || return 0
+    [[ $desktop_backend == x11 ]] || return 0
+    [[ -n ${DISPLAY:-} ]] || {
+        printf '警告：无线副屏桥缺少 X11 DISPLAY。\n' >&2
+        return 1
+    }
+    [[ -x $second_screen_bridge ]] || return 1
+    if [[ ! -S $virtual_display_socket ]] && systemd_user_available; then
+        load_state=$(systemctl --user show --property=LoadState --value \
+            uu-remote-virtual-display.service 2>/dev/null || true)
+        if [[ $load_state != loaded ]]; then
+            systemctl --user daemon-reload \
+                >>"$second_screen_bridge_log" 2>&1 || true
+            load_state=$(systemctl --user show --property=LoadState --value \
+                uu-remote-virtual-display.service 2>/dev/null || true)
+        fi
+        if [[ $load_state == loaded ]]; then
+            systemctl --user start uu-remote-virtual-display.service \
+                >>"$second_screen_bridge_log" 2>&1 || true
+            for ((attempt = 0; attempt < 100; attempt++)); do
+                [[ -S $virtual_display_socket ]] && break
+                sleep 0.05
+            done
+        fi
+    fi
+    if ! "$second_screen_bridge" check "$virtual_display_socket" \
+        >>"$second_screen_bridge_log" 2>&1; then
+        return 1
+    fi
+    # UU identifies its newly created second screen by comparing the monitor
+    # list before and after the virtual-driver request.  A display left active
+    # by an earlier login/session is therefore mistaken for an ordinary screen
+    # and UU falls back to the primary monitor.  Before starting a fresh server
+    # generation, make the dedicated DP output absent from the baseline list.
+    if [[ -x $virtual_display_control ]] &&
+        ! wine_image_running "$server"; then
+        if ! "$virtual_display_control" remove \
+            >>"$second_screen_bridge_log" 2>&1; then
+            printf '警告：无法清理上次会话的无线副屏。\n' >&2
+            return 1
+        fi
+    fi
+    if second_screen_bridge_process_active &&
+        [[ -s $second_screen_bridge_endpoint ]]; then
+        return 0
+    fi
+    stop_second_screen_bridge_runtime
+    rm -f -- "$second_screen_bridge_endpoint"
+
+    if systemd_user_available; then
+        command=(
+            systemd-run
+            --user
+            "--unit=$second_screen_runtime_unit"
+            --collect
+            --quiet
+            --property=Restart=on-failure
+            --property=RestartSec=1s
+            --property=TimeoutStopSec=5s
+            "--property=StandardOutput=append:$second_screen_bridge_log"
+            "--property=StandardError=append:$second_screen_bridge_log"
+        )
+        for variable in DISPLAY XAUTHORITY XDG_RUNTIME_DIR PATH; do
+            if [[ -v $variable ]]; then
+                command+=("--setenv=$variable=${!variable}")
+            fi
+        done
+        command+=(
+            "$second_screen_bridge" watch
+            "$second_screen_bridge_endpoint"
+            "$second_screen_bridge_status"
+            "$virtual_display_socket"
+            "$second_screen_bridge_lock"
+        )
+        if "${command[@]}" 9>&-; then
+            systemd_launched=true
+        else
+            printf '警告：无法创建无线副屏用户服务，改用兼容后台进程。\n' >&2
+        fi
+    fi
+    if ! $systemd_launched &&
+        ! runtime_unit_active "$second_screen_runtime_unit"; then
+        nohup "$second_screen_bridge" watch \
+            "$second_screen_bridge_endpoint" \
+            "$second_screen_bridge_status" \
+            "$virtual_display_socket" \
+            "$second_screen_bridge_lock" \
+            9>&- </dev/null >>"$second_screen_bridge_log" 2>&1 &
+    fi
+
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        if [[ -s $second_screen_bridge_endpoint ]] &&
+            second_screen_bridge_process_active; then
+            return 0
+        fi
+        sleep 0.02
+    done
+    return 1
+}
+
 start_input_bridge() {
     local variable attempt restart_policy="on-failure"
     local systemd_launched=false
@@ -2888,6 +3154,7 @@ stop_tray_proxy_runtime() {
 stop_managed_runtime_services() {
     local pid="" cmdline=""
 
+    stop_second_screen_bridge_runtime
     stop_input_bridge_runtime
     stop_hwencode_policy_runtime
     if systemd_user_available; then
@@ -2897,6 +3164,7 @@ stop_managed_runtime_services() {
             "$healthd_runtime_unit.service" \
             "$keyboard_runtime_unit.service" \
             "$input_runtime_unit.service" \
+            "$second_screen_runtime_unit.service" \
             "$input_injector_runtime_unit.service" \
             "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
         systemctl --user reset-failed \
@@ -2905,6 +3173,7 @@ stop_managed_runtime_services() {
             "$healthd_runtime_unit.service" \
             "$keyboard_runtime_unit.service" \
             "$input_runtime_unit.service" \
+            "$second_screen_runtime_unit.service" \
             "$input_injector_runtime_unit.service" \
             "$focus_injector_runtime_unit.service" >/dev/null 2>&1 || true
     fi
@@ -3938,6 +4207,10 @@ print_diagnostics() {
         "被控端输入事件" "$(input_bridge_event_label)" \
         "被控端鼠标屏幕" "$(input_bridge_target_label)" \
         "原生光标形状" "$(native_cursor_status_label)" \
+        "无线副屏原生桥" "$(second_screen_bridge_status_label)" \
+        "主控无线副屏入口" "$(second_screen_hook_status_label "$second_screen_controller_hook_status" controller)" \
+        "服务端虚拟显示驱动" "$(second_screen_hook_status_label "$second_screen_server_hook_status" server)" \
+        "无线副屏桥日志" "$second_screen_bridge_log" \
         "Wayland 画面桥" "$(wayland_capture_status_label)" \
         "Wayland GDI 画面钩子" "$(wayland_frame_hook_status_label)" \
         "竖屏原画缩放" "$(portrait_original_quality_status_label)" \
@@ -3958,6 +4231,7 @@ print_diagnostics() {
         "Linux 休眠抑制" "$(native_sleep_inhibition_active && printf '生效中' || printf '未生效')" \
         "防休眠兼容桥" "$([[ -x $sleep_bridge ]] && printf '就绪' || printf '缺失')" \
         "UU 内置更新开关" "$(uu_remote_auto_update_enabled && printf '开启' || printf '关闭')" \
+        "启动更新策略" "$(startup_update_policy_label)" \
         "Linux 自动更新" \
         "图形启动延迟 ${update_bridge_initial_delay} 秒后台检查，运行期间每 ${update_bridge_interval} 秒检查" \
         "安全更新状态" "$(update_status_label)" \
@@ -4033,6 +4307,8 @@ check_base_requirements
 [[ -x $input_bridge && -r $input_hook_source &&
     -r $input_injector_source ]] ||
     die "缺少 Linux 原生输入桥或 Win64 输入钩子。请重新安装本项目"
+[[ -x $second_screen_bridge && -x $virtual_display_control ]] ||
+    die "缺少 X11 无线副屏兼容桥：$second_screen_bridge。请重新安装本项目"
 [[ -x $wol_bridge && -x $wol_configure ]] ||
     die "缺少远程开机兼容桥：$wol_bridge。请重新安装本项目"
 [[ -r $powershell_bridge_source ]] ||
@@ -5954,6 +6230,16 @@ if ! sync_autostart_once; then
         "$autostart_log" >&2
 fi
 
+# The official controller performs its own release request before IPC login
+# and the main window.  A cold DNS path can therefore hold the splash screen
+# for every upstream retry.  Linux already owns a transactional updater with
+# cached status, semantic compatibility checks, and rollback.  Disable only
+# the controller's synchronous/idle checker before it starts; the Linux
+# watcher below remains enabled and checks after the graphical grace period.
+if ! defer_official_startup_update_check; then
+    printf '警告：无法将 UU 前台更新检查移交给 Linux 后台；继续启动当前版本。\n' >&2
+fi
+
 $setup_only && exit 0
 
 if hwdecode_enabled; then
@@ -6182,6 +6468,10 @@ wait_input_hook_active() {
 if ! start_input_bridge; then
     printf '警告：被控端原生键鼠输入不可用，详见 %s\n' \
         "$input_bridge_log" >&2
+fi
+if ! start_second_screen_bridge; then
+    printf '警告：无线副屏兼容桥不可用，详见 %s\n' \
+        "$second_screen_bridge_log" >&2
 fi
 # Start the persistent watcher before GameViewerServer.  It safely waits for
 # an absent target and injects the first process generation as soon as Wine

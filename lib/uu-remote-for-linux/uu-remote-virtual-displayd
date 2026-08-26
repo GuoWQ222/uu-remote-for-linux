@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Per-user state machine for the UU Remote X11 virtual display."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import stat
+import struct
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+PROTOCOL_VERSION = 1
+MAX_REQUEST_BYTES = 64 * 1024
+OUTPUT = os.environ.get("UU_REMOTE_VDISPLAY_OUTPUT", "DP-0")
+BASE_STATE_DIR = Path(
+    os.environ.get(
+        "UU_REMOTE_VDISPLAYD_STATE_DIR",
+        str(
+            Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+            / "uu-remote-for-linux"
+        ),
+    )
+)
+BASE_RUNTIME_DIR = Path(
+    os.environ.get(
+        "UU_REMOTE_VDISPLAYD_RUNTIME_DIR",
+        str(
+            Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+            / "uu-remote-for-linux"
+        ),
+    )
+)
+SOCKET_PATH = BASE_RUNTIME_DIR / "virtual-display.sock"
+STATUS_PATH = BASE_STATE_DIR / "virtual-displayd-status.json"
+DESIRED_PATH = BASE_STATE_DIR / "virtual-displayd-desired.json"
+LAYOUT_PATH = BASE_STATE_DIR / "virtual-displayd-layout.json"
+LOG_PATH = BASE_STATE_DIR / "virtual-displayd.log"
+MANAGER = Path(
+    os.environ.get(
+        "UU_REMOTE_VDISPLAYD_MANAGER",
+        str(Path(__file__).resolve().with_name("uu-remote-x11-virtual-display")),
+    )
+)
+MONITOR_INTERVAL = float(os.environ.get("UU_REMOTE_VDISPLAYD_MONITOR_INTERVAL", "2"))
+VALID_ROTATIONS = {"normal", "left", "right", "inverted"}
+VALID_PROJECTIONS = {"extend", "duplicate"}
+VALID_COMMANDS = {"ping", "status", "create", "update", "remove", "recover"}
+
+
+class DisplayDaemonError(RuntimeError):
+    pass
+
+
+class RequestError(DisplayDaemonError):
+    pass
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    atomic_write(
+        path,
+        (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(),
+    )
+
+
+def setup_logging() -> logging.Logger:
+    BASE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(BASE_STATE_DIR, 0o700)
+    logger = logging.getLogger("uu-remote-virtual-displayd")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def stable_display_id() -> str:
+    try:
+        machine_id = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        machine_id = f"uid-{os.getuid()}"
+    edid_path = Path(
+        os.environ.get(
+            "UU_REMOTE_X11_VDISPLAY_SYSTEM_EDID",
+            "/usr/share/uu-remote-for-linux/edid/uu-remote-virtual-display.bin",
+        )
+    )
+    try:
+        edid_hash = hashlib.sha256(edid_path.read_bytes()).hexdigest()
+    except OSError:
+        edid_hash = "missing-edid"
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"io.github.guowq222.uu-remote:x11:{machine_id}:{OUTPUT}:{edid_hash}",
+        )
+    )
+
+
+class ManagerBackend:
+    def __init__(self, manager: Path) -> None:
+        self.manager = manager
+
+    async def _run(self, *arguments: str) -> str:
+        if not self.manager.is_file() or not os.access(self.manager, os.X_OK):
+            raise DisplayDaemonError(f"X11 后端不可执行：{self.manager}")
+        process = await asyncio.create_subprocess_exec(
+            str(self.manager),
+            *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            raise DisplayDaemonError(f"X11 后端超时：{' '.join(arguments)}") from None
+        if process.returncode != 0:
+            detail = (stderr or stdout).decode(errors="replace").strip()
+            raise DisplayDaemonError(
+                f"X11 后端失败（{process.returncode}）：{' '.join(arguments)}：{detail}"
+            )
+        return stdout.decode(errors="replace")
+
+    async def status(self) -> dict[str, Any]:
+        output = await self._run("--output", OUTPUT, "status")
+        try:
+            value = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise DisplayDaemonError(f"X11 后端状态不是 JSON：{error}") from error
+        if not isinstance(value, dict) or "xrandr" not in value:
+            raise DisplayDaemonError("X11 后端状态缺少 xrandr 字段。")
+        return value
+
+    async def enable(self, desired: dict[str, Any]) -> dict[str, Any]:
+        await self._run(
+            "--output",
+            OUTPUT,
+            "enable",
+            "--mode",
+            desired["mode"],
+            "--rate",
+            desired["rate"],
+            "--rotate",
+            desired["rotation"],
+            "--projection",
+            desired["projection"],
+        )
+        return await self.status()
+
+    async def disable(self) -> dict[str, Any]:
+        await self._run("--output", OUTPUT, "disable")
+        return await self.status()
+
+    async def restore_layout(self, outputs: list[dict[str, Any]]) -> dict[str, Any]:
+        await self._run(
+            "--output",
+            OUTPUT,
+            "restore-layout",
+            "--layout-json",
+            json.dumps(outputs, ensure_ascii=False, separators=(",", ":")),
+        )
+        return await self.status()
+
+
+def default_desired() -> dict[str, Any]:
+    return {
+        "active": False,
+        "mode": "1920x1080",
+        "rate": "60",
+        "rotation": "normal",
+        "projection": "extend",
+    }
+
+
+def validate_desired(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RequestError("期望状态必须是 JSON 对象。")
+    desired = default_desired()
+    desired.update({key: value[key] for key in desired if key in value})
+    if not isinstance(desired["active"], bool):
+        raise RequestError("active 必须是布尔值。")
+    if not isinstance(desired["mode"], str) or not re.fullmatch(
+        r"[1-9]\d{2,4}x[1-9]\d{2,4}", desired["mode"]
+    ):
+        raise RequestError(f"无效分辨率：{desired['mode']}")
+    if not isinstance(desired["rate"], str) or not re.fullmatch(
+        r"\d{2,3}(?:\.\d{1,3})?", desired["rate"]
+    ):
+        raise RequestError(f"无效刷新率：{desired['rate']}")
+    numeric_rate = float(desired["rate"])
+    if not 30 <= numeric_rate <= 240:
+        raise RequestError(f"刷新率超出安全范围：{desired['rate']}")
+    if desired["rotation"] not in VALID_ROTATIONS:
+        raise RequestError(f"无效旋转方向：{desired['rotation']}")
+    if desired["projection"] not in VALID_PROJECTIONS:
+        raise RequestError(f"无效投影模式：{desired['projection']}")
+    return desired
+
+
+class VirtualDisplayDaemon:
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self.backend = ManagerBackend(MANAGER)
+        self.display_id = stable_display_id()
+        self.state = "starting"
+        self.desired = default_desired()
+        self.backend_state: dict[str, Any] | None = None
+        self.last_error: str | None = None
+        self.generation = 0
+        self.recovery_count = 0
+        self.layout_snapshot: dict[str, Any] | None = None
+        self.observed_virtual: dict[str, Any] | None = None
+        self.updated_utc = utc_now()
+        self.operation_lock = asyncio.Lock()
+        self.stop_event = asyncio.Event()
+        self.server: asyncio.AbstractServer | None = None
+        self.monitor_task: asyncio.Task[None] | None = None
+
+    def transition(self, state: str, detail: str) -> None:
+        if self.state != state:
+            self.logger.info("state %s -> %s: %s", self.state, state, detail)
+        self.state = state
+        self.updated_utc = utc_now()
+        self.publish_status()
+
+    def public_status(self) -> dict[str, Any]:
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "pid": os.getpid(),
+            "uid": os.getuid(),
+            "display_id": self.display_id,
+            "output": OUTPUT,
+            "state": self.state,
+            "desired": self.desired,
+            "backend": self.backend_state,
+            "generation": self.generation,
+            "recovery_count": self.recovery_count,
+            "layout_snapshot": (
+                {
+                    "captured_utc": self.layout_snapshot.get("captured_utc"),
+                    "outputs": [
+                        item.get("output")
+                        for item in self.layout_snapshot.get("outputs", [])
+                    ],
+                }
+                if self.layout_snapshot
+                else None
+            ),
+            "observed_virtual": self.observed_virtual,
+            "last_error": self.last_error,
+            "socket": str(SOCKET_PATH),
+            "updated_utc": self.updated_utc,
+        }
+
+    def publish_status(self) -> None:
+        atomic_json(STATUS_PATH, self.public_status())
+
+    def persist_desired(self) -> None:
+        atomic_json(
+            DESIRED_PATH,
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "display_id": self.display_id,
+                "output": OUTPUT,
+                "desired": self.desired,
+                "updated_utc": utc_now(),
+            },
+        )
+
+    def capture_layout(self, backend: dict[str, Any]) -> None:
+        outputs: list[dict[str, Any]] = []
+        for item in backend.get("outputs", []):
+            if (
+                not isinstance(item, dict)
+                or item.get("output") == OUTPUT
+                or not item.get("connected")
+            ):
+                continue
+            entry: dict[str, Any] = {
+                "output": item.get("output"),
+                "active": bool(item.get("active")),
+                "primary": bool(item.get("primary")),
+            }
+            if entry["active"]:
+                geometry = item.get("geometry")
+                mode = item.get("current_mode")
+                rate = item.get("current_rate")
+                rotation = item.get("rotation")
+                if (
+                    not isinstance(geometry, list)
+                    or len(geometry) != 4
+                    or not isinstance(mode, str)
+                    or not isinstance(rate, str)
+                    or rotation not in VALID_ROTATIONS
+                ):
+                    raise DisplayDaemonError(
+                        f"无法保存物理显示器布局：{item.get('output')} 状态不完整。"
+                    )
+                entry.update(
+                    mode=mode,
+                    rate=rate,
+                    rotation=rotation,
+                    position=[geometry[2], geometry[3]],
+                )
+            outputs.append(entry)
+        if not outputs or not any(item["active"] for item in outputs):
+            raise DisplayDaemonError("无法保存物理显示器布局：没有活动物理输出。")
+        snapshot = {
+            "protocol_version": PROTOCOL_VERSION,
+            "display_id": self.display_id,
+            "output": OUTPUT,
+            "captured_utc": utc_now(),
+            "outputs": outputs,
+        }
+        atomic_json(LAYOUT_PATH, snapshot)
+        self.layout_snapshot = snapshot
+        self.logger.info(
+            "captured physical layout outputs=%s",
+            ",".join(str(item["output"]) for item in outputs),
+        )
+
+    def load_layout(self) -> bool:
+        if not LAYOUT_PATH.is_file() or LAYOUT_PATH.is_symlink():
+            self.layout_snapshot = None
+            return False
+        try:
+            value = json.loads(LAYOUT_PATH.read_text())
+            if (
+                not isinstance(value, dict)
+                or value.get("protocol_version") != PROTOCOL_VERSION
+                or value.get("display_id") != self.display_id
+                or value.get("output") != OUTPUT
+                or not isinstance(value.get("outputs"), list)
+            ):
+                raise DisplayDaemonError("物理显示器布局快照不属于当前虚拟显示器。")
+            self.layout_snapshot = value
+            return True
+        except (OSError, json.JSONDecodeError, DisplayDaemonError) as error:
+            self.logger.warning("忽略无效物理显示器布局快照：%s", error)
+            self.layout_snapshot = None
+            return False
+
+    def clear_layout(self) -> None:
+        LAYOUT_PATH.unlink(missing_ok=True)
+        self.layout_snapshot = None
+
+    async def restore_layout(self, reason: str) -> dict[str, Any]:
+        if self.layout_snapshot is None and not self.load_layout():
+            return await self.backend.status()
+        assert self.layout_snapshot is not None
+        self.logger.info("restoring physical layout: %s", reason)
+        backend = await self.backend.restore_layout(self.layout_snapshot["outputs"])
+        self.clear_layout()
+        self.backend_state = backend
+        return backend
+
+    def load_desired(self) -> bool:
+        if not DESIRED_PATH.is_file() or DESIRED_PATH.is_symlink():
+            return False
+        try:
+            value = json.loads(DESIRED_PATH.read_text())
+            if value.get("protocol_version") != PROTOCOL_VERSION:
+                raise DisplayDaemonError("持久状态协议版本不兼容。")
+            if value.get("display_id") != self.display_id or value.get("output") != OUTPUT:
+                raise DisplayDaemonError("持久状态不属于当前虚拟显示器。")
+            self.desired = validate_desired(value.get("desired"))
+            return True
+        except (OSError, json.JSONDecodeError, DisplayDaemonError) as error:
+            self.logger.warning("忽略无效持久状态：%s", error)
+            return False
+
+    def adopt_backend(self, backend: dict[str, Any]) -> None:
+        output = backend["xrandr"]
+        desired = default_desired()
+        if output.get("active"):
+            desired.update(
+                {
+                    "active": True,
+                    "mode": output.get("current_mode") or "1920x1080",
+                    "rotation": output.get("rotation") or "normal",
+                }
+            )
+        self.desired = validate_desired(desired)
+        self.persist_desired()
+        self.logger.info("adopted existing backend state active=%s", desired["active"])
+
+    def expected_right_edge(self, backend: dict[str, Any]) -> int | None:
+        geometries = [
+            output.get("geometry")
+            for output in backend.get("outputs", [])
+            if output.get("active") and output.get("output") != OUTPUT
+        ]
+        geometries = [geometry for geometry in geometries if geometry]
+        if not geometries:
+            return None
+        return max(geometry[2] + geometry[0] for geometry in geometries)
+
+    def backend_matches_desired(self, backend: dict[str, Any]) -> bool:
+        output = backend["xrandr"]
+        if self.desired["active"]:
+            if not output.get("connected") or not output.get("active"):
+                return False
+            if output.get("current_mode") != self.desired["mode"]:
+                return False
+            if output.get("rotation") != self.desired["rotation"]:
+                return False
+            # Once the monitor is active, UU's Windows SetDisplayConfig call
+            # owns the topology.  Treating its position change as drift makes
+            # the monitor loop race it with xrandr and can wedge the X server.
+            return True
+        return not output.get("active")
+
+    def observe_virtual_topology(self, backend: dict[str, Any]) -> None:
+        output = backend["xrandr"]
+        observed = {
+            key: output.get(key)
+            for key in (
+                "connected",
+                "active",
+                "current_mode",
+                "current_rate",
+                "rotation",
+                "geometry",
+            )
+        }
+        if observed != self.observed_virtual:
+            self.logger.info("observed UU virtual topology: %s", observed)
+            self.observed_virtual = observed
+
+    async def reconcile(self, reason: str) -> dict[str, Any]:
+        backend = await self.backend.status()
+        self.backend_state = backend
+        if self.backend_matches_desired(backend):
+            self.last_error = None
+            self.transition("active" if self.desired["active"] else "off", reason)
+            return backend
+        if self.desired["active"]:
+            self.transition("recovering", reason)
+            backend = await self.backend.enable(self.desired)
+        else:
+            self.transition("disabling", reason)
+            backend = await self.backend.disable()
+        self.backend_state = backend
+        if not self.backend_matches_desired(backend):
+            raise DisplayDaemonError("后端操作完成，但显示状态与期望状态不一致。")
+        self.last_error = None
+        self.transition("active" if self.desired["active"] else "off", reason)
+        return backend
+
+    async def handle_operation(self, request: dict[str, Any]) -> dict[str, Any]:
+        command = request["command"]
+        async with self.operation_lock:
+            if command == "ping":
+                return self.public_status()
+            if command == "status":
+                self.backend_state = await self.backend.status()
+                self.publish_status()
+                return self.public_status()
+            if command in {"create", "update"}:
+                if command == "update" and not self.desired["active"]:
+                    raise RequestError("虚拟显示器尚未创建，不能直接 update。")
+                backend = await self.backend.status()
+                if command == "create" and not backend["xrandr"].get("active"):
+                    self.capture_layout(backend)
+                supported_modes = backend["xrandr"].get("modes", [])
+                candidate = dict(self.desired)
+                candidate["active"] = True
+                for key in ("mode", "rate", "rotation", "projection"):
+                    if key in request:
+                        candidate[key] = str(request[key])
+                candidate = validate_desired(candidate)
+                if candidate["mode"] not in supported_modes:
+                    raise RequestError(
+                        f"后端不支持分辨率 {candidate['mode']}：{', '.join(supported_modes)}"
+                    )
+                self.desired = candidate
+                self.generation += 1
+                self.persist_desired()
+                self.transition("enabling" if command == "create" else "updating", command)
+                try:
+                    await self.reconcile(command)
+                except (DisplayDaemonError, OSError):
+                    if command == "create":
+                        self.desired = {**self.desired, "active": False}
+                        self.persist_desired()
+                        with contextlib.suppress(DisplayDaemonError, OSError):
+                            await self.backend.disable()
+                        with contextlib.suppress(DisplayDaemonError, OSError):
+                            await self.restore_layout("create-rollback")
+                    raise
+                return self.public_status()
+            if command == "remove":
+                self.desired = {**self.desired, "active": False}
+                self.generation += 1
+                self.persist_desired()
+                self.transition("disabling", command)
+                await self.reconcile(command)
+                await self.restore_layout(command)
+                self.transition("off", "layout-restored")
+                return self.public_status()
+            if command == "recover":
+                self.recovery_count += 1
+                await self.reconcile("explicit-recover")
+                return self.public_status()
+        raise DisplayDaemonError(f"未处理的命令：{command}")
+
+    async def process_request(self, request: Any) -> dict[str, Any]:
+        request_id: Any = None
+        try:
+            if not isinstance(request, dict):
+                raise RequestError("请求必须是 JSON 对象。")
+            request_id = request.get("request_id")
+            if request.get("version") != PROTOCOL_VERSION:
+                raise RequestError(
+                    f"协议版本不兼容：{request.get('version')}，预期 {PROTOCOL_VERSION}。"
+                )
+            command = request.get("command")
+            if command not in VALID_COMMANDS:
+                raise RequestError(f"未知命令：{command}")
+            result = await self.handle_operation(request)
+            return {"ok": True, "request_id": request_id, "result": result}
+        except RequestError as error:
+            self.last_error = str(error)
+            self.logger.info("request rejected id=%r: %s", request_id, error)
+            self.publish_status()
+            return {"ok": False, "request_id": request_id, "error": str(error)}
+        except (DisplayDaemonError, OSError, json.JSONDecodeError) as error:
+            self.last_error = str(error)
+            self.logger.warning("request failed id=%r: %s", request_id, error)
+            self.transition("fault", f"request {request_id!r}")
+            return {"ok": False, "request_id": request_id, "error": str(error)}
+
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            raw_socket = writer.get_extra_info("socket")
+            if raw_socket is None:
+                raise DisplayDaemonError("无法读取客户端 socket。")
+            credentials = raw_socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            _pid, uid, _gid = struct.unpack("3i", credentials)
+            if uid != os.getuid():
+                raise DisplayDaemonError(f"拒绝其他用户的 IPC 请求：uid={uid}")
+            data = await asyncio.wait_for(reader.readline(), timeout=10)
+            if not data or len(data) > MAX_REQUEST_BYTES or not data.endswith(b"\n"):
+                raise DisplayDaemonError("请求为空、过长或缺少换行结束符。")
+            try:
+                request = json.loads(data)
+            except json.JSONDecodeError as error:
+                response = {"ok": False, "request_id": None, "error": f"JSON 无效：{error}"}
+            else:
+                response = await self.process_request(request)
+            writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode())
+            await writer.drain()
+        except (DisplayDaemonError, OSError, TimeoutError) as error:
+            with contextlib.suppress(OSError):
+                writer.write(
+                    (
+                        json.dumps(
+                            {"ok": False, "request_id": None, "error": str(error)},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def monitor(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=MONITOR_INTERVAL)
+                continue
+            except TimeoutError:
+                pass
+            try:
+                async with self.operation_lock:
+                    backend = await self.backend.status()
+                    self.backend_state = backend
+                    if self.desired["active"]:
+                        # After CREATE returns, UU's official SetDisplayConfig
+                        # transaction may temporarily detach the output, change
+                        # its mode, and move every path before committing the
+                        # final topology.  Any xrandr write here races that
+                        # transaction and makes UU report a driver failure.
+                        # Observe the whole active session but never mutate it;
+                        # UPDATE/REMOVE requests and restart recovery remain
+                        # serialized through handle_operation/startup.
+                        self.observe_virtual_topology(backend)
+                        if not backend["xrandr"].get("connected"):
+                            self.last_error = "UU 活动期间虚拟输出已断开连接。"
+                            self.transition("fault", "monitor-passive-disconnected")
+                        else:
+                            self.last_error = None
+                            self.transition("active", "monitor-passive")
+                        continue
+                    if not self.desired["active"] and (
+                        self.layout_snapshot is not None or LAYOUT_PATH.is_file()
+                    ):
+                        await self.restore_layout("monitor-off")
+                        backend = self.backend_state or backend
+                    if not self.backend_matches_desired(backend):
+                        self.recovery_count += 1
+                        self.logger.warning("display drift detected; recovery=%d", self.recovery_count)
+                        await self.reconcile("monitor-recovery")
+                    else:
+                        self.last_error = None
+                        self.transition(
+                            "active" if self.desired["active"] else "off",
+                            "monitor-healthy",
+                        )
+            except (DisplayDaemonError, OSError) as error:
+                self.last_error = str(error)
+                self.logger.warning("monitor recovery failed: %s", error)
+                self.transition("fault", "monitor")
+
+    async def prepare_socket(self) -> None:
+        BASE_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(BASE_RUNTIME_DIR, 0o700)
+        if SOCKET_PATH.exists() or SOCKET_PATH.is_socket():
+            mode = SOCKET_PATH.lstat().st_mode
+            if not stat.S_ISSOCK(mode) or SOCKET_PATH.lstat().st_uid != os.getuid():
+                raise DisplayDaemonError(f"拒绝删除不安全的 socket 路径：{SOCKET_PATH}")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.2)
+                if probe.connect_ex(str(SOCKET_PATH)) == 0:
+                    raise DisplayDaemonError("虚拟显示器守护进程已经在运行。")
+            finally:
+                probe.close()
+            SOCKET_PATH.unlink()
+        self.server = await asyncio.start_unix_server(self.handle_client, path=SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+
+    async def start(self) -> None:
+        if os.environ.get("XDG_SESSION_TYPE", "").lower() != "x11":
+            raise DisplayDaemonError("阶段 2 守护进程只支持 X11 会话。")
+        backend = await self.backend.status()
+        self.backend_state = backend
+        self.load_layout()
+        if not self.load_desired():
+            self.adopt_backend(backend)
+        async with self.operation_lock:
+            await self.reconcile("startup")
+            if not self.desired["active"] and self.layout_snapshot is not None:
+                await self.restore_layout("startup-off")
+                self.transition("off", "startup-layout-restored")
+        await self.prepare_socket()
+        self.monitor_task = asyncio.create_task(self.monitor())
+        self.logger.info(
+            "ready socket=%s display_id=%s output=%s", SOCKET_PATH, self.display_id, OUTPUT
+        )
+        self.publish_status()
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+        if self.monitor_task is not None:
+            self.monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.monitor_task
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+        async with self.operation_lock:
+            try:
+                self.transition("disabling", "daemon-stop")
+                # A clean graphical-session/logout stop ends the projection.
+                # Do not resurrect it before UU can take its next pre-create
+                # monitor snapshot.  A hard crash never reaches this path, so
+                # systemd crash recovery can still restore an active session.
+                self.desired = {**self.desired, "active": False}
+                self.persist_desired()
+                self.backend_state = await self.backend.disable()
+                await self.restore_layout("daemon-stop")
+                self.transition("stopped", "daemon-stop")
+            except (DisplayDaemonError, OSError) as error:
+                self.last_error = str(error)
+                self.logger.warning("stop cleanup failed: %s", error)
+                self.transition("fault", "daemon-stop")
+        SOCKET_PATH.unlink(missing_ok=True)
+
+    async def run(self) -> None:
+        await self.start()
+        await self.stop_event.wait()
+        await self.stop()
+
+
+def self_test() -> None:
+    first = stable_display_id()
+    second = stable_display_id()
+    assert first == second
+    assert uuid.UUID(first).version == 5
+    assert validate_desired(default_desired())["mode"] == "1920x1080"
+    assert validate_desired(
+        {
+            "active": True,
+            "mode": "2560x1440",
+            "rate": "59.95",
+            "rotation": "left",
+            "projection": "duplicate",
+        }
+    )["projection"] == "duplicate"
+    for invalid in (
+        {"active": True, "mode": "0x0"},
+        {"active": True, "rate": "500"},
+        {"active": True, "rotation": "diagonal"},
+        {"active": True, "projection": "span"},
+    ):
+        try:
+            validate_desired(invalid)
+        except DisplayDaemonError:
+            pass
+        else:
+            raise AssertionError(f"invalid desired state accepted: {invalid}")
+    print(json.dumps({"result": "pass", "display_id": first}, ensure_ascii=False))
+
+
+async def async_main() -> int:
+    parser = argparse.ArgumentParser(description="UU Remote X11 虚拟显示器用户守护进程")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+    logger = setup_logging()
+    daemon = VirtualDisplayDaemon(logger)
+    loop = asyncio.get_running_loop()
+    for signal_name in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        loop.add_signal_handler(signal_name, daemon.stop_event.set)
+    try:
+        await daemon.run()
+    except DisplayDaemonError as error:
+        logger.error("startup failed: %s", error)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(asyncio.run(async_main()))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

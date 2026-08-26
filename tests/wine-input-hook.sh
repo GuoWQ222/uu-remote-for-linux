@@ -158,11 +158,11 @@ prepare_wine_prefix() {
     -lwevtapi \
     -lws2_32
 
-if objdump -p "$compiled_probe" | grep -Fq 'GetCursorInfo'; then
+if objdump -p "$compiled_probe" | grep -F 'GetCursorInfo' >/dev/null; then
     printf '测试主程序不应导入 GetCursorInfo。\n' >&2
     exit 1
 fi
-objdump -p "$compiled_streamer_probe" | grep -Fq 'GetCursorInfo'
+objdump -p "$compiled_streamer_probe" | grep -F 'GetCursorInfo' >/dev/null
 
 prepare_wine_prefix
 install -Dm0644 "$hook" "$prefix/drive_c/uu-remote-input-hook.dll"
@@ -332,7 +332,7 @@ grep -A3 -F '[calls]' "$wol_status" | grep -Fq 'if_table2=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'addresses=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'info=1'
 grep -A3 -F '[patched]' "$wol_status" | grep -Fq 'if_table2=1'
-grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=55'
+grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'version=64'
 grep -A4 -F '[hook]' "$frame_status" | grep -Fq 'status_bits=31'
 grep -A4 -F '[capture]' "$frame_status" | grep -Eq 'rendered=[1-9]'
 grep -A12 -F '[capture]' "$frame_status" | grep -Eq 'direct_copy_calls=[1-9]'

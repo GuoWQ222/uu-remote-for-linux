@@ -39,7 +39,25 @@
 #define UUIP_HELLO 1u
 #define UUIP_MOUSE 2u
 #define UUIP_KEYBOARD 3u
-#define HOOK_VERSION 55u
+#define UUSS_MAGIC 0x53535555u
+#define UUSS_VERSION 1u
+#define UUSS_CREATE 1u
+#define UUSS_UPDATE 2u
+#define UUSS_REMOVE 3u
+#define UUSS_PING 4u
+#define UUSS_PREPARE 5u
+#define UUSS_RESPONSE 0x80u
+#define UUSS_IOCTL_PLUG_IN 0x0030c004u
+#define UUSS_IOCTL_PLUG_OUT 0x0030c008u
+#define UUSS_IOCTL_UPDATE_MODES 0x0030c010u
+#define UUSS_DEFAULT_WIDTH 1920u
+#define UUSS_DEFAULT_HEIGHT 1080u
+#define UUSS_DEFAULT_RATE_MILLIHZ 60000u
+#define UUSS_BRIDGE_TIMEOUT_MS 8000u
+#define UUSS_PREPARE_TIMEOUT_MS 20000u
+#define UUSS_DISPLAY_SETTLE_TIMEOUT_MS 5000u
+#define UUSS_DISPLAY_SETTLE_POLL_MS 50u
+#define HOOK_VERSION 64u
 #define LOCK_STATE_CONFIRM_TIMEOUT_MS 2000u
 #define UUWF_MAGIC 0x46575555u
 #define UUWF_VERSION 2u
@@ -136,6 +154,19 @@ typedef DWORD(WINAPI *msg_wait_for_multiple_objects_ex_fn)(
     DWORD, const HANDLE *, DWORD, DWORD, DWORD
 );
 typedef BOOL(WINAPI *post_message_w_fn)(HWND, UINT, WPARAM, LPARAM);
+typedef BOOL(WINAPI *device_io_control_fn)(
+    HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED
+);
+typedef BOOL(WINAPI *enum_display_devices_w_fn)(
+    LPCWSTR, DWORD, PDISPLAY_DEVICEW, DWORD
+);
+typedef LONG(WINAPI *set_display_config_fn)(
+    UINT32, const void *, UINT32, const void *, UINT32
+);
+typedef LONG(WINAPI *change_display_settings_ex_w_fn)(
+    LPCWSTR, DEVMODEW *, HWND, DWORD, LPVOID
+);
+typedef LONG(WINAPI *display_config_set_device_info_fn)(const void *);
 typedef ULONG(WINAPI *get_adapters_addresses_fn)(
     ULONG,
     ULONG,
@@ -185,6 +216,13 @@ static peek_message_w_fn original_peek_message_w;
 static msg_wait_for_multiple_objects_ex_fn
     original_msg_wait_for_multiple_objects_ex;
 static post_message_w_fn original_post_message_w;
+static device_io_control_fn original_device_io_control;
+static enum_display_devices_w_fn original_enum_display_devices_w;
+static set_display_config_fn original_set_display_config;
+static change_display_settings_ex_w_fn
+    original_change_display_settings_ex_w;
+static display_config_set_device_info_fn
+    original_display_config_set_device_info;
 static get_adapters_addresses_fn original_get_adapters_addresses;
 static get_adapters_info_fn original_get_adapters_info;
 static get_if_table2_fn original_get_if_table2;
@@ -206,6 +244,8 @@ static CHAR frame_status_path[MAX_PATH];
 static CHAR focus_status_path[MAX_PATH];
 static CHAR focus_show_request_path[MAX_PATH];
 static CHAR controller_restart_request_path[MAX_PATH];
+static WCHAR second_screen_endpoint_path[MAX_PATH];
+static CHAR second_screen_hook_status_path[MAX_PATH];
 static WCHAR controller_root_path[MAX_PATH];
 static WCHAR controller_runtime_module[MAX_PATH] = L"Qt5Core.dll";
 static enum hook_process_kind process_kind;
@@ -219,6 +259,68 @@ static volatile LONG sequence_number;
 static volatile LONG input_send_test_delay_once;
 static ULONGLONG endpoint_checked_at;
 static BOOL endpoint_valid;
+static SRWLOCK second_screen_endpoint_lock = SRWLOCK_INIT;
+static SOCKET second_screen_socket = INVALID_SOCKET;
+static struct sockaddr_in second_screen_address;
+static unsigned char second_screen_token[16];
+static ULONGLONG second_screen_endpoint_checked_at;
+static BOOL second_screen_endpoint_valid;
+static BOOL second_screen_device_ioctl_hooked;
+static BOOL second_screen_display_identity_hooked;
+static BOOL second_screen_set_display_config_hooked;
+static BOOL second_screen_change_display_settings_hooked;
+static BOOL second_screen_display_config_set_info_hooked;
+static BOOL second_screen_controller_gate_hooked;
+static BOOL second_screen_driver_open_hooked;
+static volatile LONG second_screen_sequence;
+static volatile LONG second_screen_controller_candidates;
+static volatile LONG second_screen_controller_patches;
+static volatile LONG second_screen_driver_open_candidates;
+static volatile LONG second_screen_driver_open_patches;
+static volatile LONG second_screen_requests;
+static volatile LONG second_screen_successes;
+static volatile LONG second_screen_failures;
+static volatile LONG second_screen_last_ioctl;
+static volatile LONG second_screen_last_bridge_error;
+static volatile LONG second_screen_display_identity_calls;
+static volatile LONG second_screen_display_identity_rewrites;
+static volatile LONG second_screen_display_identity_active_rewrites;
+static volatile LONG second_screen_set_display_config_calls;
+static volatile LONG second_screen_set_display_config_successes;
+static volatile LONG second_screen_set_display_config_failures;
+static volatile LONG second_screen_set_display_config_last_result;
+static volatile LONG second_screen_set_display_config_last_flags;
+static volatile LONG second_screen_set_display_config_last_path_count;
+static volatile LONG second_screen_set_display_config_last_mode_count;
+static volatile LONG second_screen_change_display_settings_calls;
+static volatile LONG second_screen_change_display_settings_successes;
+static volatile LONG second_screen_change_display_settings_failures;
+static volatile LONG second_screen_change_display_settings_last_result;
+static volatile LONG second_screen_change_display_settings_last_flags;
+static volatile LONG second_screen_change_display_settings_last_fields;
+static volatile LONG second_screen_change_display_settings_last_width;
+static volatile LONG second_screen_change_display_settings_last_height;
+static volatile LONG second_screen_change_display_settings_last_x;
+static volatile LONG second_screen_change_display_settings_last_y;
+static volatile LONG second_screen_change_display_settings_suppressed;
+static volatile LONG second_screen_native_topology_active;
+static volatile LONG second_screen_display_config_set_info_calls;
+static volatile LONG second_screen_display_config_set_info_successes;
+static volatile LONG second_screen_display_config_set_info_failures;
+static volatile LONG second_screen_display_config_set_info_last_result;
+static volatile LONG second_screen_display_config_set_info_last_type;
+static volatile LONG second_screen_display_config_set_info_last_id;
+static volatile LONG second_screen_display_settle_waits;
+static volatile LONG second_screen_display_settle_successes;
+static volatile LONG second_screen_display_settle_timeouts;
+static volatile LONG second_screen_display_settle_polls;
+static volatile LONG second_screen_display_settle_last_ms;
+typedef void (WINAPI *second_screen_apply_action_fn)(
+    void *controller,
+    unsigned int action,
+    void *button_geometry
+);
+static second_screen_apply_action_fn second_screen_apply_action;
 static BOOL force_cursor_visible;
 static volatile LONG native_lock_keys;
 static volatile LONG lock_state_valid;
@@ -508,6 +610,7 @@ static HMODULE focus_scanned_modules[FOCUS_MAX_MODULES];
 
 static void write_wol_hook_status(void);
 static void write_frame_hook_status(void);
+static void write_second_screen_hook_status(void);
 static BOOL wide_contains_ordinal_ci(
     const WCHAR *text,
     const WCHAR *needle
@@ -564,6 +667,30 @@ struct keyboard_packet {
     uint64_t extra_info;
 };
 
+struct second_screen_request {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t command;
+    uint16_t size;
+    uint32_t sequence;
+    unsigned char token[16];
+    uint32_t width;
+    uint32_t height;
+    uint32_t rate_millihz;
+    uint32_t rotation;
+};
+
+struct second_screen_response {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t command;
+    uint16_t size;
+    uint32_t sequence;
+    unsigned char token[16];
+    uint32_t ok;
+    uint32_t error_code;
+};
+
 struct wayland_frame_header {
     uint32_t magic;
     uint32_t version;
@@ -593,6 +720,13 @@ struct native_cursor_header {
     unsigned char reserved[28];
 };
 #pragma pack(pop)
+
+typedef char second_screen_request_must_be_44_bytes[
+    sizeof(struct second_screen_request) == 44u ? 1 : -1
+];
+typedef char second_screen_response_must_be_36_bytes[
+    sizeof(struct second_screen_response) == 36u ? 1 : -1
+];
 
 typedef char wayland_frame_header_must_be_64_bytes[
     sizeof(struct wayland_frame_header) == UUWF_HEADER_SIZE ? 1 : -1
@@ -954,6 +1088,210 @@ static BOOL refresh_endpoint(void) {
     }
     ReleaseSRWLockExclusive(&endpoint_lock);
     return TRUE;
+}
+
+static BOOL refresh_second_screen_endpoint_locked(BOOL force) {
+    ULONGLONG now = GetTickCount64();
+    WCHAR token_text[64];
+    unsigned char new_token[16];
+    UINT port;
+
+    if (
+        !force &&
+        now - second_screen_endpoint_checked_at < 1000u
+    ) {
+        return second_screen_endpoint_valid;
+    }
+    second_screen_endpoint_checked_at = now;
+    port = GetPrivateProfileIntW(
+        L"bridge", L"port", 0, second_screen_endpoint_path
+    );
+    token_text[0] = L'\0';
+    GetPrivateProfileStringW(
+        L"bridge",
+        L"token",
+        L"",
+        token_text,
+        (DWORD)(sizeof(token_text) / sizeof(token_text[0])),
+        second_screen_endpoint_path
+    );
+    if (
+        !port || port > 65535u ||
+        !parse_hex_token(token_text, new_token) ||
+        !InitOnceExecuteOnce(&winsock_once, initialize_winsock, NULL, NULL)
+    ) {
+        second_screen_endpoint_valid = FALSE;
+        return FALSE;
+    }
+    if (
+        second_screen_socket == INVALID_SOCKET ||
+        !second_screen_endpoint_valid ||
+        second_screen_address.sin_port != htons((u_short)port) ||
+        memcmp(
+            second_screen_token, new_token, sizeof(second_screen_token)
+        ) != 0
+    ) {
+        if (second_screen_socket != INVALID_SOCKET) {
+            closesocket(second_screen_socket);
+        }
+        second_screen_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (second_screen_socket == INVALID_SOCKET) {
+            second_screen_endpoint_valid = FALSE;
+            return FALSE;
+        }
+    }
+    ZeroMemory(&second_screen_address, sizeof(second_screen_address));
+    second_screen_address.sin_family = AF_INET;
+    second_screen_address.sin_port = htons((u_short)port);
+    second_screen_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CopyMemory(
+        second_screen_token, new_token, sizeof(second_screen_token)
+    );
+    second_screen_endpoint_valid = TRUE;
+    return TRUE;
+}
+
+static BOOL send_second_screen_request(
+    uint8_t command,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rate_millihz,
+    uint32_t rotation
+) {
+    struct second_screen_request request;
+    struct second_screen_response response;
+    struct sockaddr_in source;
+    int source_size;
+    int sent;
+    int received;
+    int timeout;
+    unsigned int receive_attempt;
+    uint32_t sequence;
+    BOOL success = FALSE;
+
+    AcquireSRWLockExclusive(&second_screen_endpoint_lock);
+    InterlockedIncrement(&second_screen_requests);
+    if (!refresh_second_screen_endpoint_locked(FALSE)) {
+        InterlockedExchange(
+            &second_screen_last_bridge_error, ERROR_FILE_NOT_FOUND
+        );
+        goto done;
+    }
+    ZeroMemory(&request, sizeof(request));
+    request.magic = UUSS_MAGIC;
+    request.version = UUSS_VERSION;
+    request.command = command;
+    request.size = (uint16_t)sizeof(request);
+    sequence = (uint32_t)InterlockedIncrement(&second_screen_sequence);
+    if (!sequence) {
+        sequence = (uint32_t)InterlockedIncrement(&second_screen_sequence);
+    }
+    request.sequence = sequence;
+    CopyMemory(
+        request.token,
+        second_screen_token,
+        sizeof(request.token)
+    );
+    request.width = width;
+    request.height = height;
+    request.rate_millihz = rate_millihz;
+    request.rotation = rotation;
+    timeout = (int)(
+        command == UUSS_PREPARE
+            ? UUSS_PREPARE_TIMEOUT_MS
+            : UUSS_BRIDGE_TIMEOUT_MS
+    );
+    if (
+        setsockopt(
+            second_screen_socket,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            (const char *)&timeout,
+            sizeof(timeout)
+        ) == SOCKET_ERROR
+    ) {
+        InterlockedExchange(
+            &second_screen_last_bridge_error, WSAGetLastError()
+        );
+        second_screen_endpoint_valid = FALSE;
+        goto done;
+    }
+    sent = sendto(
+        second_screen_socket,
+        (const char *)&request,
+        sizeof(request),
+        0,
+        (const struct sockaddr *)&second_screen_address,
+        sizeof(second_screen_address)
+    );
+    if (sent != (int)sizeof(request)) {
+        InterlockedExchange(
+            &second_screen_last_bridge_error, WSAGetLastError()
+        );
+        second_screen_endpoint_valid = FALSE;
+        goto done;
+    }
+    for (receive_attempt = 0u; receive_attempt < 16u; ++receive_attempt) {
+        ZeroMemory(&source, sizeof(source));
+        source_size = sizeof(source);
+        received = recvfrom(
+            second_screen_socket,
+            (char *)&response,
+            sizeof(response),
+            0,
+            (struct sockaddr *)&source,
+            &source_size
+        );
+        if (received == SOCKET_ERROR) {
+            InterlockedExchange(
+                &second_screen_last_bridge_error, WSAGetLastError()
+            );
+            second_screen_endpoint_valid = FALSE;
+            goto done;
+        }
+        if (
+            received != (int)sizeof(response) ||
+            source.sin_family != AF_INET ||
+            source.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
+            source.sin_port != second_screen_address.sin_port ||
+            response.magic != UUSS_MAGIC ||
+            response.version != UUSS_VERSION ||
+            response.command != (uint8_t)(command | UUSS_RESPONSE) ||
+            response.size != sizeof(response) ||
+            response.sequence != sequence ||
+            memcmp(
+                response.token,
+                second_screen_token,
+                sizeof(response.token)
+            ) != 0
+        ) {
+            continue;
+        }
+        if (!response.ok) {
+            InterlockedExchange(
+                &second_screen_last_bridge_error,
+                response.error_code ? (LONG)response.error_code : ERROR_GEN_FAILURE
+            );
+            goto done;
+        }
+        InterlockedExchange(&second_screen_last_bridge_error, 0);
+        success = TRUE;
+        break;
+    }
+    if (!success && receive_attempt == 16u) {
+        InterlockedExchange(
+            &second_screen_last_bridge_error, ERROR_INVALID_DATA
+        );
+    }
+
+done:
+    if (success) {
+        InterlockedIncrement(&second_screen_successes);
+    } else {
+        InterlockedIncrement(&second_screen_failures);
+    }
+    ReleaseSRWLockExclusive(&second_screen_endpoint_lock);
+    return success;
 }
 
 static LONG clamp_long(LONG value, LONG minimum, LONG maximum) {
@@ -2172,6 +2510,360 @@ static BOOL frame_mapping_matches_path(void) {
         mapped_info.nFileIndexLow == current_info.nFileIndexLow;
     CloseHandle(current);
     return matches;
+}
+
+static void write_second_screen_status_value(
+    const CHAR *section,
+    const CHAR *key,
+    LONG value
+) {
+    CHAR text[32];
+
+    wsprintfA(text, "%ld", value);
+    WritePrivateProfileStringA(
+        section, key, text, second_screen_hook_status_path
+    );
+}
+
+static void write_second_screen_hook_status(void) {
+    DWORD status = 0u;
+
+    if (!second_screen_hook_status_path[0]) {
+        return;
+    }
+    if (second_screen_endpoint_valid) {
+        status |= 1u;
+    }
+    if (second_screen_controller_gate_hooked) {
+        status |= 2u;
+    }
+    if (second_screen_driver_open_hooked) {
+        status |= 4u;
+    }
+    if (second_screen_device_ioctl_hooked) {
+        status |= 8u;
+    }
+    if (InterlockedCompareExchange(&second_screen_successes, 0, 0) > 0) {
+        status |= 16u;
+    }
+    if (second_screen_display_identity_hooked) {
+        status |= 32u;
+    }
+    if (second_screen_set_display_config_hooked) {
+        status |= 64u;
+    }
+    if (second_screen_change_display_settings_hooked) {
+        status |= 128u;
+    }
+    if (second_screen_display_config_set_info_hooked) {
+        status |= 256u;
+    }
+    write_second_screen_status_value(
+        "hook", "pid", (LONG)GetCurrentProcessId()
+    );
+    write_second_screen_status_value("hook", "version", HOOK_VERSION);
+    write_second_screen_status_value("hook", "status_bits", (LONG)status);
+    write_second_screen_status_value(
+        "hook", "process_kind", (LONG)process_kind
+    );
+    write_second_screen_status_value(
+        "controller",
+        "candidates",
+        InterlockedCompareExchange(
+            &second_screen_controller_candidates, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "controller",
+        "patches",
+        InterlockedCompareExchange(&second_screen_controller_patches, 0, 0)
+    );
+    write_second_screen_status_value(
+        "server",
+        "driver_open_candidates",
+        InterlockedCompareExchange(
+            &second_screen_driver_open_candidates, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "driver_open_patches",
+        InterlockedCompareExchange(
+            &second_screen_driver_open_patches, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_identity_hooked",
+        second_screen_display_identity_hooked ? 1 : 0
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_identity_calls",
+        InterlockedCompareExchange(
+            &second_screen_display_identity_calls, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_identity_rewrites",
+        InterlockedCompareExchange(
+            &second_screen_display_identity_rewrites, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_identity_active_rewrites",
+        InterlockedCompareExchange(
+            &second_screen_display_identity_active_rewrites, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_hooked",
+        second_screen_set_display_config_hooked ? 1 : 0
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_calls",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_calls, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_successes",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_successes, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_failures",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_failures, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_last_result",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_last_result, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_last_flags",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_last_flags, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_last_path_count",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_last_path_count, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "set_display_config_last_mode_count",
+        InterlockedCompareExchange(
+            &second_screen_set_display_config_last_mode_count, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_hooked",
+        second_screen_change_display_settings_hooked ? 1 : 0
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_calls",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_calls, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_successes",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_successes, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_failures",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_failures, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_result",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_result, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_flags",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_flags, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_fields",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_fields, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_width",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_width, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_height",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_height, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_x",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_x, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_last_y",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_last_y, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "change_display_settings_suppressed",
+        InterlockedCompareExchange(
+            &second_screen_change_display_settings_suppressed, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "native_topology_active",
+        InterlockedCompareExchange(
+            &second_screen_native_topology_active, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_hooked",
+        second_screen_display_config_set_info_hooked ? 1 : 0
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_calls",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_calls, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_successes",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_successes, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_failures",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_failures, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_last_result",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_last_result, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_last_type",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_last_type, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_config_set_info_last_id",
+        InterlockedCompareExchange(
+            &second_screen_display_config_set_info_last_id, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_settle_waits",
+        InterlockedCompareExchange(&second_screen_display_settle_waits, 0, 0)
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_settle_successes",
+        InterlockedCompareExchange(
+            &second_screen_display_settle_successes, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_settle_timeouts",
+        InterlockedCompareExchange(
+            &second_screen_display_settle_timeouts, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_settle_polls",
+        InterlockedCompareExchange(&second_screen_display_settle_polls, 0, 0)
+    );
+    write_second_screen_status_value(
+        "server",
+        "display_settle_last_ms",
+        InterlockedCompareExchange(
+            &second_screen_display_settle_last_ms, 0, 0
+        )
+    );
+    write_second_screen_status_value(
+        "bridge",
+        "requests",
+        InterlockedCompareExchange(&second_screen_requests, 0, 0)
+    );
+    write_second_screen_status_value(
+        "bridge",
+        "successes",
+        InterlockedCompareExchange(&second_screen_successes, 0, 0)
+    );
+    write_second_screen_status_value(
+        "bridge",
+        "failures",
+        InterlockedCompareExchange(&second_screen_failures, 0, 0)
+    );
+    write_second_screen_status_value(
+        "bridge",
+        "last_error",
+        InterlockedCompareExchange(&second_screen_last_bridge_error, 0, 0)
+    );
+    write_second_screen_status_value(
+        "bridge",
+        "last_ioctl",
+        InterlockedCompareExchange(&second_screen_last_ioctl, 0, 0)
+    );
 }
 
 static void write_frame_hook_status(void) {
@@ -5293,6 +5985,707 @@ cleanup:
         SetLastError(failure_error);
     }
     return success;
+}
+
+static HANDLE WINAPI hooked_second_screen_driver_open(void) {
+    HANDLE handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+
+    if (!handle) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    }
+    return handle;
+}
+
+static BOOL second_screen_virtual_child_id(const WCHAR *device_id) {
+    static const WCHAR marker[] = L"DISPLAY#UUR0001#";
+    SIZE_T marker_length = (sizeof(marker) / sizeof(marker[0])) - 1u;
+    SIZE_T index;
+
+    if (!device_id) {
+        return FALSE;
+    }
+    for (index = 0u; device_id[index]; ++index) {
+        SIZE_T compared;
+
+        for (compared = 0u; compared < marker_length; ++compared) {
+            WCHAR actual = device_id[index + compared];
+            WCHAR expected = marker[compared];
+
+            if (!actual) {
+                break;
+            }
+            if (actual >= L'a' && actual <= L'z') {
+                actual = (WCHAR)(actual - L'a' + L'A');
+            }
+            if (actual != expected) {
+                break;
+            }
+        }
+        if (compared == marker_length) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL second_screen_adapter_has_virtual_child(
+    const WCHAR *adapter_name
+) {
+    DWORD child_index;
+
+    if (!adapter_name || !adapter_name[0] || !original_enum_display_devices_w) {
+        return FALSE;
+    }
+    for (child_index = 0u; child_index < 16u; ++child_index) {
+        DISPLAY_DEVICEW child;
+
+        ZeroMemory(&child, sizeof(child));
+        child.cb = sizeof(child);
+        if (!original_enum_display_devices_w(
+                adapter_name,
+                child_index,
+                &child,
+                EDD_GET_DEVICE_INTERFACE_NAME
+            )) {
+            break;
+        }
+        if (second_screen_virtual_child_id(child.DeviceID)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL second_screen_virtual_adapter_is_active(void) {
+    DWORD adapter_index;
+
+    if (!original_enum_display_devices_w) {
+        return FALSE;
+    }
+    for (adapter_index = 0u; adapter_index < 16u; ++adapter_index) {
+        DISPLAY_DEVICEW adapter;
+
+        ZeroMemory(&adapter, sizeof(adapter));
+        adapter.cb = sizeof(adapter);
+        if (!original_enum_display_devices_w(
+                NULL, adapter_index, &adapter, 0u
+            )) {
+            break;
+        }
+        if (second_screen_adapter_has_virtual_child(adapter.DeviceName)) {
+            return (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0u;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL second_screen_wait_for_virtual_adapter(BOOL expected_active) {
+    ULONGLONG started = GetTickCount64();
+
+    InterlockedIncrement(&second_screen_display_settle_waits);
+    for (;;) {
+        BOOL active = second_screen_virtual_adapter_is_active();
+        LONG elapsed = (LONG)(GetTickCount64() - started);
+
+        InterlockedIncrement(&second_screen_display_settle_polls);
+        if (active == expected_active) {
+            InterlockedExchange(
+                &second_screen_display_settle_last_ms, elapsed
+            );
+            InterlockedIncrement(&second_screen_display_settle_successes);
+            return TRUE;
+        }
+        if ((DWORD)elapsed >= UUSS_DISPLAY_SETTLE_TIMEOUT_MS) {
+            InterlockedExchange(
+                &second_screen_display_settle_last_ms, elapsed
+            );
+            InterlockedIncrement(&second_screen_display_settle_timeouts);
+            SetLastError(ERROR_TIMEOUT);
+            return FALSE;
+        }
+        Sleep(UUSS_DISPLAY_SETTLE_POLL_MS);
+    }
+}
+
+static BOOL WINAPI hooked_second_screen_enum_display_devices_w(
+    LPCWSTR device,
+    DWORD device_index,
+    PDISPLAY_DEVICEW display_device,
+    DWORD flags
+) {
+    static const WCHAR virtual_adapter_name[] =
+        L"GameViewer Virtual Display Adapter";
+    BOOL result;
+    DWORD saved_error;
+
+    if (!original_enum_display_devices_w) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    result = original_enum_display_devices_w(
+        device, device_index, display_device, flags
+    );
+    saved_error = GetLastError();
+    InterlockedIncrement(&second_screen_display_identity_calls);
+    if (
+        result && !device && display_device &&
+        display_device->cb >= sizeof(*display_device) &&
+        second_screen_adapter_has_virtual_child(display_device->DeviceName)
+    ) {
+        lstrcpynW(
+            display_device->DeviceString,
+            virtual_adapter_name,
+            (int)(sizeof(display_device->DeviceString) / sizeof(WCHAR))
+        );
+        InterlockedIncrement(&second_screen_display_identity_rewrites);
+        if (display_device->StateFlags & DISPLAY_DEVICE_ACTIVE) {
+            InterlockedIncrement(
+                &second_screen_display_identity_active_rewrites
+            );
+        }
+    }
+    SetLastError(saved_error);
+    return result;
+}
+
+static LONG WINAPI hooked_second_screen_set_display_config(
+    UINT32 path_count,
+    const void *paths,
+    UINT32 mode_count,
+    const void *modes,
+    UINT32 flags
+) {
+    LONG result;
+
+    if (!original_set_display_config) {
+        return ERROR_PROC_NOT_FOUND;
+    }
+    InterlockedIncrement(&second_screen_set_display_config_calls);
+    InterlockedExchange(
+        &second_screen_set_display_config_last_flags, (LONG)flags
+    );
+    InterlockedExchange(
+        &second_screen_set_display_config_last_path_count, (LONG)path_count
+    );
+    InterlockedExchange(
+        &second_screen_set_display_config_last_mode_count, (LONG)mode_count
+    );
+    result = original_set_display_config(
+        path_count, paths, mode_count, modes, flags
+    );
+    InterlockedExchange(
+        &second_screen_set_display_config_last_result, result
+    );
+    if (result == ERROR_SUCCESS) {
+        InterlockedIncrement(&second_screen_set_display_config_successes);
+    } else {
+        InterlockedIncrement(&second_screen_set_display_config_failures);
+    }
+    write_second_screen_hook_status();
+    return result;
+}
+
+static LONG WINAPI hooked_second_screen_change_display_settings_ex_w(
+    LPCWSTR device,
+    DEVMODEW *mode,
+    HWND window,
+    DWORD flags,
+    LPVOID parameters
+) {
+    LONG result;
+
+    if (!original_change_display_settings_ex_w) {
+        return DISP_CHANGE_FAILED;
+    }
+    InterlockedIncrement(&second_screen_change_display_settings_calls);
+    InterlockedExchange(
+        &second_screen_change_display_settings_last_flags, (LONG)flags
+    );
+    if (mode) {
+        InterlockedExchange(
+            &second_screen_change_display_settings_last_fields,
+            (LONG)mode->dmFields
+        );
+        InterlockedExchange(
+            &second_screen_change_display_settings_last_width,
+            (LONG)mode->dmPelsWidth
+        );
+        InterlockedExchange(
+            &second_screen_change_display_settings_last_height,
+            (LONG)mode->dmPelsHeight
+        );
+        InterlockedExchange(
+            &second_screen_change_display_settings_last_x,
+            mode->dmPosition.x
+        );
+        InterlockedExchange(
+            &second_screen_change_display_settings_last_y,
+            mode->dmPosition.y
+        );
+    }
+    if (
+        InterlockedCompareExchange(
+            &second_screen_native_topology_active, 0, 0
+        ) != 0 &&
+        (
+            (
+                device && mode &&
+                (flags & (CDS_UPDATEREGISTRY | CDS_NORESET)) ==
+                    (CDS_UPDATEREGISTRY | CDS_NORESET)
+            ) ||
+            (
+                !device && !mode && !window && !parameters && flags == 0u
+            )
+        )
+    ) {
+        /*
+         * The native X11 manager has already committed the requested UU
+         * topology before the emulated IDD Create call returns.  UU then
+         * stages every Windows display with CDS_NORESET and commits the batch
+         * using an all-NULL call.  Wine translates that Windows-only batch
+         * back to RandR, detaches the virtual output, and makes UU time out
+         * with "virtual display driver abnormal".  Preserve the authoritative
+         * native topology for this exact CREATE-to-REMOVE window only.  The
+         * hook is process-local and all unrelated display-setting calls still
+         * reach USER32.
+         */
+        result = DISP_CHANGE_SUCCESSFUL;
+        InterlockedIncrement(
+            &second_screen_change_display_settings_suppressed
+        );
+    } else {
+        result = original_change_display_settings_ex_w(
+            device, mode, window, flags, parameters
+        );
+    }
+    InterlockedExchange(
+        &second_screen_change_display_settings_last_result, result
+    );
+    if (result == DISP_CHANGE_SUCCESSFUL) {
+        InterlockedIncrement(&second_screen_change_display_settings_successes);
+    } else {
+        InterlockedIncrement(&second_screen_change_display_settings_failures);
+    }
+    write_second_screen_hook_status();
+    return result;
+}
+
+struct second_screen_display_config_device_info_header {
+    UINT32 type;
+    UINT32 size;
+    LUID adapter_id;
+    UINT32 id;
+};
+
+static LONG WINAPI hooked_second_screen_display_config_set_device_info(
+    const void *request
+) {
+    const struct second_screen_display_config_device_info_header *header =
+        (const struct second_screen_display_config_device_info_header *)request;
+    LONG result;
+
+    if (!original_display_config_set_device_info) {
+        return ERROR_PROC_NOT_FOUND;
+    }
+    InterlockedIncrement(&second_screen_display_config_set_info_calls);
+    if (header) {
+        InterlockedExchange(
+            &second_screen_display_config_set_info_last_type,
+            (LONG)header->type
+        );
+        InterlockedExchange(
+            &second_screen_display_config_set_info_last_id,
+            (LONG)header->id
+        );
+    }
+    result = original_display_config_set_device_info(request);
+    InterlockedExchange(
+        &second_screen_display_config_set_info_last_result, result
+    );
+    if (result == ERROR_SUCCESS) {
+        InterlockedIncrement(&second_screen_display_config_set_info_successes);
+    } else {
+        InterlockedIncrement(&second_screen_display_config_set_info_failures);
+    }
+    write_second_screen_hook_status();
+    return result;
+}
+
+static BOOL second_screen_update_geometry(
+    LPVOID input_buffer,
+    DWORD input_size,
+    uint32_t *width,
+    uint32_t *height,
+    uint32_t *rate_millihz
+) {
+    MEMORY_BASIC_INFORMATION memory;
+    const uint32_t *values = (const uint32_t *)input_buffer;
+    uint32_t count;
+    SIZE_T required;
+
+    if (
+        !input_buffer || input_size < 20u ||
+        VirtualQuery(input_buffer, &memory, sizeof(memory)) != sizeof(memory)
+    ) {
+        return FALSE;
+    }
+    count = values[1];
+    if (!count || count > 256u) {
+        return FALSE;
+    }
+    required = 8u + (SIZE_T)count * 12u;
+    if (
+        required > input_size ||
+        !allocation_span_accessible(
+            memory.AllocationBase, input_buffer, required
+        )
+    ) {
+        return FALSE;
+    }
+    *width = values[2];
+    *height = values[3];
+    *rate_millihz = values[4];
+    if (
+        *width < 320u || *width > 16384u ||
+        *height < 240u || *height > 16384u
+    ) {
+        return FALSE;
+    }
+    if (*rate_millihz >= 30u && *rate_millihz <= 240u) {
+        *rate_millihz *= 1000u;
+    }
+    if (*rate_millihz < 30000u || *rate_millihz > 240000u) {
+        *rate_millihz = UUSS_DEFAULT_RATE_MILLIHZ;
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI hooked_second_screen_device_io_control(
+    HANDLE device,
+    DWORD control_code,
+    LPVOID input_buffer,
+    DWORD input_size,
+    LPVOID output_buffer,
+    DWORD output_size,
+    LPDWORD bytes_returned,
+    LPOVERLAPPED overlapped
+) {
+    uint8_t command;
+    uint32_t width = UUSS_DEFAULT_WIDTH;
+    uint32_t height = UUSS_DEFAULT_HEIGHT;
+    uint32_t rate_millihz = UUSS_DEFAULT_RATE_MILLIHZ;
+    uint32_t rotation = 0u;
+
+    if (
+        control_code != UUSS_IOCTL_PLUG_IN &&
+        control_code != UUSS_IOCTL_PLUG_OUT &&
+        control_code != UUSS_IOCTL_UPDATE_MODES
+    ) {
+        if (!original_device_io_control) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return FALSE;
+        }
+        return original_device_io_control(
+            device,
+            control_code,
+            input_buffer,
+            input_size,
+            output_buffer,
+            output_size,
+            bytes_returned,
+            overlapped
+        );
+    }
+    (void)device;
+    (void)output_buffer;
+    (void)output_size;
+    (void)overlapped;
+    InterlockedExchange(
+        &second_screen_last_ioctl, (LONG)control_code
+    );
+    if (control_code == UUSS_IOCTL_PLUG_OUT) {
+        command = UUSS_REMOVE;
+    } else if (control_code == UUSS_IOCTL_UPDATE_MODES) {
+        command = UUSS_UPDATE;
+        (void)second_screen_update_geometry(
+            input_buffer,
+            input_size,
+            &width,
+            &height,
+            &rate_millihz
+        );
+    } else {
+        command = UUSS_CREATE;
+    }
+    if (!send_second_screen_request(
+            command, width, height, rate_millihz, rotation
+        )) {
+        if (command == UUSS_CREATE) {
+            InterlockedExchange(&second_screen_native_topology_active, 0);
+        }
+        SetLastError(ERROR_DEVICE_NOT_CONNECTED);
+        write_second_screen_hook_status();
+        return FALSE;
+    }
+    if (
+        (command == UUSS_CREATE || command == UUSS_REMOVE) &&
+        !second_screen_wait_for_virtual_adapter(command == UUSS_CREATE)
+    ) {
+        if (command == UUSS_CREATE) {
+            InterlockedExchange(&second_screen_native_topology_active, 0);
+            (void)send_second_screen_request(
+                UUSS_REMOVE,
+                UUSS_DEFAULT_WIDTH,
+                UUSS_DEFAULT_HEIGHT,
+                UUSS_DEFAULT_RATE_MILLIHZ,
+                0u
+            );
+        }
+        write_second_screen_hook_status();
+        return FALSE;
+    }
+    if (command == UUSS_CREATE) {
+        InterlockedExchange(&second_screen_native_topology_active, 1);
+    } else if (command == UUSS_REMOVE) {
+        InterlockedExchange(&second_screen_native_topology_active, 0);
+    }
+    if (bytes_returned) {
+        *bytes_returned = 0u;
+    }
+    SetLastError(ERROR_SUCCESS);
+    write_second_screen_hook_status();
+    return TRUE;
+}
+
+static void WINAPI hooked_controller_second_screen_entry(
+    void *controller,
+    void *button_geometry
+) {
+    if (!second_screen_apply_action) {
+        return;
+    }
+    /*
+     * Ask for the topology before UU opens its device panel.  The native
+     * chooser is therefore visible while this expected modal action waits;
+     * the server-side DeviceIoControl path never performs UI or waits for a
+     * human decision.
+     */
+    if (!send_second_screen_request(
+            UUSS_PREPARE,
+            UUSS_DEFAULT_WIDTH,
+            UUSS_DEFAULT_HEIGHT,
+            UUSS_DEFAULT_RATE_MILLIHZ,
+            0u
+        )) {
+        write_second_screen_hook_status();
+        return;
+    }
+    write_second_screen_hook_status();
+    second_screen_apply_action(controller, 0u, button_geometry);
+}
+
+static BOOL patch_controller_second_screen_gate(HMODULE module) {
+    /*
+     * HomePageTitle::slotSecondScreenBtnClicked obtains a
+     * SecondScreenEntryAction from HomeTitleBarPresenter and immediately
+     * forwards it to applySecondScreenEntryAction:
+     *
+     *     call presenter_entry_action
+     *     mov  r8, rbx              ; button geometry
+     *     mov  edx, eax             ; SecondScreenEntryAction
+     *     mov  rcx, rdi
+     *     ...
+     *     jmp  applySecondScreenEntryAction
+     *
+     * Wine is classified as the unsupported-system action even when our
+     * native bridge is ready.  Replace this unique slot entry with a native
+     * prepare gate: it obtains the user's Duplicate/Extend choice first, then
+     * calls applySecondScreenEntryAction with the normal/open action.  This
+     * keeps all human interaction out of the server's driver IOCTL thread.
+     */
+    static const unsigned char prefix[] = {
+        0x48, 0x89, 0x5c, 0x24, 0x08,
+        0x57,
+        0x48, 0x83, 0xec, 0x20,
+        0x48, 0x8b, 0xf9,
+        0x48, 0x8b, 0xda,
+        0x48, 0x8b, 0x49, 0x50,
+        0xe8
+    };
+    static const unsigned char suffix[] = {
+        0x4c, 0x8b, 0xc3,
+        0x8b, 0xd0,
+        0x48, 0x8b, 0xcf,
+        0x48, 0x8b, 0x5c, 0x24, 0x30,
+        0x48, 0x83, 0xc4, 0x20,
+        0x5f,
+        0xe9
+    };
+    const SIZE_T suffix_offset = sizeof(prefix) + 4u;
+    const SIZE_T pattern_span =
+        sizeof(prefix) + 4u + sizeof(suffix) + 4u;
+    const SIZE_T action_field_offsets[] = {
+        sizeof(prefix) + 4u + 3u,
+        sizeof(prefix) + 4u + 4u
+    };
+    const unsigned char original_fields[] = {0x8bu, 0xd0u};
+    const unsigned char patched_fields[] = {0x33u, 0xd2u};
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
+    unsigned char *candidate = NULL;
+    second_screen_apply_action_fn apply_candidate = NULL;
+    unsigned int candidate_count = 0u;
+    SIZE_T index;
+
+    if (second_screen_controller_gate_hooked) {
+        return TRUE;
+    }
+    if (
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < pattern_span
+    ) {
+        return FALSE;
+    }
+    for (index = 0u; index + pattern_span <= text_span; ++index) {
+        unsigned char *current = text_start + index;
+        unsigned char *current_suffix = current + suffix_offset;
+        unsigned char *tail_jump =
+            current_suffix + sizeof(suffix) - 1u;
+        int32_t displacement;
+        unsigned char *apply_target;
+        if (
+            !bytes_equal(current, prefix, sizeof(prefix)) ||
+            !bytes_equal(current_suffix, suffix, 3u) ||
+            !bytes_equal(
+                current_suffix + 5u,
+                suffix + 5u,
+                sizeof(suffix) - 5u
+            ) ||
+            !(
+                (current[action_field_offsets[0]] == original_fields[0] &&
+                 current[action_field_offsets[1]] == original_fields[1]) ||
+                (current[action_field_offsets[0]] == patched_fields[0] &&
+                 current[action_field_offsets[1]] == patched_fields[1])
+            )
+        ) {
+            continue;
+        }
+        CopyMemory(
+            &displacement, tail_jump + 1u, sizeof(displacement)
+        );
+        apply_target = tail_jump + 5u + displacement;
+        if (
+            (uintptr_t)apply_target < (uintptr_t)image.base ||
+            (uintptr_t)apply_target - (uintptr_t)image.base >= image.size
+        ) {
+            continue;
+        }
+        candidate = current;
+        apply_candidate =
+            (second_screen_apply_action_fn)(void *)apply_target;
+        ++candidate_count;
+    }
+    InterlockedExchange(
+        &second_screen_controller_candidates, (LONG)candidate_count
+    );
+    if (candidate_count != 1u || !candidate || !apply_candidate) {
+        SetLastError(ERROR_REVISION_MISMATCH);
+        return FALSE;
+    }
+    second_screen_apply_action = apply_candidate;
+    second_screen_controller_gate_hooked = patch_executable_entry(
+        candidate, (void *)hooked_controller_second_screen_entry
+    );
+    if (second_screen_controller_gate_hooked) {
+        InterlockedIncrement(&second_screen_controller_patches);
+    } else {
+        second_screen_apply_action = NULL;
+    }
+    return second_screen_controller_gate_hooked;
+}
+
+static BOOL patch_second_screen_driver_open(HMODULE module) {
+    static const unsigned char prefix[] = {
+        0x33, 0xff, 0x8b, 0xdf,
+        0x89, 0x5c, 0x24, 0x40,
+        0x8d, 0x4f, 0x02,
+        0xe8
+    };
+    static const unsigned char suffix[] = {
+        0x84, 0xc0, 0x74, 0x4b,
+        0x88, 0x5c, 0x24, 0x28,
+        0xc7, 0x44, 0x24, 0x20,
+        0x58, 0x01, 0x00, 0x00
+    };
+    static const unsigned char prologue[] = {
+        0x48, 0x89, 0x5c, 0x24, 0x08,
+        0x48, 0x89, 0x6c, 0x24, 0x10,
+        0x48, 0x89, 0x74, 0x24, 0x18,
+        0x48, 0x89, 0x7c, 0x24, 0x20,
+        0x41, 0x56,
+        0x48, 0x81, 0xec, 0x70, 0x03, 0x00, 0x00
+    };
+    const SIZE_T function_delta = 0x2fu;
+    const SIZE_T pattern_span = sizeof(prefix) + 4u + sizeof(suffix);
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *text_start = NULL;
+    SIZE_T text_span = 0u;
+    unsigned char *candidate = NULL;
+    unsigned int candidate_count = 0u;
+    SIZE_T index;
+
+    if (second_screen_driver_open_hooked) {
+        return TRUE;
+    }
+    if (
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(
+            &image, ".text", &text, &text_start, &text_span
+        ) ||
+        text_span < pattern_span + function_delta
+    ) {
+        return FALSE;
+    }
+    for (
+        index = function_delta;
+        index + pattern_span <= text_span;
+        ++index
+    ) {
+        unsigned char *current = text_start + index;
+        unsigned char *function = current - function_delta;
+        if (
+            bytes_equal(current, prefix, sizeof(prefix)) &&
+            bytes_equal(
+                current + sizeof(prefix) + 4u,
+                suffix,
+                sizeof(suffix)
+            ) &&
+            bytes_equal(function, prologue, sizeof(prologue))
+        ) {
+            candidate = function;
+            ++candidate_count;
+        }
+    }
+    InterlockedExchange(
+        &second_screen_driver_open_candidates, (LONG)candidate_count
+    );
+    if (candidate_count != 1u || !candidate) {
+        SetLastError(ERROR_REVISION_MISMATCH);
+        return FALSE;
+    }
+    second_screen_driver_open_hooked = patch_executable_entry(
+        candidate, (void *)hooked_second_screen_driver_open
+    );
+    if (second_screen_driver_open_hooked) {
+        InterlockedIncrement(&second_screen_driver_open_patches);
+    }
+    return second_screen_driver_open_hooked;
 }
 
 static BOOL patch_frame_adapter_accessor(void *function) {
@@ -9152,6 +10545,7 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
         }
         if (now - last_status_write >= 1000u) {
             write_focus_hook_status();
+            write_second_screen_hook_status();
             last_status_write = now;
         }
         if (now - last_activation_scan >= FOCUS_MODULE_SCAN_MS) {
@@ -9173,6 +10567,8 @@ static DWORD WINAPI focus_worker_main(LPVOID parameter) {
 }
 
 static BOOL initialize_controller_focus_hook(void) {
+    BOOL second_screen_ready;
+
     if (event_loop_tls_index == TLS_OUT_OF_INDEXES) {
         event_loop_tls_index = TlsAlloc();
     }
@@ -9181,6 +10577,16 @@ static BOOL initialize_controller_focus_hook(void) {
     }
     if (controller_restart_request_path[0]) {
         DeleteFileA(controller_restart_request_path);
+    }
+    second_screen_ready = send_second_screen_request(
+        UUSS_PING,
+        UUSS_DEFAULT_WIDTH,
+        UUSS_DEFAULT_HEIGHT,
+        UUSS_DEFAULT_RATE_MILLIHZ,
+        0u
+    );
+    if (second_screen_ready) {
+        (void)patch_controller_second_screen_gate(GetModuleHandleW(NULL));
     }
     focus_home_show_request_pending();
     patch_controller_focus_imports();
@@ -9205,6 +10611,7 @@ static BOOL initialize_controller_focus_hook(void) {
         }
     }
     write_focus_hook_status();
+    write_second_screen_hook_status();
     return (controller_focus_hook_status() & 927u) == 927u;
 }
 
@@ -9438,6 +10845,24 @@ static void initialize_endpoint_path(void) {
         "C:\\uu-remote-controller-restart.request",
         MAX_PATH
     );
+    lstrcpynW(
+        second_screen_endpoint_path,
+        L"C:\\uu-remote-second-screen-bridge.ini",
+        MAX_PATH
+    );
+    if (process_kind == HOOK_PROCESS_CONTROLLER) {
+        lstrcpynA(
+            second_screen_hook_status_path,
+            "C:\\uu-remote-second-screen-controller-status.ini",
+            MAX_PATH
+        );
+    } else {
+        lstrcpynA(
+            second_screen_hook_status_path,
+            "C:\\uu-remote-second-screen-server-status.ini",
+            MAX_PATH
+        );
+    }
 }
 
 static void initialize_frame_adapter_luid(void) {
@@ -10234,6 +11659,14 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     if (GetModuleHandleW(L"streamer.dll")) {
         streamer_ready = patch_streamer_imports();
     }
+    (void)patch_second_screen_driver_open(GetModuleHandleW(NULL));
+    (void)send_second_screen_request(
+        UUSS_PING,
+        UUSS_DEFAULT_WIDTH,
+        UUSS_DEFAULT_HEIGHT,
+        UUSS_DEFAULT_RATE_MILLIHZ,
+        0u
+    );
     ready = (
         streamer_ready &&
         send_input_hooked &&
@@ -10243,6 +11676,7 @@ __declspec(dllexport) DWORD WINAPI UURemoteInputHookInitialize(LPVOID unused) {
     );
     write_wol_hook_status();
     write_frame_hook_status();
+    write_second_screen_hook_status();
     return ready ? 1u : 0u;
 }
 
@@ -10254,6 +11688,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         executable_patch_exception_handler_handle = NULL;
         if (handler) {
             RemoveVectoredExceptionHandler(handler);
+        }
+        if (second_screen_socket != INVALID_SOCKET) {
+            closesocket(second_screen_socket);
+            second_screen_socket = INVALID_SOCKET;
         }
         if (frame_snapshot) {
             VirtualFree(frame_snapshot, 0, MEM_RELEASE);
@@ -10281,6 +11719,41 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         return TRUE;
     }
     main_module = GetModuleHandleW(NULL);
+    second_screen_display_identity_hooked = patch_import(
+        main_module,
+        "USER32.dll",
+        "EnumDisplayDevicesW",
+        (void *)hooked_second_screen_enum_display_devices_w,
+        (void **)&original_enum_display_devices_w
+    );
+    second_screen_set_display_config_hooked = patch_import(
+        main_module,
+        "USER32.dll",
+        "SetDisplayConfig",
+        (void *)hooked_second_screen_set_display_config,
+        (void **)&original_set_display_config
+    );
+    second_screen_change_display_settings_hooked = patch_import(
+        main_module,
+        "USER32.dll",
+        "ChangeDisplaySettingsExW",
+        (void *)hooked_second_screen_change_display_settings_ex_w,
+        (void **)&original_change_display_settings_ex_w
+    );
+    second_screen_display_config_set_info_hooked = patch_import(
+        main_module,
+        "USER32.dll",
+        "DisplayConfigSetDeviceInfo",
+        (void *)hooked_second_screen_display_config_set_device_info,
+        (void **)&original_display_config_set_device_info
+    );
+    second_screen_device_ioctl_hooked = patch_import(
+        main_module,
+        "KERNEL32.dll",
+        "DeviceIoControl",
+        (void *)hooked_second_screen_device_io_control,
+        (void **)&original_device_io_control
+    );
     send_input_hooked = patch_import(
         main_module,
         "USER32.dll",

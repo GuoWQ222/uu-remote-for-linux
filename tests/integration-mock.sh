@@ -33,6 +33,7 @@ export UU_REMOTE_DISABLE_SLEEP_WATCHER=1
 export UU_REMOTE_DISABLE_UPDATE_WATCHER=1
 export UU_REMOTE_DISABLE_KEYBOARD_BRIDGE=1
 export UU_REMOTE_DISABLE_INPUT_BRIDGE=1
+export UU_REMOTE_DISABLE_SECOND_SCREEN_BRIDGE=1
 export UU_REMOTE_DISABLE_FOCUS_STABILIZER=1
 export UU_REMOTE_TRAY_PROXY_BIN="$fixture_bin/uu-remote-tray-proxy"
 export UU_REMOTE_UPDATE_NO_RESTART=1
@@ -470,7 +471,12 @@ grep -q $'^4.34.0.8979\t' \
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
     "$expected_streamer_patched_sha"
 "$launcher" --diagnose | grep -q '硬解桥开关.*已启用'
-"$launcher" --diagnose | grep -q 'UU 内置更新开关.*开启'
+# A graphical launch with the Linux watcher enabled permanently hands update
+# ownership away from the synchronous official controller.  Later maintenance
+# and codec operations must preserve that non-blocking policy.
+"$launcher" --diagnose | grep -q 'UU 内置更新开关.*关闭'
+UU_REMOTE_DISABLE_UPDATE_WATCHER=0 "$launcher" --diagnose | grep -q \
+    '启动更新策略.*已移交 Linux 后台'
 "$launcher" --diagnose | grep -q \
     'Linux 自动更新.*图形启动延迟 60 秒后台检查'
 "$launcher" --diagnose | grep -q '官方更新器保护.*完整'
@@ -660,7 +666,7 @@ frame_status="$prefix/drive_c/uu-remote-wayland-frame-status.ini"
 printf '%s\r\n' \
     '[hook]' \
     'pid=5151' \
-    'version=55' \
+    'version=58' \
     'status_bits=12' \
     '[capture]' \
     'calls=0' \
@@ -668,12 +674,12 @@ printf '%s\r\n' \
     >"$frame_status"
 XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test-0 \
     "$launcher" --diagnose >"$test_root/wayland-idle-frame-hook.txt"
-grep -q 'Wayland GDI 画面钩子.*已安装（v55；等待远控采集）' \
+grep -q 'Wayland GDI 画面钩子.*已安装（v58；等待远控采集）' \
     "$test_root/wayland-idle-frame-hook.txt"
 printf '%s\r\n' \
     '[hook]' \
     'pid=5151' \
-    'version=55' \
+    'version=58' \
     'status_bits=12' \
     '[capture]' \
     'calls=1' \

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly state_file='@STATE@'
+state=$(<"$state_file")
+
+if [[ ${1:-} == --listproviders ]]; then
+    printf '%s\n' \
+        'Providers: number : 1' \
+        'Provider 0: id: 0x1b7 cap: 0x1, Source Output crtcs: 4 outputs: 6 associated providers: 0 name:NVIDIA-0'
+    exit 0
+fi
+
+if [[ ${1:-} == --query ]]; then
+    if [[ $state == connected-on ]]; then
+        current='5920 x 2560'
+    else
+        current='4000 x 2560'
+    fi
+    printf 'Screen 0: minimum 8 x 8, current %s, maximum 32767 x 32767\n' "$current"
+    printf '%s\n' \
+        'HDMI-0 connected 1440x2560+0+0 left (normal left inverted right x axis y axis)' \
+        '   2560x1440     74.97*+' \
+        'DP-1 disconnected (normal left inverted right x axis y axis)'
+    case $state in
+        disconnected)
+            printf '%s\n' 'DP-0 disconnected (normal left inverted right x axis y axis)'
+            ;;
+        connected-off)
+            printf '%s\n' \
+                'DP-0 connected (normal left inverted right x axis y axis)' \
+                '   2560x1440     59.95 +' \
+                '   1920x1080     60.00*'
+            ;;
+        connected-on)
+            printf '%s\n' \
+                'DP-0 connected 1920x1080+4000+0 (normal left inverted right x axis y axis)' \
+                '   2560x1440     59.95 +' \
+                '   1920x1080     60.00*'
+            ;;
+        connected-duplicate)
+            printf '%s\n' \
+                'DP-0 connected 2560x1440+1440+0 (normal left inverted right x axis y axis)' \
+                '   2560x1440     59.95*+' \
+                '   1920x1080     60.00'
+            ;;
+        *)
+            printf '未知测试状态：%s\n' "$state" >&2
+            exit 2
+            ;;
+    esac
+    printf '%s\n' \
+        'HDMI-1 connected primary 2560x1440+1440+0 (normal left inverted right x axis y axis)' \
+        '   2560x1440     59.95*+'
+    exit 0
+fi
+
+if [[ ${1:-} == --output && ${2:-} == DP-0 ]]; then
+    if [[ " $* " == *' --off '* ]]; then
+        printf '%s\n' connected-off >"$state_file"
+    elif [[ " $* " == *' --same-as HDMI-1 '* ]]; then
+        printf '%s\n' connected-duplicate >"$state_file"
+    else
+        printf '%s\n' connected-on >"$state_file"
+    fi
+    exit 0
+fi
+
+printf '不支持的 xrandr 测试参数：%s\n' "$*" >&2
+exit 2

@@ -9,7 +9,8 @@ fi
 
 # Real systemd-run returns after dispatching this long-lived watcher.  Running
 # it synchronously in the fixture would block the integration test forever.
-if [[ $* == *"uu-remote-encoder-policy watch"* ]]; then
+if [[ $* == *"uu-remote-encoder-policy watch"* ||
+    $* == *"uu-remote-second-screen-bridge watch"* ]]; then
     exit 0
 fi
 

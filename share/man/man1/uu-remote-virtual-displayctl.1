@@ -1,0 +1,61 @@
+.TH UU-REMOTE-VIRTUAL-DISPLAYCTL 1 "@RELEASE_DATE@" "uu-remote-for-linux @VERSION@" "User Commands"
+.SH NAME
+uu-remote-virtual-displayctl \- manage the UU Remote X11 virtual display
+.SH SYNOPSIS
+.B uu-remote-virtual-displayctl
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+Controls the per-user
+.B uu-remote-virtual-displayd
+service over an authenticated Unix socket.
+The service serializes NVIDIA XRandR operations, preserves the requested mode,
+and restores the virtual output after display-stack drift or a service restart.
+.SH COMMANDS
+.TP
+.B status
+Print the desired state, live backend state, stable display identifier, and diagnostics as JSON.
+.TP
+.B create
+Enable the virtual display.  Accepts
+.BR --mode ,
+.BR --rate ,
+and
+.BR --rotation .
+.TP
+.B update
+Change one or more properties of an active virtual display.
+.TP
+.B remove
+Disable the virtual display and persist the off state.
+.TP
+.B recover
+Reconcile the live XRandR state with the persisted desired state immediately.
+.TP
+.B ping
+Check service availability and print its current status.
+.TP
+.B wait
+Wait up to 60 seconds for the requested
+.BR active ,
+.BR off ,
+or
+.B fault
+state.
+.SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/uu-remote-for-linux/virtual-display.sock
+Per-user control socket, mode 0600.
+.TP
+.I $XDG_STATE_HOME/uu-remote-for-linux/virtual-displayd-status.json
+Current daemon and backend status.
+.TP
+.I $XDG_STATE_HOME/uu-remote-for-linux/virtual-displayd-desired.json
+Persisted desired display state.
+.TP
+.I $XDG_STATE_HOME/uu-remote-for-linux/virtual-displayd.log
+Service log.
+.SH SEE ALSO
+.BR xrandr (1),
+.BR systemctl (1),
+.BR uu-remote-for-linux (1)

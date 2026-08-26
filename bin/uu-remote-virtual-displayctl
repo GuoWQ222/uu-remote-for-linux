@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Control client for uu-remote-virtual-displayd."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+PROTOCOL_VERSION = 1
+SOCKET_PATH = Path(
+    os.environ.get(
+        "UU_REMOTE_VDISPLAYD_SOCKET",
+        str(
+            Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+            / "uu-remote-for-linux/virtual-display.sock"
+        ),
+    )
+)
+
+
+class ControlError(RuntimeError):
+    pass
+
+
+def send_request(command: str, **fields: Any) -> dict[str, Any]:
+    request_id = str(uuid.uuid4())
+    request = {
+        "version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "command": command,
+        **fields,
+    }
+    deadline = time.monotonic() + 2
+    client: socket.socket | None = None
+    while client is None:
+        candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        candidate.settimeout(10)
+        try:
+            candidate.connect(str(SOCKET_PATH))
+        except (FileNotFoundError, ConnectionRefusedError) as error:
+            candidate.close()
+            if time.monotonic() >= deadline:
+                raise ControlError(
+                    f"虚拟显示器服务尚未就绪：{SOCKET_PATH}：{error}"
+                ) from error
+            time.sleep(0.05)
+        except (ConnectionError, TimeoutError, OSError) as error:
+            candidate.close()
+            raise ControlError(f"连接虚拟显示器服务失败：{error}") from error
+        else:
+            client = candidate
+    try:
+        client.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode())
+        chunks = bytearray()
+        while not chunks.endswith(b"\n"):
+            chunk = client.recv(65536 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+            if len(chunks) >= 65536:
+                raise ControlError("守护进程响应过长。")
+    except (ConnectionError, TimeoutError, OSError) as error:
+        raise ControlError(f"连接虚拟显示器服务失败：{error}") from error
+    finally:
+        client.close()
+    if not chunks.endswith(b"\n"):
+        raise ControlError("守护进程响应不完整。")
+    try:
+        response = json.loads(chunks)
+    except json.JSONDecodeError as error:
+        raise ControlError(f"守护进程响应不是 JSON：{error}") from error
+    if response.get("request_id") != request_id:
+        raise ControlError("守护进程响应 request_id 不匹配。")
+    if not response.get("ok"):
+        raise ControlError(str(response.get("error", "未知服务端错误")))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise ControlError("守护进程响应缺少 result。")
+    return result
+
+
+def print_result(result: dict[str, Any]) -> None:
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="控制 UU Remote X11 虚拟显示器服务")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("ping")
+    subparsers.add_parser("status")
+    create = subparsers.add_parser("create")
+    create.add_argument("--mode", default="1920x1080")
+    create.add_argument("--rate", default="60")
+    create.add_argument(
+        "--rotation",
+        choices=("normal", "left", "right", "inverted"),
+        default="normal",
+    )
+    create.add_argument(
+        "--projection", choices=("extend", "duplicate"), default="extend"
+    )
+    update = subparsers.add_parser("update")
+    update.add_argument("--mode")
+    update.add_argument("--rate")
+    update.add_argument(
+        "--rotation", choices=("normal", "left", "right", "inverted")
+    )
+    update.add_argument("--projection", choices=("extend", "duplicate"))
+    subparsers.add_parser("remove")
+    subparsers.add_parser("recover")
+    wait = subparsers.add_parser("wait")
+    wait.add_argument("--state", choices=("active", "off", "fault"), required=True)
+    wait.add_argument("--timeout", type=float, default=10)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command in {"ping", "status", "remove", "recover"}:
+        print_result(send_request(args.command))
+        return 0
+    if args.command == "create":
+        print_result(
+            send_request(
+                "create",
+                mode=args.mode,
+                rate=args.rate,
+                rotation=args.rotation,
+                projection=args.projection,
+            )
+        )
+        return 0
+    if args.command == "update":
+        fields = {
+            name: value
+            for name, value in (
+                ("mode", args.mode),
+                ("rate", args.rate),
+                ("rotation", args.rotation),
+                ("projection", args.projection),
+            )
+            if value is not None
+        }
+        if not fields:
+            raise ControlError("update 至少需要一个模式、刷新率或旋转参数。")
+        print_result(send_request("update", **fields))
+        return 0
+    if args.command == "wait":
+        if not 0 < args.timeout <= 60:
+            raise ControlError("wait 超时必须在 0 到 60 秒之间。")
+        deadline = time.monotonic() + args.timeout
+        latest: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            latest = send_request("status")
+            if latest.get("state") == args.state:
+                print_result(latest)
+                return 0
+            time.sleep(0.1)
+        raise ControlError(f"等待状态 {args.state} 超时：{latest}")
+    raise ControlError(f"未知命令：{args.command}")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ControlError as error:
+        print(f"错误：{error}", file=sys.stderr)
+        raise SystemExit(1)

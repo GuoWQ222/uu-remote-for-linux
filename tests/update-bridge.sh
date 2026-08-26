@@ -24,6 +24,7 @@ readonly lock_file="$test_root/state/update-bridge.lock"
 readonly request_file="$test_root/prefix/drive_c/uu-remote-upstream-update.request"
 readonly processing_file="$test_root/prefix/drive_c/uu-remote-upstream-update.processing"
 readonly status_file="$test_root/state/update-bridge-status"
+readonly policy_lock="$test_root/state/client-update-policy.lock"
 
 write_setting() {
     local value=$1
@@ -37,6 +38,52 @@ write_setting() {
 write_setting 0
 if "$bridge" setting-enabled "$setting"; then
     printf 'AutoUpdate=0 被误判为已启用。\n' >&2
+    exit 1
+fi
+
+# The foreground handoff must preserve unrelated settings, handle CRLF/BOM,
+# disable every supported upstream key, and remain atomic under a launch storm.
+printf '\357\273\277[global]\r\nAutoUpdate=true\r\nKeepGlobal=yes\r\n' \
+    >"$setting"
+printf '[settingCenter]\r\n  aUtOuPdAtE = 1\r\nCloseOption=1\r\n' \
+    >>"$setting"
+declare -a policy_pids=()
+for _attempt in {1..64}; do
+    "$bridge" defer-client-check "$setting" "$policy_lock" &
+    policy_pids+=("$!")
+done
+for policy_pid in "${policy_pids[@]}"; do
+    wait "$policy_pid"
+done
+if "$bridge" setting-enabled "$setting"; then
+    printf '并发移交后 AutoUpdate 仍被识别为启用。\n' >&2
+    exit 1
+fi
+/usr/bin/python3 - "$setting" <<'PY'
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1]).read_bytes()
+assert data.startswith(b"\xef\xbb\xbf")
+assert b"\r\n" in data and b"\n" not in data.replace(b"\r\n", b"")
+text = data.decode("utf-8-sig").casefold()
+assert text.count("autoupdate=true") == 0
+assert text.count("autoupdate=0") == 1
+assert text.count("autoupdate = 0") == 1
+assert "keepglobal=yes" in text
+assert "closeoption=1" in text
+PY
+policy_hash_before=$(sha256sum "$setting")
+policy_hash_before=${policy_hash_before%% *}
+"$bridge" defer-client-check "$setting" "$policy_lock"
+policy_hash_after=$(sha256sum "$setting")
+policy_hash_after=${policy_hash_after%% *}
+test "$policy_hash_before" = "$policy_hash_after"
+
+ln -s "$setting" "$test_root/unsafe-setting.ini"
+if "$bridge" defer-client-check \
+    "$test_root/unsafe-setting.ini" "$policy_lock" >/dev/null 2>&1; then
+    printf '策略移交意外接受了符号链接设置文件。\n' >&2
     exit 1
 fi
 

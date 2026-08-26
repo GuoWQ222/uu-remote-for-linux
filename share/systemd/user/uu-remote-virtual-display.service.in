@@ -1,0 +1,19 @@
+[Unit]
+Description=UU Remote X11 virtual display state manager
+Documentation=https://github.com/GuoWQ222/uu-remote-for-linux
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=@LIBDIR@/uu-remote-virtual-displayd
+ExecStopPost=-@LIBDIR@/uu-remote-x11-virtual-display disable
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
