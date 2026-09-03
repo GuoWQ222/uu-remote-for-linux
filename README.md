@@ -16,6 +16,10 @@
 > [!IMPORTANT]
 > This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries.
 
+## 🔜 Coming Soon
+
+Remote control of the login screen after logout is coming soon.
+
 ## 🗺️ Contents
 
 - [✨ Highlights](#highlights)
