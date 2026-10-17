@@ -576,6 +576,32 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as o
         unrelated.terminate()
         unrelated.wait()
 
+# The direct-launch source= form also needs proof of the loaded controller
+# image. A generic UUID-bearing process in the same prefix must be excluded.
+with tempfile.TemporaryDirectory() as prefix:
+    environment = os.environ.copy()
+    environment["WINEPREFIX"] = prefix
+    controller_id = "A537971D-B665-47E5-8B5B-DFF52C5CDE44"
+    (Path(prefix) / controller_id).write_text("sleep 5\n")
+    child = subprocess.Popen(
+        ["source=", controller_id], executable="/bin/bash", cwd=prefix,
+        env=environment,
+    )
+    original_read_text = Path.read_text
+    try:
+        assert child.pid not in namespace["controller_processes"](prefix)
+        expected = Path(prefix) / "drive_c/Program Files/Netease/GameViewer/bin/GameViewer.exe"
+        def mapped_controller(path, *args, **kwargs):
+            if str(path) == f"/proc/{child.pid}/maps":
+                return f"140000000-140001000 r--p 00000000 fc:00 123 {expected}\n"
+            return original_read_text(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", mapped_controller):
+            assert child.pid in namespace["controller_processes"](prefix)
+            assert child.pid not in namespace["controller_processes"](prefix + "-other")
+    finally:
+        child.terminate()
+        child.wait()
+
 # Controller recovery must not SIGKILL a different process that reused the
 # controller PID after the graceful termination request.
 with tempfile.TemporaryDirectory() as state:
@@ -1003,6 +1029,10 @@ class RepaintX11:
 
     def __init__(self):
         self.resizes = []
+        self.title = "网易UU远程"
+        self.size = (920, 680)
+        self.mapped = True
+        self.closed = False
 
     @staticmethod
     def windows():
@@ -1014,21 +1044,22 @@ class RepaintX11:
             return "gameviewer.exe", "gameviewer.exe"
         return "other.exe", "other.exe"
 
-    @staticmethod
-    def property_first_cardinal(window, atom):
+    def property_first_cardinal(self, window, atom):
         if window != 0x200:
             return None
-        return 4242 if atom == 1 else 1
+        return 4242 if atom == 1 else (1 if self.mapped else 0)
 
-    @staticmethod
-    def geometry(window):
-        return (920, 680) if window == 0x200 else (10, 10)
+    def geometry(self, window):
+        return self.size if window == 0x200 else (10, 10)
+
+    def window_title(self, window):
+        return self.title if window == 0x200 else "other"
 
     def resize(self, window, width, height):
         self.resizes.append((window, width, height))
 
     def close(self):
-        pass
+        self.closed = True
 
 repaint_x11 = RepaintX11()
 repaint_globals = namespace["repaint_home_window"].__globals__
@@ -1046,6 +1077,33 @@ try:
         (0x200, 921, 681),
         (0x200, 920, 680),
     ]
+    assert repaint_x11.closed
+    repaint_x11.size = (520, 360)
+    assert namespace["mapped_home_window"](repaint_x11, "/mock-prefix") == (0x200, 520, 360)
+    repaint_x11.title = "GameViewer"
+    repaint_x11.size = (352, 245)
+    assert namespace["mapped_home_window"](repaint_x11, "/mock-prefix") is None
+    repaint_x11.title = "Remote desktop - another device"
+    repaint_x11.size = (1280, 720)
+    assert namespace["mapped_home_window"](repaint_x11, "/mock-prefix") is None
+    repaint_x11.title = "网易UU远程"
+    repaint_x11.mapped = False
+    repaint_x11.resizes = []
+    clock = [0.0]
+    def advance(seconds):
+        clock[0] += seconds
+    with mock.patch.object(namespace["time"], "sleep", side_effect=advance), mock.patch.object(namespace["time"], "monotonic", side_effect=lambda: clock[0]):
+        assert not namespace["repaint_home_window"]("/mock-prefix", 0, 250)
+    assert not repaint_x11.resizes
+    assert clock[0] == 0.25
+    # A startup window becoming the real home during the wait is accepted.
+    clock[0] = 0
+    def show_after_delay(seconds):
+        advance(seconds)
+        if clock[0] >= 0.2:
+            repaint_x11.mapped = True
+    with mock.patch.object(namespace["time"], "sleep", side_effect=show_after_delay), mock.patch.object(namespace["time"], "monotonic", side_effect=lambda: clock[0]):
+        assert namespace["repaint_home_window"]("/mock-prefix", 0, 1000)
 finally:
     repaint_globals["controller_processes"] = original_controller_processes
     repaint_globals["X11"] = original_x11
