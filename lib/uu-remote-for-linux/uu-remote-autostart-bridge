@@ -190,31 +190,44 @@ file_signature() {
 watch_autostart() {
     local registry=$1 desktop=$2 launcher=$3 log_file=$4 lock_file=$5
     local interval=${6:-2}
-    local previous_signature="" current_signature state
+    local live_every=${UU_REMOTE_AUTOSTART_LIVE_EVERY:-5}
+    local previous_signature="" current_signature state=""
+    local files previous_files="" polls=0
 
     [[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
         printf '无效的轮询间隔：%s\n' "$interval" >&2
         return 2
     }
+    [[ $live_every =~ ^[1-9][0-9]*$ ]] || live_every=5
     mkdir -p -- "${lock_file%/*}"
     exec 8>"$lock_file"
     flock -n 8 || return 0
 
     log_message "$log_file" "自启动兼容桥开始监视 UU 注册表"
     while [[ -x $launcher ]]; do
-        if effective_autostart_enabled "$registry"; then
-            state=enabled
-        else
-            state=disabled
+        files="$(file_signature "$registry")|$(file_signature "$desktop")"
+        # A live registry query starts a Wine process.  Re-read it when a
+        # watched file changed and otherwise every live_every polls, rather
+        # than spawning Wine on every short poll for the whole session.
+        if [[ -z $state || $files != "$previous_files" ]] ||
+            ((polls % live_every == 0)); then
+            if effective_autostart_enabled "$registry"; then
+                state=enabled
+            else
+                state=disabled
+            fi
         fi
-        current_signature="$(file_signature "$registry")|$(file_signature "$desktop")|$state"
+        polls=$((polls + 1))
+        current_signature="$files|$state"
         if [[ $current_signature != "$previous_signature" ]]; then
             if ! apply_autostart_state \
                 "$state" "$desktop" "$launcher" "$log_file"; then
                 log_message "$log_file" "自启动同步未完成；将等待下一次文件变化"
             fi
-            previous_signature="$(file_signature "$registry")|$(file_signature "$desktop")|$state"
+            files="$(file_signature "$registry")|$(file_signature "$desktop")"
+            previous_signature="$files|$state"
         fi
+        previous_files=$files
         sleep "$interval"
     done
     log_message "$log_file" "启动器已移除，自启动兼容桥退出"
