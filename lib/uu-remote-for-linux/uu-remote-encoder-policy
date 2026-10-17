@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -19,6 +20,36 @@ NVENC_V8_IMPL = 0
 NVENC_V11_IMPL = 1
 SOFTWARE_IMPLS = {5, 6}
 PATCHED_NVDEC_IMPL = 33
+CURRENT_PORTRAIT_SCALE = bytes.fromhex(
+    "41 8b 4d 04 bb ff ff ff ff 85 c9 75 06 41 8b 45 30 eb 02 8b c3 "
+    "41 89 84 24 c0 00 00 00 85 c9 75 04 41 8b 5d 34 "
+    "41 89 9c 24 c4 00 00 00 41 89 8c 24 c8 00 00 00"
+)
+CURRENT_PORTRAIT_SCALER = bytes.fromhex(
+    "44 8b 8e 90 00 00 00 41 2b d0 44 2b 8e 88 00 00 00 "
+    "44 8b 45 cc 44 8b 55 c4 4c 89 a4 24 90 03 00 00 41 3b d1 7f 4f "
+    "8b 8e 94 00 00 00 41 8b c0 2b 8e 8c 00 00 00 41 2b c2 3b c1 7f 39 "
+    "41 0f 10 55 24 45 8b 65 2c 66 0f 6f c2 66 41 0f 7e d7 "
+    "66 0f 73 d8 0c 66 48 0f 7e d2 66 0f 7e c1 66 0f 6f c2 "
+    "66 0f 73 d8 04 66 0f 7e 44 24 34 0f 11 54 24 40 e9 a9 00 00 00 "
+    "8b 86 94 00 00 00 0f 57 c0 2b 86 8c 00 00 00 0f 57 c9 "
+    "0f 29 bc 24 70 03 00 00 45 2b c2 0f 57 ff "
+    "44 0f 29 84 24 60 03 00 00 f3 0f 2a c2 f3 0f 2a f8 "
+    "45 0f 57 c0 f3 41 0f 2a c9 f3 45 0f 2a c0 "
+    "f3 0f 5e c8 f3 41 0f 5e f8 f3 0f 5d f9"
+)
+
+
+def field_pattern_offsets(data: bytes, start: int, end: int, pattern: bytes,
+                          fields: tuple[tuple[int, int, int], ...]) -> list[int]:
+    parts = []
+    position = 0
+    for offset, original, patched in fields:
+        parts += [re.escape(pattern[position:offset]), b"[" + re.escape(bytes((original, patched))) + b"]"]
+        position = offset + 1
+    parts.append(re.escape(pattern[position:]))
+    return [start + match.start() for match in re.finditer(b"".join(parts), data[start:end])]
+
 CAPABILITY_INTEGER_FIELDS = {
     "video_codec",
     "adapter_id",
@@ -394,21 +425,28 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
     text_size = min(text_virtual_size, text_raw_size)
     text_end = text_offset + text_size
     candidates: list[tuple[int, int, int]] = []
+    native_device_vtables: set[int] = set()
     prefix = bytes.fromhex("e80000000090488d05")
     suffix = bytes.fromhex("4989074989b7a8000000")
 
     for offset in range(text_offset, max(text_offset, text_end - 22)):
         instruction = data[offset : offset + 23]
-        if (
-            len(instruction) != 23
-            or instruction[0] != prefix[0]
-            or instruction[5:9] != prefix[5:9]
-            or instruction[13:23] != suffix
-        ):
-            continue
         instruction_rva = text_rva + offset - text_offset
-        displacement = struct.unpack_from("<i", instruction, 9)[0]
-        vtable_rva = instruction_rva + 13 + displacement
+        legacy_constructor = (
+            len(instruction) == 23 and instruction[0] == prefix[0]
+            and instruction[5:9] == prefix[5:9] and instruction[13:23] == suffix
+        )
+        native_constructor = (
+            instruction[:3] == bytes.fromhex("488d05")
+            and instruction[7:14] == bytes.fromhex("4d89aea8000000")
+            and instruction[14:22] == bytes.fromhex("488d542420498906")
+        )
+        if legacy_constructor:
+            vtable_rva = instruction_rva + 13 + struct.unpack_from("<i", instruction, 9)[0]
+        elif native_constructor:
+            vtable_rva = instruction_rva + 7 + struct.unpack_from("<i", instruction, 3)[0]
+        else:
+            continue
         if not (
             rdata_rva <= vtable_rva
             and vtable_rva + 7 * 8
@@ -449,6 +487,8 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
             candidates.append((vtable_rva, vtable_rva + 5 * 8, 5))
         elif common_valid and expanded_adapter_slot:
             candidates.append((vtable_rva, vtable_rva + 6 * 8, 6))
+            if native_constructor:
+                native_device_vtables.add(vtable_rva)
 
     if len(candidates) != 1:
         fail(
@@ -456,6 +496,7 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
             f"候选数={len(candidates)}"
         )
     vtable_rva, slot_rva, gdi_adapter_slot_index = candidates[0]
+    native_device_pointer = vtable_rva in native_device_vtables
 
     adapter_getter_pattern = bytes.fromhex("8b4144c3")
     adapter_getter_offsets: list[int] = []
@@ -496,6 +537,17 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         ) >= 0:
             encoder_accessor_offsets.append(search_offset)
         search_offset += 1
+    if native_device_pointer:
+        # New UU queues GPUDevice pointers, not integer LUIDs. Supplying the
+        # old constant at this virtual call would become an invalid pointer.
+        encoder_accessor_offsets = []
+        native_call = bytes.fromhex("488b01ff50304c8bf0488bcbe8")
+        offset = text_offset
+        while (offset := data.find(native_call, offset, text_end)) >= 0:
+            window = data[offset: min(offset + 256, text_end)]
+            if bytes.fromhex("4d85f60f84") in window and bytes.fromhex("4c3b7010") in window:
+                encoder_accessor_offsets.append(offset)
+            offset += 1
     if len(encoder_accessor_offsets) != 1:
         fail(
             "无法唯一定位编码器实际读取的队列包装帧适配器方法；"
@@ -538,7 +590,40 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         return matches == 1
 
     impl_switch_candidates: list[int] = []
-    if (
+    if native_device_pointer:
+        implementation_profile = "native-nvenc"
+        software_impl = 5
+        try:
+            nvenc_name_rva = unique_ascii_rva(b"Nvenc")
+            software_name_rva = unique_ascii_rva(b"SoftWare")
+        except ValueError as error:
+            fail(f"无法验证原生编码器实现编号：{error}")
+        native_switch = bytes.fromhex("0fb6c283f8050f87")
+        offset = text_offset
+        while (offset := data.find(native_switch, offset, text_end)) >= 0:
+            if (
+                data[offset + 12:offset + 15] == bytes.fromhex("4c8d05")
+                and data[offset + 19:offset + 23] == bytes.fromhex("418b9480")
+                and data[offset + 27:offset + 32] == bytes.fromhex("4903d0ffe2")
+            ):
+                try:
+                    origin = offset_to_rva(offset, 32)
+                    table = rva_to_offset(read_u32(data, offset + 23), 24)
+                    targets = struct.unpack_from("<6I", data, table)
+                    names = []
+                    for index in (0, 5):
+                        target = rva_to_offset(targets[index], 7)
+                        if data[target:target + 3] != bytes.fromhex("488d05"):
+                            raise ValueError("编码器名称不在直接返回分支")
+                        names.append(targets[index] + 7 + struct.unpack_from("<i", data, target + 3)[0])
+                    base_rva = origin + 19 + struct.unpack_from("<i", data, offset + 15)[0]
+                    default_rva = origin + 12 + struct.unpack_from("<i", data, offset + 8)[0]
+                    if base_rva == 0 and default_rva == targets[5] and names == [nvenc_name_rva, software_name_rva]:
+                        impl_switch_candidates.append(origin)
+                except (ValueError, struct.error):
+                    pass
+            offset += 1
+    elif (
         data.count(b"Nvenc V8\0") == 1
         and data.count(b"Nvenc V11\0") == 1
         and data.count(b"SoftWare\0") == 1
@@ -798,9 +883,7 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
             name = rtti_class_name(vtable_offset)
             if name is not None:
                 rtti_named_slots += 1
-            constructor_references = adapter_constructor_references(
-                long_vtable_rva
-            )
+            constructor_references = 0 if native_device_pointer else adapter_constructor_references(long_vtable_rva)
             rtti_is_frame = name is None or (
                 "Frame" in name
                 and "@streamer@@" in name
@@ -828,14 +911,15 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
             "RawVideoFrame 适配器函数还存在无法分类的引用；"
             f"总数={getter_slots}，短虚表={base_slots}，长虚表={long_slots}"
         )
-    if len(wrapper_candidates) != 1:
+    if native_device_pointer:
+        wrapper_slot_rva, wrapper_vtable_rva, wrapper_ctor_refs, wrapper_rtti = 0, 0, 0, "native-device-pointer"
+    elif len(wrapper_candidates) != 1:
         fail(
             "无法用构造器与 adapter_id 字段布局唯一识别编码包装帧；"
             f"候选数={len(wrapper_candidates)}"
         )
-    wrapper_slot_rva, wrapper_vtable_rva, wrapper_ctor_refs, wrapper_rtti = (
-        wrapper_candidates[0]
-    )
+    else:
+        wrapper_slot_rva, wrapper_vtable_rva, wrapper_ctor_refs, wrapper_rtti = wrapper_candidates[0]
     portrait_scale_pattern = bytes.fromhex(
         "41 8b 56 04 85 d2 75 10 41 8b 46 30 "
         "89 83 c0 00 00 00 41 8b 46 34 eb 08 "
@@ -872,6 +956,10 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         if portrait_scale_offsets
         else 0
     )
+    if native_device_pointer:
+        portrait_scale_offsets = field_pattern_offsets(data, text_offset, text_end,
+            CURRENT_PORTRAIT_SCALE, ((36, 0x34, 0x30),))
+        portrait_scale_rva = offset_to_rva(portrait_scale_offsets[0], len(CURRENT_PORTRAIT_SCALE)) if len(portrait_scale_offsets) == 1 else 0
     portrait_capture_pattern = bytes.fromhex(
         "41 8b 85 c0 00 00 00 89 86 24 01 00 00 "
         "41 8b 85 c4 00 00 00 89 86 28 01 00 00"
@@ -1019,6 +1107,10 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         if portrait_scaler_offsets
         else 0
     )
+    if native_device_pointer:
+        portrait_scaler_offsets = field_pattern_offsets(data, text_offset, text_end,
+            CURRENT_PORTRAIT_SCALER, ((40, 0x94, 0x90), (49, 0x8C, 0x88), (119, 0x94, 0x90), (128, 0x8C, 0x88)))
+        portrait_scaler_rva = offset_to_rva(portrait_scaler_offsets[0], len(CURRENT_PORTRAIT_SCALER)) if len(portrait_scaler_offsets) == 1 else 0
     profile: dict[str, object] = {
         "vtable_rva": vtable_rva,
         "slot_rva": slot_rva,
@@ -1034,8 +1126,9 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         "encoder_accessor_rva": encoder_accessor_rva,
         "encoder_path_candidates": len(encoder_accessor_offsets),
         "implementation_profile": implementation_profile,
+        "frame_adapter_mode": "native-device-pointer" if native_device_pointer else "legacy-luid",
         "nvenc_v8_impl": NVENC_V8_IMPL,
-        "nvenc_v11_impl": NVENC_V11_IMPL,
+        "nvenc_v11_impl": NVENC_V8_IMPL if native_device_pointer else NVENC_V11_IMPL,
         "software_impl": software_impl,
         "impl_33": "software",
         "impl_switch_candidates": len(impl_switch_candidates),
@@ -1064,7 +1157,8 @@ def probe_streamer(path: Path, *, emit: bool = True) -> dict[str, object]:
         f"\tencoder_path_candidates={len(encoder_accessor_offsets)}"
         f"\timplementation_profile={implementation_profile}"
         f"\tnvenc_v8_impl={NVENC_V8_IMPL}"
-        f"\tnvenc_v11_impl={NVENC_V11_IMPL}"
+        f"\tnvenc_v11_impl={profile['nvenc_v11_impl']}"
+        f"\tframe_adapter_mode={profile['frame_adapter_mode']}"
         f"\tsoftware_impl={software_impl}"
         f"\timpl_33=software"
         f"\timpl_switch_candidates={len(impl_switch_candidates)}"
@@ -1092,6 +1186,18 @@ def portrait_profile_ready(profile: dict[str, object]) -> bool:
 
 
 def encoder_profile_ready(profile: dict[str, object]) -> bool:
+    if profile.get("frame_adapter_mode") == "native-device-pointer":
+        return (
+            profile.get("implementation_profile") == "native-nvenc"
+            and profile.get("encoder_path_candidates") == 1
+            and profile.get("impl_switch_candidates") == 1
+            and profile.get("gdi_adapter_slot_index") == 6
+            and profile.get("nvenc_v8_impl") == 0
+            and profile.get("nvenc_v11_impl") == 0
+            and profile.get("software_impl") == 5
+            and all(isinstance(profile.get(name), int) and profile[name] > 0
+                    for name in ("vtable_rva", "slot_rva", "encoder_accessor_rva"))
+        )
     positive_rvas = (
         "vtable_rva",
         "slot_rva",

@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "uu-remote-current-streamer.h"
 
 #define UUIP_MAGIC 0x50495555u
 #define UUIP_VERSION 1u
@@ -261,6 +262,7 @@ static volatile LONG dxgi_cursor_shape_updates;
 static volatile LONG dxgi_cursor_shape_fallbacks;
 static volatile LONG dxgi_cursor_delivered_sequence;
 static BOOL streamer_frame_adapter_hooked;
+static BOOL streamer_native_device_pointer;
 static DWORD configured_frame_adapter_luid;
 static void *original_frame_adapter_id;
 static volatile LONG frame_adapter_hook_calls;
@@ -2689,6 +2691,11 @@ static void write_frame_hook_status(void) {
     );
     WritePrivateProfileStringA(
         "encoder", "adapter_luid", value, frame_status_path
+    );
+    WritePrivateProfileStringA(
+        "encoder", "adapter_mode",
+        streamer_native_device_pointer ? "native-device-pointer" : "legacy-luid",
+        frame_status_path
     );
     WritePrivateProfileStringA(
         "encoder",
@@ -5310,6 +5317,61 @@ static BOOL patch_frame_adapter_accessor(void *function) {
  * same direction-neutral maximum as its width.  This changes only the upper
  * bound: the capture path still keeps the monitor's real aspect ratio.
  */
+static BOOL patch_current_portrait_fields(
+    HMODULE module, const unsigned char *pattern, SIZE_T pattern_size,
+    const SIZE_T *fields, const unsigned char *values, SIZE_T field_count,
+    volatile LONG *candidates, volatile LONG *patches, BOOL *hooked
+) {
+    struct loaded_pe_image image;
+    const IMAGE_SECTION_HEADER *text = NULL;
+    unsigned char *start = NULL;
+    unsigned char *candidate = NULL;
+    SIZE_T span = 0u, index, field;
+    unsigned char originals[4];
+    unsigned int count = 0u;
+
+    if (field_count > 4u || !field_count ||
+        !parse_loaded_pe_image(module, &image) ||
+        !loaded_pe_find_section(&image, ".text", &text, &start, &span) ||
+        span < pattern_size) {
+        return FALSE;
+    }
+    for (field = 0u; field < field_count; ++field) {
+        originals[field] = pattern[fields[field]];
+    }
+    for (index = 0u; index + pattern_size <= span; ++index) {
+        SIZE_T segment = 0u;
+        unsigned char *current = start + index;
+        BOOL matches = TRUE;
+        if (current[0] != pattern[0]) {
+            continue;
+        }
+        for (field = 0u; field < field_count; ++field) {
+            SIZE_T offset = fields[field];
+            if (!bytes_equal(current + segment, pattern + segment, offset - segment) ||
+                (current[offset] != originals[field] && current[offset] != values[field])) {
+                matches = FALSE;
+                break;
+            }
+            segment = offset + 1u;
+        }
+        if (matches && bytes_equal(current + segment, pattern + segment, pattern_size - segment)) {
+            candidate = current;
+            ++count;
+        }
+    }
+    if (count != 1u || !candidate) {
+        return FALSE;
+    }
+    InterlockedExchange(candidates, (LONG)count);
+    if (!patch_executable_byte_fields(candidate, pattern_size, fields, originals,
+                                     values, field_count, patches)) {
+        return FALSE;
+    }
+    *hooked = TRUE;
+    return TRUE;
+}
+
 static BOOL patch_streamer_portrait_scale_limit(HMODULE module) {
     static const unsigned char scale_copy_pattern[] = {
         0x41, 0x8b, 0x56, 0x04, 0x85, 0xd2, 0x75, 0x10,
@@ -5336,6 +5398,12 @@ static BOOL patch_streamer_portrait_scale_limit(HMODULE module) {
     SIZE_T index;
 
     if (streamer_portrait_scale_limit_hooked) {
+        return TRUE;
+    }
+    if (patch_current_portrait_fields(module, current_portrait_scale_pattern,
+            sizeof(current_portrait_scale_pattern), current_portrait_scale_fields,
+            current_portrait_scale_values, 1u, &frame_portrait_scale_limit_candidates,
+            &frame_portrait_scale_limit_patches, &streamer_portrait_scale_limit_hooked)) {
         return TRUE;
     }
     if (
@@ -5620,6 +5688,12 @@ static BOOL patch_streamer_portrait_scaler(HMODULE module) {
     BOOL matches;
 
     if (streamer_portrait_scaler_hooked) {
+        return TRUE;
+    }
+    if (patch_current_portrait_fields(module, current_portrait_scaler_pattern,
+            sizeof(current_portrait_scaler_pattern), current_portrait_scaler_fields,
+            current_portrait_scaler_values, 4u, &frame_portrait_scaler_candidates,
+            &frame_portrait_scaler_patches, &streamer_portrait_scaler_hooked)) {
         return TRUE;
     }
     if (
@@ -5923,13 +5997,15 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
     unsigned int wrapper_slot_count = 0;
     unsigned int rtti_named_count = 0;
     unsigned int encoder_path_accessor_count = 0;
+    unsigned int native_constructor_count = 0u;
+    unsigned int native_path_count = 0u;
     unsigned int section_index;
     SIZE_T index;
 
     if (!configured_frame_adapter_luid) {
         return TRUE;
     }
-    if (streamer_frame_adapter_hooked) {
+    if (streamer_frame_adapter_hooked || streamer_native_device_pointer) {
         return TRUE;
     }
     if (
@@ -5946,6 +6022,32 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
     }
     base = image.base;
     nt = image.nt;
+    {
+        static const unsigned char pointer_path[] = {
+            0x48, 0x8b, 0x01, 0xff, 0x50, 0x30, 0x4c, 0x8b, 0xf0,
+            0x48, 0x8b, 0xcb, 0xe8
+        };
+        static const unsigned char pointer_test[] = {0x4d, 0x85, 0xf6, 0x0f, 0x84};
+        static const unsigned char pointer_compare[] = {0x4c, 0x3b, 0x70, 0x10};
+        for (index = 0u; index + 256u <= text_span; ++index) {
+            SIZE_T check;
+            BOOL tested = FALSE, compared = FALSE;
+            if (!bytes_equal(text_start + index, pointer_path, sizeof(pointer_path))) {
+                continue;
+            }
+            for (check = 0u; check + sizeof(pointer_test) <= 256u; ++check) {
+                if (bytes_equal(text_start + index + check, pointer_test, sizeof(pointer_test))) {
+                    tested = TRUE;
+                }
+                if (bytes_equal(text_start + index + check, pointer_compare, sizeof(pointer_compare))) {
+                    compared = TRUE;
+                }
+            }
+            if (tested && compared) {
+                ++native_path_count;
+            }
+        }
+    }
     for (index = 0;
          index + sizeof(base_adapter_getter_code) <= text_span;
          ++index) {
@@ -5993,6 +6095,11 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
         unsigned char *instruction = text_start + index;
         int32_t displacement;
         void **vtable;
+        BOOL native_constructor = FALSE;
+        static const unsigned char native_tail[] = {
+            0x4d, 0x89, 0xae, 0xa8, 0, 0, 0,
+            0x48, 0x8d, 0x54, 0x24, 0x20, 0x49, 0x89, 0x06
+        };
 
         if (
             instruction[0] != constructor_prefix[0] ||
@@ -6006,10 +6113,15 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
                 sizeof(constructor_suffix)
             )
         ) {
-            continue;
+            if (instruction[0] != 0x48u || instruction[1] != 0x8du ||
+                instruction[2] != 0x05u ||
+                !bytes_equal(instruction + 7u, native_tail, sizeof(native_tail))) {
+                continue;
+            }
+            native_constructor = TRUE;
         }
-        CopyMemory(&displacement, instruction + 9, sizeof(displacement));
-        vtable = (void **)(instruction + 13 + displacement);
+        CopyMemory(&displacement, instruction + (native_constructor ? 3u : 9u), sizeof(displacement));
+        vtable = (void **)(instruction + (native_constructor ? 7u : 13u) + displacement);
         if (!address_in_image_section(
                 base, rdata, vtable, 7u * sizeof(*vtable)
             ) ||
@@ -6041,9 +6153,22 @@ static BOOL patch_streamer_gdi_frame_adapter(HMODULE module) {
             continue;
         }
         ++candidate_count;
+        if (native_constructor) {
+            ++native_constructor_count;
+        }
     }
     if (candidate_count != 1u || !candidate_slot) {
         return FALSE;
+    }
+    if (native_constructor_count) {
+        /* This method now returns GPUDevice*. Never patch it, the base tables,
+         * or the queue with a numeric LUID from the legacy client ABI. */
+        if (native_constructor_count != 1u || native_path_count != 1u) {
+            return FALSE;
+        }
+        InterlockedExchange(&frame_adapter_encoder_path_candidates, 1);
+        streamer_native_device_pointer = TRUE;
+        return TRUE;
     }
     {
         for (index = 0u;
@@ -9230,6 +9355,7 @@ static BOOL patch_streamer_imports(void) {
         dxgi_output_vtable_hooked = FALSE;
         dxgi_duplication_vtable_hooked = FALSE;
         streamer_frame_adapter_hooked = FALSE;
+        streamer_native_device_pointer = FALSE;
         streamer_wrapper_frame_adapter_hooked = FALSE;
         streamer_portrait_scale_limit_hooked = FALSE;
         streamer_portrait_capture_limit_hooked = FALSE;
