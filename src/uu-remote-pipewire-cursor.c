@@ -105,6 +105,9 @@ struct stream_data {
     uint32_t node;
     uint32_t width;
     uint32_t height;
+    /* Negotiated buffer size; physical pixels when stage views are scaled. */
+    uint32_t buffer_width;
+    uint32_t buffer_height;
     struct cursor_snapshot cursor;
     bool has_cursor;
     bool streaming;
@@ -463,9 +466,130 @@ static bool cursor_inside_stream(
     const struct cursor_event *event
 )
 {
+    /* SPA_META_Cursor positions use the negotiated buffer's pixels. */
+    uint32_t width = stream_data->buffer_width
+        ? stream_data->buffer_width
+        : stream_data->width;
+    uint32_t height = stream_data->buffer_height
+        ? stream_data->buffer_height
+        : stream_data->height;
+
     return event->position_x >= 0 && event->position_y >= 0 &&
-        (uint32_t)event->position_x < stream_data->width &&
-        (uint32_t)event->position_y < stream_data->height;
+        (uint32_t)event->position_x < width &&
+        (uint32_t)event->position_y < height;
+}
+
+static uint32_t scaled_extent(uint32_t value, uint32_t logical, uint32_t buffer)
+{
+    uint64_t scaled = ((uint64_t)value * logical + buffer / 2u) / buffer;
+
+    return scaled ? (uint32_t)scaled : 1u;
+}
+
+/*
+ * Bring a buffer-pixel cursor bitmap to the logical pixel size of the frames
+ * Wine sees, so a 200% desktop does not show a double-size remote cursor.
+ * Colors are alpha-weighted to keep translucent edges free of dark fringes.
+ */
+static int scale_cursor_snapshot(
+    struct cursor_snapshot *snapshot,
+    const struct stream_data *stream_data
+)
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t row;
+    uint32_t column;
+    unsigned char *pixels;
+
+    if (
+        !stream_data->buffer_width || !stream_data->buffer_height ||
+        (stream_data->buffer_width <= stream_data->width &&
+         stream_data->buffer_height <= stream_data->height)
+    ) {
+        return 0;
+    }
+    width = scaled_extent(
+        snapshot->width,
+        stream_data->width,
+        stream_data->buffer_width
+    );
+    height = scaled_extent(
+        snapshot->height,
+        stream_data->height,
+        stream_data->buffer_height
+    );
+    if (width >= snapshot->width && height >= snapshot->height) {
+        return 0;
+    }
+    width = SPA_MIN(width, snapshot->width);
+    height = SPA_MIN(height, snapshot->height);
+    pixels = malloc((size_t)width * height * 4u);
+    if (!pixels) {
+        return -ENOMEM;
+    }
+    for (row = 0; row < height; ++row) {
+        uint32_t first_row = row * snapshot->height / height;
+        uint32_t end_row = SPA_MAX(
+            first_row + 1u,
+            (row + 1u) * snapshot->height / height
+        );
+
+        for (column = 0; column < width; ++column) {
+            uint32_t first_column = column * snapshot->width / width;
+            uint32_t end_column = SPA_MAX(
+                first_column + 1u,
+                (column + 1u) * snapshot->width / width
+            );
+            uint64_t color[3] = { 0, 0, 0 };
+            uint64_t alpha = 0;
+            uint64_t count = 0;
+            unsigned char *destination = pixels +
+                ((size_t)row * width + column) * 4u;
+            uint32_t source_row;
+            uint32_t source_column;
+            uint32_t channel;
+
+            for (source_row = first_row; source_row < end_row; ++source_row) {
+                for (
+                    source_column = first_column;
+                    source_column < end_column;
+                    ++source_column
+                ) {
+                    const unsigned char *source = snapshot->pixels +
+                        ((size_t)source_row * snapshot->width +
+                         source_column) * 4u;
+
+                    for (channel = 0; channel < 3u; ++channel) {
+                        color[channel] +=
+                            (uint64_t)source[channel] * source[3];
+                    }
+                    alpha += source[3];
+                    count += 1u;
+                }
+            }
+            for (channel = 0; channel < 3u; ++channel) {
+                destination[channel] = alpha
+                    ? (unsigned char)((color[channel] + alpha / 2u) / alpha)
+                    : 0u;
+            }
+            destination[3] = (unsigned char)((alpha + count / 2u) / count);
+        }
+    }
+    snapshot->hotspot_x = SPA_MIN(
+        (uint32_t)((uint64_t)snapshot->hotspot_x * width / snapshot->width),
+        width - 1u
+    );
+    snapshot->hotspot_y = SPA_MIN(
+        (uint32_t)((uint64_t)snapshot->hotspot_y * height / snapshot->height),
+        height - 1u
+    );
+    free(snapshot->pixels);
+    snapshot->pixels = pixels;
+    snapshot->width = width;
+    snapshot->height = height;
+    snapshot->pixel_size = width * height * 4u;
+    return 0;
 }
 
 static int extract_cursor(
@@ -764,6 +888,13 @@ static void process_cursor_meta(
         }
         return;
     }
+    if (
+        event.has_bitmap &&
+        scale_cursor_snapshot(&event.snapshot, stream_data) < 0
+    ) {
+        free(event.snapshot.pixels);
+        return;
+    }
     if (event.has_bitmap) {
         free(stream_data->cursor.pixels);
         stream_data->cursor = event.snapshot;
@@ -964,6 +1095,8 @@ static void on_param_changed(
         );
         return;
     }
+    stream_data->buffer_width = width;
+    stream_data->buffer_height = height;
     modifier_property = spa_pod_find_prop(
         param,
         NULL,
@@ -1073,6 +1206,8 @@ static const struct spa_pod *build_cursor_format(
 {
     struct spa_pod_frame format_frame;
     struct spa_pod_frame modifier_frame;
+    struct spa_rectangle minimum_size = SPA_RECTANGLE(1, 1);
+    struct spa_rectangle maximum_size = SPA_RECTANGLE(16384, 16384);
     uint32_t index;
 
     spa_pod_builder_push_object(
@@ -1107,10 +1242,11 @@ static const struct spa_pod *build_cursor_format(
         spa_pod_builder_long(builder, modifiers->values[index]);
     }
     spa_pod_builder_pop(builder, &modifier_frame);
+    /* Scaled stage views offer physical-pixel buffers only. */
     spa_pod_builder_add(
         builder,
         SPA_FORMAT_VIDEO_size,
-        SPA_POD_Rectangle(size),
+        SPA_POD_CHOICE_RANGE_Rectangle(size, &minimum_size, &maximum_size),
         0
     );
     return spa_pod_builder_pop(builder, &format_frame);
@@ -1255,6 +1391,42 @@ static int self_test(void)
         fprintf(stderr, "PipeWire inactive cursor stream self-test failed\n");
         return 1;
     }
+    /* A 200% stage view: logical 1920x1080 stream, 3840x2160 buffers. */
+    stream_data.width = 1920;
+    stream_data.height = 1080;
+    stream_data.buffer_width = 3840;
+    stream_data.buffer_height = 2160;
+    event.position_x = 3839;
+    event.position_y = 2159;
+    if (!cursor_inside_stream(&stream_data, &event)) {
+        fprintf(stderr, "PipeWire scaled cursor bounds self-test failed\n");
+        return 1;
+    }
+    memset(&event.snapshot, 0, sizeof(event.snapshot));
+    event.snapshot.width = 4;
+    event.snapshot.height = 2;
+    event.snapshot.hotspot_x = 3;
+    event.snapshot.hotspot_y = 1;
+    event.snapshot.pixel_size = 32;
+    event.snapshot.pixels = calloc(1, 32);
+    if (!event.snapshot.pixels) {
+        return 1;
+    }
+    /* Opaque white beside a transparent pixel must stay white, half alpha. */
+    memset(event.snapshot.pixels, 0xff, 4);
+    if (
+        scale_cursor_snapshot(&event.snapshot, &stream_data) != 0 ||
+        event.snapshot.width != 2 || event.snapshot.height != 1 ||
+        event.snapshot.hotspot_x != 1 || event.snapshot.hotspot_y != 0 ||
+        event.snapshot.pixel_size != 8 ||
+        event.snapshot.pixels[0] != 0xff || event.snapshot.pixels[3] != 0x40 ||
+        event.snapshot.pixels[7] != 0
+    ) {
+        free(event.snapshot.pixels);
+        fprintf(stderr, "PipeWire cursor scaling self-test failed\n");
+        return 1;
+    }
+    free(event.snapshot.pixels);
     if (
         stream_state_is_terminal(
             PW_STREAM_STATE_UNCONNECTED,

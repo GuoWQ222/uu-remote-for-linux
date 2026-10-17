@@ -40,6 +40,10 @@ export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
 grep -q '#define UUDC_PIPEWIRE_BUFFERS 3' "$capture_source"
 grep -q '#define UUDC_STAGE_SLOTS 3u' "$capture_source"
 grep -q 'SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)' "$capture_source"
+grep -q 'sizeof(struct frame_notification) == 32' "$capture_source"
+# Scaled stage views offer physical-pixel buffers for logical Portal streams.
+grep -q 'SPA_POD_CHOICE_RANGE_Rectangle(size, &minimum_size, &maximum_size)' \
+    "$capture_source"
 /usr/bin/python3 - "$capture_source" <<'PY'
 from pathlib import Path
 import sys
@@ -76,7 +80,15 @@ assert module.CAPTURE_PIPEWIRE_BUFFERS == 3
 assert module.CAPTURE_TRANSPORT_DMABUF == "dmabuf-native"
 assert not hasattr(module, "CAPTURE_TRANSPORT_MEMFD")
 assert module.CAPTURE_NATIVE_STAGE_SLOTS == 3
-assert module.CAPTURE_NATIVE_NOTIFICATION.size == 24
+assert module.CAPTURE_NATIVE_NOTIFICATION.size == 32
+unscaled = {"width": 1920, "height": 1080}
+assert module.stream_buffer_point(unscaled, 1919, 1079) == (1919.0, 1079.0)
+scaled = dict(unscaled, buffer_width=3840, buffer_height=2160)
+assert module.stream_buffer_point(scaled, 1919, 1079) == (3838.0, 2158.0)
+fractional = {
+    "width": 2048, "height": 1152, "buffer_width": 2560, "buffer_height": 1440
+}
+assert module.stream_buffer_point(fractional, 1024, 576) == (1280.0, 720.0)
 assert module.PORTAL_CURSOR_EMBEDDED == 2
 assert module.PORTAL_CURSOR_METADATA == 4
 assert module.selected_portal_cursor_mode() == module.PORTAL_CURSOR_METADATA
@@ -562,12 +574,15 @@ os.write(
         9,
         8,
         123456,
+        4,
+        2,
     ),
 )
 os.close(notify_write)
 native_thread.join(timeout=2)
 assert not native_thread.is_alive()
 assert native_seen == [(0, 88, 8, 123456, b"staging!")]
+assert (native_stream["buffer_width"], native_stream["buffer_height"]) == (4, 2)
 assert os.read(release_read, 1) == b"\x01"
 assert native_backend.capture_callback_error == ""
 for descriptor in (notify_read, release_read, release_write):

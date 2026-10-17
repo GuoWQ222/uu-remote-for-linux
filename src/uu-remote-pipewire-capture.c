@@ -16,6 +16,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,18 +42,27 @@
 #define UUDC_STAGE_SLOTS 3u
 #define UUDC_PIPEWIRE_BUFFERS 3
 #define UUDC_MAX_MODIFIERS 64u
+#define UUDC_MAX_DIMENSION 16384u
 #define UUDC_NOTIFICATION_MAGIC UINT32_C(0x43445555)
 
+/*
+ * buffer_width/height report the negotiated PipeWire buffer size.  With
+ * scaled stage views Mutter produces physical-pixel buffers while the Portal
+ * describes the stream in logical pixels; the staging slot always holds the
+ * logical size the Python bridge requested.
+ */
 struct frame_notification {
     uint32_t magic;
     uint32_t slot;
     uint32_t sequence;
     uint32_t stride;
     uint64_t pts;
+    uint32_t buffer_width;
+    uint32_t buffer_height;
 };
 
 _Static_assert(
-    sizeof(struct frame_notification) == 24,
+    sizeof(struct frame_notification) == 32,
     "native capture notification ABI must stay fixed"
 );
 
@@ -82,6 +92,8 @@ struct application {
     uint32_t node;
     uint32_t width;
     uint32_t height;
+    uint32_t source_width;
+    uint32_t source_height;
     uint32_t stride;
     uint32_t drm_format;
     uint64_t modifier;
@@ -104,6 +116,13 @@ struct application {
     PFNEGLDESTROYIMAGEKHRPROC egl_destroy_image;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture;
     struct image_cache images[UUDC_PIPEWIRE_BUFFERS];
+    GLuint scale_program;
+    GLuint scale_texture;
+    GLuint scale_framebuffer;
+    GLint scale_position;
+    GLint scale_texcoord;
+    GLint scale_source;
+    GLint scale_step;
     unsigned char *rgba_scratch;
     bool direct_bgra_read;
     bool modifier_import;
@@ -496,10 +515,33 @@ static bool initialize_egl(struct application *application)
     return true;
 }
 
-static void destroy_egl(struct application *application)
+static void destroy_image_caches(struct application *application)
 {
     uint32_t index;
 
+    for (index = 0; index < UUDC_PIPEWIRE_BUFFERS; ++index) {
+        destroy_image_cache(application, &application->images[index]);
+    }
+}
+
+static void destroy_scale_pipeline(struct application *application)
+{
+    if (application->scale_framebuffer) {
+        glDeleteFramebuffers(1, &application->scale_framebuffer);
+    }
+    if (application->scale_texture) {
+        glDeleteTextures(1, &application->scale_texture);
+    }
+    if (application->scale_program) {
+        glDeleteProgram(application->scale_program);
+    }
+    application->scale_framebuffer = 0;
+    application->scale_texture = 0;
+    application->scale_program = 0;
+}
+
+static void destroy_egl(struct application *application)
+{
     if (application->egl_display != EGL_NO_DISPLAY &&
         application->egl_context != EGL_NO_CONTEXT) {
         eglMakeCurrent(
@@ -508,9 +550,8 @@ static void destroy_egl(struct application *application)
             application->egl_surface,
             application->egl_context
         );
-        for (index = 0; index < UUDC_PIPEWIRE_BUFFERS; ++index) {
-            destroy_image_cache(application, &application->images[index]);
-        }
+        destroy_image_caches(application);
+        destroy_scale_pipeline(application);
     }
     if (application->egl_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(
@@ -535,6 +576,237 @@ static void destroy_egl(struct application *application)
     }
     free(application->rgba_scratch);
     application->rgba_scratch = NULL;
+}
+
+/*
+ * Mutter sizes a scaled stream as roundf(logical * scale) per axis, so the
+ * cross products of a genuine uniform scale differ by at most half of each
+ * logical extent.  Anything else means the Portal layout is stale.
+ */
+static bool uniform_scale(
+    uint32_t logical_width,
+    uint32_t logical_height,
+    uint32_t buffer_width,
+    uint32_t buffer_height
+)
+{
+    uint64_t left = (uint64_t)buffer_width * logical_height;
+    uint64_t right = (uint64_t)buffer_height * logical_width;
+    uint64_t difference = left > right ? left - right : right - left;
+
+    return difference <= ((uint64_t)logical_width + logical_height) / 2u + 1u;
+}
+
+static bool scaling_required(const struct application *application)
+{
+    return application->source_width != application->width ||
+        application->source_height != application->height;
+}
+
+static void set_sampling(GLint filter)
+{
+    /* GLES2 samples NPOT textures as black unless they clamp to edge. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static GLuint compile_shader(GLenum type, const char *source)
+{
+    GLuint shader = glCreateShader(type);
+    GLint compiled = GL_FALSE;
+    char message[512];
+
+    if (!shader) {
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+        message[0] = '\0';
+        glGetShaderInfoLog(shader, sizeof(message), NULL, message);
+        fprintf(stderr, "native capture shader failed: %s\n", message);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+/*
+ * Mutter's scaled stage views produce physical-pixel buffers for a stream the
+ * Portal and XWayland describe in logical pixels.  Downscale on the GPU into
+ * the logical staging size.  Four bilinear taps at quarter-pixel offsets
+ * form an exact box filter for 2x and 4x and a close one for fractional
+ * scales.
+ */
+static bool ensure_scale_pipeline(struct application *application)
+{
+    static const char vertex_source[] =
+        "attribute vec2 a_position;\n"
+        "attribute vec2 a_texcoord;\n"
+        "varying vec2 v_texcoord;\n"
+        "void main() {\n"
+        "    v_texcoord = a_texcoord;\n"
+        "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+        "}\n";
+    static const char fragment_source[] =
+        "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+        "precision highp float;\n"
+        "#else\n"
+        "precision mediump float;\n"
+        "#endif\n"
+        "uniform sampler2D u_source;\n"
+        "uniform vec2 u_step;\n"
+        "varying vec2 v_texcoord;\n"
+        "void main() {\n"
+        "    gl_FragColor = 0.25 * (\n"
+        "        texture2D(u_source, v_texcoord + vec2(-u_step.x, -u_step.y)) +\n"
+        "        texture2D(u_source, v_texcoord + vec2(u_step.x, -u_step.y)) +\n"
+        "        texture2D(u_source, v_texcoord + vec2(-u_step.x, u_step.y)) +\n"
+        "        texture2D(u_source, v_texcoord + vec2(u_step.x, u_step.y)));\n"
+        "}\n";
+    GLuint vertex_shader;
+    GLuint fragment_shader;
+    GLint linked = GL_FALSE;
+
+    if (application->scale_program) {
+        return true;
+    }
+    vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_source);
+    fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+    if (vertex_shader && fragment_shader) {
+        application->scale_program = glCreateProgram();
+    }
+    if (application->scale_program) {
+        glAttachShader(application->scale_program, vertex_shader);
+        glAttachShader(application->scale_program, fragment_shader);
+        glLinkProgram(application->scale_program);
+        glGetProgramiv(application->scale_program, GL_LINK_STATUS, &linked);
+    }
+    if (vertex_shader) {
+        glDeleteShader(vertex_shader);
+    }
+    if (fragment_shader) {
+        glDeleteShader(fragment_shader);
+    }
+    if (linked != GL_TRUE) {
+        fprintf(stderr, "native capture scale program failed to link\n");
+        destroy_scale_pipeline(application);
+        return false;
+    }
+    application->scale_position = glGetAttribLocation(
+        application->scale_program,
+        "a_position"
+    );
+    application->scale_texcoord = glGetAttribLocation(
+        application->scale_program,
+        "a_texcoord"
+    );
+    application->scale_source = glGetUniformLocation(
+        application->scale_program,
+        "u_source"
+    );
+    application->scale_step = glGetUniformLocation(
+        application->scale_program,
+        "u_step"
+    );
+
+    glGenTextures(1, &application->scale_texture);
+    glBindTexture(GL_TEXTURE_2D, application->scale_texture);
+    set_sampling(GL_NEAREST);
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        (GLsizei)application->width,
+        (GLsizei)application->height,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        NULL
+    );
+    glGenFramebuffers(1, &application->scale_framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, application->scale_framebuffer);
+    glFramebufferTexture2D(
+        GL_FRAMEBUFFER,
+        GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D,
+        application->scale_texture,
+        0
+    );
+    if (
+        application->scale_position < 0 ||
+        application->scale_texcoord < 0 ||
+        application->scale_source < 0 ||
+        application->scale_step < 0 ||
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+        glGetError() != GL_NO_ERROR
+    ) {
+        fprintf(stderr, "native capture scale target is incomplete\n");
+        destroy_scale_pipeline(application);
+        return false;
+    }
+    return true;
+}
+
+static bool render_scaled(struct application *application, GLuint texture)
+{
+    /* Texture row 0 is the first buffer row; keep it at framebuffer row 0. */
+    static const GLfloat positions[] = {
+        -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
+    };
+    static const GLfloat texcoords[] = {
+        0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f,
+    };
+
+    if (!ensure_scale_pipeline(application)) {
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, application->scale_framebuffer);
+    glViewport(
+        0,
+        0,
+        (GLsizei)application->width,
+        (GLsizei)application->height
+    );
+    glUseProgram(application->scale_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(application->scale_source, 0);
+    glUniform2f(
+        application->scale_step,
+        0.25f / (GLfloat)application->width,
+        0.25f / (GLfloat)application->height
+    );
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(
+        (GLuint)application->scale_position,
+        2,
+        GL_FLOAT,
+        GL_FALSE,
+        0,
+        positions
+    );
+    glVertexAttribPointer(
+        (GLuint)application->scale_texcoord,
+        2,
+        GL_FLOAT,
+        GL_FALSE,
+        0,
+        texcoords
+    );
+    glEnableVertexAttribArray((GLuint)application->scale_position);
+    glEnableVertexAttribArray((GLuint)application->scale_texcoord);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)application->scale_position);
+    glDisableVertexAttribArray((GLuint)application->scale_texcoord);
+    if (glGetError() != GL_NO_ERROR) {
+        fprintf(stderr, "native capture GPU downscale failed\n");
+        return false;
+    }
+    return true;
 }
 
 static struct image_cache *get_image_cache(
@@ -571,8 +843,8 @@ static struct image_cache *get_image_cache(
         attributes[n++] = (key); \
         attributes[n++] = (EGLint)(value); \
     } while (0)
-    ADD_ATTRIBUTE(EGL_WIDTH, application->width);
-    ADD_ATTRIBUTE(EGL_HEIGHT, application->height);
+    ADD_ATTRIBUTE(EGL_WIDTH, application->source_width);
+    ADD_ATTRIBUTE(EGL_HEIGHT, application->source_height);
     ADD_ATTRIBUTE(EGL_LINUX_DRM_FOURCC_EXT, application->drm_format);
     ADD_ATTRIBUTE(EGL_DMA_BUF_PLANE0_FD_EXT, fd);
     ADD_ATTRIBUTE(EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset);
@@ -612,25 +884,29 @@ static struct image_cache *get_image_cache(
     }
     glGenTextures(1, &cache->texture);
     glBindTexture(GL_TEXTURE_2D, cache->texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    set_sampling(scaling_required(application) ? GL_LINEAR : GL_NEAREST);
     application->image_target_texture(
         GL_TEXTURE_2D,
         (GLeglImageOES)cache->image
     );
-    glGenFramebuffers(1, &cache->framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
-    glFramebufferTexture2D(
-        GL_FRAMEBUFFER,
-        GL_COLOR_ATTACHMENT0,
-        GL_TEXTURE_2D,
-        cache->texture,
-        0
-    );
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        fprintf(stderr, "imported DMA-BUF framebuffer is incomplete\n");
-        destroy_image_cache(application, cache);
-        return NULL;
+    if (!scaling_required(application)) {
+        glGenFramebuffers(1, &cache->framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            cache->texture,
+            0
+        );
+        if (
+            glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE
+        ) {
+            fprintf(stderr, "imported DMA-BUF framebuffer is incomplete\n");
+            destroy_image_cache(application, cache);
+            return NULL;
+        }
     }
     cache->fd = fd;
     cache->stride = stride;
@@ -678,7 +954,13 @@ static bool read_dma_buf(
     if (!cache) {
         return false;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
+    if (scaling_required(application)) {
+        if (!render_scaled(application, cache->texture)) {
+            return false;
+        }
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
+    }
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(
         0,
@@ -806,6 +1088,8 @@ static void on_process(void *userdata)
     notification.sequence = application->sequence;
     notification.stride = application->width * 4u;
     notification.pts = header ? (uint64_t)header->pts : 0u;
+    notification.buffer_width = application->source_width;
+    notification.buffer_height = application->source_height;
     if (write(
             application->notify_fd,
             &notification,
@@ -865,8 +1149,9 @@ static void on_param_changed(
     }
     memset(&raw, 0, sizeof(raw));
     if (spa_format_video_raw_parse(param, &raw) < 0 ||
-        raw.size.width != application->width ||
-        raw.size.height != application->height ||
+        raw.size.width == 0 || raw.size.height == 0 ||
+        raw.size.width > UUDC_MAX_DIMENSION ||
+        raw.size.height > UUDC_MAX_DIMENSION ||
         (raw.format != SPA_VIDEO_FORMAT_BGRA &&
          raw.format != SPA_VIDEO_FORMAT_BGRx)) {
         pw_stream_set_error(
@@ -876,10 +1161,58 @@ static void on_param_changed(
         );
         return;
     }
+    if (application->source_width == 0) {
+        if (!uniform_scale(
+                application->width,
+                application->height,
+                raw.size.width,
+                raw.size.height
+            )) {
+            pw_stream_set_error(
+                application->stream,
+                -EINVAL,
+                "native capture buffer does not scale the Portal stream"
+            );
+            return;
+        }
+        application->source_width = raw.size.width;
+        application->source_height = raw.size.height;
+        fprintf(
+            stderr,
+            "native capture node %" PRIu32 " buffer %" PRIu32 "x%" PRIu32
+            " staged as %" PRIu32 "x%" PRIu32 "\n",
+            application->node,
+            application->source_width,
+            application->source_height,
+            application->width,
+            application->height
+        );
+    } else if (raw.size.width != application->source_width ||
+        raw.size.height != application->source_height) {
+        /*
+         * A monitor mode or scale change leaves the bridge's logical layout
+         * stale.  Exit so its supervisor rebuilds the Portal session at the
+         * new geometry instead of stretching frames into the old slot.
+         */
+        fprintf(
+            stderr,
+            "native capture node %" PRIu32 " buffer changed %" PRIu32
+            "x%" PRIu32 " -> %" PRIu32 "x%" PRIu32
+            "; restarting to rebuild the stream layout\n",
+            application->node,
+            application->source_width,
+            application->source_height,
+            raw.size.width,
+            raw.size.height
+        );
+        application->failed = true;
+        pw_main_loop_quit(application->loop);
+        return;
+    }
     application->drm_format = raw.format == SPA_VIDEO_FORMAT_BGRA
         ? DRM_FORMAT_ARGB8888
         : DRM_FORMAT_XRGB8888;
-    application->stride = application->width * 4u;
+    application->stride = application->source_width * 4u;
     application->modifier = DRM_FORMAT_MOD_INVALID;
     modifier_property = spa_pod_find_prop(
         param,
@@ -934,7 +1267,9 @@ static void on_param_changed(
         SPA_PARAM_BUFFERS_blocks,
         SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_size,
-        SPA_POD_Int((int32_t)application->frame_size),
+        SPA_POD_Int((int32_t)(
+            (size_t)application->stride * application->source_height
+        )),
         SPA_PARAM_BUFFERS_stride,
         SPA_POD_Int((int32_t)application->stride),
         SPA_PARAM_BUFFERS_dataType,
@@ -960,10 +1295,33 @@ static void on_param_changed(
     }
 }
 
+static void on_remove_buffer(void *userdata, struct pw_buffer *buffer)
+{
+    struct application *application = userdata;
+    uint32_t index;
+    int fd;
+
+    if (!buffer || !buffer->buffer || buffer->buffer->n_datas < 1) {
+        return;
+    }
+    /*
+     * PipeWire closes the descriptor after this callback; the kernel can hand
+     * its number to the next buffer.  Drop the import now so a reused number
+     * cannot resolve to the old buffer's EGL image.
+     */
+    fd = (int)buffer->buffer->datas[0].fd;
+    for (index = 0; index < UUDC_PIPEWIRE_BUFFERS; ++index) {
+        if (fd >= 0 && application->images[index].fd == fd) {
+            destroy_image_cache(application, &application->images[index]);
+        }
+    }
+}
+
 static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .state_changed = on_state_changed,
     .param_changed = on_param_changed,
+    .remove_buffer = on_remove_buffer,
     .process = on_process,
 };
 
@@ -1004,6 +1362,11 @@ static const struct spa_pod *build_capture_format(
 {
     struct spa_pod_frame format_frame;
     struct spa_pod_frame modifier_frame;
+    struct spa_rectangle minimum_size = SPA_RECTANGLE(1, 1);
+    struct spa_rectangle maximum_size = SPA_RECTANGLE(
+        UUDC_MAX_DIMENSION,
+        UUDC_MAX_DIMENSION
+    );
     uint32_t index;
 
     spa_pod_builder_push_object(
@@ -1047,10 +1410,14 @@ static const struct spa_pod *build_capture_format(
         spa_pod_builder_long(builder, modifiers->values[index]);
     }
     spa_pod_builder_pop(builder, &modifier_frame);
+    /*
+     * Prefer the Portal's logical size but accept the producer's own: with
+     * scaled stage views Mutter offers physical-pixel buffers only.
+     */
     spa_pod_builder_add(
         builder,
         SPA_FORMAT_VIDEO_size,
-        SPA_POD_Rectangle(size),
+        SPA_POD_CHOICE_RANGE_Rectangle(size, &minimum_size, &maximum_size),
         0
     );
     return spa_pod_builder_pop(builder, &format_frame);
@@ -1122,10 +1489,22 @@ static int self_test(void)
     notification.sequence = UINT32_MAX;
     notification.stride = 16;
     notification.pts = UINT64_MAX;
-    if (sizeof(notification) != 24 ||
+    notification.buffer_width = UUDC_MAX_DIMENSION;
+    notification.buffer_height = UUDC_MAX_DIMENSION;
+    if (sizeof(notification) != 32 ||
+        offsetof(struct frame_notification, buffer_width) != 24 ||
         notification.magic != UUDC_NOTIFICATION_MAGIC ||
         notification.slot >= UUDC_STAGE_SLOTS) {
         fprintf(stderr, "native capture notification self-test failed\n");
+        return 1;
+    }
+    if (!uniform_scale(1920u, 1080u, 1920u, 1080u) ||
+        !uniform_scale(1920u, 1080u, 3840u, 2160u) ||
+        !uniform_scale(1920u, 1080u, 2400u, 1350u) ||
+        !uniform_scale(1365u, 767u, 1706u, 959u) ||
+        uniform_scale(1920u, 1080u, 2560u, 1600u) ||
+        uniform_scale(1080u, 1920u, 1920u, 1080u)) {
+        fprintf(stderr, "native capture scale validation self-test failed\n");
         return 1;
     }
     rgba_to_bgra(destination, source, 2);
@@ -1137,6 +1516,109 @@ static int self_test(void)
         return 1;
     }
     printf("PipeWire DMA-BUF capture self-test passed\n");
+    return 0;
+}
+
+/*
+ * Run the GPU downscale on a synthetic source whose channels encode the
+ * column and row.  Each output pixel must be the box average of its
+ * factor x factor footprint, and output row 0 must come from source row 0
+ * exactly like the unscaled readback path.
+ */
+static bool egl_scale_case(uint32_t factor)
+{
+    struct application application;
+    unsigned char source[8u * 8u * 4u];
+    unsigned char output[2u * 2u * 4u];
+    uint32_t size = 2u * factor;
+    uint32_t row;
+    uint32_t column;
+    GLuint texture = 0;
+    bool ok;
+
+    memset(&application, 0, sizeof(application));
+    application.width = 2u;
+    application.height = 2u;
+    application.source_width = size;
+    application.source_height = size;
+    application.frame_size = sizeof(output);
+    if (!initialize_egl(&application)) {
+        destroy_egl(&application);
+        return false;
+    }
+    for (row = 0; row < size; ++row) {
+        for (column = 0; column < size; ++column) {
+            unsigned char *pixel = source + (row * size + column) * 4u;
+
+            pixel[0] = (unsigned char)(column * 30u);
+            pixel[1] = (unsigned char)(row * 30u);
+            pixel[2] = 200u;
+            pixel[3] = 255u;
+        }
+    }
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    set_sampling(GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        (GLsizei)size,
+        (GLsizei)size,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        source
+    );
+    ok = scaling_required(&application) &&
+        render_scaled(&application, texture);
+    if (ok) {
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, output);
+        ok = glGetError() == GL_NO_ERROR;
+    }
+    for (row = 0; ok && row < 2u; ++row) {
+        for (column = 0; ok && column < 2u; ++column) {
+            const unsigned char *pixel = output + (row * 2u + column) * 4u;
+            /* Mean of factor consecutive indices starting at index*factor. */
+            int expected_red = (int)((2u * column * factor + factor - 1u) * 15u);
+            int expected_green = (int)((2u * row * factor + factor - 1u) * 15u);
+
+            ok = abs((int)pixel[0] - expected_red) <= 1 &&
+                abs((int)pixel[1] - expected_green) <= 1 &&
+                abs((int)pixel[2] - 200) <= 1;
+            if (!ok) {
+                fprintf(
+                    stderr,
+                    "native capture %ux downscale pixel %u,%u = %d,%d,%d"
+                    " expected %d,%d,200\n",
+                    factor,
+                    column,
+                    row,
+                    pixel[0],
+                    pixel[1],
+                    pixel[2],
+                    expected_red,
+                    expected_green
+                );
+            }
+        }
+    }
+    if (texture) {
+        glDeleteTextures(1, &texture);
+    }
+    destroy_egl(&application);
+    return ok;
+}
+
+static int egl_scale_self_test(void)
+{
+    if (!egl_scale_case(2u) || !egl_scale_case(4u)) {
+        fprintf(stderr, "native capture GPU downscale self-test failed\n");
+        return 1;
+    }
+    printf("PipeWire DMA-BUF GPU downscale self-test passed\n");
     return 0;
 }
 
@@ -1152,6 +1634,9 @@ int main(int argc, char **argv)
     memset(&application, 0, sizeof(application));
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
+    }
+    if (argc == 2 && strcmp(argv[1], "--egl-scale-self-test") == 0) {
+        return egl_scale_self_test();
     }
     if (argc == 2 && strcmp(argv[1], "--egl-smoke") == 0) {
         application.width = 64;

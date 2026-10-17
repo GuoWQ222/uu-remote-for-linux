@@ -101,7 +101,7 @@ CAPTURE_PIPEWIRE_BUFFERS = 3
 CAPTURE_TRANSPORT_DMABUF = "dmabuf-native"
 CAPTURE_NATIVE_STAGE_SLOTS = 3
 CAPTURE_NATIVE_NOTIFICATION_MAGIC = 0x43445555
-CAPTURE_NATIVE_NOTIFICATION = struct.Struct("<IIIIQ")
+CAPTURE_NATIVE_NOTIFICATION = struct.Struct("<IIIIQII")
 CAPTURE_MAX_STREAMS = 16
 CAPTURE_PRIMARY_STREAM_RATE = 60
 CAPTURE_SECONDARY_STREAM_RATE = 30
@@ -422,6 +422,22 @@ def map_absolute_point(
     return x, y
 
 
+def stream_buffer_point(
+    stream: dict[str, Any], x: int, y: int
+) -> tuple[float, float]:
+    """Express a logical stream pixel in the negotiated buffer's pixels.
+
+    The Portal and XWayland describe a stream in logical pixels, but Mutter
+    divides absolute stream positions by the monitor scale: with scaled stage
+    views it expects the physical pixels of the PipeWire buffer.
+    """
+    width = int(stream["width"])
+    height = int(stream["height"])
+    buffer_width = int(stream.get("buffer_width") or width)
+    buffer_height = int(stream.get("buffer_height") or height)
+    return x * buffer_width / width, y * buffer_height / height
+
+
 def x11_monitor_descriptors() -> list[dict[str, Any]]:
     """Return every X11 monitor with a stable connector-derived identity."""
     try:
@@ -454,12 +470,17 @@ def x11_monitor_descriptors() -> list[dict[str, Any]]:
             monitor = display.get_monitor(index)
             if monitor is None:
                 continue
+            # GDK3 reports application pixels divided by the integer UI scale
+            # (GNOME's 200% setting or GDK_SCALE).  XRandR, XTest and Wine
+            # use device pixels; without this a scaled 4K monitor would map
+            # input into its top-left 1920x1080 quarter.
+            scale = max(1, int(monitor.get_scale_factor()))
             rectangle = monitor.get_geometry()
             geometry = (
-                int(rectangle.x),
-                int(rectangle.y),
-                int(rectangle.width),
-                int(rectangle.height),
+                int(rectangle.x) * scale,
+                int(rectangle.y) * scale,
+                int(rectangle.width) * scale,
+                int(rectangle.height) * scale,
             )
             if geometry[2] <= 0 or geometry[3] <= 0:
                 continue
@@ -740,6 +761,20 @@ class XTestBackend:
         self.x11.XDisplayWidth.restype = ctypes.c_int
         self.x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.x11.XDisplayHeight.restype = ctypes.c_int
+        self.x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.x11.XGetGeometry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self.x11.XGetGeometry.restype = ctypes.c_int
         self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
         self.x11.XStringToKeysym.restype = ctypes.c_ulong
         self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
@@ -811,6 +846,29 @@ class XTestBackend:
         self.x11.XFlush(self.display)
 
     def virtual_desktop_geometry(self) -> tuple[int, int, int, int]:
+        # Xlib caches DisplayWidth/DisplayHeight at connection setup and only
+        # refreshes them through XRRUpdateConfiguration, which this
+        # long-lived connection never calls.  Ask the server for the root
+        # size so a resolution or monitor-layout change reaches input mapping.
+        root = ctypes.c_ulong()
+        origin_x = ctypes.c_int()
+        origin_y = ctypes.c_int()
+        width = ctypes.c_uint()
+        height = ctypes.c_uint()
+        border = ctypes.c_uint()
+        depth = ctypes.c_uint()
+        if self.x11.XGetGeometry(
+            self.display,
+            self.x11.XDefaultRootWindow(self.display),
+            ctypes.byref(root),
+            ctypes.byref(origin_x),
+            ctypes.byref(origin_y),
+            ctypes.byref(width),
+            ctypes.byref(height),
+            ctypes.byref(border),
+            ctypes.byref(depth),
+        ):
+            return (0, 0, max(int(width.value), 1), max(int(height.value), 1))
         return (
             0,
             0,
@@ -1800,17 +1858,30 @@ class WaylandPortalBackend:
                 while len(pending) >= CAPTURE_NATIVE_NOTIFICATION.size:
                     raw = bytes(pending[:CAPTURE_NATIVE_NOTIFICATION.size])
                     del pending[:CAPTURE_NATIVE_NOTIFICATION.size]
-                    magic, slot, _sequence, source_stride, pts = (
-                        CAPTURE_NATIVE_NOTIFICATION.unpack(raw)
-                    )
+                    (
+                        magic,
+                        slot,
+                        _sequence,
+                        source_stride,
+                        pts,
+                        buffer_width,
+                        buffer_height,
+                    ) = CAPTURE_NATIVE_NOTIFICATION.unpack(raw)
                     if (
                         magic != CAPTURE_NATIVE_NOTIFICATION_MAGIC
                         or slot >= CAPTURE_NATIVE_STAGE_SLOTS
                         or source_stride < int(stream["width"]) * 4
+                        or not 1 <= buffer_width <= FRAME_MAX_DIMENSION
+                        or not 1 <= buffer_height <= FRAME_MAX_DIMENSION
                     ):
                         raise RuntimeError(
                             "原生 DMA-BUF 捕获辅助进程返回了无效通知"
                         )
+                    # The helper stages logical pixels; pointer injection
+                    # needs the producer's buffer size (see
+                    # stream_buffer_point).
+                    stream["buffer_width"] = buffer_width
+                    stream["buffer_height"] = buffer_height
                     offset = slot * frame_size
                     source = memoryview(stage_map)[offset:offset + frame_size]
                     try:
@@ -2705,6 +2776,7 @@ class WaylandPortalBackend:
             if self.last_absolute_pointer == pointer_key and actual_is_target:
                 self.pointer_motion_suppressed += 1
                 return
+            stream_x, stream_y = stream_buffer_point(target, x, y)
             self._notify(
                 "NotifyPointerMotionAbsolute",
                 "(oa{sv}udd)",
@@ -2712,8 +2784,8 @@ class WaylandPortalBackend:
                     self.session_handle,
                     options,
                     int(target["node"]),
-                    float(x),
-                    float(y),
+                    stream_x,
+                    stream_y,
                 ),
             )
             self.last_absolute_pointer = pointer_key

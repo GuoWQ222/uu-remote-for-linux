@@ -41,6 +41,14 @@ check "native frame helper sanitized stress" \
 check "PipeWire DMA-BUF capture self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
     --self-test
+if "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
+    --egl-smoke >/dev/null 2>&1; then
+    check "PipeWire DMA-BUF GPU downscale self-test" \
+        "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" \
+        --egl-scale-self-test
+else
+    printf 'SKIP PipeWire DMA-BUF GPU downscale self-test（无可用 EGL 设备）\n'
+fi
 check "PipeWire cursor bridge self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     --self-test
