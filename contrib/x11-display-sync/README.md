@@ -109,8 +109,8 @@ Stop the watcher and remove its autostart entry without stopping UU:
 - Final single-screen checks validated 33 GNOME-selectable resolutions and
   nine actual transitions spanning 800×600 through 3840×2160. Each used one
   native submission and independently checked Wine's resulting size.
-- Final 3840×2160 GDI capture returned 12 identical static frames. The final
-  configuration and synchronization service also survived graphical
+- Final 3840×2160 GDI capture returned 12 identical static frames. The
+  synchronization service also started automatically after graphical
   logout/login during the display setup.
 
 These checks cover the reported stale-geometry and first-apply failures on
