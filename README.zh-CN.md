@@ -16,9 +16,11 @@
 > [!IMPORTANT]
 > 这是非官方 Linux 兼容包装层，不分发网易专有安装程序或客户端二进制文件。
 
-## 🔜 Coming Soon（即将推出）
+## 💬 问题反馈
 
-即将支持注销界面远程控制
+遇到问题或有改进建议？欢迎通过 [GitHub Issues](https://github.com/GuoWQ222/uu-remote-for-linux/issues) 反馈。你的反馈能帮助我们提高兼容性和稳定性。
+
+反馈时请尽量附上复现步骤、预期与实际表现、Linux 发行版与桌面会话（X11/Wayland）、Wine 和 UU 远程版本，以及相关日志或截图，便于排查。
 
 ## 🗺️ 目录
 

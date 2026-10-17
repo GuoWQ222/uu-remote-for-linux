@@ -16,9 +16,11 @@
 > [!IMPORTANT]
 > This is an unofficial compatibility wrapper. It does not distribute NetEase's proprietary installer or client binaries.
 
-## 🔜 Coming Soon
+## 💬 Feedback
 
-Remote control of the login screen after logout is coming soon.
+Found a bug or have an idea for improvement? Please share it on [GitHub Issues](https://github.com/GuoWQ222/uu-remote-for-linux/issues). Your feedback helps us improve compatibility and stability.
+
+When possible, include steps to reproduce, expected and actual behavior, your Linux distribution and desktop session (X11/Wayland), Wine and UU Remote versions, and relevant logs or screenshots to help us investigate.
 
 ## 🗺️ Contents
 
