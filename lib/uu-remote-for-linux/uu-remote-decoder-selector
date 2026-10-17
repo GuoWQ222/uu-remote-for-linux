@@ -170,9 +170,40 @@ write_selection() {
     mv -f "$temp" "$config"
 }
 
+# Shrink a dialog's preferred size to 90% of the primary monitor's work area
+# (GTK logical pixels) so 720p, 768p and scaled displays keep its buttons on
+# screen.  Prints "WIDTH HEIGHT"; keeps the preference when GDK is unavailable.
+fit_dialog_size() {
+    local width=$1 height=$2 area_width area_height
+
+    if read -r area_width area_height < <(
+        /usr/bin/python3 - 2>/dev/null <<'PY'
+import gi
+
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk
+
+display = Gdk.Display.get_default()
+monitor = display and (display.get_primary_monitor() or display.get_monitor(0))
+if monitor is not None:
+    area = monitor.get_workarea()
+    print(area.width, area.height)
+PY
+    ) && [[ $area_width =~ ^[1-9][0-9]*$ && $area_height =~ ^[1-9][0-9]*$ ]]; then
+        if ((width > area_width * 9 / 10)); then
+            width=$((area_width * 9 / 10))
+        fi
+        if ((height > area_height * 9 / 10)); then
+            height=$((area_height * 9 / 10))
+        fi
+    fi
+    printf '%s %s\n' "$width" "$height"
+}
+
 select_graphically() {
     local config=$1 current chosen id device type backend codecs quality fps rate
     local status selectable marked prompt_text saved_text
+    local dialog_width dialog_height
     local -a rows=()
 
     command -v zenity >/dev/null 2>&1 ||
@@ -201,10 +232,11 @@ select_graphically() {
             "$quality" "$fps" "$rate" "$status")
     done < <(list_devices)
 
+    read -r dialog_width dialog_height < <(fit_dialog_size 1420 650)
     chosen=$(zenity --list --radiolist \
         --title='网易 UU 远程 — 解码设备选择' \
         --text="$prompt_text" \
-        --width=1420 --height=650 \
+        --width="$dialog_width" --height="$dialog_height" \
         --column='选择' --column='内部 ID' --column='设备' --column='类型' \
         --column='接入后端' --column='编码能力' --column='最高画质' \
         --column='最高帧率' --column='最高解码率' --column='状态' \

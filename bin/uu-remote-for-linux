@@ -291,6 +291,36 @@ network_curl() {
         "$@"
 }
 
+# Shrink a dialog's preferred size to 90% of the primary monitor's work area
+# (GTK logical pixels) so 720p, 768p and scaled displays keep its buttons on
+# screen.  Prints "WIDTH HEIGHT"; keeps the preference when GDK is unavailable.
+fit_dialog_size() {
+    local width=$1 height=$2 area_width area_height
+
+    if read -r area_width area_height < <(
+        /usr/bin/python3 - 2>/dev/null <<'PY'
+import gi
+
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk
+
+display = Gdk.Display.get_default()
+monitor = display and (display.get_primary_monitor() or display.get_monitor(0))
+if monitor is not None:
+    area = monitor.get_workarea()
+    print(area.width, area.height)
+PY
+    ) && [[ $area_width =~ ^[1-9][0-9]*$ && $area_height =~ ^[1-9][0-9]*$ ]]; then
+        if ((width > area_width * 9 / 10)); then
+            width=$((area_width * 9 / 10))
+        fi
+        if ((height > area_height * 9 / 10)); then
+            height=$((area_height * 9 / 10))
+        fi
+    fi
+    printf '%s %s\n' "$width" "$height"
+}
+
 eula_gui_prompt_allowed() {
     [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || return 1
     command -v "$zenity_bin" >/dev/null 2>&1 || return 1
@@ -308,7 +338,7 @@ eula_gui_prompt_allowed() {
 }
 
 prompt_eula_acceptance() {
-    local html_file text_file status=0
+    local html_file text_file status=0 dialog_width dialog_height
 
     html_file=$(mktemp "$cache_dir/.eula-source.XXXXXX") || return 2
     text_file=$(mktemp "$cache_dir/.eula-text.XXXXXX") || {
@@ -404,11 +434,12 @@ PY
         return 2
     fi
 
+    read -r dialog_width dialog_height < <(fit_dialog_size 900 700)
     "$zenity_bin" --text-info \
         --title='网易 UU 远程软件许可及服务协议' \
         --filename="$text_file" \
-        --width=900 \
-        --height=700 \
+        --width="$dialog_width" \
+        --height="$dialog_height" \
         --checkbox='我已阅读并同意上述《网易UU远程软件许可及服务协议》' \
         --ok-label='接受并继续' \
         --cancel-label='拒绝并退出' >/dev/null 2>&1 || status=$?
