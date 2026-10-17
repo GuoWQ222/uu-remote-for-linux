@@ -18,6 +18,7 @@ SOURCE_SUFFIX = b"wake_on_lan.cpp"
 ENABLED = b"Enabled"
 DISABLED = b"Disabled"
 FAILED = b"Failed to check WOL support"
+NETWORK_CHECK = b"wol_network_card_check supported="
 
 
 class ProfileError(RuntimeError):
@@ -184,8 +185,9 @@ def derive_patch_offset(image: PeImage) -> int:
         if value.endswith(SOURCE_SUFFIX)
         for rva in rvas
     }
-    if not enabled or not disabled or not source:
-        raise ProfileError("缺少 WOL 源码路径或 Enabled/Disabled 语义标记")
+    network_check = set(strings.get(NETWORK_CHECK, ()))
+    if not source or not ((enabled and disabled) or network_check):
+        raise ProfileError("缺少 WOL 源码路径或能力判断语义标记")
 
     functions = runtime_functions(image)
     begins = [item.begin for item in functions]
@@ -195,6 +197,7 @@ def derive_patch_offset(image: PeImage) -> int:
         "disabled": disabled,
         "source": source,
         "failed": failed,
+        "network_check": network_check,
     }
     for instruction, target in rip_relative_lea_xrefs(image):
         index = bisect.bisect_right(begins, instruction) - 1
@@ -209,7 +212,9 @@ def derive_patch_offset(image: PeImage) -> int:
 
     candidates: list[RuntimeFunction] = []
     for function, names in refs.items():
-        if not {"enabled", "disabled", "source"}.issubset(names):
+        legacy = {"enabled", "disabled", "source"}.issubset(names)
+        inline_status = {"network_check", "source"}.issubset(names)
+        if not (legacy or inline_status):
             continue
         # The larger command/configuration function also mentions these strings,
         # but owns this failure message. The capability predicate does not.
@@ -218,6 +223,16 @@ def derive_patch_offset(image: PeImage) -> int:
         start = image.file_offset(function.begin)
         finish = image.file_offset(function.end - 1) + 1
         code = image.data[start:finish]
+        # New MSVC builds compare these short strings as integer immediates.
+        # The network-card predicate must still own both comparisons; matching
+        # the generic power-management query would skip required out-parameters.
+        if inline_status and not legacy and not (
+            code.count(b"Disabled") == 1
+            and code.count(bytes.fromhex("81 e9 45 6e 61 62")) == 1
+            and re.search(rb"[\x48-\x4f][\xb8-\xbf]Disabled", code)
+            and re.search(rb"(?:[\x40-\x4f])?\x83\xfa\x07", code)
+        ):
+            continue
         if b"\xc3" not in code or not has_bool_return(code) or not has_true_assignment(code):
             continue
         candidates.append(function)
@@ -263,7 +278,7 @@ def add_lea(data: bytearray, file_offset: int, instruction_rva: int, target_rva:
     struct.pack_into("<i", data, file_offset + 3, target_rva - instruction_rva - 7)
 
 
-def synthetic_pe(duplicate: bool = False) -> bytes:
+def synthetic_pe(duplicate: bool = False, *, inline_status: bool = False) -> bytes:
     data = bytearray(0x2600)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x80)
@@ -285,8 +300,8 @@ def synthetic_pe(duplicate: bool = False) -> bytes:
 
     string_values = (
         b"S:\\repo_remote\\src\\server_core\\support\\wol\\wake_on_lan.cpp\0",
-        b"Enabled\0",
-        b"Disabled\0",
+        (NETWORK_CHECK if inline_status else ENABLED) + b"\0",
+        b"inline-status\0" if inline_status else DISABLED + b"\0",
         b"Failed to check WOL support\0",
     )
     string_rvas: list[int] = []
@@ -302,6 +317,11 @@ def synthetic_pe(duplicate: bool = False) -> bytes:
             instruction_raw = raw + 0x20 + index * 8
             add_lea(data, instruction_raw, rva + 0x20 + index * 8, target)
         data[raw + 0x70 : raw + 0x78] = bytes.fromhex("41 b5 01 41 0f b6 c5 c3")
+        if inline_status:
+            data[raw + 0x48 : raw + 0x48 + 20] = (
+                bytes.fromhex("49 bf") + b"Disabled"
+                + bytes.fromhex("81 e9 45 6e 61 62 49 83 fa 07")
+            )
 
     add_function(0x500, 0x1100, tuple(string_rvas[:3]))
     pdata_cursor = 0x1C00
@@ -336,6 +356,24 @@ def self_test() -> None:
         raise ProfileError("自检生成的 WOL 偏移或字段数错误")
     if patched[0x500:0x503] != PATCHED_BYTES:
         raise ProfileError("自检 WOL 补丁未写入")
+    current = synthetic_pe(inline_status=True)
+    current_row, current_patched = derive_profile(current, "9.9.9.10")
+    if current_row.split("\t")[3] != "0x500" or current_patched[0x500:0x503] != PATCHED_BYTES:
+        raise ProfileError("自检未识别内联 Enabled/Disabled 的网卡能力谓词")
+    missing_comparison = bytearray(current)
+    missing_comparison[0x54A] = ord("X")
+    try:
+        derive_profile(bytes(missing_comparison), "9.9.9.10")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检接受了缺少 Disabled 比较的 WOL 谓词")
+    try:
+        derive_profile(synthetic_pe(duplicate=True, inline_status=True), "9.9.9.10")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检接受了重复的内联 WOL 谓词")
     try:
         derive_profile(synthetic_pe(duplicate=True), "9.9.9.9")
     except ProfileError:
