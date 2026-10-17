@@ -81,8 +81,28 @@ while (($# > 0)); do
     shift
 done
 
+if $head_only && [[ -n ${UU_REMOTE_FAKE_HEAD_VERSIONS:-} ]]; then
+    # The official endpoint load-balances between staged releases, so
+    # consecutive version probes can name different releases.
+    read -r -a head_versions <<<"$UU_REMOTE_FAKE_HEAD_VERSIONS"
+    head_counter="${UU_REMOTE_FAKE_TRACE:?}.head-probes"
+    head_index=0
+    if [[ -r $head_counter ]]; then
+        head_index=$(<"$head_counter")
+    fi
+    printf '%s\n' "$((head_index + 1))" >"$head_counter"
+    effective_url="https://a56.gdl.netease.com/UURemote_Setup_${head_versions[head_index % ${#head_versions[@]}]}_0723104500_gwqd.exe?test=1"
+fi
+
 if ! $head_only; then
     [[ -n $output_file ]]
+    if [[ -n ${UU_REMOTE_FAKE_DOWNLOAD_VERSION:-} ]]; then
+        # A download that still lands on a different staged release.
+        effective_url="https://a56.gdl.netease.com/UURemote_Setup_${UU_REMOTE_FAKE_DOWNLOAD_VERSION}_0723104500_gwqd.exe?test=1"
+    elif [[ $request_url == https://a56.gdl.netease.com/UURemote_Setup_* ]]; then
+        # A resolved CDN URL is served directly without another redirect.
+        effective_url=$request_url
+    fi
     if [[ $request_url == *'/contact/20240402/40294_1146065.html' ]]; then
         printf 'EULA_FETCH\n' >>"${UU_REMOTE_FAKE_TRACE:?}"
         printf '%s\n' \

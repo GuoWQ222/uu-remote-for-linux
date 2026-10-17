@@ -815,13 +815,14 @@ official_update_request_error() {
     esac
 }
 
-official_latest_version() {
-    local version_variable=$1 error_variable=$2
+official_release_probe() {
+    local version_variable=$1 url_variable=$2 error_variable=$3
     local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
     local source_host effective_url clean_url filename
     local curl_error_file curl_detail="" curl_status=0
 
     printf -v "$version_variable" '%s' ""
+    printf -v "$url_variable" '%s' ""
     printf -v "$error_variable" '%s' ""
     source_host=${source_url#*://}
     source_host=${source_host%%/*}
@@ -865,6 +866,7 @@ official_latest_version() {
     filename=${clean_url##*/}
     if [[ $filename =~ UURemote_Setup_([0-9]+([.][0-9]+){2,3})_ ]]; then
         printf -v "$version_variable" '%s' "${BASH_REMATCH[1]}"
+        printf -v "$url_variable" '%s' "$effective_url"
         return
     fi
     filename=${filename//$'\n'/ }
@@ -873,6 +875,35 @@ official_latest_version() {
         '网易官方接口已响应，但下载文件名无法识别版本（文件名：%.160s）' \
         "${filename:-空}"
     return 1
+}
+
+official_latest_version() {
+    local version_variable=$1 error_variable=$2 url_variable=${3:-}
+    local probes=${UU_REMOTE_OFFICIAL_RELEASE_PROBES:-3}
+    local best_version="" best_url="" probe_version probe_url probe_error
+    local attempt
+
+    [[ $probes =~ ^[1-9]$ ]] || probes=3
+    printf -v "$version_variable" '%s' ""
+    printf -v "$error_variable" '%s' ""
+    [[ -z $url_variable ]] || printf -v "$url_variable" '%s' ""
+    # NetEase's release endpoint load-balances between staged releases on
+    # every request.  Keep the newest release seen across a few cheap HEAD
+    # probes, and hand its resolved URL to the download so both agree.
+    for ((attempt = 0; attempt < probes; ++attempt)); do
+        if ! official_release_probe probe_version probe_url probe_error; then
+            [[ -n $best_version ]] && break
+            printf -v "$error_variable" '%s' "$probe_error"
+            return 1
+        fi
+        if [[ -z $best_version ]] ||
+            version_greater "$probe_version" "$best_version"; then
+            best_version=$probe_version
+            best_url=$probe_url
+        fi
+    done
+    printf -v "$version_variable" '%s' "$best_version"
+    [[ -z $url_variable ]] || printf -v "$url_variable" '%s' "$best_url"
 }
 
 load_hwdecode_profile() {
@@ -4188,12 +4219,13 @@ download_installer() {
     local temp_file effective_url clean_url filename version checksum size magic
     local archive_file
     local source_url="${UU_REMOTE_OFFICIAL_INSTALLER_URL:-$official_installer_url_default}"
+    local request_url=${1:-$source_url}
 
     temp_file=$(mktemp "$cache_dir/.UURemote_Setup.XXXXXX")
     notify_status "正在从网易官方下载客户端"
     printf '正在从网易官方下载 Windows 客户端……\n'
     if ! effective_url=$(network_curl --fail --location --retry 3 --connect-timeout 15 \
-        --output "$temp_file" --write-out '%{url_effective}' "$source_url" 9>&-); then
+        --output "$temp_file" --write-out '%{url_effective}' "$request_url" 9>&-); then
         rm -f -- "$temp_file"
         die "官方安装包下载失败"
     fi
@@ -5575,13 +5607,30 @@ update_restart_ready() {
 }
 
 run_update_transaction() {
-    local latest=$1
-    local snapshot bridge_state_snapshot installed_after
+    local mode=$1 installed=$2 checked=$3 checked_url=${4:-}
+    local latest="" snapshot bridge_state_snapshot installed_after
 
-    download_installer
-    [[ -r $installer_version_file &&
-        $(<"$installer_version_file") == "$latest" ]] ||
-        die "官方安装包版本与更新检查结果不一致；现有客户端未作修改"
+    download_installer "$checked_url"
+    # Even the resolved URL is only a hint: target the verified installer
+    # that will actually run.  The post-install registry check still binds
+    # it to what was installed.
+    if [[ -r $installer_version_file ]]; then
+        latest=$(<"$installer_version_file")
+    fi
+    [[ $latest =~ ^[0-9]+([.][0-9]+){2,3}$ ]] ||
+        die "无法识别已下载官方安装包的版本；现有客户端未作修改"
+    if [[ $latest != "$checked" ]]; then
+        printf '网易官方接口本次下载返回 %s（版本检查返回 %s）；以实际下载并已验证的安装包为准。\n' \
+            "$latest" "$checked"
+    fi
+    if ! version_greater "$latest" "$installed"; then
+        write_update_status error "$installed" "$latest" \
+            "官方下载接口本次返回的安装包 $latest 不高于当前版本；现有客户端未作修改"
+        die "官方下载接口本次返回的安装包 $latest 不高于当前版本 $installed；现有客户端未作修改，下次检查时会重试"
+    fi
+    if automatic_update_deferred "$mode" "$installed" "$latest"; then
+        return 0
+    fi
 
     snapshot=$(create_update_snapshot)
     bridge_state_snapshot=$(create_version_bridge_state_snapshot)
@@ -5699,8 +5748,18 @@ automatic_update_retry_blocked() {
         $recorded_package == "$package_version" ]]
 }
 
+automatic_update_deferred() {
+    local mode=$1 installed=$2 latest=$3
+
+    [[ $mode == automatic ]] &&
+        automatic_update_retry_blocked "$installed" "$latest" || return 1
+    notify_status "已暂缓再次安装未通过兼容性核验的 UU $latest"
+    printf 'UU %s 上次未通过兼容性核验；自动更新已暂缓，保留 %s。\n' \
+        "$latest" "$installed"
+}
+
 perform_update_check() {
-    local mode=${1:-manual} installed latest="" check_error=""
+    local mode=${1:-manual} installed latest="" latest_url="" check_error=""
 
     app_files_present ||
         die "UU 客户端尚未安装，无法检查更新"
@@ -5708,7 +5767,7 @@ perform_update_check() {
     [[ -n $installed ]] || die "无法读取当前 UU 版本"
 
     notify_status "正在检查 UU 官方更新"
-    if ! official_latest_version latest check_error; then
+    if ! official_latest_version latest check_error latest_url; then
         check_error=${check_error:-官方版本检查失败，未返回具体原因}
         write_update_status error "$installed" unknown "$check_error"
         die "检查网易官方版本失败：$check_error；现有客户端未作修改"
@@ -5719,15 +5778,11 @@ perform_update_check() {
             "$installed" "$latest"
         return
     fi
-    if [[ $mode == automatic ]] &&
-        automatic_update_retry_blocked "$installed" "$latest"; then
-        notify_status "已暂缓再次安装未通过兼容性核验的 UU $latest"
-        printf 'UU %s 上次未通过兼容性核验；自动更新已暂缓，保留 %s。\n' \
-            "$latest" "$installed"
+    if automatic_update_deferred "$mode" "$installed" "$latest"; then
         return
     fi
 
-    run_update_transaction "$latest"
+    run_update_transaction "$mode" "$installed" "$latest" "$latest_url"
 }
 
 perform_upstream_update_handoff() {

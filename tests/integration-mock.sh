@@ -5,6 +5,8 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 readonly project_root
 readonly launcher="$project_root/bin/uu-remote-for-linux"
 readonly fixture_bin="$project_root/tests/fixtures/bin"
+package_version=$(<"$project_root/lib/uu-remote-for-linux/package-version")
+readonly package_version_pattern=${package_version//./\\.}
 
 test_root=$(mktemp -d)
 cleanup() {
@@ -619,6 +621,61 @@ cmp -s \
 test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
     "$expected_streamer_patched_sha"
 
+# NetEase's release endpoint load-balances between staged releases.  The
+# check keeps the newest probed release and downloads exactly that URL.
+printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
+rm -f -- "$UU_REMOTE_FAKE_TRACE.head-probes"
+trace_lines_before_probe=$(wc -l <"$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_FAKE_HEAD_VERSIONS='4.33.5.8500 4.34.0.8979 4.33.5.8500' \
+    "$launcher" --check-update
+test "$(<"$UU_REMOTE_FAKE_TRACE.head-probes")" -eq 3
+tail -n "+$((trace_lines_before_probe + 1))" "$UU_REMOTE_FAKE_TRACE" |
+    grep '^CURL .*--output .* https://a56\.gdl\.netease\.com/UURemote_Setup_4\.34\.0\.8979_' \
+    >/dev/null
+"$launcher" --diagnose | grep -q 'UU 版本.*4.34.0.8979'
+"$launcher" --diagnose | grep -q '安全更新状态.*已更新到 4.34.0.8979'
+
+# Even a resolved URL may land on another release; the transaction then
+# targets the verified installer it actually downloaded.
+printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
+UU_REMOTE_FAKE_LATEST_VERSION=4.33.5.8500 \
+UU_REMOTE_FAKE_DOWNLOAD_VERSION=4.34.0.8979 \
+    "$launcher" --check-update >"$test_root/update-staged-release.out"
+grep -Fq '本次下载返回 4.34.0.8979（版本检查返回 4.33.5.8500）' \
+    "$test_root/update-staged-release.out"
+"$launcher" --diagnose | grep -q 'UU 版本.*4.34.0.8979'
+"$launcher" --diagnose | grep -q '安全更新状态.*已更新到 4.34.0.8979'
+test "$(sha256sum "$streamer" | cut -d' ' -f1)" = \
+    "$expected_streamer_patched_sha"
+
+sha256sum \
+    "$install_dir/bin/Upgrade.exe" \
+    "$install_dir/bin/Upgrade.uu-remote-original.exe" \
+    "$install_dir/bin/d3d11.dll" \
+    "$install_dir/bin/dxgi.dll" \
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" >"$protected_before"
+if UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+    UU_REMOTE_FAKE_DOWNLOAD_VERSION=4.34.0.8979 \
+    "$launcher" --check-update 2>"$test_root/update-stale-download.err"; then
+    printf '不高于当前版本的官方下载被意外安装。\n' >&2
+    exit 1
+fi
+grep -Fq '不高于当前版本 4.34.0.8979；现有客户端未作修改' \
+    "$test_root/update-stale-download.err"
+sha256sum \
+    "$install_dir/bin/Upgrade.exe" \
+    "$install_dir/bin/Upgrade.uu-remote-original.exe" \
+    "$install_dir/bin/d3d11.dll" \
+    "$install_dir/bin/dxgi.dll" \
+    "$install_dir/bin/streamer.dll" \
+    "$prefix/drive_c/windows/system32/nvcuda.dll" \
+    "$prefix/drive_c/windows/system32/nvcuvid.dll" >"$protected_after"
+cmp -s "$protected_before" "$protected_after"
+"$launcher" --diagnose | grep -q 'UU 版本.*4.34.0.8979'
+"$launcher" --diagnose | grep -q '安全更新状态.*检查失败：官方下载接口本次返回'
+
 printf '4.33.0.8000\n' >"$install_dir/bin/.installed-version"
 sha256sum \
     "$install_dir/bin/Upgrade.exe" \
@@ -652,6 +709,14 @@ UU_REMOTE_FAKE_LATEST_VERSION=4.34.0.8979 \
     >"$test_root/automatic-rollback-retry.out"
 grep -q '自动更新已暂缓，保留 4.33.0.8000' \
     "$test_root/automatic-rollback-retry.out"
+# A check that lands on another staged release must not bypass the hold on
+# the rolled-back version the download actually resolves to.
+UU_REMOTE_FAKE_LATEST_VERSION=4.35.0.9000 \
+UU_REMOTE_FAKE_DOWNLOAD_VERSION=4.34.0.8979 \
+    "$launcher" --auto-update-check \
+    >"$test_root/automatic-rollback-retry-staged.out"
+grep -q '自动更新已暂缓，保留 4.33.0.8000' \
+    "$test_root/automatic-rollback-retry-staged.out"
 "$launcher" --diagnose | grep -q 'UU 版本.*4.33.0.8000'
 printf '4.34.0.8979\n' >"$install_dir/bin/.installed-version"
 
@@ -883,7 +948,7 @@ for graphical_launch_arg in --autostart ''; do
         "$UU_REMOTE_FAKE_TRACE")" -eq \
         "$((client_unit_count_before_graphical_launch + 1))"
     grep -q \
-        'SYSTEMD_RUN .*--unit=uu-remote-for-linux-update .* 1\.1\.42 60$' \
+        "SYSTEMD_RUN .*--unit=uu-remote-for-linux-update .* $package_version_pattern 60\$" \
         "$UU_REMOTE_FAKE_TRACE"
 done
 
