@@ -35,8 +35,10 @@ WINDOW_LAYOUT_REFLOW_ATTEMPTS = 3
 WINDOW_LAYOUT_SETTLED = -1
 WINDOW_LAYOUT_REFLOW_INTERVAL_SECONDS = 2.0
 WINDOW_LAYOUT_RESTORE_DELAY_MS = 80
-WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH = 16
-WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT = 9
+# A learned viewer shape outside 1:4..4:1 is not a plausible display; the
+# layout then fills the work area and UU letterboxes the video itself.
+WINDOW_LAYOUT_MIN_ASPECT = 0.25
+WINDOW_LAYOUT_MAX_ASPECT = 4.0
 WINDOW_LAYOUT_DEFAULT_NONCLIENT_HEIGHT = 40
 WINDOW_LAYOUT_MIN_NONCLIENT_HEIGHT = 24
 WINDOW_LAYOUT_MAX_NONCLIENT_HEIGHT = 96
@@ -57,6 +59,16 @@ CONTROLLER_RESTART_REQUIRED_HOOK_VERSION = 16
 CONTROLLER_HARD_STALL_REQUIRED_HOOK_VERSION = 18
 CONTROLLER_HARD_STALL_REQUIRED_TIMEOUTS = 2
 CONTROLLER_RESTART_IDLE_CONFIRMATIONS = 2
+# UU 4.43+ writes only encrypted .slog files, so controlled-session activity
+# is inferred from remote input and GameViewerServer's capture/encode load.
+# A session counts as active until it has been quiet for the whole window.
+CONTROLLED_SESSION_QUIET_SECONDS = 60.0
+CONTROLLED_SESSION_SAMPLE_SECONDS = 2.0
+# An idle GameViewerServer measured 1-2% of one core per 2 s sample on a
+# 2560x1440 + 1024x768 X11 desktop; screen capture and encoding for a viewer
+# costs several times more.
+CONTROLLED_SESSION_SERVER_CPU_PERCENT = 5.0
+INPUT_BRIDGE_STATUS_NAME = "input-bridge-status.json"
 UPSTREAM_UPDATE_REQUEST_MARKER = "uu-remote-upstream-update.request"
 UPSTREAM_UPDATE_PROCESSING_MARKER = "uu-remote-upstream-update.processing"
 UPSTREAM_UPDATE_HANDOFF_MAX_AGE_SECONDS = 300
@@ -73,12 +85,23 @@ class XClassHint(ctypes.Structure):
     ]
 
 
+# Xlib's default error handler prints the error and exits the process.  Wine
+# windows can vanish between XQueryTree and the next property read, which
+# used to kill the tray with BadWindow.  Every query checks its status, so
+# treat protocol errors as failed calls.  Keep a reference: Xlib stores it.
+X_ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+)
+X_ERROR_HANDLER = X_ERROR_HANDLER_TYPE(lambda _display, _event: 0)
+
+
 class X11:
     """Small libX11 binding used only for targeted legacy icon removal."""
 
     def __init__(self, display_name: str | None):
         self.lib = ctypes.CDLL("libX11.so.6")
         self._configure_prototypes()
+        self.lib.XSetErrorHandler(X_ERROR_HANDLER)
         encoded = display_name.encode() if display_name else None
         self.display = self.lib.XOpenDisplay(encoded)
         if not self.display:
@@ -180,6 +203,8 @@ class X11:
         lib.XMoveResizeWindow.restype = ctypes.c_int
         lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XSetErrorHandler.argtypes = [X_ERROR_HANDLER_TYPE]
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
 
     def close(self) -> None:
         if self.display:
@@ -403,6 +428,22 @@ def write_window_layout(path: Path, value: str) -> None:
     os.replace(temporary, path)
 
 
+def gdk_device_rectangle(monitor, rectangle) -> tuple[int, int, int, int]:
+    """Convert a GDK monitor rectangle to X11 device pixels.
+
+    GDK3 divides monitor geometry by the integer UI scale (GNOME's 200%
+    setting or GDK_SCALE); XRandR, X11 window geometry and Wine keep device
+    pixels, so a scaled 4K monitor would otherwise look like 1920x1080.
+    """
+    scale = max(1, int(monitor.get_scale_factor()))
+    return (
+        int(rectangle.x) * scale,
+        int(rectangle.y) * scale,
+        int(rectangle.width) * scale,
+        int(rectangle.height) * scale,
+    )
+
+
 def gdk_monitor_descriptors(gdk) -> list[dict[str, object]]:
     """Enumerate every monitor with a connector-derived stable identity."""
 
@@ -416,13 +457,7 @@ def gdk_monitor_descriptors(gdk) -> list[dict[str, object]]:
         monitor = display.get_monitor(index)
         if monitor is None:
             continue
-        geometry = monitor.get_geometry()
-        rectangle = (
-            int(geometry.x),
-            int(geometry.y),
-            int(geometry.width),
-            int(geometry.height),
-        )
+        rectangle = gdk_device_rectangle(monitor, monitor.get_geometry())
         if rectangle[2] <= 0 or rectangle[3] <= 0:
             continue
         manufacturer = (monitor.get_manufacturer() or "").strip()
@@ -518,7 +553,9 @@ def mapped_remote_windows(
         if rect is None:
             continue
         x, y, width, height = rect
-        if width < 640 or height < 480:
+        # Skip small helper windows in either orientation; a viewer for a
+        # portrait remote display can be narrower than 640 pixels.
+        if min(width, height) < 480 or max(width, height) < 640:
             continue
         candidates.append((window, x, y, width, height))
     return sorted(
@@ -539,35 +576,58 @@ def gdk_monitor_workareas(gdk) -> list[tuple[int, int, int, int]]:
         monitor = display.get_monitor(index)
         if monitor is None:
             continue
-        area = monitor.get_workarea()
-        if area.width <= 0 or area.height <= 0:
+        area = gdk_device_rectangle(monitor, monitor.get_workarea())
+        if area[2] <= 0 or area[3] <= 0:
             continue
-        monitors.append(
-            (
-                monitor == primary,
-                int(area.x),
-                int(area.y),
-                int(area.width),
-                int(area.height),
-            )
-        )
+        monitors.append((monitor == primary, *area))
     monitors.sort(key=lambda row: (not row[0], row[1], row[2]))
     return [row[1:] for row in monitors]
+
+
+def window_client_aspect(
+    rect: tuple[int, int, int, int] | None,
+) -> tuple[int, int] | None:
+    """Return the client shape UU gave a viewer, or None if implausible.
+
+    UU opens each viewer for its remote display, so its first geometry carries
+    that display's shape (16:9, 16:10, ultrawide or portrait).  The X11 window
+    also holds UU's caption strip; assume its default height while learning.
+    """
+
+    if rect is None:
+        return None
+    width = rect[2]
+    client_height = rect[3] - WINDOW_LAYOUT_DEFAULT_NONCLIENT_HEIGHT
+    if width <= 0 or client_height <= 0:
+        return None
+    if not (
+        WINDOW_LAYOUT_MIN_ASPECT
+        <= width / client_height
+        <= WINDOW_LAYOUT_MAX_ASPECT
+    ):
+        return None
+    return width, client_height
 
 
 def fit_video_window_to_workarea(
     area: tuple[int, int, int, int],
     current_rect: tuple[int, int, int, int] | None,
+    aspect: tuple[int, int] | None,
 ) -> tuple[int, int, int, int]:
-    """Fit an exact 16:9 client surface inside a monitor work area."""
+    """Fit a viewer with the given client shape inside a monitor work area.
 
+    Without a known shape the viewer fills the work area and UU letterboxes
+    the video inside it.
+    """
+
+    if aspect is None:
+        return area
+    aspect_width, aspect_height = aspect
     area_x, area_y, area_width, area_height = area
     nonclient_height = WINDOW_LAYOUT_DEFAULT_NONCLIENT_HEIGHT
     if current_rect is not None:
         inferred = current_rect[3] - round(
-            current_rect[2]
-            * WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT
-            / WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH
+            current_rect[2] * aspect_height / aspect_width
         )
         if (
             WINDOW_LAYOUT_MIN_NONCLIENT_HEIGHT
@@ -577,14 +637,15 @@ def fit_video_window_to_workarea(
             nonclient_height = inferred
 
     available_client_height = area_height - nonclient_height
-    aspect_units = min(
-        area_width // WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH,
-        available_client_height // WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT,
-    )
-    if aspect_units <= 0:
+    if available_client_height <= 0:
         return area
-    client_width = aspect_units * WINDOW_LAYOUT_VIDEO_ASPECT_WIDTH
-    client_height = aspect_units * WINDOW_LAYOUT_VIDEO_ASPECT_HEIGHT
+    client_width = min(
+        area_width,
+        available_client_height * aspect_width // aspect_height,
+    )
+    client_height = client_width * aspect_height // aspect_width
+    if client_width <= 0 or client_height <= 0:
+        return area
     outer_height = client_height + nonclient_height
     return (
         area_x + (area_width - client_width) // 2,
@@ -750,6 +811,65 @@ def controller_processes(prefix: str) -> set[int]:
     return result
 
 
+def windows_image_name(path: str) -> str:
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def server_processes(prefix: str) -> set[int]:
+    """Return the GameViewerServer PIDs for one Wine prefix.
+
+    /proc/PID/comm holds at most 15 bytes ("GameViewerServe"), so match the
+    Windows image path that Wine keeps in argv[0] instead.
+    """
+
+    result: set[int] = set()
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+        pid = int(proc_entry.name)
+        arguments = process_arguments(pid)
+        if not arguments or windows_image_name(arguments[0]).casefold() != (
+            "gameviewerserver.exe"
+        ):
+            continue
+        if process_matches_prefix(pid, prefix):
+            result.add(pid)
+    return result
+
+
+def stat_cpu_ticks(payload: str) -> int | None:
+    # comm is parenthesized and may contain spaces; utime and stime are
+    # fields 14 and 15 of proc_pid_stat(5), i.e. 12 and 13 after comm.
+    fields = payload.rsplit(")", 1)[-1].split()
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_cpu_ticks(pid: int) -> int | None:
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return stat_cpu_ticks(payload)
+
+
+def input_bridge_activity(state_dir: Path) -> tuple[int, int] | None:
+    """Return the input bridge PID and its remote mouse/keyboard packets."""
+
+    try:
+        payload = json.loads(
+            (state_dir / INPUT_BRIDGE_STATUS_NAME).read_text(encoding="utf-8")
+        )
+        return (
+            int(payload["pid"]),
+            int(payload["mouse_packets"]) + int(payload["keyboard_packets"]),
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def quiesce_controller(prefix: str, natural_grace_seconds: float) -> bool:
     """Let UU exit naturally, then terminate only its matching Qt controller."""
 
@@ -870,6 +990,7 @@ class TrayProxy:
             int,
             tuple[tuple[int, int, int, int], int, float],
         ] = {}
+        self.window_layout_aspects: dict[int, tuple[int, int] | None] = {}
         self.ever_saw_client = False
         self.client_missing_ticks = 0
         self.removed_icons = 0
@@ -967,21 +1088,117 @@ class TrayProxy:
             candidates = list(
                 self.server_connection_log_dir.glob("connection_log_*.txt")
             )
-            return max(
+            latest = max(
                 candidates,
                 key=lambda path: path.stat().st_mtime_ns,
                 default=None,
             )
+            if latest is None:
+                return None
+            # Text logs left behind by an older UU are stale once the
+            # current client writes encrypted .slog files.
+            newest_slog = max(
+                (
+                    path.stat().st_mtime_ns
+                    for path in self.server_connection_log_dir.glob(
+                        "connection_log_*.slog"
+                    )
+                ),
+                default=0,
+            )
+            if newest_slog > latest.stat().st_mtime_ns:
+                return None
+            return latest
         except OSError:
             return None
+
+    def controlled_session_activity_state(self) -> str:
+        """Estimate controlled-session activity without UU's text logs.
+
+        Remote input and GameViewerServer's capture/encode load both show a
+        viewer on this desktop.  Report idle only after a full quiet window,
+        or when no GameViewerServer runs at all, and unknown while warming up
+        or when neither signal can be read.
+        """
+
+        now = time.monotonic()
+        if getattr(self, "session_observed_since", None) is None:
+            self.session_observed_since = now
+        last_sample = getattr(self, "session_sample_at", None)
+        if (
+            last_sample is not None
+            and now - last_sample < CONTROLLED_SESSION_SAMPLE_SECONDS
+        ):
+            return getattr(self, "session_activity_state", "unknown")
+
+        servers = server_processes(self.prefix)
+        ticks: dict[int, int] = {}
+        for pid in servers:
+            value = process_cpu_ticks(pid)
+            if value is not None:
+                ticks[pid] = value
+        state_dir = getattr(self, "state_dir", None)
+        inputs = (
+            input_bridge_activity(Path(state_dir))
+            if state_dir is not None
+            else None
+        )
+        active = False
+        if last_sample is not None:
+            previous_ticks = getattr(self, "session_server_ticks", {})
+            used = sum(
+                value - previous_ticks[pid]
+                for pid, value in ticks.items()
+                if pid in previous_ticks
+            )
+            elapsed = now - last_sample
+            if (
+                used * 100.0 / (os.sysconf("SC_CLK_TCK") * elapsed)
+                >= CONTROLLED_SESSION_SERVER_CPU_PERCENT
+            ):
+                active = True
+            # A bridge restart also changes the (pid, packets) pair; counting
+            # it as activity only delays recovery.
+            previous_inputs = getattr(self, "session_inputs", None)
+            if (
+                inputs is not None
+                and previous_inputs is not None
+                and inputs != previous_inputs
+            ):
+                active = True
+        self.session_sample_at = now
+        self.session_server_ticks = ticks
+        self.session_inputs = inputs
+        if active:
+            self.session_activity_at = now
+
+        activity_at = getattr(self, "session_activity_at", None)
+        if activity_at is not None and (
+            now - activity_at < CONTROLLED_SESSION_QUIET_SECONDS
+        ):
+            state = "active"
+        elif not servers:
+            # Without GameViewerServer nobody can be controlling this desktop.
+            state = "idle"
+        elif (
+            now - self.session_observed_since
+            < CONTROLLED_SESSION_QUIET_SECONDS
+            or (not ticks and inputs is None)
+        ):
+            state = "unknown"
+        else:
+            state = "idle"
+        self.session_activity_state = state
+        return state
 
     def controlled_session_state(self) -> str:
         """Return active, idle, or unknown without exposing RTC log data."""
 
         latest = self.latest_server_connection_log()
         if latest is None:
-            self.last_controlled_session_state = "unknown"
-            return "unknown"
+            state = self.controlled_session_activity_state()
+            self.last_controlled_session_state = state
+            return state
         if latest != getattr(self, "server_log_path", None):
             self.server_log_path = latest
             self.server_log_offset = 0
@@ -1302,6 +1519,11 @@ class TrayProxy:
         )
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.status_file)
+        self.status_written = (
+            status,
+            detail,
+            getattr(self, "last_controlled_session_state", "unknown"),
+        )
 
     def import_ui(self) -> None:
         import gi
@@ -1642,10 +1864,30 @@ class TrayProxy:
 
         now = time.monotonic()
         applied = 0
+        aspects = getattr(self, "window_layout_aspects", None)
+        if aspects is None:
+            aspects = self.window_layout_aspects = {}
         for window, monitor_area in plans:
             state = self.window_layout_state.get(window)
             rect = self.x11.window_rect(window)
-            target_area = fit_video_window_to_workarea(monitor_area, rect)
+            # Learn each viewer's shape once, before the first reflow, and
+            # keep it across monitor changes for the window's lifetime.
+            if window not in aspects and rect is not None:
+                aspects[window] = window_client_aspect(rect)
+                if aspects[window] is None:
+                    logging.info(
+                        "远控窗口初始形状无法识别，按工作区铺满：window=0x%x",
+                        window,
+                    )
+                else:
+                    logging.info(
+                        "远控窗口画面形状：window=0x%x client=%dx%d",
+                        window,
+                        *aspects[window],
+                    )
+            target_area = fit_video_window_to_workarea(
+                monitor_area, rect, aspects.get(window)
+            )
             outside_target = (
                 rect is not None
                 and not self.rect_center_in_area(rect, monitor_area)
@@ -1931,6 +2173,11 @@ class TrayProxy:
         client_quit = self.consume_client_quit_event()
         update_handoff = upstream_update_handoff_active(self.prefix)
         controlled_state = self.controlled_session_state()
+        written = getattr(self, "status_written", None)
+        if written is not None and written[2] != controlled_state:
+            # The session estimate settles after its warm-up and quiet
+            # windows, not only on tray events; keep the published state live.
+            self.write_status(written[0], written[1])
         if self.controller_recovery_requested():
             if controlled_state != "idle":
                 self.defer_controller_recovery(

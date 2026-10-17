@@ -61,16 +61,20 @@ class LayoutArea:
 
 
 class LayoutMonitor:
-    def __init__(self, area, manufacturer, model):
+    def __init__(self, area, manufacturer, model, scale=1):
         self.area = LayoutArea(*area)
         self.manufacturer = manufacturer
         self.model = model
+        self.scale = scale
 
     def get_workarea(self):
         return self.area
 
     def get_geometry(self):
         return self.area
+
+    def get_scale_factor(self):
+        return self.scale
 
     def get_manufacturer(self):
         return self.manufacturer
@@ -110,24 +114,62 @@ assert namespace["gdk_monitor_workareas"](LayoutGdk) == [
     (1506, 32, 2494, 1408),
     (0, 0, 1440, 2560),
 ]
-assert namespace["fit_video_window_to_workarea"](
+fit = namespace["fit_video_window_to_workarea"]
+assert fit(
     (1506, 32, 2494, 1408),
     (1537, 32, 2432, 1408),
+    (16, 9),
 ) == (1537, 32, 2432, 1408)
-assert namespace["fit_video_window_to_workarea"](
+assert fit(
     (1506, 32, 2494, 1408),
     (1506, 32, 2494, 1408),
+    (16, 9),
 ) == (1537, 32, 2432, 1408)
-assert namespace["fit_video_window_to_workarea"](
+assert fit(
     (0, 0, 1440, 2560),
     (0, 0, 1000, 700),
+    (16, 9),
 ) == (0, 855, 1440, 850)
+# The learned remote shape replaces a fixed 16:9 surface: portrait, 21:9
+# ultrawide and 16:10 hosts keep their proportions on the same work area.
+assert fit((1506, 32, 2494, 1408), None, (9, 16)) == (2368, 32, 769, 1407)
+assert fit((1506, 32, 2494, 1408), None, (3440, 1440)) == (
+    1506, 194, 2494, 1084
+)
+assert fit((1506, 32, 2494, 1408), None, (1920, 1200)) == (
+    1659, 32, 2188, 1407
+)
+# An unknown shape fills the work area and UU letterboxes the video.
+assert fit((1506, 32, 2494, 1408), None, None) == (1506, 32, 2494, 1408)
+
+client_aspect = namespace["window_client_aspect"]
+assert client_aspect((0, 0, 1280, 760)) == (1280, 720)
+assert client_aspect((0, 0, 612, 1128)) == (612, 1088)
+assert client_aspect((0, 0, 2600, 520)) is None
+assert client_aspect((0, 0, 100, 30)) is None
+assert client_aspect(None) is None
 
 monitor_descriptors = namespace["gdk_monitor_descriptors"](LayoutGdk)
 assert [row["id"] for row in monitor_descriptors] == [
     "PHL|HDMI-0",
     "AOC|HDMI-1",
 ]
+
+# GNOME's 200% scale halves GDK geometry; X11 window moves need device pixels.
+unscaled_monitors = layout_display.monitors
+layout_display.monitors = [
+    LayoutMonitor((0, 0, 1280, 720), "AOC", "Q27", scale=2),
+    LayoutMonitor((1280, 0, 1920, 1080), "DEL", "U2720Q", scale=2),
+]
+assert namespace["gdk_monitor_workareas"](LayoutGdk) == [
+    (2560, 0, 3840, 2160),
+    (0, 0, 2560, 1440),
+]
+assert [
+    row["geometry"]
+    for row in namespace["gdk_monitor_descriptors"](LayoutGdk)
+] == [(0, 0, 2560, 1440), (2560, 0, 3840, 2160)]
+layout_display.monitors = unscaled_monitors
 assert [row["primary"] for row in monitor_descriptors] == [False, True]
 assert namespace["monitor_menu_label"](monitor_descriptors[1]) == (
     "HDMI-1 — 2494×1408（主显示器）"
@@ -152,10 +194,13 @@ class LayoutX11:
         self.moves = []
         self.accept_moves = True
         self.visible_windows = [0x300, 0x301, 0x302]
+        # UU's startup viewers: a 16:9 video area plus its 40-pixel caption.
         self.rects = {
-            0x300: (0, 0, 1200, 800),
-            0x301: (0, 0, 1000, 700),
+            0x300: (0, 0, 1280, 760),
+            0x301: (0, 0, 1024, 616),
             0x302: (100, 100, 920, 680),
+            0x303: (0, 0, 612, 1128),
+            0x304: (0, 0, 2600, 520),
         }
 
     def windows(self):
@@ -163,13 +208,13 @@ class LayoutX11:
 
     @staticmethod
     def window_class(window):
-        if window in (0x300, 0x301, 0x302):
+        if window in (0x300, 0x301, 0x302, 0x303, 0x304):
             return "gameviewer.exe", "gameviewer.exe"
         return "other.exe", "other.exe"
 
     @staticmethod
     def property_first_cardinal(window, atom):
-        if window not in (0x300, 0x301, 0x302):
+        if window not in (0x300, 0x301, 0x302, 0x303, 0x304):
             return None
         return 4242 if atom == 1 else 1
 
@@ -179,6 +224,8 @@ class LayoutX11:
             0x300: "DESKTOP-PRIMARY",
             0x301: "DESKTOP-SECONDARY",
             0x302: "网易UU远程",
+            0x303: "DESKTOP-PORTRAIT",
+            0x304: "DESKTOP-ODD-SHAPE",
         }[window]
 
     def window_rect(self, window):
@@ -244,7 +291,7 @@ try:
         1,
         0.0,
     )
-    layout_x11.rects[0x300] = (0, 0, 1200, 800)
+    layout_x11.rects[0x300] = (0, 0, 1280, 760)
     assert layout_proxy.apply_window_layout() == 1
     assert layout_x11.moves == [
         (0x300, 1537, 32, 2432, 1408),
@@ -283,8 +330,8 @@ try:
     # Failed moves retain the finite three-attempt ceiling.
     layout_proxy.window_layout = namespace["WINDOW_LAYOUT_SINGLE"]
     layout_proxy.window_layout_state.clear()
-    layout_x11.rects[0x300] = (0, 0, 1200, 800)
-    layout_x11.rects[0x301] = (0, 0, 1000, 700)
+    layout_x11.rects[0x300] = (0, 0, 1280, 760)
+    layout_x11.rects[0x301] = (0, 0, 1024, 616)
     layout_x11.accept_moves = False
     for attempt in range(namespace["WINDOW_LAYOUT_REFLOW_ATTEMPTS"]):
         if attempt:
@@ -300,6 +347,32 @@ try:
     layout_x11.moves.clear()
     assert layout_proxy.apply_window_layout() == 0
     assert layout_x11.moves == []
+
+    # A portrait remote display keeps its own shape instead of a fixed 16:9
+    # surface, even though UU opened its viewer narrower than 640 pixels.
+    layout_x11.accept_moves = True
+    layout_x11.visible_windows = [0x303]
+    layout_proxy.window_layout_state.clear()
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout(force=True) == 1
+    assert layout_x11.moves == [(0x303, 2368, 32, 769, 1407)]
+    assert layout_proxy.window_layout_aspects[0x303] == (612, 1088)
+
+    # The shape is learned once per viewer: a later re-layout keeps the
+    # portrait proportions even if the window now reports another geometry.
+    layout_x11.rects[0x303] = (0, 0, 1280, 760)
+    layout_proxy.window_layout_state.clear()
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout(force=True) == 1
+    assert layout_x11.moves == [(0x303, 2368, 32, 769, 1407)]
+
+    # An implausible startup shape falls back to filling the work area.
+    layout_x11.visible_windows = [0x304]
+    layout_proxy.window_layout_state.clear()
+    layout_x11.moves.clear()
+    assert layout_proxy.apply_window_layout(force=True) == 1
+    assert layout_x11.moves == [(0x304, 1506, 32, 2494, 1408)]
+    assert layout_proxy.window_layout_aspects[0x304] is None
 finally:
     layout_globals["controller_processes"] = (
         original_layout_controller_processes
@@ -394,14 +467,40 @@ original_prefix_processes = namespace["prefix_processes"]
 namespace["prefix_processes"].__globals__["prefix_processes"] = (
     lambda *_args: set()
 )
+written_statuses = []
+
+
+def record_status(status, detail=""):
+    written_statuses.append((status, detail))
+    instance.status_written = (status, detail, "idle")
+
+
 try:
     assert instance.periodic_check()
     assert not instance.ever_saw_client
     assert instance.client_missing_ticks == 0
+
+    # A session state that settles after startup is republished once with
+    # the last status and detail, not only on the next tray event.
+    instance.write_status = record_status
+    instance.status_written = ("active", "原生托盘已注册", "unknown")
+    assert instance.periodic_check()
+    assert instance.periodic_check()
+    assert written_statuses == [("active", "原生托盘已注册")]
 finally:
     namespace["prefix_processes"].__globals__["prefix_processes"] = (
         original_prefix_processes
     )
+
+with tempfile.TemporaryDirectory() as state:
+    status_proxy = proxy_class.__new__(proxy_class)
+    status_proxy.state_dir = Path(state)
+    status_proxy.status_file = Path(state) / "tray-proxy-status"
+    status_proxy.removed_icons = 0
+    status_proxy.last_controlled_session_state = "idle"
+    status_proxy.write_status("active", "ok")
+    assert "controlled_session=idle\n" in status_proxy.status_file.read_text()
+    assert status_proxy.status_written == ("active", "ok", "idle")
 
 with tempfile.TemporaryDirectory() as prefix:
     environment = os.environ.copy()
@@ -780,6 +879,122 @@ with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as s
             "Session: 123 Old state: stable New state: closed\n"
         )
     assert active.controlled_session_state() == "idle"
+
+# UU 4.43+ writes only encrypted .slog files; the session estimate then uses
+# remote input and GameViewerServer's capture/encode load.
+assert namespace["windows_image_name"](
+    r"C:\Program Files\Netease\GameViewer\bin\GameViewerServer.exe"
+) == "GameViewerServer.exe"
+assert namespace["stat_cpu_ticks"](
+    "1234 (a) b) S 1 1 1 0 -1 4194560 10 0 0 0 70 30 0 0 20 0"
+) == 100
+assert namespace["stat_cpu_ticks"]("1234 (truncated) S 1") is None
+assert isinstance(namespace["process_cpu_ticks"](os.getpid()), int)
+
+with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as state:
+    (Path(state) / "input-bridge-status.json").write_text(
+        '{"pid": 41, "mouse_packets": 2, "keyboard_packets": 3}'
+    )
+    assert namespace["input_bridge_activity"](Path(state)) == (41, 5)
+    (Path(state) / "input-bridge-status.json").write_text("{")
+    assert namespace["input_bridge_activity"](Path(state)) is None
+
+    estimate_globals = proxy_class.controlled_session_activity_state.__globals__
+    clock = [100.0]
+    servers = {7001}
+    cpu = {7001: 1000}
+    inputs = [(41, 0)]
+    patched = {
+        "server_processes": lambda _prefix: set(servers),
+        "process_cpu_ticks": lambda pid: cpu.get(pid),
+        "input_bridge_activity": lambda _state_dir: inputs[0],
+    }
+    originals = {name: estimate_globals[name] for name in patched}
+    estimate_globals.update(patched)
+    hz = os.sysconf("SC_CLK_TCK")
+    quiet_samples = int(
+        namespace["CONTROLLED_SESSION_QUIET_SECONDS"]
+        // namespace["CONTROLLED_SESSION_SAMPLE_SECONDS"]
+    )
+
+    def advance(seconds, cpu_percent=1.0):
+        clock[0] += seconds
+        for pid in cpu:
+            cpu[pid] += round(hz * seconds * cpu_percent / 100)
+
+    def new_estimate():
+        instance = proxy_class.__new__(proxy_class)
+        instance.prefix = namespace["canonical_path"](prefix)
+        instance.state_dir = Path(state)
+        return instance
+
+    try:
+        with mock.patch.object(
+            namespace["time"], "monotonic", lambda: clock[0]
+        ):
+            estimate = new_estimate()
+            # Warming up: a full quiet window has not been observed yet.
+            assert estimate.controlled_session_state() == "unknown"
+            advance(2)
+            assert estimate.controlled_session_state() == "unknown"
+            # A whole quiet window at idle load (1% of one core) is idle.
+            for _ in range(quiet_samples):
+                advance(2)
+                estimate.controlled_session_state()
+            assert estimate.controlled_session_state() == "idle"
+            assert estimate.last_controlled_session_state == "idle"
+
+            # Remote input keeps the session active for a full quiet window;
+            # samples between the 2 s intervals reuse the cached state.
+            inputs[0] = (41, 3)
+            advance(2)
+            assert estimate.controlled_session_state() == "active"
+            advance(0.5)
+            assert estimate.controlled_session_state() == "active"
+            for _ in range(quiet_samples - 1):
+                advance(2)
+                assert estimate.controlled_session_state() == "active"
+            advance(2)
+            assert estimate.controlled_session_state() == "idle"
+
+            # A passive viewer sends no input but keeps capture/encode busy.
+            advance(2, cpu_percent=40)
+            assert estimate.controlled_session_state() == "active"
+
+            # Without GameViewerServer nobody can control this desktop.
+            servers.clear()
+            alone = new_estimate()
+            assert alone.controlled_session_state() == "idle"
+            servers.add(7001)
+
+            # Neither signal readable stays unknown even after warming up.
+            cpu.clear()
+            inputs[0] = None
+            blind = new_estimate()
+            for _ in range(quiet_samples + 1):
+                blind.controlled_session_state()
+                advance(2)
+            assert blind.controlled_session_state() == "unknown"
+            cpu[7001] = 1000
+            inputs[0] = (41, 3)
+
+            # Text logs left by an older UU are ignored once .slog is newer.
+            stale = new_estimate()
+            log_dir = stale.server_connection_log_dir
+            log_dir.mkdir(parents=True)
+            text_log = log_dir / "connection_log_20260803000000000_1.txt"
+            text_log.write_text(
+                "Session: 9 Old state: have-remote-offer New state: stable\n"
+            )
+            slog = log_dir / "connection_log_controlled.slog"
+            slog.write_bytes(b"\0")
+            os.utime(text_log, (1_000_000, 1_000_000))
+            assert stale.latest_server_connection_log() is None
+            assert stale.controlled_session_state() == "unknown"
+            os.utime(slog, (900_000, 900_000))
+            assert stale.latest_server_connection_log() == text_log
+    finally:
+        estimate_globals.update(originals)
 
 
 class RepaintX11:
