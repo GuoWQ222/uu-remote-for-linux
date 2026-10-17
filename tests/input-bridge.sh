@@ -113,11 +113,13 @@ PY
 # The launcher must supervise runtime Portal/PipeWire failures.  A stale
 # stream used to exit permanently and remove the shared frame, leaving every
 # later remote capture black until UU was launched by hand again.
-if rg -q 'restart_policy="no"' "$project_root/bin/uu-remote-for-linux"; then
+if grep -qF 'restart_policy="no"' "$project_root/bin/uu-remote-for-linux"; then
     printf 'Wayland 输入桥不应禁用 systemd 运行时恢复。\n' >&2
     exit 1
 fi
-rg -q -- '--property=Restart=\$restart_policy' \
+# The launcher source contains this literal shell expansion.
+# shellcheck disable=SC2016
+grep -qF -- '--property=Restart=$restart_policy' \
     "$project_root/bin/uu-remote-for-linux"
 
 printf '{"version":1,"monitor_id":"AOC|HDMI-1"}\n' \

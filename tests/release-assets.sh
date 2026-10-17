@@ -101,8 +101,11 @@ gzip -dc "$tmp_dir/package/usr/share/doc/uu-remote-for-linux/changelog.gz" \
 for relay in nvcuda.dll.so nvcuvid.dll.so nvencodeapi64.dll.so; do
     relay_path="$tmp_dir/package/usr/lib/uu-remote-for-linux/hwdecode/wine/x86_64-unix/$relay"
     file "$relay_path" | grep -Fq 'stripped'
-    readelf -d "$relay_path" | grep -Eq 'BIND_NOW|FLAGS_1.*NOW'
-    if readelf -S "$relay_path" | grep -q '\.comment'; then
+    # Capture before grep -q so pipefail cannot report SIGPIPE as a result.
+    relay_dynamic=$(readelf -d "$relay_path")
+    relay_sections=$(readelf -S "$relay_path")
+    grep -Eq 'BIND_NOW|FLAGS_1.*NOW' <<<"$relay_dynamic"
+    if grep -q '\.comment' <<<"$relay_sections"; then
         printf '%s 不应保留 .comment 段。\n' "$relay" >&2
         exit 1
     fi

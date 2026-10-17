@@ -158,11 +158,15 @@ prepare_wine_prefix() {
     -lwevtapi \
     -lws2_32
 
-if objdump -p "$compiled_probe" | grep -Fq 'GetCursorInfo'; then
+# Capture before grep -q: under pipefail an early match kills objdump with
+# SIGPIPE, failing the positive check and passing the negative one.
+probe_imports=$(objdump -p "$compiled_probe")
+streamer_probe_imports=$(objdump -p "$compiled_streamer_probe")
+if grep -Fq 'GetCursorInfo' <<<"$probe_imports"; then
     printf '测试主程序不应导入 GetCursorInfo。\n' >&2
     exit 1
 fi
-objdump -p "$compiled_streamer_probe" | grep -Fq 'GetCursorInfo'
+grep -Fq 'GetCursorInfo' <<<"$streamer_probe_imports"
 
 prepare_wine_prefix
 install -Dm0644 "$hook" "$prefix/drive_c/uu-remote-input-hook.dll"

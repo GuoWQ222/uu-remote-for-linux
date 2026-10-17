@@ -31,7 +31,9 @@ DESTDIR="$build_root/stage" meson install -C "$build_root/build"
 unix_relay="$build_root/stage/usr/lib/wine/x86_64-unix/nvcuda.dll.so"
 windows_relay="$build_root/stage/usr/lib/wine/x86_64-windows/nvcuda.dll"
 strip --strip-unneeded --remove-section=.comment "$unix_relay"
-readelf -d "$unix_relay" | grep -Eq 'BIND_NOW|FLAGS_1.*NOW' || {
+# Capture before grep -q so pipefail cannot report SIGPIPE as a missing flag.
+unix_relay_dynamic=$(readelf -d "$unix_relay")
+grep -Eq 'BIND_NOW|FLAGS_1.*NOW' <<<"$unix_relay_dynamic" || {
     printf 'nvcuda Unix relay 缺少 BIND_NOW。\n' >&2
     exit 1
 }
