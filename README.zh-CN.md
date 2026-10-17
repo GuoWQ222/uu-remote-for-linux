@@ -45,7 +45,7 @@
 [下载最新 Debian 安装包](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest)，然后在 X11 或 GNOME Wayland 中直接安装：
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.43_amd64.deb
 uu-remote-for-linux
 ```
 

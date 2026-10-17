@@ -45,7 +45,7 @@ Remote control of the login screen after logout is coming soon.
 [Download the latest Debian package](https://github.com/GuoWQ222/uu-remote-for-linux/releases/latest), then install it on X11 or GNOME Wayland:
 
 ```bash
-sudo apt install ./uu-remote-for-linux_1.1.42_amd64.deb
+sudo apt install ./uu-remote-for-linux_1.1.43_amd64.deb
 uu-remote-for-linux
 ```
 

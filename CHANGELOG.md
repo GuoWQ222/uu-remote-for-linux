@@ -2,6 +2,68 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.43] - 2026-10-17
+
+- Adapt NVENC and portrait capture to UU 4.43.1.3614. Recognize the native
+  GPUDevice pointer ABI without overwriting its methods, and derive all four
+  portrait scaling patch sites from the current official binaries.
+- Recognize native NVDEC discovery in current UU releases. Validate its
+  dedicated decoder call path without rewriting the codec detector shared
+  with encoder probes, and keep NVIDIA visible to DXVK for device selection.
+- Derive the WOL support predicate when current UU inlines its status
+  comparisons, while keeping semantic validation and rollback protection.
+  The updated patch is deployed; physical wake-up testing remains pending.
+- Fix official UU updates failing with "官方安装包版本与更新检查结果不一致".
+  NetEase's release endpoint load-balances between staged releases, so the
+  version check and the installer download could resolve to different
+  versions (for example 4.43.0.3607 and 4.43.1.3614), aborting roughly every
+  other attempt. The check now keeps the newest release seen across three
+  HEAD probes and downloads exactly the URL it resolved. The transaction
+  targets the version of the downloaded, Authenticode-verified installer,
+  requires it to be newer than the installed client, still verifies the
+  installed version afterwards, and keeps the rolled-back-version hold keyed
+  to the version actually downloaded.
+- Support scaled Wayland displays (for example 4K at 200% or 2K at 125%).
+  Mutter produces physical-pixel PipeWire buffers for streams the Portal
+  describes in logical pixels, so the capture and cursor helpers failed to
+  negotiate any frames and absolute pointer motion landed at 1/scale of the
+  target. The helpers now accept the producer's buffer size, downscale video
+  on the GPU into the logical staging slot, scale cursor bitmaps, and report
+  the buffer size so pointer positions are sent in buffer pixels. A later
+  buffer-size change restarts the capture so the layout is rebuilt. The
+  capture helper also drops cached EGL imports when PipeWire removes a
+  buffer, so a reused descriptor number cannot show a stale frame.
+- Read X11 monitor geometry in device pixels. GDK reports monitor geometry
+  and work areas divided by the integer UI scale, so GNOME's 200% setting made
+  input mapping and tray window layout cover only the top-left quarter of a
+  4K or 2K monitor.
+- Follow runtime resolution and monitor-layout changes in the X11 input
+  backend. Xlib caches the screen size per connection, so the virtual-desktop
+  mapping stayed at the startup resolution; it now queries the root window.
+- Fit the licence and decoder-selection dialogs to the monitor work area
+  instead of fixed 900x700 and 1420x650 sizes that pushed buttons off 720p and
+  768p screens.
+- Stop the keyboard bridge and tray proxy from exiting on X11 BadWindow
+  errors when a window closes while being inspected. The keyboard bridge
+  crash could leave Super and Super+Space disabled until it restarted.
+- Poll the live Wine registry for the autostart setting every fifth check
+  instead of starting a Wine process every two seconds.
+- Lay out remote viewers in their own shape instead of a fixed 16:9 surface.
+  The single- and dual-window modes learn each viewer's client shape from the
+  geometry UU opens it with, so 16:10, ultrawide and portrait hosts keep their
+  proportions; an implausible shape fills the work area. Portrait viewers
+  narrower than 640 pixels are no longer skipped.
+- Restore hung-controller recovery on UU releases that write encrypted .slog
+  logs. Controlled-session activity is now inferred from remote input and
+  GameViewerServer's capture/encode load: recovery waits while either was
+  seen in the last 60 s and stays deferred when neither can be read. Text
+  connection logs are still used while the installed UU writes them, and are
+  ignored once newer .slog files exist. The tray status file now follows the
+  session state as it changes instead of keeping its startup value.
+- Make the test suite independent of ripgrep, derive the expected package
+  version instead of hard-coding it, and avoid SIGPIPE false results from
+  `grep -q` pipelines under `pipefail`.
+
 ## [1.1.42] - 2026-08-23
 
 - Keep graphical startup independent of network update latency, start the
