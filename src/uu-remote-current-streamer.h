@@ -36,4 +36,3 @@ static const SIZE_T current_portrait_scaler_fields[] = {40u, 49u, 119u, 128u};
 static const unsigned char current_portrait_scaler_values[] = {0x90u, 0x88u, 0x90u, 0x88u};
 
 #endif
-
