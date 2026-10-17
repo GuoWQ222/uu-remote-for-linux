@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+systemctl --user stop pjlab-uu-display-sync.service || true
+startup="$HOME/.config/autostart/pjlab-uu-display-sync.desktop"
+state="$HOME/.local/state/uu-remote-for-linux"
+mkdir -p "$state"
+if [[ -f "$startup" ]]; then
+    mv -- "$startup" "$state/pjlab-uu-display-sync.desktop.disabled"
+fi
+printf 'UU native display synchronization has been disabled. Applications were not stopped.\n'

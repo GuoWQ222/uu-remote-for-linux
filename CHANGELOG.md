@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Restore the actual UU home after tray activation. Check that a controller
+  process still owns the fresh heartbeat, initialize missing backends when
+  activation leaves only a splash, and report failure if no real home appears.
+  Preserve active sessions and recognize current small-screen home windows.
+- Preserve the tested opt-in X11 display synchronization companion under
+  `contrib/x11-display-sync`. It follows native geometry and monitor layouts,
+  refreshes the isolated Wine prefix without restarting UU, and restricts
+  Vulkan driver-discovery overrides to its notification child. Its internal
+  Wine ABI is guarded to 11.19; other versions require revalidation. The
+  companion is source-only and is not enabled by the Debian package.
+
 ## [1.1.43] - 2026-10-17
 
 - Adapt NVENC and portrait capture to UU 4.43.1.3614. Recognize the native

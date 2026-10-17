@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PJLAB UU native display synchronization
+Comment=Synchronize Wine capture geometry after native display changes
+Exec=/usr/local/libexec/pjlab-uu-display-sync-start
+OnlyShowIn=GNOME;Unity;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
