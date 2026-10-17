@@ -1,8 +1,9 @@
 uu-remote-for-linux (@VERSION@) unstable; urgency=medium
 
-  * Keep graphical startup independent of network update latency.
-  * Generate UU compatibility profiles from current binary semantics.
-  * Ship one adaptive X11 and GNOME Wayland amd64 package.
-  * Add Debian policy metadata, checksums, ELF hardening, and documentation.
+  * Adapt UU 4.43 NVENC, NVDEC, portrait capture and WOL compatibility.
+  * Fix scaled Wayland/X11 capture, cursor mapping and viewer layouts.
+  * Accept legacy and RFC2253 installer subjects with strict publisher checks.
+  * Restore the real tray home and recover missing backend initialization.
+  * Keep the display-sync companion opt-in and host display settings excluded.
 
  -- Wenqi Guo <129141646+GuoWQ222@users.noreply.github.com>  @DEBIAN_DATE@

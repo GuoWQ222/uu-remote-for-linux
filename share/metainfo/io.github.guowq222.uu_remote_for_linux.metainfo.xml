@@ -25,8 +25,9 @@
   <url type="bugtracker">https://github.com/GuoWQ222/uu-remote-for-linux/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.1.43" date="2026-10-17">
+    <release version="1.1.43" date="2026-10-18">
       <description>
+        <p>Accept valid installer publishers in both legacy and RFC2253 certificate subjects while preserving signature and revocation checks. Restore the actual home after tray activation, recover missing backends and reject stale controller heartbeats.</p>
         <p>Adapt NVENC and portrait capture to UU 4.43.1.3614, recognize its native NVDEC discovery without changing shared encoder probes, and derive the updated WOL support predicate.</p>
         <p>Keep official UU updates working while NetEase's download endpoint serves different staged releases to the version check and the download, support scaled 2K and 4K displays on Wayland and X11, follow runtime resolution changes, lay out remote viewers in the remote display's own shape, restore hung-UI recovery on current UU releases, and stop X11 window races from closing the keyboard bridge and tray.</p>
       </description>
