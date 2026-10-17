@@ -838,6 +838,44 @@ test ! -e "$show_request"
 test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq \
     "$((client_count_before_show + 1))"
 
+# A live UI heartbeat can belong to the splash, while required backend
+# processes are missing. --show must finish initialization, then verify the
+# real home instead of reporting a successful single-instance activation.
+rm -f -- "$install_dir/bin/.healthd-running" "$install_dir/bin/.server-running"
+touch "$prefix/drive_c/uu-remote-focus-hook-status.ini"
+healthd_before=$(grep -c '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE")
+server_before=$(grep -c '^SERVER$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_FAKE_HOME_MODE=needs-backend "$launcher" --show \
+    >"$test_root/show-startup-race.out" 2>&1
+test "$(grep -c '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE")" -eq "$((healthd_before + 1))"
+test "$(grep -c '^SERVER$' "$UU_REMOTE_FAKE_TRACE")" -eq "$((server_before + 1))"
+grep -q '补齐运行依赖后重试' "$test_root/show-startup-race.out"
+grep -q -- '--repaint-timeout-ms 15000' "$UU_REMOTE_FAKE_TRACE"
+
+# Starting/activating a process successfully is not a visible-window success.
+touch "$prefix/drive_c/uu-remote-focus-hook-status.ini"
+if UU_REMOTE_FAKE_HOME_MODE=missing "$launcher" --show \
+    >"$test_root/show-no-home.out" 2>&1; then
+    printf '未显示主窗口时 --show 错误地返回成功。\n' >&2
+    exit 1
+fi
+grep -q 'UU 主界面未在等待时间内显示' "$test_root/show-no-home.out"
+
+# A fresh heartbeat file left by an exited controller must not skip full
+# startup. Backend initialization happens before the first client launch.
+touch "$prefix/drive_c/uu-remote-focus-hook-status.ini"
+rm -f -- "$install_dir/bin/.healthd-running" "$install_dir/bin/.server-running"
+healthd_before=$(grep -c '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE")
+client_before=$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")
+UU_REMOTE_FAKE_CONTROLLER_RUNNING=0 UU_REMOTE_FAKE_HOME_MODE=needs-backend \
+    "$launcher" --show >"$test_root/show-stale-hook.out" 2>&1
+test "$(grep -c '^HEALTHD$' "$UU_REMOTE_FAKE_TRACE")" -eq "$((healthd_before + 1))"
+test "$(grep -c '^CLIENT$' "$UU_REMOTE_FAKE_TRACE")" -eq "$((client_before + 1))"
+if grep -q '补齐运行依赖后重试' "$test_root/show-stale-hook.out"; then
+    printf '已退出控制器的残留心跳错误触发快捷激活。\n' >&2
+    exit 1
+fi
+
 # A fresh worker status is not sufficient proof that the Qt UI thread is
 # alive. Two real heartbeat timeouts must prevent another single-instance
 # activation from being sent into the hard-stalled controller.

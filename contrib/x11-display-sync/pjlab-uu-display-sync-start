@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+[[ -n ${DISPLAY:-} ]] || exit 0
+if systemctl --user is-active --quiet pjlab-uu-display-sync.service; then exit 0; fi
+state="$HOME/.local/state/uu-remote-for-linux"
+mkdir -p "$state"
+exec systemd-run --user --collect --unit=pjlab-uu-display-sync \
+ --property=Restart=on-failure --property=RestartSec=3s \
+ --property=PartOf=graphical-session.target \
+ --property="StandardOutput=append:$state/display-sync.log" \
+ --property="StandardError=append:$state/display-sync.log" \
+ --setenv="DISPLAY=$DISPLAY" --setenv="XAUTHORITY=${XAUTHORITY:-}" \
+ /usr/local/libexec/pjlab-uu-display-sync.py

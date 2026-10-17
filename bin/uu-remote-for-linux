@@ -3498,7 +3498,11 @@ controller_focus_hook_live() {
     modified=$(stat -c %Y "$controller_focus_hook_status" 2>/dev/null) || return 1
     printf -v now '%(%s)T' -1
     [[ $modified =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] || return 1
-    ((modified <= now && now - modified <= 3))
+    ((modified <= now && now - modified <= 3)) || return 1
+    # A just-exited controller leaves a fresh status file behind. Never use
+    # that file to launch a new client through the activation-only shortcut.
+    "$tray_proxy" --controller-running --prefix "$prefix" \
+        </dev/null >/dev/null 2>&1
 }
 
 controller_focus_ui_state() {
@@ -3564,11 +3568,13 @@ authorize_controller_home_show() {
 }
 
 repaint_controller_home_window() {
+    local timeout_ms="${1:-3000}"
     [[ -x $tray_proxy ]] || return 1
     "$tray_proxy" \
         --repaint-home-window \
         --prefix "$prefix" \
         --repaint-delay-ms 2500 \
+        --repaint-timeout-ms "$timeout_ms" \
         </dev/null >>"$tray_proxy_log" 2>&1
 }
 
@@ -4180,9 +4186,12 @@ if controller_focus_hook_live; then
             -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
             -u ALL_PROXY -u NO_PROXY \
             "$wine" "$client" || show_result=$?
-        repaint_controller_home_window ||
-            printf '警告：无法刷新 UU 主界面的 X11 表面。\n' >&2
-        exit "$show_result"
+        # A responsive Qt message window may only be the splash screen.
+        # Do not skip backend initialization until the real home is visible.
+        if ((show_result == 0)) && repaint_controller_home_window; then
+            exit 0
+        fi
+        printf 'UU 显示请求未产生主界面；正在补齐运行依赖后重试。\n' >&2
     fi
 fi
 
@@ -6442,6 +6451,21 @@ if systemd_user_available; then
     wait_input_hook_active ||
         printf '警告：GameViewerServer 输入钩子尚未确认连接，详见 %s\n' \
             "$input_bridge_log" >&2
+    if $show_requested && ! repaint_controller_home_window 15000; then
+        die "UU 主界面未在等待时间内显示，详见 $tray_proxy_log"
+    fi
+    exit 0
+fi
+if $show_requested; then
+    # Without systemd, retain a bounded caller while Wine owns the GUI.
+    nohup env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+        -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY \
+        -u ALL_PROXY -u NO_PROXY \
+        "$wine" "$client" "${client_args[@]}" 9>&- </dev/null \
+        >>"$runtime_log" 2>&1 &
+    if ! repaint_controller_home_window 15000; then
+        die "UU 主界面未在等待时间内显示，详见 $tray_proxy_log"
+    fi
     exit 0
 fi
 exec env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \

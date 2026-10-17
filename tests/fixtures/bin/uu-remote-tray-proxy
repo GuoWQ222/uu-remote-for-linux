@@ -8,3 +8,16 @@ if [[ ${1:-} == --check ]]; then
 fi
 
 printf 'TRAY_PROXY %s\n' "$*" >>"${UU_REMOTE_FAKE_TRACE:?}"
+if [[ ${1:-} == --controller-running ]]; then
+    [[ ${UU_REMOTE_FAKE_CONTROLLER_RUNNING:-1} == 1 ]]
+    exit
+fi
+if [[ ${1:-} == --repaint-home-window ]]; then
+    case ${UU_REMOTE_FAKE_HOME_MODE:-ready} in
+        missing) exit 1 ;;
+        needs-backend)
+            bin_dir="${WINEPREFIX:?}/drive_c/Program Files/Netease/GameViewer/bin"
+            [[ -f "$bin_dir/.healthd-running" && -f "$bin_dir/.server-running" ]]
+            ;;
+    esac
+fi

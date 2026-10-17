@@ -45,7 +45,6 @@ WINDOW_LAYOUT_MAX_NONCLIENT_HEIGHT = 96
 HOME_REPAINT_DELAY_MS = 2500
 HOME_REPAINT_RETRY_MS = 100
 HOME_REPAINT_RESTORE_DELAY_MS = 80
-HOME_REPAINT_MAX_ATTEMPTS = 30
 CLIENT_MISSING_GRACE_TICKS = 8
 CLIENT_QUIT_MARKER = (
     "GameViewerApplication::quitApplication] Quit application"
@@ -681,7 +680,14 @@ def mapped_home_window(
         if not geometry:
             continue
         width, height = geometry
-        if width < 640 or height < 480:
+        title = "".join(x11.window_title(window).split()).casefold()
+        # Current UU home titles identify the real Qt home at any DPI/size.
+        # Legacy "GameViewer" is also used by the small startup splash.
+        if title not in {"网易uu远程", "uuremote", "gameviewer"}:
+            continue
+        if width <= 1 or height <= 1:
+            continue
+        if title == "gameviewer" and (width < 640 or height < 480):
             continue
         candidates.append((window, width, height))
     if not candidates:
@@ -689,18 +695,22 @@ def mapped_home_window(
     return max(candidates, key=lambda candidate: candidate[1] * candidate[2])
 
 
-def repaint_home_window(prefix: str, delay_ms: int) -> bool:
+def repaint_home_window(prefix: str, delay_ms: int, timeout_ms: int = 3000) -> bool:
     """Send two separately synchronized X11 configures after a UI restore."""
 
     time.sleep(delay_ms / 1000)
     x11 = X11(os.environ.get("DISPLAY"))
     try:
         target = None
-        for _attempt in range(HOME_REPAINT_MAX_ATTEMPTS):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
             target = mapped_home_window(x11, canonical_path(prefix))
             if target is not None:
                 break
-            time.sleep(HOME_REPAINT_RETRY_MS / 1000)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(HOME_REPAINT_RETRY_MS / 1000, remaining))
         if target is None:
             logging.warning("显示主界面后未找到已映射的 UU 顶层窗口")
             return False
@@ -785,10 +795,9 @@ def controller_processes(prefix: str) -> set[int]:
     """Return the real Qt controller PIDs for one Wine prefix.
 
     UU rewrites its controller command line to ``source=start.exe <uuid>``
-    after the outer GameViewer launcher exits. Linux then exposes the first
-    token as the process name, so matching only ``GameViewer.exe`` misses the
-    long-lived UI process. Prefix ownership plus this exact token keeps the
-    recovery target narrow and excludes GameViewerServer/Healthd/Service.
+    (or ``source= <uuid>`` for direct client launches). For the empty-source
+    form, also require the actual controller image to be mapped; the prefix
+    and a generic source token alone do not prove a process's identity.
     """
 
     result = prefix_processes(prefix, "GameViewer.exe")
@@ -801,12 +810,26 @@ def controller_processes(prefix: str) -> set[int]:
         arguments = process_arguments(pid)
         if (
             len(arguments) == 2
-            and arguments[0].casefold() == "source=start.exe"
+            and arguments[0].casefold() in {"source=start.exe", "source="}
         ):
             try:
                 uuid.UUID(arguments[1])
             except ValueError:
                 continue
+            if arguments[0].casefold() == "source=":
+                expected_image = canonical_path(
+                    str(Path(prefix) / "drive_c/Program Files/Netease/GameViewer/bin/GameViewer.exe")
+                )
+                try:
+                    mappings = Path(f"/proc/{pid}/maps").read_text().splitlines()
+                except OSError:
+                    continue
+                if not any(
+                    len(fields := line.split(None, 5)) == 6
+                    and fields[5] == expected_image
+                    for line in mappings
+                ):
+                    continue
             result.add(pid)
     return result
 
@@ -2315,11 +2338,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--quiesce-controller", action="store_true")
+    parser.add_argument("--controller-running", action="store_true")
     parser.add_argument("--repaint-home-window", action="store_true")
     parser.add_argument("--grace-seconds", type=float, default=8.0)
     parser.add_argument(
         "--repaint-delay-ms", type=int, default=HOME_REPAINT_DELAY_MS
     )
+    parser.add_argument("--repaint-timeout-ms", type=int, default=3000)
     parser.add_argument("--prefix")
     parser.add_argument("--launcher")
     parser.add_argument("--state-dir")
@@ -2334,14 +2359,18 @@ def parse_args() -> argparse.Namespace:
         for operation in (
             args.check,
             args.quiesce_controller,
+            args.controller_running,
             args.repaint_home_window,
         )
     )
     if operation_count > 1:
         parser.error(
-            "--check、--quiesce-controller 和 --repaint-home-window 不能组合"
+            "--check、--controller-running、--quiesce-controller 和 --repaint-home-window 不能组合"
         )
-    if args.quiesce_controller:
+    if args.controller_running:
+        if not args.prefix:
+            parser.error("--controller-running 需要 --prefix")
+    elif args.quiesce_controller:
         if not args.prefix:
             parser.error("--quiesce-controller 需要 --prefix")
         if args.grace_seconds < 0:
@@ -2351,6 +2380,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--repaint-home-window 需要 --prefix")
         if not 0 <= args.repaint_delay_ms <= 10000:
             parser.error("--repaint-delay-ms 必须介于 0 和 10000 之间")
+        if not 0 <= args.repaint_timeout_ms <= 30000:
+            parser.error("--repaint-timeout-ms 必须介于 0 和 30000 之间")
     elif not args.check:
         missing = [
             name
@@ -2376,6 +2407,8 @@ def main() -> int:
     args = parse_args()
     if args.check:
         return dependency_check()
+    if args.controller_running:
+        return 0 if controller_processes(canonical_path(args.prefix)) else 1
     if args.quiesce_controller:
         return 0 if quiesce_controller(args.prefix, args.grace_seconds) else 1
     if args.repaint_home_window:
@@ -2384,7 +2417,7 @@ def main() -> int:
             format="%(asctime)s %(levelname)s %(message)s",
         )
         return 0 if repaint_home_window(
-            args.prefix, args.repaint_delay_ms
+            args.prefix, args.repaint_delay_ms, args.repaint_timeout_ms
         ) else 1
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)

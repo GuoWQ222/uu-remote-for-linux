@@ -95,3 +95,15 @@ identity or a new output grammar requires review instead of automatic trust.
 同时执行实际缩放指令的横竖屏回归，确认 GPUDevice 方法未被整数覆盖。
 官方样本只复制到临时目录，不纳入仓库。此测试不执行关机、休眠或网卡唤醒，
 也不替代另一台设备发起的完整远控会话验收。
+
+## Optional X11 display synchronization
+
+On the tested Wine 11.19 / NVIDIA virtual-output setup, a missing Wine
+desktop owner left capture geometry stale after native display changes.
+The opt-in companion in [contrib/x11-display-sync](contrib/x11-display-sync/README.md)
+refreshes the isolated prefix from live X11 geometry and monitor layouts.
+It does not set display modes or restart UU. The Wine internal notification
+ABI is version-guarded, and its NVIDIA Vulkan-query workaround affects only
+the short-lived helper child. See that directory for exact prerequisites,
+installation, rollback, reproduction evidence and validation boundaries.
+This component is not enabled or installed by the Debian package.
