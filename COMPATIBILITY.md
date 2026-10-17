@@ -19,9 +19,9 @@
 | 功能 | 等级 | 当前自适应机制 | 新 UU 版本的处理 |
 |---|---:|---|---|
 | 输入、锁键、焦点、画面与光标 Hook | A+B | `uu-remote-runtime-profiler` 解析 PE32+ 导入表，按 API 名验证 USER32、GDI、DXGI、IPHLPAPI，并自动发现唯一 `Qt*Core.dll`；运行时 Hook 再按唯一 IAT/vtable/语义候选安装 | 导入契约和运行时唯一候选都成立才启用；否则更新事务失败并回滚 |
-| NVDEC 探测补丁 | B | `uu-remote-hwdecode-profiler` 结合 `.pdata` 函数边界、日志语义字符串、RIP 相对引用和局部数据流派生两个位置；生成前后 SHA256；随后运行官方解码探测 | 可从结构变化后的新二进制重新派生；候选不唯一、越界或真实解码失败时保留 CPU 解码 |
-| NVENC、HEVC 与竖屏原画 | B | `uu-remote-encoder-policy` 按导入、RTTI、vtable、函数边界和指令字段生成哈希绑定档案；由实际 vtable 布局决定是否必须具备四个竖屏语义点；补丁在暂停其他线程且确认 RIP 不在修改区后一次提交；D3D11→CUDA 真实纹理上传探测作为最终门禁 | 语义和真实 GPU 探测均通过才部署；不能证明时保留 OpenH264，核心运行时契约仍单独失败闭合 |
-| WOL 能力与网卡映射 | A+B | `uu-remote-wol-profiler` 用源码路径、状态字符串、函数边界与返回值语义定位唯一谓词；物理网卡信息由 Linux 侧动态回填 | 唯一匹配并复核前后 SHA256 后自动生成；失败时不修改服务端并保留通用 Win32 映射 |
+| NVDEC 探测兼容 | B | `uu-remote-hwdecode-profiler` 结合 `.pdata` 与链式展开边界、日志语义、RIP 引用和局部数据流生成哈希绑定档案；旧布局派生两处补丁，新布局必须证明已有唯一的 NVDEC 专用调用链并保持官方 DLL 原样；DXVK 对 UU 暴露真实 NVIDIA 标识 | 不修改新版共用的编码/解码探测函数；候选不唯一、越界或真实解码失败时保留 CPU 解码 |
+| NVENC、HEVC 与竖屏原画 | B | `uu-remote-encoder-policy` 验证实际编码器编号、vtable 和队列调用语义；区分旧整数 LUID 与新 GPUDevice 指针接口，新接口保持官方指针方法不变；四处竖屏操作独立验证，在暂停其他线程并核对 RIP 后修改字段；D3D11→CUDA 真实纹理上传作为最终门禁 | 禁止把旧整数补丁写入新指针接口；语义和真实 GPU 探测通过才部署，不能证明时保留 OpenH264 |
+| WOL 能力与网卡映射 | A+B | `uu-remote-wol-profiler` 用源码路径、状态字符串或内联 Enabled/Disabled 比较、网卡能力日志、函数边界与布尔返回语义定位唯一谓词；物理网卡信息由 Linux 侧动态回填 | 不把带输出参数的电源配置查询误认为能力谓词；唯一匹配并核验 SHA256 后生成，失败时保留通用 Win32 映射 |
 | 官方更新器接管 | A | 项目管理的更新入口以原始文件哈希和清单核验；下载只允许 HTTPS 重定向，并验证系统 CA 链、Authenticode 和网易发布者身份；Linux 侧拥有快照与回滚事务 | 不依赖版本哈希白名单；新安装后从实际文件重建语义档案与清单，核心契约或完整性不符即回滚 |
 | Event Log、系统代理、自启动、防休眠、键盘快捷键 | A | Wine API shim、注册表/配置文件和 Linux 桌面 API 桥；不依赖官方代码 RVA | 格式仍可解析时自动工作；未知或超时均失败闭合并恢复桌面状态 |
 | Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 只协商三槽 DMA-BUF、EGL 读入独立 staging 后立即归还 producer；锁键状态从 XWayland XKB 指示器读取并缓存 | 不依赖官方 UU 或合成器内部版本号；DMA-BUF/EGL 不可用时明确失败，不切换到语义不同的隐藏回退 |
@@ -63,3 +63,11 @@
 - Wayland 上 Portal 重连、DMA-BUF 三缓冲、多屏、拼音提交与无旧新帧 ABA 测试。
 
 没有以上证据时，新版本只能使用不依赖该补丁的安全回退路径，不能标记为兼容。
+
+`tests/native-nvdec-profile.sh` 验证原生 NVDEC 档案的无修改部署、关闭桥接、
+篡改拒绝以及展开链边界。`tests/current-streamer.sh` 可通过
+`UU_REMOTE_TEST_OFFICIAL_INSTALL_DIR` 指向本机官方安装目录，在独立 Wine
+前缀内验证官方 H.264/HEVC 编解码、纹理上传和真实 DLL 的八个竖屏字段；
+同时执行实际缩放指令的横竖屏回归，确认 GPUDevice 方法未被整数覆盖。
+官方样本只复制到临时目录，不纳入仓库。此测试不执行关机、休眠或网卡唤醒，
+也不替代另一台设备发起的完整远控会话验收。
