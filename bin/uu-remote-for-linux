@@ -905,9 +905,13 @@ load_hwdecode_profile() {
         $offset_2 =~ ^0[xX][[:xdigit:]]+$ &&
         $before_1 =~ ^[[:xdigit:]]{6}$ &&
         $before_2 =~ ^[[:xdigit:]]{6}$ &&
-        ${after_1,,} == b22190 &&
-        ${after_2,,} == 6a2158 &&
         $offset_1 != "$offset_2" ]] || return 1
+    if [[ ${original_sha,,} == "${patched_sha,,}" ]]; then
+        [[ ${before_1,,} == "${after_1,,}" &&
+            ${before_2,,} == "${after_2,,}" ]] || return 1
+    else
+        [[ ${after_1,,} == b22190 && ${after_2,,} == 6a2158 ]] || return 1
+    fi
 
     streamer_profile_version=$version
     streamer_original_sha=${original_sha,,}
@@ -1304,6 +1308,11 @@ file_sha256() {
 streamer_bridge_ready() {
     load_hwdecode_profile ||
         load_hwdecode_profile_from_streamer_files || return 1
+    if [[ $streamer_original_sha == "$streamer_patched_sha" ]]; then
+        [[ -f $streamer_dll &&
+            $(file_sha256 "$streamer_dll") == "$streamer_original_sha" ]]
+        return
+    fi
     [[ -f $streamer_dll && -f $streamer_original ]] &&
         [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]] &&
         [[ $(file_sha256 "$streamer_original") == "$streamer_original_sha" ]]
@@ -4291,6 +4300,16 @@ deploy_streamer_patch() {
     [[ -f $streamer_dll || -f $streamer_original ]] ||
         die "UU streamer.dll 缺失，请先运行：uu-remote-for-linux --repair"
 
+    if [[ $streamer_original_sha == "$streamer_patched_sha" ]]; then
+        [[ -f $streamer_dll &&
+            $(file_sha256 "$streamer_dll") == "$streamer_original_sha" &&
+            $(streamer_bytes_at "$streamer_dll" "$streamer_patch_offset_1") == "$streamer_patch_before_1" &&
+            $(streamer_bytes_at "$streamer_dll" "$streamer_patch_offset_2") == "$streamer_patch_before_2" ]] ||
+            die "原生 NVDEC 调用链档案与客户端不匹配；未修改客户端"
+        printf 'UU %s 已有原生 NVDEC 调用链；保留官方 streamer.dll。\n' "$streamer_profile_version"
+        return
+    fi
+
     if [[ -f $streamer_original ]]; then
         original_sha=$(file_sha256 "$streamer_original")
         [[ $original_sha == "$streamer_original_sha" ]] ||
@@ -4375,7 +4394,7 @@ remove_streamer_patch() {
                 rm -f -- "$streamer_original"
             fi
         fi
-    elif [[ -f $streamer_dll ]] &&
+    elif [[ $streamer_original_sha != "$streamer_patched_sha" && -f $streamer_dll ]] &&
         [[ $(file_sha256 "$streamer_dll") == "$streamer_patched_sha" ]]; then
         die "已修改的 streamer.dll 缺少原版备份；为避免破坏客户端，未关闭硬解桥"
     fi
@@ -4867,6 +4886,8 @@ configure_hwdecode_environment() {
     export WINEDLLPATH="${hwdecode_wine_dir}${WINEDLLPATH:+:$WINEDLLPATH}"
     export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}d3d11=n;dxgi=n;nvcuda=b;nvcuvid=b"
     export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+    # Recent UU decoders reject non-NVIDIA DXGI adapters before trying CUDA.
+    export DXVK_CONFIG="${DXVK_CONFIG:+$DXVK_CONFIG; }dxgi.hideNvidiaGpu = False"
 }
 
 probe_hwdecode_bridge() {

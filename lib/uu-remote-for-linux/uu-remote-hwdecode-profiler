@@ -26,6 +26,11 @@ PROBE_MARKERS = (
 )
 RESULT_MARKER = b"RESULT,%d,%d,%d,%d,%d,%d"
 FALLBACK_MARKER = b"decoder probe produced only software fallback"
+CURRENT_MARKERS = {
+    PROBE_MARKERS[2]: b"batch probe: {} {} ({}) adapter {} device {}",
+    PROBE_MARKERS[5]: b"batch probe: {} {} ({}) adapter {} returned {} results",
+    PROBE_MARKERS[6]: b"batch probe: {} {} adapter {} device {} output missing BATCH_DONE, discarding",
+}
 
 
 class ProfileError(RuntimeError):
@@ -133,14 +138,43 @@ def printable_strings(image: PeImage) -> dict[bytes, list[int]]:
 
 
 def runtime_functions(image: PeImage) -> list[RuntimeFunction]:
-    functions: list[RuntimeFunction] = []
+    rows: dict[int, tuple[int, int]] = {}
     start = image.pdata.raw_offset
     end = start + image.pdata.raw_size
     text_end = image.text.rva + max(image.text.virtual_size, image.text.raw_size)
     for offset in range(start, end - 11, 12):
-        begin, finish, _ = struct.unpack_from("<III", image.data, offset)
+        begin, finish, unwind = struct.unpack_from("<III", image.data, offset)
         if image.text.rva <= begin < finish <= text_end:
-            functions.append(RuntimeFunction(begin, finish))
+            rows[begin] = (finish, unwind)
+    groups: dict[int, list[RuntimeFunction]] = {}
+    for begin, (finish, unwind) in rows.items():
+        root = begin
+        seen: set[int] = set()
+        while unwind:
+            if unwind in seen:
+                raise ProfileError("PE 链式展开信息存在循环")
+            seen.add(unwind)
+            try:
+                raw = image.file_offset(unwind, 4)
+            except ProfileError:
+                break
+            flags, count = image.data[raw] >> 3, image.data[raw + 2]
+            if not flags & 4:
+                break
+            chain = image.file_offset(unwind + 4 + ((count + 1) & ~1) * 2, 12)
+            parent, parent_end, unwind = struct.unpack_from("<III", image.data, chain)
+            if parent not in rows or rows[parent] != (parent_end, unwind):
+                raise ProfileError("PE 链式展开信息未指向有效函数边界")
+            root = parent
+        groups.setdefault(root, []).append(RuntimeFunction(begin, finish))
+    functions: list[RuntimeFunction] = []
+    for members in groups.values():
+        members.sort(key=lambda item: item.begin)
+        if any(a.end != b.begin for a, b in zip(members, members[1:])):
+            # Do not absorb unrelated code between non-contiguous funclets.
+            functions.extend(members)
+        else:
+            functions.append(RuntimeFunction(members[0].begin, members[-1].end))
     functions.sort(key=lambda item: item.begin)
     if not functions:
         raise ProfileError("PE .pdata 中没有有效的 x64 函数边界")
@@ -176,7 +210,9 @@ def locate_probe_function(
         raise ProfileError("缺少或重复的 NVDEC 软件回退语义标记")
     marker_rvas: dict[int, bytes] = {}
     for marker in PROBE_MARKERS:
-        rvas = strings.get(marker, ())
+        rvas = list(strings.get(marker, ()))
+        if marker in CURRENT_MARKERS:
+            rvas.extend(strings.get(CURRENT_MARKERS[marker], ()))
         if len(rvas) != 1:
             raise ProfileError(
                 f"缺少或重复的 NVDEC 探测语义标记：{marker.decode()}"
@@ -202,7 +238,7 @@ def locate_probe_function(
         for function, refs in references.items()
         if set(refs) == set(PROBE_MARKERS)
         and all(len(refs[marker]) == 1 for marker in PROBE_MARKERS)
-        and 0x800 <= function.end - function.begin <= 0x1800
+        and 0x800 <= function.end - function.begin <= 0x2000
     ]
     if len(candidates) != 1:
         details = ", ".join(
@@ -216,7 +252,7 @@ def locate_probe_function(
     return candidates[0]
 
 
-def derive_patch_offsets(image: PeImage) -> tuple[int, int]:
+def derive_patch_offsets(image: PeImage) -> tuple[int, int, bool]:
     function, refs = locate_probe_function(image)
     start = image.file_offset(function.begin)
     finish = image.file_offset(function.end - 1) + 1
@@ -229,14 +265,42 @@ def derive_patch_offsets(image: PeImage) -> tuple[int, int]:
     selector_matches = list(
         re.finditer(rb"\x49\x8b\xd8\x89\x55(.)\x4c\x8b[\xe1\xf1]", code)
     )
-    if len(selector_matches) != 1:
+    native_matches = list(re.finditer(rb"\x8b\xf2\x89\x55(.)\x89\x55.\x83\xfa\x05", code))
+    native = not selector_matches and len(native_matches) == 1
+    if native:
+        # The shared batch helper now handles encoders AND decoders. Never
+        # force its selector globally: prove the existing decoder-only NVDEC
+        # call chain, then deploy the CUDA bridge without changing this DLL.
+        selector_match = native_matches[0]
+        first_relative = selector_match.start() + 2
+        frame_displacement = selector_match.group(1)
+        text_start = image.text.raw_offset
+        text_end = text_start + image.text.raw_size
+        text_code = image.data[text_start:text_end]
+        wrappers: set[int] = set()
+        wrapper_prefix = bytes.fromhex("48895c2418564883ec40488bf1488d4c2420e8")
+        for match in re.finditer(re.escape(wrapper_prefix), text_code):
+            call_rva = image.text.rva + match.end() - 1
+            target = call_rva + 5 + struct.unpack_from("<i", text_code, match.end())[0]
+            if target == function.begin:
+                wrappers.add(image.text.rva + match.start())
+        callers = []
+        for match in re.finditer(re.escape(bytes.fromhex("4c8d442420ba21000000e8")), text_code):
+            call_rva = image.text.rva + match.end() - 1
+            target = call_rva + 5 + struct.unpack_from("<i", text_code, match.end())[0]
+            if target in wrappers:
+                callers.append(call_rva)
+        if len(wrappers) != 1 or len(callers) != 1:
+            raise ProfileError("无法唯一证明原生 NVDEC 专用调用链")
+    elif len(selector_matches) != 1:
         raise ProfileError(
             "NVDEC 选择参数保存点不是唯一匹配："
             f"候选数={len(selector_matches)}"
         )
-    selector_match = selector_matches[0]
-    first_relative = selector_match.start() + 3
-    frame_displacement = selector_match.group(1)
+    else:
+        selector_match = selector_matches[0]
+        first_relative = selector_match.start() + 3
+        frame_displacement = selector_match.group(1)
     first = start + first_relative
 
     result_reference = refs[RESULT_MARKER][0] - function.begin
@@ -262,18 +326,18 @@ def derive_patch_offsets(image: PeImage) -> tuple[int, int]:
             f"候选数={len(result_matches)}"
         )
     second = start + result_matches[0]
-    if not 0x800 <= second - first <= 0xD00:
+    if not 0x800 <= second - first <= (0x1200 if native else 0xD00):
         raise ProfileError(
             f"NVDEC 两个语义点不属于同一已知数据流：间距={second - first:#x}"
         )
-    return first, second
+    return first, second, native
 
 
 def derive_profile(data: bytes, version: str) -> tuple[str, bytes]:
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2,3}", version):
         raise ProfileError("UU 版本号格式无效")
     image = parse_pe(data)
-    first, second = derive_patch_offsets(image)
+    first, second, native = derive_patch_offsets(image)
     first_before = data[first : first + 3]
     second_before = data[second : second + 3]
     if first_before[:2] != b"\x89\x55" or second_before[:2] != b"\x8b\x45":
@@ -282,8 +346,10 @@ def derive_profile(data: bytes, version: str) -> tuple[str, bytes]:
         raise ProfileError("NVDEC 选择参数与能力字段没有引用同一栈变量")
 
     patched = bytearray(data)
-    patched[first : first + 3] = PATCH_1_AFTER
-    patched[second : second + 3] = PATCH_2_AFTER
+    first_after = first_before if native else PATCH_1_AFTER
+    second_after = second_before if native else PATCH_2_AFTER
+    patched[first : first + 3] = first_after
+    patched[second : second + 3] = second_after
     patched_bytes = bytes(patched)
     row = "\t".join(
         (
@@ -292,10 +358,10 @@ def derive_profile(data: bytes, version: str) -> tuple[str, bytes]:
             hashlib.sha256(patched_bytes).hexdigest(),
             hex(first),
             first_before.hex(),
-            PATCH_1_AFTER.hex(),
+            first_after.hex(),
             hex(second),
             second_before.hex(),
-            PATCH_2_AFTER.hex(),
+            second_after.hex(),
         )
     )
     return row, patched_bytes
@@ -315,6 +381,7 @@ def synthetic_pe(
     duplicate: bool = False,
     frame_displacement: int = 0xD0,
     second_relative: int = 0x850,
+    native: bool = False,
 ) -> bytes:
     data = bytearray(0x4000)
     data[:2] = b"MZ"
@@ -346,7 +413,7 @@ def synthetic_pe(
     marker_rvas: dict[bytes, int] = {}
     cursor = 0x3500
     for marker in PROBE_MARKERS + (FALLBACK_MARKER,):
-        value = marker + b"\0"
+        value = (CURRENT_MARKERS.get(marker, marker) if native else marker) + b"\0"
         data[cursor : cursor + len(value)] = value
         marker_rvas[marker] = 0x5000 + cursor - 0x3400
         cursor += len(value) + 8
@@ -360,6 +427,11 @@ def synthetic_pe(
             + bytes((frame_displacement,))
             + bytes.fromhex("4c 8b f1")
         )
+        if native:
+            data[raw + 0x30 : raw + 0x3B] = (
+                bytes.fromhex("8b f2 89 55") + bytes((frame_displacement,))
+                + bytes.fromhex("89 55 90 83 fa 05")
+            )
         offsets = (
             0x100,
             0x120,
@@ -379,6 +451,19 @@ def synthetic_pe(
 
     add_function(0x500, 0x1100)
     struct.pack_into("<III", data, 0x3C00, 0x1100, 0x1E00, 0x7000)
+    if native:
+        # One source function can have several chained .pdata fragments.
+        data[0x3A00:0x3A04] = bytes.fromhex("01 00 00 00")
+        data[0x3A10:0x3A14] = bytes.fromhex("21 00 00 00")
+        struct.pack_into("<III", data, 0x3A14, 0x1100, 0x1800, 0x5600)
+        struct.pack_into("<III", data, 0x3C00, 0x1100, 0x1800, 0x5600)
+        struct.pack_into("<III", data, 0x3C0C, 0x1800, 0x2700, 0x5610)
+        wrapper = bytes.fromhex("48895c2418564883ec40488bf1488d4c2420e8")
+        data[0x2A00:0x2A00+len(wrapper)] = wrapper
+        struct.pack_into("<i", data, 0x2A00+len(wrapper), 0x1100-(0x3600+len(wrapper)+4))
+        caller = bytes.fromhex("4c8d442420ba21000000e8")
+        data[0x2B00:0x2B00+len(caller)] = caller
+        struct.pack_into("<i", data, 0x2B00+len(caller), 0x3600-(0x3700+len(caller)+4))
     if duplicate:
         add_function(0x1800, 0x2400)
         struct.pack_into("<III", data, 0x3C0C, 0x2400, 0x3100, 0x7010)
@@ -421,6 +506,26 @@ def self_test() -> None:
         raise ProfileError("自检未识别扩展栈帧的 NVDEC 数据流")
     if current_patched[0x1100:0x1103] != PATCH_2_AFTER:
         raise ProfileError("自检扩展布局能力补丁未写入")
+    native_fixture = synthetic_pe(native=True, frame_displacement=0x40, second_relative=0xC00)
+    native_row, native_result = derive_profile(native_fixture, "9.9.9.11")
+    if native_result != native_fixture or native_row.split("\t")[1] != native_row.split("\t")[2]:
+        raise ProfileError("自检原生 NVDEC 路径不应修改共用编码/解码函数")
+    no_native_caller = bytearray(native_fixture)
+    no_native_caller[0x2B06] = 0x20
+    try:
+        derive_profile(bytes(no_native_caller), "9.9.9.11")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检接受了没有 NVDEC 专用调用链的原生档案")
+    cyclic_unwind = bytearray(native_fixture)
+    struct.pack_into("<III", cyclic_unwind, 0x3A14, 0x1800, 0x2700, 0x5610)
+    try:
+        derive_profile(bytes(cyclic_unwind), "9.9.9.11")
+    except ProfileError:
+        pass
+    else:
+        raise ProfileError("自检接受了循环链式展开信息")
     try:
         derive_profile(synthetic_pe(duplicate=True), "9.9.9.9")
     except ProfileError:
