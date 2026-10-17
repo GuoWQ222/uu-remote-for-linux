@@ -297,11 +297,23 @@ class XClassHint(ctypes.Structure):
     ]
 
 
+# Xlib's default error handler prints the error and exits the process.  The
+# active window can be destroyed between reading _NET_ACTIVE_WINDOW and
+# querying it, which used to kill the bridge with BadWindow while the desktop
+# shortcuts were still released.  Every query checks its status, so treat
+# protocol errors as failed calls.  Keep a reference: Xlib stores the pointer.
+X_ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+)
+X_ERROR_HANDLER = X_ERROR_HANDLER_TYPE(lambda _display, _event: 0)
+
+
 class X11FocusDetector:
     def __init__(self):
         library_name = os.environ.get("UU_REMOTE_KEYBOARD_BRIDGE_X11_LIBRARY", "libX11.so.6")
         self.x11 = ctypes.CDLL(library_name)
         self._configure_signatures()
+        self.x11.XSetErrorHandler(X_ERROR_HANDLER)
         display_name = os.environ.get("DISPLAY")
         encoded_display = display_name.encode() if display_name else None
         self.display = self.x11.XOpenDisplay(encoded_display)
@@ -355,6 +367,8 @@ class X11FocusDetector:
         ]
         self.x11.XGetWindowAttributes.restype = ctypes.c_int
         self.x11.XFree.argtypes = [ctypes.c_void_p]
+        self.x11.XSetErrorHandler.argtypes = [X_ERROR_HANDLER_TYPE]
+        self.x11.XSetErrorHandler.restype = ctypes.c_void_p
 
     def close(self) -> None:
         if self.display:
