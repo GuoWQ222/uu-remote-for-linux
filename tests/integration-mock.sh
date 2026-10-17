@@ -104,6 +104,7 @@ grep -q 'CURL --proto =https --proto-redir =https ' \
     "$UU_REMOTE_FAKE_TRACE"
 grep -q 'OSSLSIGNCODE verify -in .* -CAfile /etc/ssl/certs/ca-certificates.crt' \
     "$UU_REMOTE_FAKE_TRACE"
+grep -q 'OSSLSIGNCODE verify .* -index 0' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--text-info' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--checkbox=' "$UU_REMOTE_FAKE_TRACE"
 grep -q 'ZENITY .*--ok-label=接受并继续' "$UU_REMOTE_FAKE_TRACE"
@@ -113,6 +114,16 @@ prefix="$XDG_DATA_HOME/uu-remote-for-linux/wineprefix"
 install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 cache_dir="$XDG_CACHE_HOME/uu-remote-for-linux"
 state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
+# Publisher matching follows DN fields, independently of distro, tool, or
+# client version. New osslsigncode emits RFC2253, including escaped commas.
+for signer_subject in \
+    'CN=UU,O=NetEase (Hangzhou) Network Co.\, Ltd,C=CN' \
+    'CN=UU,O=NetEase (Hangzhou) Network Co.\2C Ltd,C=CN' \
+    'CN=UU+O=NetEase (Hangzhou) Network Co.\, Ltd,C=CN'; do
+    UU_REMOTE_FAKE_SIGNATURE_SUBJECT="$signer_subject" \
+        "$launcher" --refresh-installer >"$test_root/signature-format.out" \
+        2>"$test_root/signature-format.err"
+done
 installer_before=$(sha256sum "$cache_dir/UURemote_Setup.exe")
 installer_before=${installer_before%% *}
 for signature_failure in UU_REMOTE_FAKE_SIGNATURE_FAILURE \
@@ -125,6 +136,26 @@ for signature_failure in UU_REMOTE_FAKE_SIGNATURE_FAILURE \
     fi
     grep -q 'Authenticode 证书链或网易发布者身份验证失败' \
         "$test_root/${signature_failure}.err"
+    test "$(sha256sum "$cache_dir/UURemote_Setup.exe" | cut -d' ' -f1)" = \
+        "$installer_before"
+done
+# A publisher mention inside another field, duplicate O, or malformed
+# escaping must not authorize a new download or overwrite a valid cache.
+for signer_subject in \
+    'CN=Decoy\,O=NetEase (Hangzhou) Network Co.\, Ltd,O=Unrelated' \
+    'CN=Decoy\+O=NetEase (Hangzhou) Network Co.\, Ltd,O=Unrelated' \
+    '/CN=Decoy\/O=NetEase (Hangzhou) Network Co., Ltd/O=Unrelated' \
+    'O=NetEase (Hangzhou) Network Co.\, Ltd,O=Unrelated' \
+    'CN=NetEase (Hangzhou) Network Co.\, Ltd' \
+    'CN=Bad\2Z,O=NetEase (Hangzhou) Network Co.\, Ltd'; do
+    if UU_REMOTE_FAKE_SIGNATURE_SUBJECT="$signer_subject" \
+        "$launcher" --refresh-installer >"$test_root/signature-decoy.out" \
+        2>"$test_root/signature-decoy.err"; then
+        printf '证书发布者字段未被严格校验：%s\n' "$signer_subject" >&2
+        exit 1
+    fi
+    grep -q 'Authenticode 证书链或网易发布者身份验证失败' \
+        "$test_root/signature-decoy.err"
     test "$(sha256sum "$cache_dir/UURemote_Setup.exe" | cut -d' ' -f1)" = \
         "$installer_before"
 done

@@ -55,6 +55,30 @@
 安全行为。需要新增语义规则时，应把它加入 profiler、唯一性断言和真实探测，而
 不是新增版本号分支或裸 RVA。
 
+## Installer publisher verification
+
+Official UU installer downloads, refreshes and update transactions use the
+same Authenticode publisher gate. Compatibility follows the verifier output
+format rather than an Ubuntu release, osslsigncode version or UU installer
+version. Legacy slash-delimited subjects and RFC2253 subjects are accepted,
+including escaped comma/plus/slash/backslash, hexadecimal UTF-8 values and
+multi-valued RDNs. Organization attributes must match the expected NetEase
+publisher exactly and occur once; a name in CN, OU or a certificate-chain
+entry is insufficient. Malformed, ambiguous and unknown formats fail closed.
+The verifier must still return success with the system CA bundle and its
+normal certificate, signature and revocation checks. Verification explicitly
+selects primary signature index 0, binding the verdict to the same signer
+whose subject is inspected rather than an unrelated nested signature. No ignore flags,
+certificate fingerprint pin, tool downgrade or global TLS exception is used.
+
+This fixes the wrapper's publisher parser, not unrelated failures in other
+Linux packages. The embedded WebView2 setup is taken from the verified UU
+installer and does not independently use this subject parser. Future issuer
+or signing-key changes retain compatibility while the official organization
+identity and supported output format remain the same; a changed publisher
+identity or a new output grammar requires review instead of automatic trust.
+
+
 ## 新版本验收要求
 
 - profiler 的恶意/截断 PE 边界测试和新版本样本推导测试；

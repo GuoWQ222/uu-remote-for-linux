@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [1.1.43] - 2026-10-17
 
+- Fix valid NetEase installers being rejected with newer osslsigncode
+  certificate output. Parse the actual organization attribute in legacy
+  slash-delimited and RFC2253 subjects, including escaped separators,
+  hexadecimal UTF-8 and multi-valued RDNs. Preserve mandatory signature,
+  trust-chain and revocation verification; reject ambiguous organizations
+  and publisher text embedded in unrelated attributes. The same gate covers
+  first setup, installer refresh and updates without distribution, tool or
+  client version branches. Thanks to RoshanDev for reporting #2 and the
+  initial RFC2253 fix.
 - Adapt NVENC and portrait capture to UU 4.43.1.3614. Recognize the native
   GPUDevice pointer ABI without overwriting its methods, and derive all four
   portrait scaling patch sites from the current official binaries.

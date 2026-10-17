@@ -4207,6 +4207,84 @@ run_logged() {
     } >>"$setup_log" 2>&1
 }
 
+authenticode_subject_matches_publisher() {
+    python3 - "$1" "$2" <<'PY_SIGNER'
+import re
+import sys
+
+
+def attributes(subject):
+    legacy = subject.startswith("/")
+    separators = {"/", "+"} if legacy else {",", "+"}
+    start = 1 if legacy else 0
+    position = start
+    while position < len(subject):
+        char = subject[position]
+        if char == "\\":
+            position += 2  # Keep escaped separators inside their value.
+            if position > len(subject):
+                raise ValueError("incomplete escape")
+            continue
+        if char in separators:
+            yield subject[start:position], legacy
+            start = position + 1
+        position += 1
+    yield subject[start:], legacy
+
+
+def value_text(value, legacy):
+    if not value or value.startswith((" ", "#")):
+        raise ValueError("empty or unsupported attribute value")
+    result = bytearray()
+    position = 0
+    while position < len(value):
+        char = value[position]
+        if char != "\\":
+            if char in '"<>;' or ord(char) < 32 or ord(char) == 127:
+                raise ValueError("unescaped special character")
+            if char == " " and position == len(value) - 1:
+                raise ValueError("unescaped trailing space")
+            result.extend(char.encode("utf-8"))
+            position += 1
+            continue
+        escaped = value[position + 1:]
+        if legacy and re.match(r"x[0-9a-fA-F]{2}", escaped):
+            result.append(int(escaped[1:3], 16))
+            position += 4
+        elif re.match(r"[0-9a-fA-F]{2}", escaped):
+            result.append(int(escaped[:2], 16))
+            position += 3
+        elif escaped and escaped[0] in ' ,+"\\<>;=#/':
+            result.extend(escaped[0].encode("utf-8"))
+            position += 2
+        else:
+            raise ValueError("invalid escape")
+    decoded = result.decode("utf-8")
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+        raise ValueError("control character")
+    return decoded
+
+
+try:
+    subject, expected = sys.argv[1:]
+    organizations = []
+    for attribute, legacy in attributes(subject):
+        name, equal, value = attribute.lstrip(" ").partition("=")
+        name = name.strip(" ")
+        if not equal or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9.-]*|[0-9]+(?:\.[0-9]+)+", name):
+            raise ValueError("invalid attribute")
+        decoded = value_text(value, legacy)
+        if name.casefold() in {"o", "2.5.4.10", "oid.2.5.4.10"}:
+            organizations.append(decoded)
+    # An exact, unambiguous organization attribute is required. Text in CN,
+    # OU, an escaped separator, or a second organization cannot authorize it.
+    accepted = bool(expected) and organizations == [expected]
+except (ValueError, UnicodeError):
+    accepted = False
+sys.exit(0 if accepted else 1)
+PY_SIGNER
+}
+
 verify_official_installer_signature() {
     local installer_file=$1 output_file signer_subject status=0
     local ca_file=/etc/ssl/certs/ca-certificates.crt
@@ -4219,8 +4297,10 @@ verify_official_installer_signature() {
     fi
     [[ -r $ca_file ]] || return 1
     output_file=$(mktemp "$cache_dir/.authenticode.XXXXXX") || return 1
+    # Bind the cryptographic verdict to the primary signature whose signer
+    # is inspected below; a different nested signature must not authorize it.
     timeout 90s "$authenticode_verifier" verify \
-        -in "$installer_file" -CAfile "$ca_file" \
+        -in "$installer_file" -CAfile "$ca_file" -index 0 \
         >"$output_file" 2>&1 9>&- || status=$?
     {
         printf '\n[%(%FT%T%z)T] Authenticode installer verification\n' -1
@@ -4232,14 +4312,18 @@ verify_official_installer_signature() {
             primary_signer = 1
             next
         }
+        certificate_section && /^[[:space:]]*Signer #[0-9]+:$/ { exit }
+        certificate_section && /^[^[:space:]]/ { exit }
         primary_signer && /^[[:space:]]*Subject:/ {
             sub(/^[[:space:]]*Subject:[[:space:]]*/, "")
             print
             exit
         }
         ' "$output_file")
+    # Tool/distro versions select no policy branch. Require cryptographic
+    # verification first, then parse legacy and RFC2253 organization fields.
     if ((status != 0)) ||
-        [[ $signer_subject != *"/O=$expected_signer/"* ]]; then
+        ! authenticode_subject_matches_publisher "$signer_subject" "$expected_signer"; then
         rm -f -- "$output_file"
         return 1
     fi

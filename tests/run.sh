@@ -20,6 +20,7 @@ check() {
 }
 
 check "launcher syntax" bash -n "$launcher"
+check "installer signature publisher parsing" "$project_root/tests/installer-signature.sh"
 check "decoder selector syntax" bash -n \
     "$project_root/lib/uu-remote-for-linux/uu-remote-decoder-selector"
 check "tray proxy Python syntax" /usr/bin/python3 -c \
@@ -395,6 +396,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$project_root/packaging/debian/postinst" \
         "$project_root/packaging/debian/postrm" \
         "$project_root/tests/integration-mock.sh" \
+        "$project_root/tests/installer-signature.sh" \
         "$project_root/tests/autostart-bridge.sh" \
         "$project_root/tests/sleep-bridge.sh" \
         "$project_root/tests/system-proxy-bridge.sh" \
