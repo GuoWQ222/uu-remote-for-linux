@@ -65,6 +65,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 path = sys.argv[1]
 loader = importlib.machinery.SourceFileLoader("uu_remote_input_bridge", path)
@@ -176,6 +177,7 @@ lock_backend.x11 = object()
 lock_backend._xkb_get_indicator_state = indicator_query
 lock_backend._lock_mask_cached = None
 lock_backend._lock_mask_checked_at = 0.0
+lock_backend._native_lock_mask = lambda: (False, None)
 assert lock_backend.lock_mask() == 5
 assert lock_backend.lock_mask() == 5
 assert indicator_query.calls == 1
@@ -186,6 +188,147 @@ lock_backend._xkb_get_indicator_state = None
 lock_backend._lock_mask_cached = 5
 lock_backend._lock_mask_checked_at = 0.0
 assert lock_backend.lock_mask() is None
+
+class LockConnection:
+    def __init__(self, bus):
+        self.bus = bus
+        self.closed = 0
+        self.calls = []
+
+    def call_sync(self, destination, path, interface, method, arguments, *_args):
+        self.calls.append(method)
+        if method == self.bus.fail_method:
+            raise RuntimeError("fixture native lock query failure")
+        if method == "NameHasOwner":
+            assert destination == "org.freedesktop.DBus"
+            assert arguments == ("(s)", (module.MUTTER_REMOTE_DESKTOP,))
+            value = (self.bus.owned,)
+        elif method == "CreateSession":
+            assert path == module.MUTTER_REMOTE_DESKTOP_PATH
+            value = ("/fixture/mutter/lock_session",)
+        elif method == "GetAll":
+            assert path == "/fixture/mutter/lock_session"
+            assert arguments == (
+                "(s)", (module.MUTTER_REMOTE_DESKTOP_SESSION,)
+            )
+            value = (dict(self.bus.properties),)
+        else:
+            raise AssertionError(f"unexpected lock-reader method: {method}")
+        return SimpleNamespace(unpack=lambda: value)
+
+    def close_sync(self, _cancellable):
+        self.closed += 1
+
+class LockBus:
+    def __init__(self, owned=True):
+        self.owned = owned
+        self.fail_method = ""
+        self.properties = {"CapsLockState": False, "NumLockState": True}
+        self.connections = []
+
+    def connect(self, *_args):
+        connection = LockConnection(self)
+        self.connections.append(connection)
+        return connection
+
+def native_lock_backend(bus):
+    backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
+    backend.fake_trace = ""
+    backend.Gio = SimpleNamespace(
+        BusType=SimpleNamespace(SESSION=0),
+        DBusConnectionFlags=SimpleNamespace(
+            AUTHENTICATION_CLIENT=1, MESSAGE_BUS_CONNECTION=2
+        ),
+        DBusCallFlags=SimpleNamespace(NONE=0),
+        DBusConnection=SimpleNamespace(new_for_address_sync=bus.connect),
+        dbus_address_get_for_bus_sync=lambda *_args: "unix:fixture",
+    )
+    backend.GLib = SimpleNamespace(Variant=lambda signature, values: (signature, values))
+    backend._native_lock_connection = None
+    backend._native_lock_session = ""
+    backend._native_lock_supported = None
+    backend._native_lock_retry_after = 0.0
+    backend._lock_mask_cached = None
+    backend._lock_mask_checked_at = 0.0
+    backend._xwayland_lock_mask = lambda: 5  # Stale Caps on, Num off, Scroll on.
+    return backend
+
+bus = LockBus()
+native = native_lock_backend(bus)
+assert native.lock_mask() == 6  # Native Caps off/Num on, XKB Scroll retained.
+assert native.lock_mask() == 6
+connection = bus.connections[0]
+assert connection.calls == ["NameHasOwner", "CreateSession", "GetAll"]
+bus.properties = {"CapsLockState": True, "NumLockState": False}
+native._lock_mask_checked_at = 0.0
+assert native.lock_mask() == 5
+assert len(bus.connections) == 1  # Reuse the read-only observer session.
+assert connection.calls.count("CreateSession") == 1
+native.session_handle = "/fixture/portal/session"
+native.fake_lock_mask = None
+native._notify = lambda *_args: None
+bus.properties["CapsLockState"] = False
+native.keycode(66, True)
+assert native.lock_mask() == 4  # Lock input invalidates the polling cache.
+bus.properties["CapsLockState"] = True
+native._xwayland_lock_mask = lambda: None
+native._lock_mask_checked_at = 0.0
+assert native.lock_mask() == 1  # Native Caps/Num do not need XKB indicators.
+native._close_native_lock_state()
+native._close_native_lock_state()
+assert connection.closed == 1
+assert native._native_lock_session == ""
+assert "Start" not in connection.calls and "Stop" not in connection.calls
+
+# Other compositors retain XKB, with bounded native-backend rediscovery.
+bus = LockBus(owned=False)
+other = native_lock_backend(bus)
+assert other.lock_mask() == 5
+other._lock_mask_checked_at = 0.0
+assert other.lock_mask() == 5
+assert len(bus.connections) == 1
+assert bus.connections[0].calls == ["NameHasOwner"]
+assert bus.connections[0].closed == 1
+bus.owned = True
+other._native_lock_retry_after = 0.0
+other._lock_mask_checked_at = 0.0
+assert other.lock_mask() == 6
+other._close_native_lock_state()
+
+# Never replace a failed native result with a contradictory XWayland mask.
+for method in ("NameHasOwner", "CreateSession", "GetAll"):
+    bus = LockBus()
+    bus.fail_method = method
+    native = native_lock_backend(bus)
+    assert native.lock_mask() is None, method
+    assert bus.connections[0].closed == 1
+    native._lock_mask_checked_at = 0.0
+    assert native.lock_mask() is None, method
+    assert len(bus.connections) == 1  # Retry backoff avoids repeated bus calls.
+    bus.fail_method = ""
+    native._native_lock_retry_after = 0.0
+    native._lock_mask_checked_at = 0.0
+    assert native.lock_mask() == 6, method
+    native._close_native_lock_state()
+
+bus = LockBus()
+native = native_lock_backend(bus)
+assert native.lock_mask() == 6
+bus.fail_method = "GetAll"
+native._lock_mask_checked_at = 0.0
+assert native.lock_mask() is None
+bus.fail_method = ""
+bus.owned = False  # Mutter exited; do not silently switch to stale XKB.
+native._native_lock_retry_after = 0.0
+native._lock_mask_checked_at = 0.0
+assert native.lock_mask() is None
+assert bus.connections[-1].closed == 1
+bus.owned = True
+bus.properties["CapsLockState"] = "false"
+native._native_lock_retry_after = 0.0
+native._lock_mask_checked_at = 0.0
+assert native.lock_mask() is None  # Reject malformed state, do not coerce it.
+assert bus.connections[-1].closed == 1
 
 # A stationary controller emits absolute MOVE packets continuously.  Portal
 # must receive the first one, suppress exact no-op repeats, and reassert the
@@ -346,6 +489,11 @@ class FailingX11:
         events.append("x11-close")
         raise RuntimeError("x11 close failed")
 
+class FailingNativeLockConnection:
+    def close_sync(self, _cancellable):
+        events.append("native-lock-close")
+        raise RuntimeError("native lock close failed")
+
 backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)
 backend.fake_trace = ""
 backend.capture_state = "active"
@@ -369,6 +517,7 @@ backend.Gio = type(
 )
 backend.display = object()
 backend.x11 = FailingX11()
+backend._native_lock_connection = FailingNativeLockConnection()
 backend.cleanup_errors = []
 backend.close()
 assert {
@@ -378,9 +527,10 @@ assert {
     "frame-unlink",
     "backing-unlink",
     "portal-close",
+    "native-lock-close",
     "x11-close",
 }.issubset(events)
-assert len(backend.cleanup_errors) == 5, backend.cleanup_errors
+assert len(backend.cleanup_errors) == 6, backend.cleanup_errors
 assert backend.capture_map is not None
 
 backend = module.WaylandPortalBackend.__new__(module.WaylandPortalBackend)

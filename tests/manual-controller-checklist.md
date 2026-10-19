@@ -104,6 +104,13 @@
    遗留按下状态。
 9. 运行 `uu-remote-for-linux --stop`，确认输入桥停止并释放所有按键和
    鼠标按钮。
+10. 聚焦原生 Wayland 输入框并切到英文输入模式；控制端依次关闭、开启、关闭
+    Caps Lock，每步输入 `abc`，实际输出应为 `abc`、`ABC`、`abc`，且与控制端
+    指示状态一致。切换到 XWayland 窗口后重复，再断开重连重复。
+11. Rime 使用左 Shift 切换配置时，轻按并松开左 Shift 后输入 `nihao` 应出现
+    中文候选；再按左 Shift 应直接输入英文。Caps Lock 开关期间重复测试，
+    不得发生系统报告关闭而应用仍输出大写的错位。配置及旧状态复位说明见
+    [锁键状态与 Rime](../COMPATIBILITY.md#wayland-lock-state-and-rime)。
 # Linux 登录自启动（0.3.3+）
 
 1. 正常启动 UU，打开设置页并开启“开机自动启动”。

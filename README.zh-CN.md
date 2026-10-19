@@ -105,6 +105,9 @@ cd uu-remote-for-linux
 所有补丁的精确版本边界、语义 profiler 与升级回滚事务详见
 [兼容规范](COMPATIBILITY.md)。
 
+Wayland 中 Caps Lock 与远端实际输入的大小写不一致时，参见
+[锁键状态与 Rime](COMPATIBILITY.md#wayland-lock-state-and-rime)。
+
 <a id="commands"></a>
 ## 🧰 常用命令
 

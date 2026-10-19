@@ -24,7 +24,51 @@
 | WOL 能力与网卡映射 | A+B | `uu-remote-wol-profiler` 用源码路径、状态字符串或内联 Enabled/Disabled 比较、网卡能力日志、函数边界与布尔返回语义定位唯一谓词；物理网卡信息由 Linux 侧动态回填 | 不把带输出参数的电源配置查询误认为能力谓词；唯一匹配并核验 SHA256 后生成，失败时保留通用 Win32 映射 |
 | 官方更新器接管 | A | 项目管理的更新入口以原始文件哈希和清单核验；下载只允许 HTTPS 重定向，并验证系统 CA 链、Authenticode 和网易发布者身份；Linux 侧拥有快照与回滚事务 | 不依赖版本哈希白名单；新安装后从实际文件重建语义档案与清单，核心契约或完整性不符即回滚 |
 | Event Log、系统代理、自启动、防休眠、键盘快捷键 | A | Wine API shim、注册表/配置文件和 Linux 桌面 API 桥；不依赖官方代码 RVA | 格式仍可解析时自动工作；未知或超时均失败闭合并恢复桌面状态 |
-| Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 只协商三槽 DMA-BUF、EGL 读入独立 staging 后立即归还 producer；锁键状态从 XWayland XKB 指示器读取并缓存 | 不依赖官方 UU 或合成器内部版本号；DMA-BUF/EGL 不可用时明确失败，不切换到语义不同的隐藏回退 |
+| Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 只协商三槽 DMA-BUF、EGL 读入独立 staging 后立即归还 producer；GNOME 的 Caps/Num 从 Mutter 原生状态读取，Scroll 保留 XKB 来源 | 不依赖官方 UU 或合成器内部版本号；原生锁键查询失败时停止发布权威锁键状态并重试；DMA-BUF/EGL 不可用时明确失败，不切换到语义不同的隐藏回退 |
+
+<a id="wayland-lock-state-and-rime"></a>
+## Wayland lock state and Rime / Wayland 锁键状态与 Rime
+
+On GNOME Wayland, XWayland indicators can remain stale while a native
+Wayland window has keyboard focus. The input bridge reads Caps Lock and
+Num Lock from Mutter's `RemoteDesktop.Session` properties instead. Its
+private, unstarted observer session injects no input and requests no screen
+capture; closing its bus connection releases it without closing the Portal
+session. Native query failures publish an unknown lock state and retry,
+rather than using contradictory XWayland state. Scroll Lock retains XKB;
+when Mutter is absent, other compositors retain the existing XKB path.
+
+GNOME Wayland 中，原生 Wayland 窗口聚焦时，XWayland 指示器可能保留旧状态。
+输入桥因此从 Mutter 会话属性读取 Caps Lock 和 Num Lock；查询失败时将状态
+标记为未知并重试，避免用旧值触发额外校正按键。这项修改不自动更改输入法配置。
+
+Rime has a separate Caps Lock event-handling compatibility issue tracked in
+[ibus-rime #171](https://github.com/rime/ibus-rime/issues/171) and fixed
+upstream by [librime #1011](https://github.com/rime/librime/pull/1011).
+Consuming Caps Lock events can leave desktop-reported state and the state
+delivered to applications out of sync. Package versions may contain
+backports: do not diagnose a missing fix from the base version alone.
+
+若希望左 Shift 切换中英文、Caps Lock 只控制大小写，可把以下项目合并到
+`~/.config/ibus/rime/default.custom.yaml` 的已有 `patch:` 中，然后通过 Rime
+菜单重新部署。请保留已有自定义项，不要覆盖整个文件：
+
+```yaml
+patch:
+  "ascii_composer/switch_key/Caps_Lock": noop
+  "ascii_composer/switch_key/Shift_L": commit_code
+```
+
+For left Shift to switch Chinese/English and Caps Lock to control letter
+case only, merge the overrides above into the existing Rime customization
+and redeploy. This is an explicit user configuration, not an installation
+default. Removing these two overrides and redeploying restores the prior
+bindings. An existing desktop-state mismatch needs a separate reset; save
+work and log out/in if it persists after changing the binding.
+
+验收时必须看实际输入：远端英文模式下依次关闭、开启、关闭 Caps Lock，应得到
+`abc`、`ABC`、`abc`，并核对控制端指示状态；再测试左 Shift 切换中文候选与直接
+英文输入，以及断开后重新连接。接口状态一致不能代替应用实际输出的验证。
 
 ## 自动升级事务
 

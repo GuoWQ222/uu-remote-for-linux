@@ -80,7 +80,13 @@ DEFAULT_RELEASE_TIMEOUT = 15.0
 X11_MONITOR_REFRESH_SECONDS = 2.0
 CURSOR_POLL_SECONDS = 1.0 / 60.0
 LOCK_STATE_POLL_SECONDS = 0.1
+NATIVE_LOCK_RETRY_SECONDS = 1.0
+NATIVE_LOCK_DISCOVERY_SECONDS = 5.0
 XKB_USE_CORE_KBD = 0x0100
+
+MUTTER_REMOTE_DESKTOP = "org.gnome.Mutter.RemoteDesktop"
+MUTTER_REMOTE_DESKTOP_PATH = "/org/gnome/Mutter/RemoteDesktop"
+MUTTER_REMOTE_DESKTOP_SESSION = f"{MUTTER_REMOTE_DESKTOP}.Session"
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
 PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
@@ -1113,6 +1119,10 @@ class WaylandPortalBackend:
         self._xkb_get_indicator_state = None
         self._lock_mask_cached: int | None = None
         self._lock_mask_checked_at = 0.0
+        self._native_lock_connection = None
+        self._native_lock_session = ""
+        self._native_lock_supported: bool | None = None
+        self._native_lock_retry_after = 0.0
         self.last_absolute_pointer: tuple[int, int, int] | None = None
         self.pointer_motion_requests = 0
         self.pointer_motion_injected = 0
@@ -2622,6 +2632,7 @@ class WaylandPortalBackend:
                     None,
                 ),
             )
+        cleanup("关闭原生锁键状态会话", self._close_native_lock_state)
         self._lock_mask_cached = None
         self._lock_mask_checked_at = 0.0
         self._xkb_get_indicator_state = None
@@ -2848,7 +2859,7 @@ class WaylandPortalBackend:
             )
         finally:
             if lock_bit:
-                # Reconcile the hook's optimistic toggle with XKB immediately
+                # Reconcile the hook's optimistic toggle with native state
                 # after a lock event, including a failed Portal notification.
                 self._lock_mask_checked_at = 0.0
         if (
@@ -2858,6 +2869,95 @@ class WaylandPortalBackend:
         ):
             self.fake_lock_mask ^= lock_bit
 
+    def _close_native_lock_state(self) -> None:
+        connection = getattr(self, "_native_lock_connection", None)
+        self._native_lock_connection = None
+        self._native_lock_session = ""
+        if connection is not None:
+            # Disconnecting the private bus peer destroys its unstarted Mutter
+            # session without closing the shared Portal connection.
+            connection.close_sync(None)
+
+    def _native_lock_mask(self) -> tuple[bool, int | None]:
+        now = time.monotonic()
+        if now < self._native_lock_retry_after:
+            return self._native_lock_supported is not False, None
+        try:
+            if self._native_lock_connection is None:
+                address = self.Gio.dbus_address_get_for_bus_sync(
+                    self.Gio.BusType.SESSION, None
+                )
+                flags = (
+                    self.Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                    | self.Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+                )
+                self._native_lock_connection = (
+                    self.Gio.DBusConnection.new_for_address_sync(
+                        address, flags, None, None
+                    )
+                )
+                owned = self._native_lock_connection.call_sync(
+                    "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "NameHasOwner",
+                    self.GLib.Variant("(s)", (MUTTER_REMOTE_DESKTOP,)),
+                    None, self.Gio.DBusCallFlags.NONE, 1000, None,
+                ).unpack()[0]
+                if not owned:
+                    if self._native_lock_supported is None:
+                        self._native_lock_supported = False
+                    self._close_native_lock_state()
+                    self._native_lock_retry_after = (
+                        now + NATIVE_LOCK_DISCOVERY_SECONDS
+                    )
+                    return self._native_lock_supported is not False, None
+                self._native_lock_supported = True
+                self._native_lock_session = (
+                    self._native_lock_connection.call_sync(
+                        MUTTER_REMOTE_DESKTOP, MUTTER_REMOTE_DESKTOP_PATH,
+                        MUTTER_REMOTE_DESKTOP, "CreateSession", None, None,
+                        self.Gio.DBusCallFlags.NONE, 1000, None,
+                    ).unpack()[0]
+                )
+            properties = self._native_lock_connection.call_sync(
+                MUTTER_REMOTE_DESKTOP, self._native_lock_session,
+                "org.freedesktop.DBus.Properties", "GetAll",
+                self.GLib.Variant("(s)", (MUTTER_REMOTE_DESKTOP_SESSION,)),
+                None, self.Gio.DBusCallFlags.NONE, 1000, None,
+            ).unpack()[0]
+            caps, num = properties["CapsLockState"], properties["NumLockState"]
+            if type(caps) is not bool or type(num) is not bool:
+                raise ValueError("Mutter 返回了无效的锁键状态")
+            return True, int(caps) | (int(num) << 1)
+        except Exception:
+            if self._native_lock_supported is not True:
+                self._native_lock_supported = None
+            try:
+                self._close_native_lock_state()
+            except Exception:
+                pass
+            self._native_lock_retry_after = (
+                time.monotonic() + NATIVE_LOCK_RETRY_SECONDS
+            )
+            # A failed native query must not make stale XWayland state
+            # authoritative. Retry without disrupting input or capture.
+            return True, None
+
+    def _xwayland_lock_mask(self) -> int | None:
+        if (
+            self.display is None
+            or self.x11 is None
+            or self._xkb_get_indicator_state is None
+        ):
+            return None
+        indicators = ctypes.c_uint()
+        if self._xkb_get_indicator_state(
+            self.display,
+            XKB_USE_CORE_KBD,
+            ctypes.byref(indicators),
+        ) != 0:
+            return None
+        return int(indicators.value & 0x7)
+
     def lock_mask(self) -> int | None:
         if self.fake_trace:
             return self.fake_lock_mask
@@ -2865,22 +2965,17 @@ class WaylandPortalBackend:
         if now - self._lock_mask_checked_at < LOCK_STATE_POLL_SECONDS:
             return self._lock_mask_cached
         self._lock_mask_checked_at = now
-        if (
-            self.display is None
-            or self.x11 is None
-            or self._xkb_get_indicator_state is None
-        ):
-            self._lock_mask_cached = None
-            return self._lock_mask_cached
-        indicators = ctypes.c_uint()
-        if self._xkb_get_indicator_state(
-            self.display,
-            XKB_USE_CORE_KBD,
-            ctypes.byref(indicators),
-        ) != 0:
+        native_supported, native_mask = self._native_lock_mask()
+        if native_supported and native_mask is None:
             self._lock_mask_cached = None
         else:
-            self._lock_mask_cached = int(indicators.value & 0x7)
+            xwayland_mask = self._xwayland_lock_mask()
+            # Mutter exposes Caps/Num, while Scroll Lock retains its existing
+            # XKB source. Other compositors keep the existing XKB behavior.
+            self._lock_mask_cached = (
+                native_mask | ((xwayland_mask or 0) & 0x4)
+                if native_supported else xwayland_mask
+            )
         return self._lock_mask_cached
 
     def keysym_keycode(self, name: str) -> int:

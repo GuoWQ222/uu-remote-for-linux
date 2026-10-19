@@ -106,6 +106,9 @@ The exact version boundaries, semantic profilers, and update rollback
 transaction are documented in
 [COMPATIBILITY.md](COMPATIBILITY.md).
 
+If Caps Lock and the letters typed remotely disagree on Wayland, see
+[lock state and Rime](COMPATIBILITY.md#wayland-lock-state-and-rime).
+
 <a id="commands"></a>
 ## 🧰 Commands
 
