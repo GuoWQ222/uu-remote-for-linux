@@ -53,7 +53,7 @@ uu-remote-for-linux
 
 No repository or archive key is required. On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the client and WebView2.
 
-**Wayland Caps Lock repair is included in this DEB.** On the first interactive launch, UU detects the matching Ubuntu 24.04 amd64 / GNOME 46 / Mutter `46.2-1ubuntu0.24.04.18` system and offers to apply the bundled fix. Original rollback packages and complete source are included; no extra download is needed. Other versions are left unchanged. Application requires administrator authentication and a later logout/login; the current desktop is not restarted. [Details and rollback](contrib/mutter-46-lock-state/README.md).
+**GNOME Wayland Caps Lock inversion:** the input bridge reads native lock state, but affected Mutter builds can still send applications a different state after IME filtering. The universal DEB contains no Mutter binaries, source archives, repair manager or system-package pins. See the [root-cause evidence and system-update guidance](contrib/mutter-46-lock-state/README.md); installing UU alone does not repair this compositor defect.
 
 > [!TIP]
 > Terminal-only setup: `uu-remote-for-linux --accept-eula --setup-only`

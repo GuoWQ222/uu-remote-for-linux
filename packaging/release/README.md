@@ -1,22 +1,27 @@
-# Universal DEB release
+# Direct GitHub Release package
 
-`make release-assets` produces `uu-remote-for-linux_VERSION_amd64.deb` and
-its build checksum manifest. The GitHub Release needs only one user download:
-the DEB. Its SHA-256 is included in the release notes.
+Public releases contain one user-facing amd64 download:
 
-The same runtime supports X11 and GNOME Wayland. It also embeds an opt-in
-Mutter 46 keyboard-state repair, four original rollback packages and complete
-corresponding source. All system packages remain inert during outer-DEB
-installation; the first interactive launch offers activation only on the
-matching, unmodified Ubuntu 24.04 amd64 / GNOME 46 / Mutter build.
+- `uu-remote-for-linux_VERSION_amd64.deb` contains the X11 XTest path and
+  GNOME Wayland Portal/native three-buffer DMA-BUF path.
 
-The helper validates package hashes and metadata, simulates an offline APT
-plan, refuses unrelated package changes or removals, saves rollback records,
-and runs the four-package transaction after administrator authorization.
-It does not invoke APT from maintainer scripts or restart the desktop.
-See [the repair guide](../../contrib/mutter-46-lock-state/README.md).
+```bash
+sudo apt install ./uu-remote-for-linux_VERSION_amd64.deb
+```
 
-CI validates the embedded payload and source and tests repair failure,
-rollback, mismatched systems and prompt behavior. The standard package has
-no unconditional custom-Mutter dependency and can still install on X11 or
-other desktop builds without activating the optional repair.
+The launcher selects the backend from the live user session. The package has
+no custom Mutter dependency, nested system DEBs, Mutter source archive or
+compositor repair manager. Neither installation nor first launch installs,
+pins or rolls back desktop packages. Installing UU itself requires no logout.
+Existing independent system repairs are left unchanged.
+
+Build the package with `make release-assets`. CI produces the universal DEB,
+`SHA256SUMS` and `CONTENTS.txt` for verification. Publish only the DEB as the
+release asset and place its SHA-256 in the release notes; do not publish the
+CI manifests or platform-specific system packages as extra release downloads.
+
+[Mutter root-cause evidence](../../contrib/mutter-46-lock-state/README.md)
+remains a source reference separate from UU distribution. The native lock-state
+observer does not repair compositor-internal state divergence. Use a supported
+system update containing the full fix; do not describe this universal package
+as fixing all affected GNOME builds.

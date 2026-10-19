@@ -64,11 +64,18 @@ expected_installed_size=$(
         '
 )
 [[ $(dpkg-deb -f "$package" Installed-Size) == "$expected_installed_size" ]]
-# Optional system packages are nested under the wrapper, never unpacked into
-# the live compositor library paths by installation of the outer DEB.
-[[ ! -e $tmp_dir/package/usr/lib/x86_64-linux-gnu/libmutter-14.so.0 ]]
-[[ ! -e $tmp_dir/package/usr/share/keyrings ]]
-python3 "$project_root/tests/mutter-payload.py" "$tmp_dir/package"
+if find "$tmp_dir/package" -iname '*mutter*' -o -iname '*keyring*' | \
+    grep -q .; then
+    printf '通用安装包不应包含 Mutter 或 APT keyring 载荷。\n' >&2
+    exit 1
+fi
+[[ ! -e $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-wayland-lock-fix ]]
+[[ -z $(find "$tmp_dir/package" -type f -name '*.deb' -print -quit) ]]
+if grep -Eq -- '--(wayland-keyboard-status|repair-wayland-keyboard|rollback-wayland-keyboard)' \
+    "$tmp_dir/package/usr/bin/uu-remote-for-linux"; then
+    printf '通用启动器不应包含系统合成器修复入口。\n' >&2
+    exit 1
+fi
 [[ -x $tmp_dir/package/usr/bin/uu-remote-for-linux ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-input-bridge ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture ]]

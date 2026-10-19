@@ -6,4 +6,3 @@
 *.png binary
 lib/uu-remote-for-linux/hwdecode/licenses/*.txt -whitespace
 contrib/mutter-46-lock-state/*.patch -whitespace
-*.deb binary

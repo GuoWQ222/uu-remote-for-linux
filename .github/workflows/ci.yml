@@ -47,7 +47,7 @@ jobs:
       - name: Build direct release assets
         run: make release-assets
 
-      - name: Inspect packaged repair and create checksums
+      - name: Inspect universal package and checksums
         run: |
           version=$(cat VERSION)
           package="dist/uu-remote-for-linux_${version}_amd64.deb"
@@ -63,9 +63,7 @@ jobs:
           dpkg-deb -x "$package" "$stage"
           test -x "$stage/usr/bin/uu-remote-for-linux"
           test -x "$stage/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture"
-          test ! -e "$stage/usr/lib/x86_64-linux-gnu/libmutter-14.so.0"
-          test ! -e "$stage/usr/share/keyrings"
-          python3 tests/mutter-payload.py "$stage"
+          test -z "$(find "$stage" -type f -iname '*mutter*' -o -iname '*keyring*')"
           dpkg-deb --contents "$package" > dist/CONTENTS.txt
           (cd dist && sha256sum --strict -c SHA256SUMS)
 

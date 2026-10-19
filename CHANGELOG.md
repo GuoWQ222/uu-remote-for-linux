@@ -4,21 +4,15 @@ All notable changes to this project are documented here.
 
 ## [1.1.43] - 2026-10-18
 
-- Add the optional Ubuntu 24.04 / Mutter 46 keyboard-state root-cause
-  backport to this release. Preserve the native modifier tuple, remove
-  duplicate Wayland accounting, deliver per-event modifiers in order and
-  notify applications when an IME consumes lock keys, while keeping the
-  Mutter 46 ABI. An independent IBus engine reproduces the original bug;
-  the earlier UU state observer and Rime settings alone cannot repair it.
-  Embed the four matching runtime packages, four original rollback packages,
-  complete corresponding source and a first-interactive-launch repair prompt
-  in the universal DEB. Gate activation by exact Ubuntu/Mutter versions and
-  file integrity, simulate an offline APT transaction before applying, retain
-  recovery records and preserve previous package holds on rollback. Already
-  patched systems and other versions are not reinstalled or downgraded;
-  activation never automatically restarts the desktop. Acceptance
-  passed 63,806 key events, 7,360 lock toggles, 12 bridge reconnects and two
-  desktop restarts, followed by UU/Sunlogin tests in Wayland/XWayland clients.
+- Keep the universal DEB independent of platform-specific Mutter builds:
+  remove the bundled patched/original packages, source archive, repair manager,
+  first-run repair prompt and compositor-management CLI. Public release assets
+  contain only the UU DEB. Installing or launching UU does not install, pin or
+  roll back system compositor packages and needs no logout for UU itself.
+- Retain the separate source patch, independent IBus/Chrome reproducer and
+  pressure-test evidence for the compositor state divergence. The native UU
+  lock-state observer alone does not repair affected Mutter builds; no UU-only
+  workaround is claimed as a general root fix.
 - Read Caps Lock and Num Lock from Mutter on GNOME Wayland, including
   when a native Wayland application has focus. Keep the read-only observer
   separate from input injection and treat unavailable native state as

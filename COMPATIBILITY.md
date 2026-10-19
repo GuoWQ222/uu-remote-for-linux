@@ -46,20 +46,20 @@ The remaining inversion was reproduced with a separate temporary IBus
 engine, even with the prior Rime fix installed. Mutter 46 could maintain
 different native-seat and Wayland keyboard states when an IME consumed lock
 events; correct per-event modifier ordering is required for XWayland too.
-This is not resolved by reading the native state or changing Rime bindings.
-The [optional Mutter 46 backport](https://github.com/GuoWQ222/uu-remote-for-linux/blob/v1.1.43/contrib/mutter-46-lock-state/README.md)
-contains the complete patch, exact supported Ubuntu version, independent
-reproducer, pressure tests and rollback procedure. The universal DEB embeds
-patched packages, original rollback packages and complete source. Installing
-the outer package does not replace the compositor: the first interactive UU
-launch offers an explicitly authorized, version-matched offline transaction.
-No logout or desktop restart is performed automatically. Retry with
-`--repair-wayland-keyboard`; inspect with `--wayland-keyboard-status`.
+Reading the native state does not repair a divergence already inside the
+compositor. Changing Rime bindings is not a demonstrated general fix.
+The [Mutter root-cause evidence](https://github.com/GuoWQ222/uu-remote-for-linux/blob/v1.1.43/contrib/mutter-46-lock-state/README.md)
+keeps the source patch, independent reproducer and pressure-test record separate
+from UU distribution. The universal DEB contains no Mutter payload or repair
+manager and does not install or pin compositor packages. Use a supported system
+update containing the complete fix; UU-only workarounds remain unverified.
+The universal UU package does not install a replacement compositor.
 
 复发问题已用独立 IBus 测试引擎复现，不能归结为 Rime 单独的缺陷。
-Mutter 46 的重复状态维护和事件顺序才是本次根因；原生状态读取与 Rime 按键
-配置不能代替该修复。1.1.43 提供严格限定 Ubuntu/Mutter 版本的独立系统包及
-完整源码，均内置于同一个 UU DEB，首次交互启动时检测并提示应用。既有 [ibus-rime #171](https://github.com/rime/ibus-rime/issues/171)
+本次对照定位到 Mutter 46 的重复状态维护和事件顺序；UU 的原生状态读取不
+会修正合成器内部偏差，改 Rime 按键也尚未证明能普遍解决。通用 DEB 不携带或
+安装任何 Mutter 组件；源码补丁和测试证据单独保留，系统修复交由匹配的系统
+更新或独立维护的回移完成。既有 [ibus-rime #171](https://github.com/rime/ibus-rime/issues/171)
 和 [librime #1011](https://github.com/rime/librime/pull/1011) 不能单独证明
 合成器已修复；发行版也可能回移补丁，不能只看主版本号判断。
 
@@ -78,8 +78,8 @@ case only, merge the overrides above into the existing Rime customization
 and redeploy. This is an explicit user configuration, not an installation
 default. Removing these two overrides and redeploying restores the prior
 bindings. Logging out/in may clear an existing mismatch temporarily, but
-does not repair the compositor bug; use the matching root-cause backport
-when the documented platform and reproduction conditions apply.
+does not repair the compositor bug. Verify a supported system update with
+the full upstream fix; the UU DEB neither installs nor requires this backport.
 
 验收时必须看实际输入：远端英文模式下依次关闭、开启、关闭 Caps Lock，应得到
 `abc`、`ABC`、`abc`，并核对控制端指示状态；再测试左 Shift 切换中文候选与直接

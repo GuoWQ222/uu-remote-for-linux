@@ -478,12 +478,6 @@ usage() {
   --autostart          Linux 登录自启动入口（由兼容桥生成）
   --stop               停止此独立 Wine 前缀
   --diagnose           输出只读诊断信息
-  --wayland-keyboard-status
-                       检查内置 Mutter 键盘修复的适用状态
-  --repair-wayland-keyboard
-                       重新显示 Wayland 键盘修复提示
-  --rollback-wayland-keyboard
-                       提示恢复本工具安装前的 Mutter 包
   --uri URI            打开 uuremote: URI
   --version            输出包装层版本
   -h, --help           显示帮助
@@ -516,21 +510,6 @@ decoder_direct_choice=""
 uri=""
 uri_requested=false
 client_args=()
-
-# System repair is a standalone action, outside Wine setup and APT postinst.
-case ${1:-} in
-    --wayland-keyboard-status|--repair-wayland-keyboard|--rollback-wayland-keyboard)
-        (($# == 1)) || die "Wayland 键盘维护选项须单独使用"
-        case $1 in
-            --wayland-keyboard-status)
-                exec "$runtime_dir/uu-remote-wayland-lock-fix" --status ;;
-            --repair-wayland-keyboard)
-                exec "$runtime_dir/uu-remote-wayland-lock-fix" --prompt --force ;;
-            --rollback-wayland-keyboard)
-                exec "$runtime_dir/uu-remote-wayland-lock-fix" --request-rollback ;;
-        esac
-        ;;
-esac
 
 while (($# > 0)); do
     case $1 in
@@ -6176,11 +6155,6 @@ if ! sync_autostart_once; then
 fi
 
 $setup_only && exit 0
-
-if ! $autostart_launch && [[ -x $runtime_dir/uu-remote-wayland-lock-fix ]]; then
-    "$runtime_dir/uu-remote-wayland-lock-fix" --prompt ||
-        printf 'Wayland 键盘修复未完成，可稍后运行 --repair-wayland-keyboard 重试。\n' >&2
-fi
 
 if hwdecode_enabled; then
     hwdecode_runtime_ready ||

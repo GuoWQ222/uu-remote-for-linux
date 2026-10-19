@@ -130,21 +130,6 @@ install -Dm0644 \
 mkdir -p "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode"
 cp -a "$project_root/lib/uu-remote-for-linux/hwdecode/." \
     "$stage_dir/usr/lib/uu-remote-for-linux/hwdecode/"
-# Keep the version-specific system packages inert until an explicit first-run
-# repair. Never invoke APT recursively from Debian maintainer scripts.
-install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wayland-lock-fix" \
-    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-wayland-lock-fix"
-install -d "$stage_dir/usr/lib/uu-remote-for-linux/mutter-lock-fix"
-for payload in "$project_root"/third_party/mutter-46/*.deb \
-    "$project_root/third_party/mutter-46/manifest.json"; do
-    install -m0644 "$payload" "$stage_dir/usr/lib/uu-remote-for-linux/mutter-lock-fix/"
-done
-install -Dm0644 "$project_root/third_party/mutter-46/mutter-46.2-pjlablock3-source.tar.xz" \
-    "$stage_dir/usr/share/doc/uu-remote-for-linux/source/mutter-46.2-pjlablock3-source.tar.xz"
-for document in README.md SOURCE.json acceptance.json mutter-46-lock-state.patch; do
-    install -Dm0644 "$project_root/contrib/mutter-46-lock-state/$document" \
-        "$stage_dir/usr/share/doc/uu-remote-for-linux/mutter-lock-fix/$document"
-done
 install -d "$stage_dir/usr/share/doc/uu-remote-for-linux/licenses"
 for license_file in "$project_root"/lib/uu-remote-for-linux/hwdecode/licenses/*; do
     install -m0644 "$license_file" \

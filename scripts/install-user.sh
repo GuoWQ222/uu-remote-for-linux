@@ -83,12 +83,6 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge
     "$runtime_target/uu-remote-keyboard-bridge"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$runtime_target/uu-remote-input-bridge"
-# User source installs may inspect eligibility, but cannot elevate user-owned
-# repair code. System component installation is reserved for the root-owned DEB.
-install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-wayland-lock-fix" \
-    "$runtime_target/uu-remote-wayland-lock-fix"
-install -Dm0644 "$project_root/third_party/mutter-46/manifest.json" \
-    "$runtime_target/mutter-lock-fix/manifest.json"
 install -Dm0755 \
     "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" \
     "$runtime_target/uu-remote-frame-helper.so"
