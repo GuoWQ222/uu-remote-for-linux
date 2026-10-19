@@ -4,7 +4,7 @@
   "package_version": "46.2-1ubuntu0.24.04.18+pjlablock3",
   "architecture": "amd64",
   "base_source_commit": "58abfd9ddb5d03f2fbf221e15042ffcf8fb9ac9f",
-  "patched_source_commit": "eaa6a98fda82b04512c9ed05aea322b750965035",
+  "patched_source_commit": "6d1e81638456b17e75bd02d720dbbea8d47ee74d",
   "upstream_commits": [
     "aeac0f33c2d06ac356af253ed52c175b48999f92",
     "1940c6eba938a9413b93694573501153788d1f0f",

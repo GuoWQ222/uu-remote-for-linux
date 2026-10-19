@@ -10,9 +10,13 @@ All notable changes to this project are documented here.
   notify applications when an IME consumes lock keys, while keeping the
   Mutter 46 ABI. An independent IBus engine reproduces the original bug;
   the earlier UU state observer and Rime settings alone cannot repair it.
-  Publish the source patch, real-desktop tests, corresponding full source
-  and four matching runtime packages as separate, platform-specific assets;
-  the universal UU package does not replace the compositor. Acceptance
+  Embed the four matching runtime packages, four original rollback packages,
+  complete corresponding source and a first-interactive-launch repair prompt
+  in the universal DEB. Gate activation by exact Ubuntu/Mutter versions and
+  file integrity, simulate an offline APT transaction before applying, retain
+  recovery records and preserve previous package holds on rollback. Already
+  patched systems and other versions are not reinstalled or downgraded;
+  activation never automatically restarts the desktop. Acceptance
   passed 63,806 key events, 7,360 lock toggles, 12 bridge reconnects and two
   desktop restarts, followed by UU/Sunlogin tests in Wayland/XWayland clients.
 - Read Caps Lock and Num Lock from Mutter on GNOME Wayland, including

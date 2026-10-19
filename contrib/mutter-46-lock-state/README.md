@@ -1,151 +1,124 @@
-# Mutter 46 keyboard-state backport / 键盘状态根因修复
+# Bundled Wayland keyboard repair / 内置 Wayland 键盘根因修复
 
-This optional component belongs to release **v1.1.43**. It fixes a compositor
-state divergence that the UU native lock-state observer alone cannot repair.
-The universal UU `.deb` continues to support X11 and GNOME Wayland without
-replacing the system compositor. Install the separate Mutter bundle only on
-the exact supported platform below; installing UU alone does not install it.
+**v1.1.43 needs one DEB download.** The universal UU package includes the
+Mutter repair, original rollback packages and complete corresponding source.
+On the first interactive UU launch, a matching GNOME Wayland system is offered
+the repair. It is opt-in and requires administrator authentication. Installing
+the UU DEB itself does not replace the running desktop or invoke nested APT.
 
-本目录及 1.1.43 的独立 Mutter 附件用于修复合成器内部的大小写状态错位。
-此前 UU 的原生状态读取修复不能单独消除此根因。UU 通用 DEB 不自动替换系统
-合成器；需要此修复时，另行安装与系统版本严格匹配的 Mutter 附件。
+**1.1.43 只需下载一个 DEB。**修复包、原版回退包和完整源码均已内置。
+首次交互启动 UU 时检测当前系统，匹配后提示是否应用；用户选择后进行管理员
+认证。UU 安装时只放入组件，不直接覆盖合成器，也不自动重启桌面。
 
 ## Supported build / 适用范围
 
-- Ubuntu **24.04**, **amd64**, GNOME Wayland, Mutter ABI 14.
-- Original Ubuntu source/package version **46.2-1ubuntu0.24.04.18**.
-- Backport package version **46.2-1ubuntu0.24.04.18+pjlablock3**.
-- Four runtime packages: `libmutter-14-0`, `gir1.2-mutter-14`,
-  `mutter-common`, `mutter-common-bin`.
+- Ubuntu 24.04, amd64, GNOME Shell 46 and Mutter ABI 14.
+- Original four packages: `46.2-1ubuntu0.24.04.18`.
+- Patched version: `46.2-1ubuntu0.24.04.18+pjlablock3`.
+- Managed packages: `libmutter-14-0`, `gir1.2-mutter-14`, `mutter-common`,
+  `mutter-common-bin`.
 
-Other distributions, Mutter versions and architectures need their own build
-and acceptance testing. Do not downgrade a newer Ubuntu security update to
-install this bundle. 如果系统版本不同或已有更新的安全更新，应重新移植和验收，
-不要强行降级。PJLAB 已部署并通过验收，无需为本次发布再次安装或重启。
+Already patched systems are not reinstalled. Other versions, architectures,
+locally modified packages and incompatible dependency plans are left unchanged.
+The tool does not downgrade newer security updates. Source-only user installs
+can inspect eligibility but cannot elevate user-owned repair code; install the
+system DEB to activate the repair.
 
-## Root cause / 根因
+已安装匹配补丁的 PJLAB 不重复处理。版本不同、文件有本地修改，或依赖计划
+要求更改其他包时会停止，不降级较新的系统包。其他 X11/Wayland 环境仍可使用
+UU，内置系统修复不会自动应用。无图形环境和登录自启动不会弹出修复提示。
 
-Mutter 46 could maintain different modifier states in its native seat and
-Wayland keyboard. An IME consuming Caps Lock events could make those states
-remain out of phase. A separate temporary IBus engine reproduced the same
-failure, so this is not evidence of a Rime-only defect. A native state query
-can be correct while an application still receives the wrong state.
+## Use and rollback / 使用与回退
 
-The patch removes duplicate Wayland accounting, preserves the native
-modifier tuple, delivers the captured state in the correct order around
-each key event, refreshes state on focus entry, and notifies Wayland even
-when the IME consumes the key. It preserves the exported Mutter 46 ABI.
-There is no polling daemon or periodic Caps Lock reset.
+Install the one DEB normally and start UU. If you accept the repair, the
+helper checks all eight bundled package hashes and metadata, verifies the
+installed baseline, simulates an offline four-package APT transaction and
+rejects unrelated changes/removals. It retains the original packages and
+previous hold settings under `/var/lib/uu-remote-for-linux/wayland-lock-fix/`.
 
-原生座席与 Wayland 键盘重复维护状态，输入法过滤锁键时可能产生持久偏差；
-还必须修正逐事件的状态发送顺序，才能保证 XWayland 同样正确。补丁统一权威
-状态来源，补齐事件顺序、焦点刷新和被输入法过滤后的通知，同时保留 ABI。
+Accepting the dialog installs all four patched packages together and holds
+them against silent replacement. Save work and log out/in when convenient to
+load the repaired compositor. The tool never automatically logs out or restarts
+GDM, GNOME Shell, UU or Sunlogin. A failed installation attempts to restore all
+four original packages and previous package holds; an unsuccessful recovery
+is reported explicitly with its retained state and backup.
 
-Upstream basis, including the required follow-up:
+接受提示后，工具离线安装四个配套包并设置版本锁定；请在方便时保存工作、注销
+并重新登录。当前桌面、UU 和向日葵不会自动重启。安装失败会尝试恢复原版包和
+原有锁定；回退失败会明确报错并保留记录，不宣称修复成功。
 
-- [aeac0f3](https://github.com/GNOME/mutter/commit/aeac0f33c2d06ac356af253ed52c175b48999f92)
-- [1940c6e](https://github.com/GNOME/mutter/commit/1940c6eba938a9413b93694573501153788d1f0f)
+```bash
+# Read-only status / 只读检查
+uu-remote-for-linux --wayland-keyboard-status
+
+# Retry after choosing "not now" / 暂不处理后重新显示提示
+uu-remote-for-linux --repair-wayland-keyboard
+
+# Restore this tool's original packages and holds / 恢复原版和原有锁定
+uu-remote-for-linux --rollback-wayland-keyboard
+```
+
+Rollback also requires a later logout/login. It refuses to overwrite packages
+changed by another upgrade or local modification. A previously external repair
+with no record from this helper must use its original recovery procedure.
+Removing UU does not automatically roll back the separately managed Mutter
+packages; recovery data is retained. After removal, inspect `state.json` and
+`ROLLBACK.txt` in the path above for the original package transaction and holds.
+
+Version holds are protection for this tested backport, not a permanent substitute
+for security updates. Review new official updates, confirm the complete fix or
+rebase and retest, then restore the normal update path.
+
+## Root cause and evidence / 根因与证据
+
+Old Mutter can independently calculate native-seat and Wayland keyboard
+modifiers. Filtering a Caps event in an IME can leave them persistently out of
+phase: native Caps off, Chrome's received Caps on. Chinese composition can
+still work; Shift switches to direct English and exposes uppercase output.
+Another Caps press flips both contradictory states rather than fixing them.
+
+The backport uses the native authoritative modifier tuple, removes duplicate
+Wayland accounting, delivers per-event state in order, refreshes on focus and
+notifies clients even if the IME consumes the key. It retains the original
+Mutter 46 ABI and does not use periodic Caps resets or a mirror daemon.
+
+上游依据：
+
 - [7d0d128 / MR 4546](https://github.com/GNOME/mutter/commit/7d0d128e005fb737df7a8eea5e472d6c229898e1)
-- [0828fd6 / MR 4686](https://github.com/GNOME/mutter/commit/0828fd6169c17ca54633f76936f03ac496f6b01e)
+- [0828fd6 / MR 4686 follow-up](https://github.com/GNOME/mutter/commit/0828fd6169c17ca54633f76936f03ac496f6b01e)
+- Dependencies `aeac0f3` and `1940c6e`; Mutter 46 IME notification/ABI integration.
 
-## Download and install / 下载与安装
+Real-desktop acceptance included two animated 4K displays, eight CPU workers,
+63,806 key events, 7,360 Caps toggles, 23,680 characters, 2,560 text checks,
+4,196 state checks, 12 input/capture reconnects, two complete desktop restarts
+and four Mutter regression suites. UU and Sunlogin manual tests passed in
+Wayland/XWayland fields. A subsequent isolated Chrome/Rime test reproduced
+Chinese -> Shift -> uppercase on original Mutter in 5/5 controlled cases;
+patched Mutter passed the matching 5/5 cases, including Rime's original
+`Caps_Lock: clear` and customized `noop` bindings. The specific historical
+event that first triggered the user's mismatch was not captured.
 
-Download from the [v1.1.43 release](https://github.com/GuoWQ222/uu-remote-for-linux/releases/tag/v1.1.43):
+## Corresponding source / 对应源码与许可证
 
-- `mutter-46.2-pjlablock3-ubuntu24.04-amd64.tar.xz`: four tested Debian
-  packages, their checksums, source provenance and this guide.
-- `mutter-46.2-pjlablock3-source.tar.xz`: complete corresponding patched
-  source, Debian packaging, upstream licenses and real-desktop test scripts.
+The DEB installs the full patched source, Debian packaging, licenses and
+real-desktop test scripts here:
 
-Verify the outer archive against the release `SHA256SUMS`, extract it, and
-enter `mutter-46.2-pjlablock3-ubuntu24.04-amd64/`. Save open work and keep a
-working SSH management channel before changing the compositor. The following
-transaction checks the exact platform, downloads rollback packages first,
-then installs all four packages together:
+`/usr/share/doc/uu-remote-for-linux/source/mutter-46.2-pjlablock3-source.tar.xz`
 
-先核验 Release 校验文件，再解压并进入目录。保存工作并保留 SSH 管理通道。
-以下命令只适用于当前安装版本恰为原始版本的机器，备份下载失败即停止：
+The patch, `SOURCE.json`, acceptance summary and this guide are in
+`/usr/share/doc/uu-remote-for-linux/mutter-lock-fix/`. The full license is in
+the source archive and `/usr/share/common-licenses/GPL-2`. Exact file hashes are in
+the runtime payload's `manifest.json`; the outer DEB's SHA-256 is published
+in the Release notes. No separate archive or checksum download is required.
 
-```bash
-(
-set -eu
-. /etc/os-release
-test "$ID:$VERSION_ID:$(dpkg --print-architecture)" = 'ubuntu:24.04:amd64'
-base='46.2-1ubuntu0.24.04.18'
-test "$(dpkg-query -W -f='${Version}' libmutter-14-0)" = "$base"
-backup="$PWD/mutter-before-pjlablock3"
-mkdir -p "$backup"
-(
-cd "$backup"
-apt download "libmutter-14-0=$base" "gir1.2-mutter-14=$base" \
-  "mutter-common=$base" "mutter-common-bin=$base"
-)
-sha256sum --strict --check SHA256SUMS
-sudo apt install ./libmutter-14-0_*.deb ./gir1.2-mutter-14_*.deb \
-  ./mutter-common_*.deb ./mutter-common-bin_*.deb
-sudo apt-mark hold libmutter-14-0 gir1.2-mutter-14 mutter-common mutter-common-bin
-)
-```
+The source archive is already patched. To rebuild, extract it into a path
+without spaces, install Ubuntu's normal Mutter source build dependencies and
+run `dpkg-buildpackage -b -uc -us`. To reconstruct the original rollback
+packages' corresponding source, reverse `mutter-46-lock-state.patch` in the
+extracted source tree before building. The extra `pjlab-tests/` files do not
+affect the original Debian build.
 
-Log out and back in to load the new compositor; if the host uses a custom
-headless launcher with a library checksum guard, update that guard to the
-installed library after verifying package integrity. Do not run the acceptance
-scripts automatically during installation: they occupy the keyboard and some
-restart the graphical desktop.
-
-注销并重新登录后补丁生效。自定义无头桌面的库校验保护须同步更新。
-`apt-mark hold` prevents a normal unattended update from silently replacing
-the tested backport. Review security updates and rebase or confirm the full
-upstream fix before removing the hold; it is not a permanent substitute for
-security updates.
-
-## Rollback / 回退
-
-From the extracted bundle directory, with the four original packages saved
-above, restore all four in one transaction, then log out/in:
-
-```bash
-sudo apt-mark unhold libmutter-14-0 gir1.2-mutter-14 mutter-common mutter-common-bin
-sudo apt install --allow-downgrades ./mutter-before-pjlablock3/*.deb
-```
-
-These generic commands do not modify a custom headless launcher. Restore its
-previous checksum guard as well if you changed one. PJLAB has its own retained
-original packages and launcher recovery procedure; its private host paths are
-not required by this public bundle.
-
-## Source and validation / 源码与验收
-
-`mutter-46-lock-state.patch` is the complete source/packaging diff against the
-Ubuntu source version above. `SOURCE.json` records exact revisions and hash.
-The complete source archive is already patched: do not apply the patch twice.
-To inspect the patch on an unmodified matching Ubuntu source tree:
-
-```bash
-git apply --check /path/to/mutter-46-lock-state.patch
-git apply /path/to/mutter-46-lock-state.patch
-```
-
-Install normal Ubuntu Mutter build dependencies, extract the source archive
-in a path without spaces, and run `dpkg-buildpackage -b -uc -us` inside it.
-The source includes Debian packaging and `pjlab-tests/`. Those tests require
-the documented live desktop and installed UU input bridge; see their README
-before running them.
-
-Acceptance on 2026-10-19 used two animated 4K landscape displays and eight CPU
-workers. Across native/UU input and Wayland/XWayland clients: **63,806 key
-events, 7,360 Caps toggles, 23,680 actual characters, 2,560 text checks and
-4,196 state checks**, with zero text/state errors. It covered 640 IME filtering
-cycles, 320 bursts and 32 cross-monitor moves. Four Mutter regression suites,
-12 real input/capture reconnects and two complete desktop restarts passed.
-The user then confirmed UU and Sunlogin reconnect, Caps off/on/off and left
-Shift input-method switching in both application backends.
-
-验收同时核对实际字符与原生/应用状态，不以接口一致代替输入结果。完整私人
-日志保留在本地；公开的 `acceptance.json` 不包含认证材料、账户数据或原始
-人工输入。夹具准备中止不计为通过。结论针对当前补丁及已覆盖场景，后续系统
-升级仍须复核。
-
-The Mutter-derived patch and source retain **GPL-2.0-or-later**, upstream
-per-file notices, Debian copyright and `COPYING`; they are not relicensed
-under this wrapper project's 0BSD license.
+Mutter-derived code, packages and source retain **GPL-2.0-or-later**, upstream
+per-file notices and Debian copyright. They are not relicensed under this
+wrapper's 0BSD license. The original/modified source and build scripts are
+provided in the same DEB as the optional binaries.

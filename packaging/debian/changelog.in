@@ -3,7 +3,7 @@ uu-remote-for-linux (@VERSION@) unstable; urgency=medium
   * Adapt UU 4.43 NVENC, NVDEC, portrait capture and WOL compatibility.
   * Fix scaled Wayland/X11 capture, cursor mapping and viewer layouts.
   * Read native GNOME Wayland Caps/Num Lock state.
-  * Document the optional Mutter 46 root fix, source and tested packages.
+  * Bundle the opt-in Mutter 46 root fix, offline rollback and full source.
   * Accept legacy and RFC2253 installer subjects with strict publisher checks.
   * Restore the real tray home and recover missing backend initialization.
   * Keep the display-sync companion opt-in and host display settings excluded.

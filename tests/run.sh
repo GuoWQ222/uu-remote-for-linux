@@ -53,6 +53,8 @@ fi
 check "PipeWire cursor bridge self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     --self-test
+check "embedded Mutter repair transactions and prompts" \
+    /usr/bin/python3 "$project_root/tests/mutter-lock-fix.py"
 check "direct release asset isolation" \
     "$project_root/tests/release-assets.sh"
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \

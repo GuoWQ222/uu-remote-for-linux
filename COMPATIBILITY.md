@@ -49,13 +49,17 @@ events; correct per-event modifier ordering is required for XWayland too.
 This is not resolved by reading the native state or changing Rime bindings.
 The [optional Mutter 46 backport](https://github.com/GuoWQ222/uu-remote-for-linux/blob/v1.1.43/contrib/mutter-46-lock-state/README.md)
 contains the complete patch, exact supported Ubuntu version, independent
-reproducer, pressure tests, package/source downloads and rollback procedure.
-The universal UU package does not install a replacement compositor.
+reproducer, pressure tests and rollback procedure. The universal DEB embeds
+patched packages, original rollback packages and complete source. Installing
+the outer package does not replace the compositor: the first interactive UU
+launch offers an explicitly authorized, version-matched offline transaction.
+No logout or desktop restart is performed automatically. Retry with
+`--repair-wayland-keyboard`; inspect with `--wayland-keyboard-status`.
 
 复发问题已用独立 IBus 测试引擎复现，不能归结为 Rime 单独的缺陷。
 Mutter 46 的重复状态维护和事件顺序才是本次根因；原生状态读取与 Rime 按键
 配置不能代替该修复。1.1.43 提供严格限定 Ubuntu/Mutter 版本的独立系统包及
-完整源码。既有 [ibus-rime #171](https://github.com/rime/ibus-rime/issues/171)
+完整源码，均内置于同一个 UU DEB，首次交互启动时检测并提示应用。既有 [ibus-rime #171](https://github.com/rime/ibus-rime/issues/171)
 和 [librime #1011](https://github.com/rime/librime/pull/1011) 不能单独证明
 合成器已修复；发行版也可能回移补丁，不能只看主版本号判断。
 

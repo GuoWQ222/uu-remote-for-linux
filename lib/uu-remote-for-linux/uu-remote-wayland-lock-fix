@@ -1,0 +1,358 @@
+#!/usr/bin/python3
+"""Opt-in, version-matched Mutter repair shipped inside the universal DEB."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+SYSTEM_HELPER = Path('/usr/lib/uu-remote-for-linux/uu-remote-wayland-lock-fix')
+STATE_DIR = Path('/var/lib/uu-remote-for-linux/wayland-lock-fix')
+PACKAGES = {'libmutter-14-0', 'gir1.2-mutter-14', 'mutter-common', 'mutter-common-bin'}
+BASE = '46.2-1ubuntu0.24.04.18'
+PATCHED = BASE + '+pjlablock3'
+
+
+class Host:
+    def run(self, args):
+        env = dict(os.environ, LC_ALL='C', PATH='/usr/sbin:/usr/bin:/sbin:/bin',
+                   DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+        result = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode:
+            raise RuntimeError('Command failed: ' + ' '.join(args) + '\n' + result.stdout[-12000:])
+        return result.stdout
+
+    def platform(self):
+        data = {}
+        for line in Path('/etc/os-release').read_text().splitlines():
+            key, sep, value = line.partition('=')
+            if sep:
+                data[key] = value.strip('"')
+        return data.get('ID'), data.get('VERSION_ID'), self.run(['/usr/bin/dpkg', '--print-architecture']).strip()
+
+    def version(self, name):
+        try:
+            value = self.run(['/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}\t${Version}', name])
+            status, version = value.split('\t')
+            return version if status in ['ii ', 'hi '] else None
+        except (RuntimeError, ValueError):
+            return None
+
+    def pristine(self, name):
+        return not self.run(['/usr/bin/dpkg', '--verify', name]).strip()
+
+    def raw_version(self, name):
+        # Recovery must also recognize a package unpacked before an interrupted
+        # configure step; eligibility still requires the stricter ii status.
+        return self.run(['/usr/bin/dpkg-query', '-W', '-f=${Version}', name]).strip()
+
+    def library_hash(self):
+        return hashlib.sha256(Path('/usr/lib/x86_64-linux-gnu/libmutter-14.so.0').read_bytes()).hexdigest()
+
+    def holds(self):
+        return self.run(['/usr/bin/apt-mark', 'showhold']).splitlines()
+
+    def cache_archives(self, paths):
+        # --no-download also disables APT's file acquisition. Seed its normal
+        # cache from verified local payloads before the offline transaction.
+        cache = Path('/var/cache/apt/archives')
+        cache.mkdir(parents=True, exist_ok=True)
+        for source in paths:
+            target = cache / source.name
+            expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            if target.exists() or target.is_symlink():
+                if target.is_symlink() or hashlib.sha256(target.read_bytes()).hexdigest() != expected:
+                    raise RuntimeError('APT 缓存中有同名但内容不同的软件包：' + target.name)
+                continue
+            with tempfile.NamedTemporaryFile(dir=cache, delete=False) as file:
+                with source.open('rb') as input_file:
+                    shutil.copyfileobj(input_file, file)
+                file.flush()
+                os.fsync(file.fileno())
+                temporary = Path(file.name)
+            temporary.chmod(0o644)
+            os.replace(temporary, target)
+
+
+class Repair:
+    def __init__(self, payload=None, state_dir=STATE_DIR, host=None):
+        self.payload = payload or Path(__file__).resolve().parent / 'mutter-lock-fix'
+        if payload is None and not (self.payload / 'manifest.json').exists():
+            checkout = Path(__file__).resolve().parents[2] / 'third_party/mutter-46'
+            if (checkout / 'manifest.json').exists():
+                self.payload = checkout
+        self.state_dir = state_dir
+        self.host = host or Host()
+        self.manifest = json.loads((self.payload / 'manifest.json').read_text())
+        assert self.manifest['format'] == 1
+        assert self.manifest['base_version'] == BASE and self.manifest['patched_version'] == PATCHED
+        for key, version in [('packages', PATCHED), ('rollback_packages', BASE)]:
+            items = self.manifest[key]
+            assert len(items) == 4 and {item['package'] for item in items} == PACKAGES
+            for item in items:
+                assert item['version'] == version
+                assert Path(item['file']).name == item['file'] and item['file'].endswith('.deb')
+                assert item['architecture'] == ('all' if item['package'] == 'mutter-common' else 'amd64')
+
+    def status(self):
+        def result(state, reason):
+            return {'state': state, 'reason': reason, 'patched_version': PATCHED}
+        if self.host.platform() != ('ubuntu', '24.04', 'amd64'):
+            return result('unsupported', '此内置补丁仅适用于 Ubuntu 24.04 amd64。')
+        shell = self.host.version('gnome-shell') or ''
+        if not shell.split(':')[-1].startswith('46.'):
+            return result('unsupported', '此内置补丁仅适用于 GNOME Shell 46。')
+        versions = {name: self.host.version(name) for name in sorted(PACKAGES)}
+        if set(versions.values()) == {PATCHED}:
+            if self.host.library_hash() == self.manifest['library_sha256'] and all(self.host.pristine(n) for n in PACKAGES):
+                return result('installed', '匹配的 Mutter 修复包已安装；无需重复安装。')
+            return result('modified', 'Mutter 修复包的文件与已验收版本不同，未自动更改。')
+        if set(versions.values()) != {BASE}:
+            return result('unsupported', '当前 Mutter 版本不匹配；未降级或替换其他版本。')
+        if not all(self.host.pristine(name) for name in PACKAGES):
+            return result('modified', '现有 Mutter 文件有本地修改，未自动覆盖。')
+        return result('eligible', '当前 Mutter 版本匹配，可应用内置键盘状态修复。')
+
+    def trusted(self):
+        if os.geteuid() != 0 or Path(__file__).resolve() != SYSTEM_HELPER.resolve():
+            raise RuntimeError('系统修复只能由安装到 /usr/lib 的 DEB 组件以管理员权限执行。')
+        paths = [Path(__file__).resolve(), self.payload, self.payload / 'manifest.json']
+        paths += [self.payload / item['file'] for key in ['packages', 'rollback_packages'] for item in self.manifest[key]]
+        for path in paths:
+            if path.is_symlink():
+                raise RuntimeError('修复组件不应使用符号链接：' + str(path))
+            for candidate in [path, *path.parents]:
+                info = candidate.stat()
+                if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise RuntimeError('修复组件或父目录不是受保护的系统文件：' + str(candidate))
+
+    def verify_payload(self):
+        for key in ['packages', 'rollback_packages']:
+            for item in self.manifest[key]:
+                path = self.payload / item['file']
+                if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+                    raise RuntimeError('内置软件包校验失败：' + path.name)
+                for field, expected in [('Package', item['package']), ('Version', item['version']), ('Architecture', item['architecture'])]:
+                    if self.host.run(['/usr/bin/dpkg-deb', '-f', str(path), field]).strip() != expected:
+                        raise RuntimeError('内置软件包元数据不匹配：' + path.name)
+
+    def save(self, data):
+        with tempfile.NamedTemporaryFile(mode='w', dir=self.state_dir, delete=False) as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+            temporary = file.name
+        os.replace(temporary, self.state_dir / 'state.json')
+
+    def lock(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for path in [self.state_dir, self.state_dir.parent]:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise RuntimeError('回退记录目录权限不安全。')
+        file = (self.state_dir / 'transaction.lock').open('a')
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return file
+
+    def transaction(self, paths, downgrade=False, dry_run=False):
+        args = ['/usr/bin/apt-get', '-o', 'DPkg::Lock::Timeout=30', '--no-download', '--no-remove',
+                '--allow-change-held-packages']
+        if downgrade:
+            args.append('--allow-downgrades')
+        plan = self.host.run([*args, '--simulate', 'install', *map(str, paths)])
+        for line in plan.splitlines():
+            if line.startswith(('Inst ', 'Remv ', 'Conf ')):
+                package = line.split()[1].split(':')[0]
+                if line.startswith('Remv ') or package not in PACKAGES:
+                    raise RuntimeError('修复需要变更其他系统包，已停止：' + line)
+        if dry_run:
+            return plan
+        self.host.cache_archives(paths)
+        self.mutation_attempted = True
+        return self.host.run([*args, '-y', 'install', *map(str, paths)])
+
+    def restore_holds(self, data):
+        self.host.run(['/usr/bin/apt-mark', 'unhold', *sorted(PACKAGES)])
+        if data['holds_before']:
+            self.host.run(['/usr/bin/apt-mark', 'hold', *data['holds_before']])
+
+    def restore(self, data):
+        paths = []
+        for item in self.manifest['rollback_packages']:
+            path = self.state_dir / 'backup' / item['file']
+            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+                raise RuntimeError('原版回退包校验失败：' + path.name)
+            paths.append(path)
+        self.transaction(paths, downgrade=True)
+        assert all(self.host.version(n) == BASE and self.host.pristine(n) for n in PACKAGES)
+        self.restore_holds(data)
+        data['phase'] = 'rolled_back'
+        self.save(data)
+
+    def apply(self):
+        self.trusted()
+        self.verify_payload()
+        with self.lock():
+            status = self.status()
+            if status['state'] == 'installed':
+                return status
+            if status['state'] != 'eligible':
+                raise RuntimeError(status['reason'])
+            if self.host.run(['/usr/bin/dpkg', '--audit']).strip():
+                raise RuntimeError('系统有未完成的软件包事务，请先处理；本工具未安装补丁。')
+            install_paths = [self.payload / item['file'] for item in self.manifest['packages']]
+            self.transaction(install_paths, dry_run=True)
+            data = {'phase': 'prepared', 'base_version': BASE, 'patched_version': PATCHED,
+                    'holds_before': sorted(PACKAGES.intersection(self.host.holds()))}
+            backup = self.state_dir / 'backup'
+            backup.mkdir(exist_ok=True, mode=0o700)
+            for item in self.manifest['rollback_packages']:
+                path = backup / item['file']
+                if path.is_symlink():
+                    raise RuntimeError('回退文件不应为符号链接。')
+                shutil.copyfile(self.payload / item['file'], path)
+                path.chmod(0o600)
+            self.save(data)
+            (self.state_dir / 'ROLLBACK.txt').write_text(
+                'Original packages are retained in backup/. No graphical session was restarted.\n'
+                'While UU is installed: uu-remote-for-linux --rollback-wayland-keyboard\n'
+                'After removal: sudo apt-get --allow-downgrades install ' + str(backup) + '/*.deb\n'
+                'Then restore package holds according to state.json; log out/in to load the restored compositor.\n')
+            try:
+                self.mutation_attempted = False
+                self.transaction(install_paths)
+                if self.status()['state'] != 'installed':
+                    raise RuntimeError('安装后的 Mutter 文件或版本未通过校验。')
+                self.host.run(['/usr/bin/apt-mark', 'hold', *sorted(PACKAGES)])
+                data['phase'] = 'installed'
+                self.save(data)
+            except (Exception, KeyboardInterrupt) as error:
+                if not self.mutation_attempted:
+                    data['phase'] = 'not_applied'
+                    self.save(data)
+                    raise RuntimeError('检查未通过，未安装补丁。\n' + str(error)) from error
+                try:
+                    self.restore(data)
+                except Exception as rollback_error:
+                    data['phase'] = 'recovery_required'
+                    data['error'] = str(error)
+                    data['rollback_error'] = str(rollback_error)
+                    self.save(data)
+                    raise RuntimeError('修复失败且自动回退未完成；请保留回退记录。\n' + str(rollback_error)) from error
+                raise RuntimeError('修复未完成，已恢复原版包和原有版本锁定。\n' + str(error)) from error
+            return {'state': 'installed', 'requires_relogin': True,
+                    'reason': '补丁已安装；请保存工作后注销并重新登录。当前桌面没有重启。',
+                    'backup': str(backup), 'patched_version': PATCHED}
+
+    def rollback(self):
+        self.trusted()
+        self.verify_payload()
+        with self.lock():
+            state = self.state_dir / 'state.json'
+            if not state.exists():
+                raise RuntimeError('没有本工具创建的回退记录；请使用原部署方式的回退文件。')
+            data = json.loads(state.read_text())
+            assert data['base_version'] == BASE and data['patched_version'] == PATCHED
+            assert set(data['holds_before']).issubset(PACKAGES)
+            if set(self.host.version(n) for n in PACKAGES) == {BASE}:
+                if not all(self.host.pristine(n) for n in PACKAGES):
+                    raise RuntimeError('原版文件已有其他修改，未标记为回退完成。')
+                self.restore_holds(data)
+                data['phase'] = 'rolled_back'
+                self.save(data)
+                return {'state': 'rolled_back', 'reason': '原版包已恢复，无需重复回退。'}
+            if self.status()['state'] != 'installed':
+                recoverable = (data['phase'] in ['prepared', 'recovery_required'] and
+                    self.host.platform() == ('ubuntu', '24.04', 'amd64') and
+                    (self.host.version('gnome-shell') or '').split(':')[-1].startswith('46.') and all(
+                        self.host.raw_version(name) in [BASE, PATCHED] for name in PACKAGES))
+                if not recoverable:
+                    raise RuntimeError('当前文件或版本已改变，未自动覆盖其他系统修改。')
+            self.restore(data)
+            return {'state': 'rolled_back', 'requires_relogin': True,
+                    'reason': '原版包和原有锁定已恢复；注销并重新登录后生效。当前桌面没有重启。'}
+
+
+def prompt(repair, force=False, rollback=False):
+    status = repair.status()
+    if not rollback and status['state'] != 'eligible':
+        if force:
+            print(json.dumps(status, ensure_ascii=False))
+        return 0
+    if not force and (os.environ.get('XDG_SESSION_TYPE') != 'wayland' or
+                      'GNOME' not in os.environ.get('XDG_CURRENT_DESKTOP', '').upper()):
+        return 0
+    # A user-installed source checkout must never be elevated by pkexec.
+    if Path(__file__).resolve() != SYSTEM_HELPER.resolve():
+        if force:
+            raise RuntimeError('请先安装系统 DEB，再使用内置的系统修复入口。')
+        return 0
+    state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'uu-remote-for-linux'
+    marker = state / 'wayland-keyboard-prompt.json'
+    if not force and marker.exists():
+        try:
+            if json.loads(marker.read_text()).get('version') == PATCHED:
+                return 0
+        except (ValueError, OSError):
+            pass
+    zenity = shutil.which('zenity')
+    if not zenity or not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        if force:
+            print('无图形对话环境。应用：sudo ' + str(SYSTEM_HELPER) + ' --apply\n'
+                  '回退：sudo ' + str(SYSTEM_HELPER) + ' --rollback')
+        return 0
+    text = ('是否恢复本工具安装前的 Mutter 包？\n原有版本锁定也会恢复。注销重新登录后生效，当前桌面不会重启。'
+            if rollback else '检测到当前 GNOME Wayland 存在可修复的键盘大小写状态问题。\n'
+            '是否安装 UU 包内置的匹配系统组件？无需额外下载，原版包会保留供回退。\n'
+            '注销重新登录后生效，当前桌面不会重启。')
+    answer = subprocess.run([zenity, '--question', '--title=UU 远程：Wayland 键盘修复', '--text=' + text,
+                             '--ok-label=' + ('恢复原版' if rollback else '应用修复'), '--cancel-label=暂不处理'])
+    state.mkdir(parents=True, exist_ok=True)
+    if answer.returncode != 0:
+        if answer.returncode == 1 and not rollback:
+            marker.write_text(json.dumps({'version': PATCHED, 'decision': 'deferred'}) + '\n')
+        return 0
+    result = subprocess.run(['/usr/bin/pkexec', str(SYSTEM_HELPER), '--rollback' if rollback else '--apply'],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = state / 'wayland-keyboard-repair.log'
+    log.write_text(result.stdout)
+    if result.returncode:
+        subprocess.run([zenity, '--error', '--title=UU 远程：Wayland 键盘修复',
+                        '--text=操作未完成。详细记录：' + str(log)])
+        return result.returncode
+    marker.write_text(json.dumps({'version': PATCHED, 'decision': 'rolled_back' if rollback else 'applied'}) + '\n')
+    subprocess.run([zenity, '--info', '--title=UU 远程：Wayland 键盘修复',
+                    '--text=操作已完成。请保存工作后注销并重新登录，当前桌面没有重启。'])
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    for name in ['status', 'apply', 'rollback', 'prompt', 'request-rollback']:
+        group.add_argument('--' + name, action='store_true')
+    parser.add_argument('--force', action='store_true', help='Show the prompt again after deferring')
+    args = parser.parse_args()
+    if args.prompt and not args.force and Path(__file__).resolve() != SYSTEM_HELPER.resolve():
+        return 0
+    repair = Repair()
+    if args.prompt or args.request_rollback:
+        return prompt(repair, args.force or args.request_rollback, args.request_rollback)
+    result = repair.apply() if args.apply else repair.rollback() if args.rollback else repair.status()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (Exception, KeyboardInterrupt) as error:
+        print('Wayland keyboard repair: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)

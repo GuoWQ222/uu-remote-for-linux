@@ -35,3 +35,15 @@ Copyright: 2018-2026 SveSop contributors and Wine project contributors
 License: LGPL-2.1-or-later
  The complete relay license texts and corresponding modified source archives
  are installed with the package documentation.
+
+Files: third_party/mutter-46/* contrib/mutter-46-lock-state/*
+Copyright: GNOME Mutter contributors and Debian/Ubuntu packagers
+License: GPL-2.0-or-later
+ The bundled Mutter packages and their patches retain their upstream
+ licenses and per-file notices. The complete corresponding source,
+ including Debian copyright information and build scripts, is included
+ in the installed documentation source archive. The original rollback
+ source is reconstructed by reversing the included packaging/source patch.
+ .
+ On Debian systems the complete GPL version 2 text is available at
+ /usr/share/common-licenses/GPL-2.

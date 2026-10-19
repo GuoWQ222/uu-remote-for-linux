@@ -63,7 +63,9 @@ jobs:
           dpkg-deb -x "$package" "$stage"
           test -x "$stage/usr/bin/uu-remote-for-linux"
           test -x "$stage/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture"
-          test -z "$(find "$stage" -type f -iname '*mutter*' -o -iname '*keyring*')"
+          test ! -e "$stage/usr/lib/x86_64-linux-gnu/libmutter-14.so.0"
+          test ! -e "$stage/usr/share/keyrings"
+          python3 tests/mutter-payload.py "$stage"
           dpkg-deb --contents "$package" > dist/CONTENTS.txt
           (cd dist && sha256sum --strict -c SHA256SUMS)
 

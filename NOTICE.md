@@ -33,9 +33,13 @@ CUVID/NVENC source archive are documented in `third_party/HWDECODE.md`.
 The optional Mutter 46 keyboard-state backport under
 `contrib/mutter-46-lock-state` derives from GNOME Mutter and Ubuntu's Debian
 packaging. It retains GPL-2.0-or-later, upstream per-file notices and the
-included `COPYING`; it is not covered by the wrapper's 0BSD license. Matching
-Ubuntu runtime packages are separate optional release assets. Complete
-corresponding source, including Debian build scripts and licenses, is
-published beside those packages as `mutter-46.2-pjlablock3-source.tar.xz`.
-See that directory's `SOURCE.json` and README for exact revisions and build
-instructions. The universal UU Debian package does not contain Mutter.
+included `COPYING`; it is not covered by the wrapper's 0BSD license. The
+universal DEB carries four patched and four original rollback packages as
+inert, version-checked payloads under its private runtime directory. Complete
+corresponding source, including Debian build scripts and licenses, is shipped
+in `/usr/share/doc/uu-remote-for-linux/source/mutter-46.2-pjlablock3-source.tar.xz`.
+The complete source for the original rollback packages can be reconstructed
+by reversing the included source/packaging patch on that archive. See
+`contrib/mutter-46-lock-state/SOURCE.json` and README for exact revisions,
+licenses and build instructions. The outer DEB never directly overwrites
+system compositor files; activation is a separate, opt-in APT transaction.
