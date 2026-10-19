@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [1.1.43] - 2026-10-18
 
+- Read Caps Lock and Num Lock from Mutter on GNOME Wayland, including
+  when a native Wayland application has focus. Keep the read-only observer
+  separate from input injection and treat unavailable native state as
+  unknown instead of publishing a stale XWayland value. Add regression
+  coverage and document optional Rime left-Shift / Caps Lock settings and
+  recovery steps for inconsistent desktop lock state.
 - Restore the actual UU home after tray activation. Check that a controller
   process still owns the fresh heartbeat, initialize missing backends when
   activation leaves only a splash, and report failure if no real home appears.
