@@ -53,6 +53,8 @@ uu-remote-for-linux
 
 无需添加软件源或安装公钥。首次启动时，接受网易[官方协议](https://uuyc.163.com/contact/20240402/40294_1146065.html)即可安装客户端与 WebView2。
 
+**Ubuntu 24.04 GNOME Wayland 大小写反向问题：**1.1.43 同时提供[可选的 Mutter 46 根因修复](contrib/mutter-46-lock-state/README.md)、匹配的系统包和完整源码。该独立组件仅适用于 amd64、Mutter `46.2-1ubuntu0.24.04.18`；UU 安装包不会自动安装它。适用条件、完整验收和回退方法见说明。
+
 > [!TIP]
 > 纯终端安装：`uu-remote-for-linux --accept-eula --setup-only`
 

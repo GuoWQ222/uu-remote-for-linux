@@ -29,3 +29,13 @@ The optional NVIDIA hardware codec bridge includes:
 
 Exact revisions, checksums, build details, licenses, and the corresponding
 CUVID/NVENC source archive are documented in `third_party/HWDECODE.md`.
+
+The optional Mutter 46 keyboard-state backport under
+`contrib/mutter-46-lock-state` derives from GNOME Mutter and Ubuntu's Debian
+packaging. It retains GPL-2.0-or-later, upstream per-file notices and the
+included `COPYING`; it is not covered by the wrapper's 0BSD license. Matching
+Ubuntu runtime packages are separate optional release assets. Complete
+corresponding source, including Debian build scripts and licenses, is
+published beside those packages as `mutter-46.2-pjlablock3-source.tar.xz`.
+See that directory's `SOURCE.json` and README for exact revisions and build
+instructions. The universal UU Debian package does not contain Mutter.

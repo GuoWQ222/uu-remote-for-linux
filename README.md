@@ -53,6 +53,8 @@ uu-remote-for-linux
 
 No repository or archive key is required. On first launch, accept NetEase's [official agreement](https://uuyc.163.com/contact/20240402/40294_1146065.html) to install the client and WebView2.
 
+**Caps Lock inversion on Ubuntu 24.04 GNOME Wayland:** v1.1.43 also provides an [optional Mutter 46 root-cause backport](contrib/mutter-46-lock-state/README.md), matching runtime packages and complete source. This separate component targets Mutter `46.2-1ubuntu0.24.04.18` on amd64; the UU package does not install it automatically. See the guide for prerequisites, validation and rollback.
+
 > [!TIP]
 > Terminal-only setup: `uu-remote-for-linux --accept-eula --setup-only`
 

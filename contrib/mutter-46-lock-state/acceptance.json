@@ -1,0 +1,124 @@
+{
+  "verified_at": "2026-10-19T20:36:09+0800",
+  "version": "46.2-1ubuntu0.24.04.18+pjlablock3",
+  "libmutter_sha256": "ebe9c25bf67a4dd454d0d5659b7d73fea69b6cfb2fe406f9dbbf5da0c201fb29",
+  "package_integrity_passed": true,
+  "source_commit": "eaa6a98fda82b04512c9ed05aea322b750965035",
+  "totals": {
+    "key_events": 63806,
+    "caps_toggles": 7360,
+    "text_characters": 23680,
+    "text_checks": 2560,
+    "state_checks": 4196,
+    "ime_cycles": 640,
+    "burst_groups": 320,
+    "monitor_moves": 32,
+    "consumed_events": 856
+  },
+  "pressure_cases": [
+    {
+      "backend": "wayland",
+      "transport": "native",
+      "key_events": 15956,
+      "caps_toggles": 1840,
+      "text_characters": 5920,
+      "text_checks": 640,
+      "state_checks": 1049,
+      "ime_cycles": 160,
+      "burst_groups": 80,
+      "max_settle_seconds": 0.0963109459989937,
+      "monitor_moves": 8,
+      "elapsed_seconds": 107.764,
+      "consumed_events": 214,
+      "passed": true
+    },
+    {
+      "backend": "x11",
+      "transport": "native",
+      "key_events": 15950,
+      "caps_toggles": 1840,
+      "text_characters": 5920,
+      "text_checks": 640,
+      "state_checks": 1049,
+      "ime_cycles": 160,
+      "burst_groups": 80,
+      "max_settle_seconds": 0.09257721699759713,
+      "monitor_moves": 8,
+      "elapsed_seconds": 107.804,
+      "consumed_events": 214,
+      "passed": true
+    },
+    {
+      "backend": "wayland",
+      "transport": "uu-udp",
+      "key_events": 15950,
+      "caps_toggles": 1840,
+      "text_characters": 5920,
+      "text_checks": 640,
+      "state_checks": 1049,
+      "ime_cycles": 160,
+      "burst_groups": 80,
+      "max_settle_seconds": 0.24915775599947665,
+      "monitor_moves": 8,
+      "elapsed_seconds": 181.889,
+      "consumed_events": 214,
+      "passed": true
+    },
+    {
+      "backend": "x11",
+      "transport": "uu-udp",
+      "key_events": 15950,
+      "caps_toggles": 1840,
+      "text_characters": 5920,
+      "text_checks": 640,
+      "state_checks": 1049,
+      "ime_cycles": 160,
+      "burst_groups": 80,
+      "max_settle_seconds": 0.24949371099864948,
+      "monitor_moves": 8,
+      "elapsed_seconds": 182.922,
+      "consumed_events": 214,
+      "passed": true
+    }
+  ],
+  "reconnection_cycles": 12,
+  "desktop_restarts": 2,
+  "automatic_login_restored": true,
+  "passed": true,
+  "acceptance_complete": true,
+  "manual_client_acceptance": {
+    "confirmed": true,
+    "source": "explicit_user_reply",
+    "clients": [
+      "UU Remote",
+      "Sunlogin"
+    ],
+    "application_backends": [
+      "Wayland",
+      "XWayland"
+    ],
+    "checks": [
+      "Caps off/on/off: abc/ABC/abc",
+      "Left Shift Chinese/English",
+      "Client reconnect"
+    ]
+  },
+  "test_conditions": {
+    "displays": "2 x 3840x2160 landscape",
+    "cpu_workers": 8,
+    "animated_displays": 2,
+    "text_errors": 0,
+    "state_errors": 0
+  },
+  "mutter_regression_suites": {
+    "passed": 4,
+    "failed": 0,
+    "suites": [
+      "keybindings",
+      "native-unit",
+      "persistent-virtual-monitor",
+      "wayland-unit"
+    ]
+  },
+  "evidence_scope": "Full private logs retained locally; this public summary excludes authentication material, account data and raw manual input."
+}

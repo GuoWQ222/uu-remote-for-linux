@@ -1,0 +1,16 @@
+{
+  "upstream_project": "https://gitlab.gnome.org/GNOME/mutter",
+  "ubuntu_source_version": "46.2-1ubuntu0.24.04.18",
+  "package_version": "46.2-1ubuntu0.24.04.18+pjlablock3",
+  "architecture": "amd64",
+  "base_source_commit": "58abfd9ddb5d03f2fbf221e15042ffcf8fb9ac9f",
+  "patched_source_commit": "eaa6a98fda82b04512c9ed05aea322b750965035",
+  "upstream_commits": [
+    "aeac0f33c2d06ac356af253ed52c175b48999f92",
+    "1940c6eba938a9413b93694573501153788d1f0f",
+    "7d0d128e005fb737df7a8eea5e472d6c229898e1",
+    "0828fd6169c17ca54633f76936f03ac496f6b01e"
+  ],
+  "license": "GPL-2.0-or-later; retain upstream per-file notices and Debian copyright",
+  "patch_sha256": "d712819f0301a8919fc481c3c63de5ebcb7b3094ead59a33a4a0421249611b67"
+}

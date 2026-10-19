@@ -42,12 +42,22 @@ GNOME Wayland 中，原生 Wayland 窗口聚焦时，XWayland 指示器可能保
 输入桥因此从 Mutter 会话属性读取 Caps Lock 和 Num Lock；查询失败时将状态
 标记为未知并重试，避免用旧值触发额外校正按键。这项修改不自动更改输入法配置。
 
-Rime has a separate Caps Lock event-handling compatibility issue tracked in
-[ibus-rime #171](https://github.com/rime/ibus-rime/issues/171) and fixed
-upstream by [librime #1011](https://github.com/rime/librime/pull/1011).
-Consuming Caps Lock events can leave desktop-reported state and the state
-delivered to applications out of sync. Package versions may contain
-backports: do not diagnose a missing fix from the base version alone.
+The remaining inversion was reproduced with a separate temporary IBus
+engine, even with the prior Rime fix installed. Mutter 46 could maintain
+different native-seat and Wayland keyboard states when an IME consumed lock
+events; correct per-event modifier ordering is required for XWayland too.
+This is not resolved by reading the native state or changing Rime bindings.
+The [optional Mutter 46 backport](https://github.com/GuoWQ222/uu-remote-for-linux/blob/v1.1.43/contrib/mutter-46-lock-state/README.md)
+contains the complete patch, exact supported Ubuntu version, independent
+reproducer, pressure tests, package/source downloads and rollback procedure.
+The universal UU package does not install a replacement compositor.
+
+复发问题已用独立 IBus 测试引擎复现，不能归结为 Rime 单独的缺陷。
+Mutter 46 的重复状态维护和事件顺序才是本次根因；原生状态读取与 Rime 按键
+配置不能代替该修复。1.1.43 提供严格限定 Ubuntu/Mutter 版本的独立系统包及
+完整源码。既有 [ibus-rime #171](https://github.com/rime/ibus-rime/issues/171)
+和 [librime #1011](https://github.com/rime/librime/pull/1011) 不能单独证明
+合成器已修复；发行版也可能回移补丁，不能只看主版本号判断。
 
 若希望左 Shift 切换中英文、Caps Lock 只控制大小写，可把以下项目合并到
 `~/.config/ibus/rime/default.custom.yaml` 的已有 `patch:` 中，然后通过 Rime
@@ -63,8 +73,9 @@ For left Shift to switch Chinese/English and Caps Lock to control letter
 case only, merge the overrides above into the existing Rime customization
 and redeploy. This is an explicit user configuration, not an installation
 default. Removing these two overrides and redeploying restores the prior
-bindings. An existing desktop-state mismatch needs a separate reset; save
-work and log out/in if it persists after changing the binding.
+bindings. Logging out/in may clear an existing mismatch temporarily, but
+does not repair the compositor bug; use the matching root-cause backport
+when the documented platform and reproduction conditions apply.
 
 验收时必须看实际输入：远端英文模式下依次关闭、开启、关闭 Caps Lock，应得到
 `abc`、`ABC`、`abc`，并核对控制端指示状态；再测试左 Shift 切换中文候选与直接
