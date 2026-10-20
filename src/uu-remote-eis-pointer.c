@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
- * Pointer-only sender for an already-authorized Portal ConnectToEIS fd.
- * stdin: A/R/B/S <x> <y>; stdout: READY <x> <y> <w> <h>, then OK/ERROR.
+ * Input sender for an already-authorized Portal ConnectToEIS fd.
+ * stdin: A/R/B/S/K <x> <y>; stdout: READY <x> <y> <w> <h>, then OK/ERROR.
  * Deliberately restricted to one absolute region. No independent socket or
  * desktop authorization is created by this helper.
  */
@@ -22,6 +22,7 @@ struct device_slot {
     bool active;
     uint32_t sequence;
     unsigned int pressed;
+    bool keys[768];
 };
 static struct device_slot devices[MAX_DEVICES];
 static struct ei_device *mapped_device;
@@ -49,7 +50,7 @@ static int dispatch_events(struct ei *context)
         if (type == EI_EVENT_SEAT_ADDED) {
             ei_seat_bind_capabilities(ei_event_get_seat(event),
                 EI_DEVICE_CAP_POINTER, EI_DEVICE_CAP_POINTER_ABSOLUTE,
-                EI_DEVICE_CAP_BUTTON, EI_DEVICE_CAP_SCROLL, NULL);
+                EI_DEVICE_CAP_BUTTON, EI_DEVICE_CAP_SCROLL, EI_DEVICE_CAP_KEYBOARD, NULL);
         } else if (type == EI_EVENT_DEVICE_ADDED) {
             struct ei_device *added = ei_event_get_device(event);
             /* Without a mapping-id match, multiple absolute devices are ambiguous. */
@@ -139,6 +140,17 @@ static bool send_command(struct ei *context, const char *line)
             }
         }
         break;
+    case 'K':
+        if (x < 0 || x > 767 || x != floor(x) || (y != 0 && y != 1))
+            return false;
+        device = find_device(EI_DEVICE_CAP_KEYBOARD);
+        if (device) {
+            ei_device_keyboard_key(device, (uint32_t)x, y != 0);
+            for (size_t i = 0; i < MAX_DEVICES; i++)
+                if (devices[i].device == device)
+                    devices[i].keys[(unsigned int)x] = y != 0;
+        }
+        break;
     case 'S':
         if (x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX ||
             x != floor(x) || y != floor(y))
@@ -187,7 +199,8 @@ int main(int argc, char **argv)
         if (dispatch_events(context) < 0)
             break;
         absolute = find_device(EI_DEVICE_CAP_POINTER_ABSOLUTE);
-        if (!ready && absolute && find_device(EI_DEVICE_CAP_BUTTON)) {
+        if (!ready && absolute && find_device(EI_DEVICE_CAP_BUTTON) &&
+            find_device(EI_DEVICE_CAP_KEYBOARD)) {
             struct ei_region *region = ei_device_get_region(absolute, 0);
             if (!region || ei_device_get_region(absolute, 1) ||
                 !ei_region_get_width(region) || !ei_region_get_height(region))
@@ -246,6 +259,9 @@ out:
                 for (unsigned int button = 0; button < 8; button++)
                     if (devices[i].pressed & (1U << button))
                         ei_device_button_button(devices[i].device, 0x110 + button, false);
+                for (unsigned int key = 0; key < 768; key++)
+                    if (devices[i].keys[key])
+                        ei_device_keyboard_key(devices[i].device, key, false);
                 ei_device_frame(devices[i].device, ei_now(context));
                 ei_device_stop_emulating(devices[i].device);
             }

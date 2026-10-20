@@ -2623,6 +2623,8 @@ class WaylandPortalBackend:
             command = f"R {values[-2]} {values[-1]}"
         elif method == "NotifyPointerButton":
             command = f"B {values[-2]} {values[-1]}"
+        elif method == "NotifyKeyboardKeycode":
+            command = f"K {values[-2]} {values[-1]}"
         elif method == "NotifyPointerAxisDiscrete":
             axis, steps = values[-2:]
             horizontal = steps * 120 if axis else 0

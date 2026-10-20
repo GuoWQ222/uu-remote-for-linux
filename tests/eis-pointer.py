@@ -96,9 +96,12 @@ with tempfile.TemporaryDirectory() as directory:
         expect(peer.events,"B 272 0")
         assert peer.backend._eis_notify("NotifyPointerAxisDiscrete",(None,{},0,-1))
         expect(peer.events,"S 0 -120")
-        assert not peer.backend._eis_notify("NotifyKeyboardKeycode",(None,{},30,1))
+        assert peer.backend._eis_notify("NotifyKeyboardKeycode",(None,{},30,1))
+        expect(peer.events,"K 30 1")
+        peer.command("K 30 0")
+        expect(peer.events,"K 30 0")
         for invalid in ["A 1610 1020","A nan 3","R inf 0","B 30 1",
-                        "B 272 2","B 272.5 1","S 1.5 0","A 20 30 trailing"]:
+                        "K -1 1","K 768 1","K 30 2","B 272 2","B 272.5 1","S 1.5 0","A 20 30 trailing"]:
             peer.command(invalid,False)
         peer.control("d","REMOVED")
         assert peer.client.wait(timeout=4) != 0
@@ -117,6 +120,8 @@ for mode in ("disconnect", "eof", "multiple-regions"):
                 peer.ready()
                 peer.command("B 272 1")
                 expect(peer.events,"B 272 1")
+                peer.command("K 42 1")
+                expect(peer.events,"K 42 1")
                 if mode == "disconnect":
                     peer.server.terminate()
                     peer.server.wait(timeout=4)
@@ -125,6 +130,7 @@ for mode in ("disconnect", "eof", "multiple-regions"):
                     peer.client.stdin.close()
                     assert peer.client.wait(timeout=4) == 0
                     expect(peer.events,"B 272 0")
+                    expect(peer.events,"K 42 0")
         finally:
             peer.close()
     print("PASS EIS",mode)

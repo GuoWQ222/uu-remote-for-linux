@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 static enum eis_device_capability caps[] = {EIS_DEVICE_CAP_POINTER,
-    EIS_DEVICE_CAP_POINTER_ABSOLUTE, EIS_DEVICE_CAP_BUTTON, EIS_DEVICE_CAP_SCROLL};
+    EIS_DEVICE_CAP_POINTER_ABSOLUTE, EIS_DEVICE_CAP_BUTTON, EIS_DEVICE_CAP_SCROLL, EIS_DEVICE_CAP_KEYBOARD};
 int main(int argc, char **argv)
 {
     if (argc != 3) return 2;
@@ -27,7 +27,7 @@ int main(int argc, char **argv)
                 client = eis_client_ref(eis_event_get_client(event));
                 eis_client_connect(client);
                 seat = eis_client_new_seat(client, "test-seat");
-                for (size_t i=0;i<4;i++) eis_seat_configure_capability(seat,caps[i]);
+                for (size_t i=0;i<5;i++) eis_seat_configure_capability(seat,caps[i]);
                 eis_seat_add(seat);
                 break;
             case EIS_EVENT_SEAT_BIND:
@@ -35,7 +35,7 @@ int main(int argc, char **argv)
                 device = eis_seat_new_device(seat);
                 eis_device_configure_type(device,EIS_DEVICE_TYPE_VIRTUAL);
                 eis_device_configure_name(device,"test-pointer");
-                for(size_t i=0;i<4;i++) eis_device_configure_capability(device,caps[i]);
+                for(size_t i=0;i<5;i++) eis_device_configure_capability(device,caps[i]);
                 for(int i=0;i<atoi(argv[2]);i++) {
                     struct eis_region *region=eis_device_new_region(device);
                     eis_region_set_offset(region,10 + 1600*i,20);
@@ -54,6 +54,8 @@ int main(int argc, char **argv)
                 printf("R %.2f %.2f\n",eis_event_pointer_get_dx(event),eis_event_pointer_get_dy(event));break;
             case EIS_EVENT_BUTTON_BUTTON:
                 printf("B %u %d\n",eis_event_button_get_button(event),eis_event_button_get_is_press(event));break;
+            case EIS_EVENT_KEYBOARD_KEY:
+                printf("K %u %d\n",eis_event_keyboard_get_key(event),eis_event_keyboard_get_key_is_press(event));break;
             case EIS_EVENT_SCROLL_DISCRETE:
                 printf("S %d %d\n",eis_event_scroll_get_discrete_dx(event),eis_event_scroll_get_discrete_dy(event));break;
             case EIS_EVENT_CLIENT_DISCONNECT:

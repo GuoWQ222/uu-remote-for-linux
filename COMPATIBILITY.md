@@ -174,7 +174,8 @@ On GNOME Wayland with 200% scaling, iPhone pointer motion can diverge from the
 native cursor and clicks can land at the old cursor position. The opt-in
 `UU_REMOTE_EIS_POINTER=1` path sends pointer motion, buttons and wheel events
 through Portal `ConnectToEIS`, using the existing authorized RemoteDesktop
-session. Keyboard input continues through the Portal D-Bus API.
+session. Keyboard input also uses EIS: Portal disables legacy notification
+methods for the entire session after ConnectToEIS.
 
 The helper uses the compositor's logical EIS region rather than capture buffer
 pixels. It requires exactly one shared monitor and one absolute region, libei
