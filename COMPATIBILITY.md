@@ -197,7 +197,10 @@ Build the helper with `make eis-pointer` (C compiler, pkg-config, libei-dev).
 `tests/eis-pointer.sh` additionally needs libeis-dev; it runs an isolated local
 server and does not inject input into the desktop.
 
-Initial iPhone testing on Ubuntu 26.04.1 / GNOME Wayland, 3200×2000 at 200%,
-reported restored clicking. Precise target testing and reconnect acceptance
-of the cleaned-up implementation remain pending. Multi-monitor, rotation,
-lock/unlock and suspend/resume are not validated.
+iPhone screen-touch mode was tested on Ubuntu 26.04.1 / GNOME Wayland,
+3200×2000 at 200%, with the dc3869a input implementation: two ordered rounds
+of five target clicks and `abc123` keyboard input succeeded. The tester
+confirmed disconnect/reconnect remained functional. Use screen-touch mode
+for tap-at-location testing; mouse-pointer mode must be tested by moving the
+pointer before clicking. Multi-monitor, rotation, lock/unlock, suspend/resume
+and Windows regression with this EIS implementation remain unvalidated.
