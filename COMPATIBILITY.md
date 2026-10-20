@@ -166,3 +166,37 @@ ABI is version-guarded, and its NVIDIA Vulkan-query workaround affects only
 the short-lived helper child. See that directory for exact prerequisites,
 installation, rollback, reproduction evidence and validation boundaries.
 This component is not enabled or installed by the Debian package.
+
+
+### Optional EIS pointer transport (single monitor)
+
+On GNOME Wayland with 200% scaling, iPhone pointer motion can diverge from the
+native cursor and clicks can land at the old cursor position. The opt-in
+`UU_REMOTE_EIS_POINTER=1` path sends pointer motion, buttons and wheel events
+through Portal `ConnectToEIS`, using the existing authorized RemoteDesktop
+session. Keyboard input continues through the Portal D-Bus API.
+
+The helper uses the compositor's logical EIS region rather than capture buffer
+pixels. It requires exactly one shared monitor and one absolute region, libei
+1.1 or later, and a Portal backend supporting ConnectToEIS. The default input
+path is unchanged. If explicitly enabled but unavailable, startup fails with
+an error instead of silently switching pointer transports.
+
+Enable by adding this user service override with
+`systemctl --user edit uu-remote-for-linux-input.service`:
+
+```ini
+[Service]
+Environment=UU_REMOTE_EIS_POINTER=1
+```
+
+Restart the remote session after changing the override; Portal authorization
+may be requested again. Remove the override to return to the default path.
+Build the helper with `make eis-pointer` (C compiler, pkg-config, libei-dev).
+`tests/eis-pointer.sh` additionally needs libeis-dev; it runs an isolated local
+server and does not inject input into the desktop.
+
+Initial iPhone testing on Ubuntu 26.04.1 / GNOME Wayland, 3200×2000 at 200%,
+reported restored clicking. Precise target testing and reconnect acceptance
+of the cleaned-up implementation remain pending. Multi-monitor, rotation,
+lock/unlock and suspend/resume are not validated.
