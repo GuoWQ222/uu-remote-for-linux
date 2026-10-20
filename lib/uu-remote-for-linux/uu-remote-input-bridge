@@ -2469,6 +2469,16 @@ class WaylandPortalBackend:
     def ensure_healthy(self) -> None:
         if self.fake_trace:
             return
+        # A dead EIS sender cannot be recovered by retrying individual packets.
+        # Fail the watch loop so its existing error/cleanup path releases the
+        # Portal session and Restart=on-failure can create a fresh one.
+        eis_process = getattr(self, "_eis", None)
+        if eis_process is not None:
+            returncode = eis_process.poll()
+            if returncode is not None:
+                raise RuntimeError(
+                    f"EIS input helper exited (status={returncode})"
+                )
         if self.capture_callback_error:
             raise RuntimeError(
                 "Wayland 原生 DMA-BUF 共享帧回调失败："

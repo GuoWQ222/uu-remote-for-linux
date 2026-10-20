@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 root = Path(__file__).resolve().parents[1]
 helper = root / "lib/uu-remote-for-linux/uu-remote-eis-pointer"
@@ -59,9 +60,26 @@ class Peer:
         self.backend.streams = [{"width":1600,"height":1000,
                                  "buffer_width":3200,"buffer_height":2000}]
 
+    def health_check(self, exited=False):
+        # Keep capture healthy: input failure alone must fail the bridge,
+        # including with embedded cursors and without another input packet.
+        self.backend.fake_trace = False
+        self.backend.capture_callback_error = None
+        self.backend.capture_transport = module.CAPTURE_TRANSPORT_DMABUF
+        self.backend.capture_native_processes = [SimpleNamespace(poll=lambda: None)]
+        self.backend.portal_cursor_mode = module.PORTAL_CURSOR_EMBEDDED
+        try:
+            self.backend.ensure_healthy()
+        except RuntimeError as error:
+            assert exited and "EIS" in str(error), str(error)
+            assert str(self.client.returncode) in str(error), str(error)
+        else:
+            assert not exited, "dead EIS helper still reported healthy"
+
     def ready(self):
         assert self.backend._eis_line(4) == "READY 10 20 1600 1000"
         expect(self.events, "START")
+        self.health_check()
 
     def command(self, command, accepted=True):
         self.client.stdin.write((command + "\n").encode())
@@ -74,6 +92,7 @@ class Peer:
 
     def close(self):
         self.backend._stop_eis_pointer()
+        self.health_check()  # Disabled EIS leaves the legacy health path intact.
         if self.server.poll() is None:
             self.server.stdin.write(b"q")
         self.server.wait(timeout=4)
@@ -106,6 +125,7 @@ with tempfile.TemporaryDirectory() as directory:
         peer.control("d","REMOVED")
         assert peer.client.wait(timeout=4) != 0
         expect(peer.events,"DISCONNECTED")
+        peer.health_check(exited=True)
     finally:
         peer.close()
 print("PASS EIS pointer coordinates, buttons, scroll, validation, removal")
@@ -126,11 +146,13 @@ for mode in ("disconnect", "eof", "multiple-regions"):
                     peer.server.terminate()
                     peer.server.wait(timeout=4)
                     assert peer.client.wait(timeout=4) != 0
+                    peer.health_check(exited=True)
                 else:
                     peer.client.stdin.close()
                     assert peer.client.wait(timeout=4) == 0
                     expect(peer.events,"B 272 0")
                     expect(peer.events,"K 42 0")
+                    peer.health_check(exited=True)
         finally:
             peer.close()
     print("PASS EIS",mode)
