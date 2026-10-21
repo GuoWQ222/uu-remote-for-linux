@@ -204,3 +204,24 @@ confirmed disconnect/reconnect remained functional. Use screen-touch mode
 for tap-at-location testing; mouse-pointer mode must be tested by moving the
 pointer before clicking. Multi-monitor, rotation, lock/unlock, suspend/resume
 and Windows regression with this EIS implementation remain unvalidated.
+
+### Wayland exit lifecycle regression (2026-10-21)
+
+On Ubuntu 26.04.1 / GNOME Wayland, UU 4.43.1.3614 can withdraw its
+main window on Dock Quit while its controller remains alive, even when
+Settings → General → Close window is set to exit the main program. The
+native tray now honors that setting after a sustained window withdrawal
+and stops the background services and Portal capture. Minimize remains
+active; close-to-background mode is unchanged. The setting is not changed
+automatically by this patch.
+
+Native pointer testing verified titlebar minimize preserves input after
+12 seconds (ICCCM IconicState), followed by Dock right-click → Quit stopping
+all UU units and removing the Mutter RemoteDesktop/ScreenCast sessions.
+The installed Intel capture helpers were retained.
+
+A desktop-ended Portal session now exits the input bridge successfully,
+so Restart=on-failure does not immediately reacquire sharing. Independent
+EIS helper failure still exits nonzero. Isolated D-Bus tests cover the
+Closed signal, removed-session/EOF race, exit status and cleanup; tray
+tests cover process identity, withdrawal, minimization and background mode.

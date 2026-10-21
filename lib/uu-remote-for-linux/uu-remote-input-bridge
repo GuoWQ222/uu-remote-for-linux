@@ -1000,6 +1000,10 @@ class PortalRequestError(RuntimeError):
     """A denied, cancelled, or failed desktop-portal request."""
 
 
+class PortalSessionClosed(RuntimeError):
+    """The desktop ended this authorization; do not automatically reacquire it."""
+
+
 class WaylandCaptureStartupError(RuntimeError):
     """Portal authorization succeeded, but its capture transport did not."""
 
@@ -1066,6 +1070,8 @@ class WaylandPortalBackend:
         # permanently restored only the first selected monitor.
         self.restore_token_path = state_dir / "wayland-portal-restore-token-v2"
         self.session_handle = ""
+        self._portal_closed = False
+        self._portal_closed_subscription = 0
         self.streams: list[dict[str, Any]] = []
         self.stream_node = 0
         self.stream_width = 1
@@ -1612,6 +1618,10 @@ class WaylandPortalBackend:
         self.session_handle = str(result.get("session_handle", ""))
         if not self.session_handle:
             raise PortalRequestError("桌面门户未返回会话句柄")
+        self._portal_closed_subscription = self.connection.signal_subscribe(
+            PORTAL_BUS_NAME, PORTAL_SESSION, "Closed", self.session_handle,
+            None, self.Gio.DBusSignalFlags.NONE, self._on_portal_closed, None,
+        )
 
         restore_token = self._restore_token()
         device_options = {
@@ -2466,9 +2476,41 @@ class WaylandPortalBackend:
         self._start_capture_pipeline()
         self.capture_state = "active"
 
+    def _on_portal_closed(self, *_args) -> None:
+        self._portal_closed = True
+
+    def _check_portal_session(self, probe: bool = False) -> None:
+        if getattr(self, "_portal_closed_subscription", 0):
+            # The watch loop is socket-based; dispatch Portal signals even
+            # when the controller sends no input. Do this before helper checks.
+            context = self.GLib.MainContext.default()
+            for _ in range(64):
+                if not context.pending():
+                    break
+                context.iteration(False)
+            if probe and not self._portal_closed:
+                try:
+                    self.connection.call_sync(
+                        PORTAL_BUS_NAME, self.session_handle,
+                        "org.freedesktop.DBus.Properties", "GetAll",
+                        self.GLib.Variant("(s)", (PORTAL_SESSION,)), None,
+                        self.Gio.DBusCallFlags.NONE, 2000, None,
+                    )
+                except self.GLib.Error as error:
+                    # Helper EOF may arrive before Closed is dispatched.
+                    # A vanished session must not be treated as helper failure.
+                    if self.Gio.DBusError.get_remote_error(error) in (
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        "org.freedesktop.DBus.Error.UnknownObject",
+                    ):
+                        self._portal_closed = True
+        if getattr(self, "_portal_closed", False):
+            raise PortalSessionClosed("桌面已结束屏幕共享；需要重新启动 UU 才会再次申请")
+
     def ensure_healthy(self) -> None:
         if self.fake_trace:
             return
+        self._check_portal_session()
         # A dead EIS sender cannot be recovered by retrying individual packets.
         # Fail the watch loop so its existing error/cleanup path releases the
         # Portal session and Restart=on-failure can create a fresh one.
@@ -2476,10 +2518,12 @@ class WaylandPortalBackend:
         if eis_process is not None:
             returncode = eis_process.poll()
             if returncode is not None:
+                self._check_portal_session(probe=True)
                 raise RuntimeError(
                     f"EIS input helper exited (status={returncode})"
                 )
         if self.capture_callback_error:
+            self._check_portal_session(probe=True)
             raise RuntimeError(
                 "Wayland 原生 DMA-BUF 共享帧回调失败："
                 + self.capture_callback_error
@@ -2501,6 +2545,7 @@ class WaylandPortalBackend:
                     + ",".join(stopped)
                 )
         if transport_error:
+            self._check_portal_session(probe=True)
             raise RuntimeError(transport_error)
         if getattr(
             self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
@@ -2677,6 +2722,11 @@ class WaylandPortalBackend:
             except Exception as error:
                 errors.append(f"{label}: {error}")
 
+        subscription = getattr(self, "_portal_closed_subscription", 0)
+        if subscription and self.connection is not None:
+            self._portal_closed_subscription = 0
+            cleanup("取消 Portal 会话监听",
+                    lambda: self.connection.signal_unsubscribe(subscription))
         cleanup("关闭 EIS 输入", self._stop_eis_pointer)
         if self.fake_trace:
             cleanup("测试轨迹", lambda: self._fake_write("close"))
@@ -2725,6 +2775,7 @@ class WaylandPortalBackend:
             )
         if (
             not self.fake_trace
+            and not getattr(self, "_portal_closed", False)
             and self.session_handle
             and self.connection is not None
         ):
@@ -4175,6 +4226,11 @@ def watch(
                     ),
                 )
                 last_status = now
+        return 0
+    except PortalSessionClosed as error:
+        capture_state = "stopped"
+        logger.write(str(error))
+        publish_status("stopped", str(error))
         return 0
     except Exception as error:
         # Runtime failures and capture-start failures after authorization must
