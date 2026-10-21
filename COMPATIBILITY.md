@@ -166,3 +166,62 @@ ABI is version-guarded, and its NVIDIA Vulkan-query workaround affects only
 the short-lived helper child. See that directory for exact prerequisites,
 installation, rollback, reproduction evidence and validation boundaries.
 This component is not enabled or installed by the Debian package.
+
+
+### Optional EIS pointer transport (single monitor)
+
+On GNOME Wayland with 200% scaling, iPhone pointer motion can diverge from the
+native cursor and clicks can land at the old cursor position. The opt-in
+`UU_REMOTE_EIS_POINTER=1` path sends pointer motion, buttons and wheel events
+through Portal `ConnectToEIS`, using the existing authorized RemoteDesktop
+session. Keyboard input also uses EIS: Portal disables legacy notification
+methods for the entire session after ConnectToEIS.
+
+The helper uses the compositor's logical EIS region rather than capture buffer
+pixels. It requires exactly one shared monitor and one absolute region, libei
+1.1 or later, and a Portal backend supporting ConnectToEIS. The default input
+path is unchanged. If explicitly enabled but unavailable, startup fails with
+an error instead of silently switching pointer transports.
+
+Enable by adding this user service override with
+`systemctl --user edit uu-remote-for-linux-input.service`:
+
+```ini
+[Service]
+Environment=UU_REMOTE_EIS_POINTER=1
+```
+
+Restart the remote session after changing the override; Portal authorization
+may be requested again. Remove the override to return to the default path.
+Build the helper with `make eis-pointer` (C compiler, pkg-config, libei-dev).
+`tests/eis-pointer.sh` additionally needs libeis-dev; it runs an isolated local
+server and does not inject input into the desktop.
+
+iPhone screen-touch mode was tested on Ubuntu 26.04.1 / GNOME Wayland,
+3200×2000 at 200%, with the dc3869a input implementation: two ordered rounds
+of five target clicks and `abc123` keyboard input succeeded. The tester
+confirmed disconnect/reconnect remained functional. Use screen-touch mode
+for tap-at-location testing; mouse-pointer mode must be tested by moving the
+pointer before clicking. Multi-monitor, rotation, lock/unlock, suspend/resume
+and Windows regression with this EIS implementation remain unvalidated.
+
+### Wayland exit lifecycle regression (2026-10-21)
+
+On Ubuntu 26.04.1 / GNOME Wayland, UU 4.43.1.3614 can withdraw its
+main window on Dock Quit while its controller remains alive, even when
+Settings → General → Close window is set to exit the main program. The
+native tray now honors that setting after a sustained window withdrawal
+and stops the background services and Portal capture. Minimize remains
+active; close-to-background mode is unchanged. The setting is not changed
+automatically by this patch.
+
+Native pointer testing verified titlebar minimize preserves input after
+12 seconds (ICCCM IconicState), followed by Dock right-click → Quit stopping
+all UU units and removing the Mutter RemoteDesktop/ScreenCast sessions.
+The installed Intel capture helpers were retained.
+
+A desktop-ended Portal session now exits the input bridge successfully,
+so Restart=on-failure does not immediately reacquire sharing. Independent
+EIS helper failure still exits nonzero. Isolated D-Bus tests cover the
+Closed signal, removed-session/EOF race, exit status and cleanup; tray
+tests cover process identity, withdrawal, minimization and background mode.

@@ -1000,6 +1000,10 @@ class PortalRequestError(RuntimeError):
     """A denied, cancelled, or failed desktop-portal request."""
 
 
+class PortalSessionClosed(RuntimeError):
+    """The desktop ended this authorization; do not automatically reacquire it."""
+
+
 class WaylandCaptureStartupError(RuntimeError):
     """Portal authorization succeeded, but its capture transport did not."""
 
@@ -1066,6 +1070,8 @@ class WaylandPortalBackend:
         # permanently restored only the first selected monitor.
         self.restore_token_path = state_dir / "wayland-portal-restore-token-v2"
         self.session_handle = ""
+        self._portal_closed = False
+        self._portal_closed_subscription = 0
         self.streams: list[dict[str, Any]] = []
         self.stream_node = 0
         self.stream_width = 1
@@ -1114,6 +1120,8 @@ class WaylandPortalBackend:
             "UU_REMOTE_WAYLAND_CAPTURE_TEST_VIDEO", ""
         )
         self.connection = None
+        self._eis = None
+        self._eis_region = None
         self.x11 = None
         self.display = None
         self._xkb_get_indicator_state = None
@@ -1172,6 +1180,12 @@ class WaylandPortalBackend:
         self._configure_x11_keymap()
         self._authorize()
         self._start_capture_or_raise()
+        if os.environ.get("UU_REMOTE_EIS_POINTER") == "1":
+            try:
+                self._start_eis_pointer()
+            except Exception:
+                self.close()
+                raise
 
     def _start_capture_or_raise(self) -> None:
         try:
@@ -1604,6 +1618,10 @@ class WaylandPortalBackend:
         self.session_handle = str(result.get("session_handle", ""))
         if not self.session_handle:
             raise PortalRequestError("桌面门户未返回会话句柄")
+        self._portal_closed_subscription = self.connection.signal_subscribe(
+            PORTAL_BUS_NAME, PORTAL_SESSION, "Closed", self.session_handle,
+            None, self.Gio.DBusSignalFlags.NONE, self._on_portal_closed, None,
+        )
 
         restore_token = self._restore_token()
         device_options = {
@@ -1887,9 +1905,8 @@ class WaylandPortalBackend:
                         raise RuntimeError(
                             "原生 DMA-BUF 捕获辅助进程返回了无效通知"
                         )
-                    # The helper stages logical pixels; pointer injection
-                    # needs the producer's buffer size (see
-                    # stream_buffer_point).
+                    # Record producer pixel dimensions independently of the
+                    # Portal coordinate domain used for pointer injection.
                     stream["buffer_width"] = buffer_width
                     stream["buffer_height"] = buffer_height
                     offset = slot * frame_size
@@ -2459,10 +2476,54 @@ class WaylandPortalBackend:
         self._start_capture_pipeline()
         self.capture_state = "active"
 
+    def _on_portal_closed(self, *_args) -> None:
+        self._portal_closed = True
+
+    def _check_portal_session(self, probe: bool = False) -> None:
+        if getattr(self, "_portal_closed_subscription", 0):
+            # The watch loop is socket-based; dispatch Portal signals even
+            # when the controller sends no input. Do this before helper checks.
+            context = self.GLib.MainContext.default()
+            for _ in range(64):
+                if not context.pending():
+                    break
+                context.iteration(False)
+            if probe and not self._portal_closed:
+                try:
+                    self.connection.call_sync(
+                        PORTAL_BUS_NAME, self.session_handle,
+                        "org.freedesktop.DBus.Properties", "GetAll",
+                        self.GLib.Variant("(s)", (PORTAL_SESSION,)), None,
+                        self.Gio.DBusCallFlags.NONE, 2000, None,
+                    )
+                except self.GLib.Error as error:
+                    # Helper EOF may arrive before Closed is dispatched.
+                    # A vanished session must not be treated as helper failure.
+                    if self.Gio.DBusError.get_remote_error(error) in (
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        "org.freedesktop.DBus.Error.UnknownObject",
+                    ):
+                        self._portal_closed = True
+        if getattr(self, "_portal_closed", False):
+            raise PortalSessionClosed("桌面已结束屏幕共享；需要重新启动 UU 才会再次申请")
+
     def ensure_healthy(self) -> None:
         if self.fake_trace:
             return
+        self._check_portal_session()
+        # A dead EIS sender cannot be recovered by retrying individual packets.
+        # Fail the watch loop so its existing error/cleanup path releases the
+        # Portal session and Restart=on-failure can create a fresh one.
+        eis_process = getattr(self, "_eis", None)
+        if eis_process is not None:
+            returncode = eis_process.poll()
+            if returncode is not None:
+                self._check_portal_session(probe=True)
+                raise RuntimeError(
+                    f"EIS input helper exited (status={returncode})"
+                )
         if self.capture_callback_error:
+            self._check_portal_session(probe=True)
             raise RuntimeError(
                 "Wayland 原生 DMA-BUF 共享帧回调失败："
                 + self.capture_callback_error
@@ -2484,6 +2545,7 @@ class WaylandPortalBackend:
                     + ",".join(stopped)
                 )
         if transport_error:
+            self._check_portal_session(probe=True)
             raise RuntimeError(transport_error)
         if getattr(
             self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
@@ -2540,10 +2602,104 @@ class WaylandPortalBackend:
                 "Wayland 分支需要 XWayland DISPLAY 承载 Wine 客户端"
             )
 
+    def _eis_line(self, timeout: float = 2.0) -> str:
+        deadline = time.monotonic() + timeout
+        line = bytearray()
+        while len(line) < 256:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select(
+                [self._eis.stdout], [], [], remaining
+            )[0]:
+                raise RuntimeError("EIS pointer response timed out")
+            byte = os.read(self._eis.stdout.fileno(), 1)
+            if not byte:
+                raise RuntimeError("EIS pointer disconnected")
+            if byte == b"\n":
+                return line.decode("ascii")
+            line.extend(byte)
+        raise RuntimeError("EIS pointer response exceeded limit")
+
+    def _stop_eis_pointer(self) -> None:
+        process = getattr(self, "_eis", None)
+        if process is None:
+            return
+        self._eis = None
+        try:
+            process.stdin.close()
+        finally:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            finally:
+                process.stdout.close()
+
+    def _start_eis_pointer(self) -> None:
+        if len(self.streams) != 1:
+            raise RuntimeError("EIS pointer currently requires one monitor")
+        helper = Path(__file__).with_name("uu-remote-eis-pointer")
+        if not os.access(helper, os.X_OK):
+            raise RuntimeError("EIS pointer helper is missing or not executable")
+        reply, descriptors = self.connection.call_with_unix_fd_list_sync(
+            PORTAL_BUS_NAME, PORTAL_OBJECT_PATH, PORTAL_REMOTE_DESKTOP,
+            "ConnectToEIS", self.GLib.Variant("(oa{sv})", (self.session_handle, {})),
+            None, self.Gio.DBusCallFlags.NONE, 5000, None, None,
+        )
+        fd = descriptors.get(reply.unpack()[0])
+        try:
+            self._eis = subprocess.Popen(
+                [str(helper), str(fd)], pass_fds=(fd,),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+            )
+        finally:
+            os.close(fd)
+        ready = self._eis_line(5).split()
+        if len(ready) != 5 or ready[0] != "READY":
+            raise RuntimeError("EIS pointer did not advertise a valid region")
+        region = tuple(map(int, ready[1:]))
+        if min(region[:2]) < 0 or not all(
+            0 < value <= FRAME_MAX_DIMENSION for value in region[2:]
+        ):
+            raise RuntimeError("EIS pointer region is out of range")
+        self._eis_region = region
+        print(f"EIS pointer ready: region={region}", file=sys.stderr, flush=True)
+
+    def _eis_notify(self, method: str, values) -> bool:
+        if getattr(self, "_eis", None) is None:
+            return False
+        if method == "NotifyPointerMotionAbsolute":
+            stream = self.streams[0]
+            ox, oy, width, height = self._eis_region
+            x = ox + values[-2] * width / stream["width"]
+            y = oy + values[-1] * height / stream["height"]
+            command = f"A {x} {y}"
+        elif method == "NotifyPointerMotion":
+            command = f"R {values[-2]} {values[-1]}"
+        elif method == "NotifyPointerButton":
+            command = f"B {values[-2]} {values[-1]}"
+        elif method == "NotifyKeyboardKeycode":
+            command = f"K {values[-2]} {values[-1]}"
+        elif method == "NotifyPointerAxisDiscrete":
+            axis, steps = values[-2:]
+            horizontal = steps * 120 if axis else 0
+            vertical = steps * 120 if not axis else 0
+            command = f"S {horizontal} {vertical}"
+        else:
+            return False
+        self._eis.stdin.write((command + "\n").encode("ascii"))
+        self._eis.stdin.flush()
+        response = self._eis_line()
+        if response != "OK":
+            raise RuntimeError(response)
+        return True
+
     def _notify(self, method: str, signature: str, values) -> None:
         if self.fake_trace:
             rendered = " ".join(str(value) for value in values[2:])
             self._fake_write(f"{method} {rendered}".rstrip())
+            return
+        if self._eis_notify(method, values):
             return
         self.connection.call_sync(
             PORTAL_BUS_NAME,
@@ -2566,6 +2722,12 @@ class WaylandPortalBackend:
             except Exception as error:
                 errors.append(f"{label}: {error}")
 
+        subscription = getattr(self, "_portal_closed_subscription", 0)
+        if subscription and self.connection is not None:
+            self._portal_closed_subscription = 0
+            cleanup("取消 Portal 会话监听",
+                    lambda: self.connection.signal_unsubscribe(subscription))
+        cleanup("关闭 EIS 输入", self._stop_eis_pointer)
         if self.fake_trace:
             cleanup("测试轨迹", lambda: self._fake_write("close"))
         self.capture_state = "stopped"
@@ -2613,6 +2775,7 @@ class WaylandPortalBackend:
             )
         if (
             not self.fake_trace
+            and not getattr(self, "_portal_closed", False)
             and self.session_handle
             and self.connection is not None
         ):
@@ -2787,7 +2950,12 @@ class WaylandPortalBackend:
             if self.last_absolute_pointer == pointer_key and actual_is_target:
                 self.pointer_motion_suppressed += 1
                 return
-            stream_x, stream_y = stream_buffer_point(target, x, y)
+            if getattr(self, "_eis", None) is not None:
+                # EIS regions use logical coordinates, independently of the
+                # producer buffer dimensions used by the legacy D-Bus path.
+                stream_x, stream_y = float(x), float(y)
+            else:
+                stream_x, stream_y = stream_buffer_point(target, x, y)
             self._notify(
                 "NotifyPointerMotionAbsolute",
                 "(oa{sv}udd)",
@@ -4058,6 +4226,11 @@ def watch(
                     ),
                 )
                 last_status = now
+        return 0
+    except PortalSessionClosed as error:
+        capture_state = "stopped"
+        logger.write(str(error))
+        publish_status("stopped", str(error))
         return 0
     except Exception as error:
         # Runtime failures and capture-start failures after authorization must

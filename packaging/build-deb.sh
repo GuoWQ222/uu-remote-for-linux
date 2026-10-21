@@ -55,6 +55,7 @@ readonly output_file="$output_dir/${artifact_name}_${version}_${arch}.deb"
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-frame-helper.so" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-capture" &&
     -x "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" &&
+    -x "$project_root/lib/uu-remote-for-linux/uu-remote-eis-pointer" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-hook.dll" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-input-injector.exe" &&
     -r "$project_root/lib/uu-remote-for-linux/uu-remote-powershell-bridge.exe" &&
@@ -103,6 +104,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-keyboard-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-eis-pointer" \
+    "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-eis-pointer"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$stage_dir/usr/lib/uu-remote-for-linux/uu-remote-input-bridge"
 install -Dm0755 \

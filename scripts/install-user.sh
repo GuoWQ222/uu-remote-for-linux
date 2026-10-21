@@ -81,6 +81,8 @@ install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-encoder-policy"
     "$runtime_target/uu-remote-encoder-policy"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-keyboard-bridge" \
     "$runtime_target/uu-remote-keyboard-bridge"
+install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-eis-pointer" \
+    "$runtime_target/uu-remote-eis-pointer"
 install -Dm0755 "$project_root/lib/uu-remote-for-linux/uu-remote-input-bridge" \
     "$runtime_target/uu-remote-input-bridge"
 install -Dm0755 \
