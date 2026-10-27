@@ -176,6 +176,8 @@ check "keyboard bridge integration" "$project_root/tests/keyboard-bridge.sh"
 check "input bridge integration" "$project_root/tests/input-bridge.sh"
 check "Wayland portal input bridge integration" \
     "$project_root/tests/wayland-input-bridge.sh"
+check "EIS pointer integration" "$project_root/tests/eis-pointer.sh"
+check "Portal session close lifecycle" dbus-run-session -- /usr/bin/python3 "$project_root/tests/portal-session-close.py"
 check "Wine explicit input hook" "$project_root/tests/wine-input-hook.sh"
 check "Wine controller focus stabilizer" \
     "$project_root/tests/wine-focus-hook.sh"

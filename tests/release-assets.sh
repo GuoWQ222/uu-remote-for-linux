@@ -37,6 +37,7 @@ grep -Fq 'xdg-desktop-portal' <<<"$depends"
 grep -Fq 'xdg-desktop-portal-gnome' <<<"$depends"
 grep -Fq 'libpipewire-0.3-0' <<<"$depends"
 grep -Fq 'libegl1' <<<"$depends"
+grep -Fq 'libei1 (>= 1.1)' <<<"$depends"
 if grep -Eq '(^|, )(bash|coreutils|findutils|policykit-1|tar|util-linux)(,|$)' \
     <<<"$depends"; then
     printf 'Debian Depends 不应包含 Essential 包或过时的 policykit-1。\n' >&2
@@ -78,6 +79,7 @@ if grep -Eq -- '--(wayland-keyboard-status|repair-wayland-keyboard|rollback-wayl
 fi
 [[ -x $tmp_dir/package/usr/bin/uu-remote-for-linux ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-input-bridge ]]
+[[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-eis-pointer ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-pipewire-capture ]]
 [[ -x $tmp_dir/package/usr/lib/uu-remote-for-linux/uu-remote-encoder-policy ]]
 [[ $(stat -c %a \
@@ -121,6 +123,7 @@ for native_binary in \
     uu-remote-frame-helper.so \
     uu-remote-nvdec-probe \
     uu-remote-pipewire-capture \
+    uu-remote-eis-pointer \
     uu-remote-pipewire-cursor; do
     if readelf -S \
         "$tmp_dir/package/usr/lib/uu-remote-for-linux/$native_binary" | \

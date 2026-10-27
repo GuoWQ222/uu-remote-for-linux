@@ -598,9 +598,49 @@ with tempfile.TemporaryDirectory() as prefix:
         with mock.patch.object(Path, "read_text", mapped_controller):
             assert child.pid in namespace["controller_processes"](prefix)
             assert child.pid not in namespace["controller_processes"](prefix + "-other")
+            globals_ = namespace["controller_processes"].__globals__
+            original_arguments = globals_["process_arguments"]
+            try:
+                globals_["process_arguments"] = lambda pid: (["source=system", "idle", "process", controller_id] if pid == child.pid else original_arguments(pid))
+                assert child.pid in namespace["controller_processes"](prefix)
+                assert child.pid not in namespace["controller_processes"](prefix + "-other")
+            finally:
+                globals_["process_arguments"] = original_arguments
     finally:
         child.terminate()
         child.wait()
+
+# Exit-on-close observes withdrawn home windows, never minimized ones.
+with tempfile.TemporaryDirectory() as prefix:
+    setting = Path(prefix) / "drive_c/users/test/AppData/Local/GameViewer/setting.ini"
+    setting.parent.mkdir(parents=True)
+    setting.write_text("[settingCenter]\nCloseOption=1\n")
+    probe = proxy_class.__new__(proxy_class)
+    probe.prefix = prefix
+    class HomeX11:
+        pid_atom = 1
+        wm_state_atom = 2
+        state = 0
+        def windows(self): return [10]
+        def window_title(self, _window): return "网易UU远程"
+        def property_first_cardinal(self, _window, atom):
+            return 42 if atom == self.pid_atom else self.state
+    probe.x11 = HomeX11()
+    globals_ = namespace["controller_processes"].__globals__
+    original = globals_["controller_processes"]
+    try:
+        globals_["controller_processes"] = lambda _prefix: {42}
+        assert not probe.home_window_withdrawn()  # not shown yet
+        probe.x11.state = 1
+        assert not probe.home_window_withdrawn()
+        probe.x11.state = 3
+        assert not probe.home_window_withdrawn()  # minimized
+        probe.x11.state = 0
+        assert probe.home_window_withdrawn()
+        setting.write_text("[settingCenter]\nCloseOption=0\n")
+        assert not probe.home_window_withdrawn()  # background mode
+    finally:
+        globals_["controller_processes"] = original
 
 # Controller recovery must not SIGKILL a different process that reused the
 # controller PID after the graceful termination request.
@@ -735,6 +775,32 @@ with tempfile.TemporaryDirectory() as prefix:
 
     setting.write_text("[settingCenter]\nCloseOption=0\n")
     assert not namespace["exit_on_close_enabled"](prefix)
+
+    # Dock Quit ends the controller even when window-close means hide-to-tray.
+    # An explicit quit marker and actual process disappearance both need full
+    # cleanup; a still-running, hidden controller must remain available.
+    globals_ = monitor.periodic_check.__globals__
+    original_controllers = globals_["controller_processes"]
+    monitor.write_status = lambda *_args: None
+    monitor.consume_client_quit_event = lambda: False
+    monitor.client_missing_ticks = 0
+    exits.clear()
+    try:
+        globals_["controller_processes"] = lambda _prefix: {1234}
+        assert monitor.periodic_check()
+        assert not exits
+        globals_["controller_processes"] = lambda _prefix: set()
+        for _ in range(namespace["CLIENT_MISSING_GRACE_TICKS"] - 1):
+            assert monitor.periodic_check()
+        assert not monitor.periodic_check()
+        assert len(exits) == 1
+        exits.clear()
+        monitor.consume_client_quit_event = lambda: True
+        globals_["controller_processes"] = lambda _prefix: {1234}
+        assert not monitor.periodic_check()
+        assert len(exits) == 1
+    finally:
+        globals_["controller_processes"] = original_controllers
 
 with tempfile.TemporaryDirectory() as prefix, tempfile.TemporaryDirectory() as state:
     recovery = proxy_class.__new__(proxy_class)

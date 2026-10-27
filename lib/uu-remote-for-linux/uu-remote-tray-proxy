@@ -795,8 +795,8 @@ def controller_processes(prefix: str) -> set[int]:
     """Return the real Qt controller PIDs for one Wine prefix.
 
     UU rewrites its controller command line to ``source=start.exe <uuid>``
-    (or ``source= <uuid>`` for direct client launches). For the empty-source
-    form, also require the actual controller image to be mapped; the prefix
+    (or ``source= <uuid>`` / ``source=system idle process <uuid>``).
+    For these direct-launch forms, also require the actual controller image to be mapped; the prefix
     and a generic source token alone do not prove a process's identity.
     """
 
@@ -808,15 +808,14 @@ def controller_processes(prefix: str) -> set[int]:
         if pid in result or not process_matches_prefix(pid, prefix):
             continue
         arguments = process_arguments(pid)
-        if (
-            len(arguments) == 2
-            and arguments[0].casefold() in {"source=start.exe", "source="}
-        ):
+        source_tokens = [argument.casefold() for argument in arguments[:-1]]
+        if source_tokens in (["source=start.exe"], ["source="],
+                             ["source=system", "idle", "process"]):
             try:
-                uuid.UUID(arguments[1])
+                uuid.UUID(arguments[-1])
             except ValueError:
                 continue
-            if arguments[0].casefold() == "source=":
+            if source_tokens != ["source=start.exe"]:
                 expected_image = canonical_path(
                     str(Path(prefix) / "drive_c/Program Files/Netease/GameViewer/bin/GameViewer.exe")
                 )
@@ -2184,6 +2183,28 @@ class TrayProxy:
         self.removed_icons += removed
         return removed
 
+    def home_window_withdrawn(self) -> bool:
+        """Notice close-to-hidden only when the user selected exit on close.
+
+        ICCCM IconicState (3) is minimization, not an exit. Require a previously
+        managed home window and a grace period in periodic_check; initial
+        startup and temporary repaint/unmap must not terminate the client.
+        """
+        x11 = getattr(self, "x11", None)
+        if x11 is None or not exit_on_close_enabled(self.prefix):
+            self.home_window_seen = False
+            return False
+        pids = controller_processes(self.prefix)
+        for window in x11.windows():
+            if x11.property_first_cardinal(window, x11.pid_atom) not in pids:
+                continue
+            if not is_home_window_title(x11.window_title(window)):
+                continue
+            if x11.property_first_cardinal(window, x11.wm_state_atom) in (1, 3):
+                self.home_window_seen = True
+                return False
+        return getattr(self, "home_window_seen", False)
+
     def periodic_check(self) -> bool:
         removed = self.remove_legacy_icons()
         self.refresh_controlled_monitor_menu()
@@ -2230,12 +2251,19 @@ class TrayProxy:
         recovery_grace = time.monotonic() < getattr(
             self, "controller_recovery_grace_until", 0.0
         )
+        if (not decoder_workflow_running and not recovery_grace
+                and not update_handoff and self.home_window_withdrawn()):
+            self.home_withdrawn_ticks = getattr(self, "home_withdrawn_ticks", 0) + 1
+        else:
+            self.home_withdrawn_ticks = 0
+        if self.home_withdrawn_ticks >= CLIENT_MISSING_GRACE_TICKS:
+            self.request_full_exit("退出模式下主窗口已关闭，正在清理后台与屏幕共享")
+            return False
         if (
             client_quit
             and not decoder_workflow_running
             and not recovery_grace
             and not update_handoff
-            and exit_on_close_enabled(self.prefix)
         ):
             logging.info(
                 "检测到退出主程序完成事件，清理 Wine 残留进程与原生托盘"
@@ -2257,17 +2285,11 @@ class TrayProxy:
             self.ever_saw_client
             and self.client_missing_ticks >= CLIENT_MISSING_GRACE_TICKS
         ):
-            if exit_on_close_enabled(self.prefix):
-                logging.info(
-                    "退出模式下客户端进程已消失，清理 Wine 前缀与原生托盘"
-                )
-                self.request_full_exit(
-                    "退出模式下客户端进程已结束，正在清理后台"
-                )
-                return False
-            logging.info("UU 客户端已退出，结束原生托盘代理")
-            self.write_status("stopped", "UU 客户端已退出")
-            self.Gtk.main_quit()
+            # CloseOption governs hiding a live window, not leaving services
+            # behind after the controller process has actually disappeared.
+            # Update/decoder/recovery handoffs above retain their grace period.
+            logging.info("客户端进程已退出，清理后台服务与屏幕共享")
+            self.request_full_exit("客户端已退出，正在清理后台与屏幕共享")
             return False
         return True
 

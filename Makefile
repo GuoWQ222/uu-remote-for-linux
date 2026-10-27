@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvcuda-bridge nvencode-bridge update-blocker input-hook frame-helper pipewire-capture pipewire-cursor powershell-bridge test deb release-assets clean
+.PHONY: all shim nvdec-probe dxgi-probe nvenc-probe nvcuda-bridge nvencode-bridge update-blocker input-hook frame-helper pipewire-capture pipewire-cursor eis-pointer powershell-bridge test deb release-assets clean
 
 all: test
 
@@ -36,6 +36,9 @@ pipewire-cursor:
 
 pipewire-capture:
 	./scripts/build-pipewire-capture.sh
+
+eis-pointer:
+	./scripts/build-eis-pointer.sh
 
 powershell-bridge:
 	./scripts/build-powershell-bridge.sh
