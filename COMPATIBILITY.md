@@ -27,6 +27,36 @@
 | Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 只协商三槽 DMA-BUF、EGL 读入独立 staging 后立即归还 producer；GNOME 的 Caps/Num 从 Mutter 原生状态读取，Scroll 保留 XKB 来源 | 不依赖官方 UU 或合成器内部版本号；原生锁键查询失败时停止发布权威锁键状态并重试；DMA-BUF/EGL 不可用时明确失败，不切换到语义不同的隐藏回退 |
 
 <a id="wayland-lock-state-and-rime"></a>
+## Explicit EGL device selection / 显式选择 EGL 显卡
+
+On hybrid-GPU GNOME Wayland systems, the automatically preferred NVIDIA
+render node may fail to import or stage the compositor's DMA-BUF stream even
+when the standalone GPU scaling self-test passes. Both native PipeWire helpers
+accept `UU_REMOTE_EGL_DEVICE` to select a specific DRM node exposed by EGL.
+An unavailable explicitly requested node is an error; the helpers do not
+silently choose another device. Leaving the variable unset or empty preserves
+the existing automatic selection.
+
+混合显卡机器可在输入桥服务的用户级 drop-in 中指定与合成器画面兼容的
+DRM render node。先核对本机 `/dev/dri` 对应显卡，不要假设节点编号固定。
+例如，已确认 Intel 为 `/dev/dri/renderD128` 时：
+
+```ini
+# ~/.config/systemd/user/uu-remote-for-linux-input.service.d/graphics.conf
+[Service]
+Environment=UU_REMOTE_EGL_DEVICE=/dev/dri/renderD128
+```
+
+Run `systemctl --user daemon-reload`, then quit and restart UU when the current
+remote session can be interrupted. This selects the capture device, not the
+video encoder, and does not change the system's GPU or compositor configuration.
+
+Ubuntu 26.04.1 / GNOME Wayland, 3200×2000 at 200% scale was tested with Intel
+capture, embedded cursors, and software encoding. The Windows user confirmed
+picture, mouse/keyboard and reconnect behavior. This does not establish
+metadata-cursor, multi-monitor or rotation compatibility; existing Portal
+`Invalid position` reports remain a separate input-mapping investigation.
+
 ## Wayland lock state and Rime / Wayland 锁键状态与 Rime
 
 On GNOME Wayland, XWayland indicators can remain stale while a native
