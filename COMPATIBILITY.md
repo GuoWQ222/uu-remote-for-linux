@@ -24,18 +24,38 @@
 | WOL 能力与网卡映射 | A+B | `uu-remote-wol-profiler` 用源码路径、状态字符串或内联 Enabled/Disabled 比较、网卡能力日志、函数边界与布尔返回语义定位唯一谓词；物理网卡信息由 Linux 侧动态回填 | 不把带输出参数的电源配置查询误认为能力谓词；唯一匹配并核验 SHA256 后生成，失败时保留通用 Win32 映射 |
 | 官方更新器接管 | A | 项目管理的更新入口以原始文件哈希和清单核验；下载只允许 HTTPS 重定向，并验证系统 CA 链、Authenticode 和网易发布者身份；Linux 侧拥有快照与回滚事务 | 不依赖版本哈希白名单；新安装后从实际文件重建语义档案与清单，核心契约或完整性不符即回滚 |
 | Event Log、系统代理、自启动、防休眠、键盘快捷键 | A | Wine API shim、注册表/配置文件和 Linux 桌面 API 桥；不依赖官方代码 RVA | 格式仍可解析时自动工作；未知或超时均失败闭合并恢复桌面状态 |
-| Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 只协商三槽 DMA-BUF、EGL 读入独立 staging 后立即归还 producer；GNOME 的 Caps/Num 从 Mutter 原生状态读取，Scroll 保留 XKB 来源 | 不依赖官方 UU 或合成器内部版本号；原生锁键查询失败时停止发布权威锁键状态并重试；DMA-BUF/EGL 不可用时明确失败，不切换到语义不同的隐藏回退 |
+| Wayland Portal 输入与 PipeWire 画面 | A | Portal、PipeWire、XKB 和共享帧协议；原生 helper 优先验证 NVIDIA，再验证其他显卡，最后尝试 MemFd CPU 取帧；三槽 staging 立即归还 producer；GNOME 的 Caps/Num 从 Mutter 原生状态读取，Scroll 保留 XKB 来源 | 不依赖官方 UU 或合成器内部版本号；原生锁键查询失败时停止发布权威锁键状态并重试；捕获设备按真实帧验证，CPU 回退明确记录，保留手动指定 |
 
-<a id="wayland-lock-state-and-rime"></a>
-## Explicit EGL device selection / 显式选择 EGL 显卡
+## Capture device selection / 捕获显卡与 CPU 回退
 
 On hybrid-GPU GNOME Wayland systems, the automatically preferred NVIDIA
 render node may fail to import or stage the compositor's DMA-BUF stream even
 when the standalone GPU scaling self-test passes. Both native PipeWire helpers
 accept `UU_REMOTE_EGL_DEVICE` to select a specific DRM node exposed by EGL.
 An unavailable explicitly requested node is an error; the helpers do not
-silently choose another device. Leaving the variable unset or empty preserves
-the existing automatic selection.
+silently choose another device.
+
+不设置 `UU_REMOTE_EGL_DEVICE` 时，自动模式按以下顺序逐个验证：
+
+1. NVIDIA 显卡优先；同类设备保留 EGL 枚举顺序。
+2. 其余可用 DRM 显卡；没有枚举到设备时先尝试默认 EGL。
+3. CPU：重新协商 PipeWire `MemFd`，在 CPU 上复制和缩放像素，不映射 DMA-BUF，
+   不需要捕获辅助程序的 EGL 上下文。桌面仍需支持共享内存画面输出。
+
+元数据光标模式下，每个候选都先启动使用相同设备/传输方式的光标辅助程序，再验证所有已授权屏幕的
+真实帧已经完成导入、缩放、读回和发布。独立 EGL 自检不作为通过依据；静态或全黑
+桌面本身也是合法画面，不按像素颜色猜测失败。设备初始化、格式协商、实际导入失败
+或首帧超时才触发切换。授权失效、程序缺失或布局改变按原错误处理。
+重试时保留本次授权会话的最近有效光标位图，以兼容重新连接后仅发送位置的元数据。
+
+每个设备在同一次授权会话中最多尝试一次；单次尝试最多等待 15 秒，候选共享
+60 秒启动预算，并为后面的 CPU 尝试预留时间。所有候选失败后记录错误并停止，
+不会靠服务自动重启反复请求授权。运行中遇到明确的设备错误时继续尝试剩余候选。
+
+CPU 取帧可能增加 CPU 占用和内存带宽开销。输入桥日志记录 `capture-device-try`、
+`capture-device-rejected` 和 `capture-device-validated`；状态文件的 `capture_transport`
+为 `shared-memory-cpu` 或 `dmabuf-native`，每屏统计同时记录 `capture_device`。
+这里选择的是捕获方式，与 UU 后续采用 OpenH264 软件编码还是 NVIDIA 编码相互独立。
 
 混合显卡机器可在输入桥服务的用户级 drop-in 中指定与合成器画面兼容的
 DRM render node。先核对本机 `/dev/dri` 对应显卡，不要假设节点编号固定。
@@ -47,6 +67,18 @@ DRM render node。先核对本机 `/dev/dri` 对应显卡，不要假设节点�
 Environment=UU_REMOTE_EGL_DEVICE=/dev/dri/renderD128
 ```
 
+也可以手动指定 CPU 取帧（同时清空显卡指定）。手动配置只验证指定路径，失败时
+直接报错，不继续自动切换：
+
+```ini
+[Service]
+Environment=UU_REMOTE_CAPTURE_MODE=cpu
+Environment=UU_REMOTE_EGL_DEVICE=
+```
+
+恢复自动模式时清空 `UU_REMOTE_EGL_DEVICE` 并设置 `UU_REMOTE_CAPTURE_MODE=auto`。
+不要同时设置 CPU 模式和显式显卡，两者冲突时会明确报错。
+
 Run `systemctl --user daemon-reload`, then quit and restart UU when the current
 remote session can be interrupted. This selects the capture device, not the
 video encoder, and does not change the system's GPU or compositor configuration.
@@ -57,6 +89,7 @@ picture, mouse/keyboard and reconnect behavior. This does not establish
 metadata-cursor, multi-monitor or rotation compatibility; existing Portal
 `Invalid position` reports remain a separate input-mapping investigation.
 
+<a id="wayland-lock-state-and-rime"></a>
 ## Wayland lock state and Rime / Wayland 锁键状态与 Rime
 
 On GNOME Wayland, XWayland indicators can remain stale while a native

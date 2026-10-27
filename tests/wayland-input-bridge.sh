@@ -39,7 +39,7 @@ export UU_REMOTE_WAYLAND_CAPTURE_TEST_STREAMS='77:128x72@64,0;78:64x128@0,0'
 
 grep -q '#define UUDC_PIPEWIRE_BUFFERS 3' "$capture_source"
 grep -q '#define UUDC_STAGE_SLOTS 3u' "$capture_source"
-grep -q 'SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)' "$capture_source"
+grep -q 'application->cpu_capture ? SPA_DATA_MemFd : SPA_DATA_DmaBuf' "$capture_source"
 grep -q 'sizeof(struct frame_notification) == 32' "$capture_source"
 # Scaled stage views offer physical-pixel buffers for logical Portal streams.
 grep -q 'SPA_POD_CHOICE_RANGE_Rectangle(size, &minimum_size, &maximum_size)' \

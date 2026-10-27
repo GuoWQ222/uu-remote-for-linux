@@ -2560,7 +2560,8 @@ start_input_bridge() {
         )
         for variable in \
             DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS \
-            XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH; do
+            XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PATH \
+            UU_REMOTE_EGL_DEVICE UU_REMOTE_CAPTURE_MODE; do
             if [[ -v $variable ]]; then
                 command+=("--setenv=$variable=${!variable}")
             fi

@@ -95,11 +95,11 @@ Controlled-display choices follow hot-plug, rotation, and layout changes automat
 | CPU | amd64 / x86_64 | ✅ | Architecture of the published Debian package |
 | Runtime | Wine 11.1+ | ✅ | Required Wine version |
 | Desktop | X11 + XTest | ✅ | Direct input and existing UU capture path |
-| Desktop | GNOME Wayland Portal | ✅ | XWayland UI and Portal input; native three-buffer PipeWire DMA-BUF capture, with explicit failure instead of a hidden transport fallback |
+| Desktop | GNOME Wayland Portal | ✅ | XWayland UI and Portal input; native three-buffer capture validates NVIDIA first, then other GPUs, then explicit-status CPU shared memory; manual selection remains available |
 | Decode | CPU / OpenH264 | ✅ | Safe fallback, up to 1080p/60 fps |
 | Decode | NVIDIA NVDEC | 🧪 | Experimental; UU menu up to 4K/144 fps |
 | Encode | NVIDIA NVENC | ✅ | H.264/HEVC, enabled only after validation |
-| Intel/AMD hardware | — | ❌ | CPU fallback remains available |
+| Intel/AMD video codecs | — | ❌ | Software codecs remain available; EGL capture can still use a compatible Intel/AMD GPU |
 
 > [!WARNING]
 > Wayland requires Portal permission. On a multi-monitor desktop, select all displays in the sharing dialog; the permission is then restored for later sessions. Login-manager and lock-screen capture are outside the logged-in Portal session; use X11 for unattended access before login.

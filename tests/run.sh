@@ -53,6 +53,8 @@ fi
 check "PipeWire cursor bridge self-test" \
     "$project_root/lib/uu-remote-for-linux/uu-remote-pipewire-cursor" \
     --self-test
+check "Wayland capture device selection and CPU frames" \
+    "$project_root/tests/capture-device-selection.sh"
 check "direct release asset isolation" \
     "$project_root/tests/release-assets.sh"
 check "NVDEC profiler Python syntax" /usr/bin/python3 -c \
