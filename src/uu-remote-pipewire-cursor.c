@@ -134,6 +134,7 @@ struct application {
     uint32_t streaming_count;
     bool ready_sent;
     bool failed;
+    bool device_failed;
     EGLDisplay egl_display;
     PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dma_buf_modifiers;
     struct modifier_set modifier_sets[2];
@@ -158,129 +159,12 @@ static bool has_extension(const char *extensions, const char *needle)
     return false;
 }
 
-static bool is_nvidia_render_node(const char *path)
-{
-    const char *name;
-    char vendor_path[PATH_MAX];
-    char vendor[32];
-    FILE *handle;
-
-    if (!path || !path[0]) {
-        return false;
-    }
-    name = strrchr(path, '/');
-    name = name ? name + 1 : path;
-    if (snprintf(
-            vendor_path,
-            sizeof(vendor_path),
-            "/sys/class/drm/%s/device/vendor",
-            name
-        ) < 0) {
-        return false;
-    }
-    handle = fopen(vendor_path, "r");
-    if (!handle) {
-        return false;
-    }
-    vendor[0] = '\0';
-    if (!fgets(vendor, sizeof(vendor), handle)) {
-        fclose(handle);
-        return false;
-    }
-    fclose(handle);
-    return strncmp(vendor, "0x10de", 6) == 0;
-}
+#include "uu-remote-egl-device.h"
 
 static EGLDisplay choose_egl_display(struct application *application)
 {
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
-    PFNEGLQUERYDEVICESEXTPROC query_devices;
-    PFNEGLQUERYDEVICESTRINGEXTPROC query_device_string;
-    EGLDeviceEXT devices[16];
-    EGLint count = 0;
-    EGLint index;
-    EGLDeviceEXT selected = EGL_NO_DEVICE_EXT;
-    const char *selected_path = NULL;
-    const char *preferred = getenv("UU_REMOTE_EGL_DEVICE");
-
-    get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
-        eglGetProcAddress("eglGetPlatformDisplayEXT");
-    query_devices = (PFNEGLQUERYDEVICESEXTPROC)
-        eglGetProcAddress("eglQueryDevicesEXT");
-    query_device_string = (PFNEGLQUERYDEVICESTRINGEXTPROC)
-        eglGetProcAddress("eglQueryDeviceStringEXT");
-    if (get_platform_display && query_devices && query_device_string &&
-        query_devices(16, devices, &count)) {
-        for (index = 0; index < count; ++index) {
-            const char *path = query_device_string(
-                devices[index],
-                EGL_DRM_RENDER_NODE_FILE_EXT
-            );
-
-            if (!path) {
-                path = query_device_string(
-                    devices[index],
-                    EGL_DRM_DEVICE_FILE_EXT
-                );
-            }
-            if (preferred && *preferred) {
-                if (path && strcmp(path, preferred) == 0) {
-                    selected = devices[index];
-                    selected_path = path;
-                    break;
-                }
-                continue;
-            }
-            if (!selected && path) {
-                selected = devices[index];
-                selected_path = path;
-            }
-            if (is_nvidia_render_node(path)) {
-                selected = devices[index];
-                selected_path = path;
-                break;
-            }
-        }
-        if (selected) {
-            if (selected_path) {
-                snprintf(
-                    application->egl_device,
-                    sizeof(application->egl_device),
-                    "%s",
-                    selected_path
-                );
-            }
-            return get_platform_display(
-                EGL_PLATFORM_DEVICE_EXT,
-                selected,
-                NULL
-            );
-        }
-    }
-    if (preferred && *preferred) {
-        fprintf(stderr, "requested EGL device unavailable: %s\n", preferred);
-        return EGL_NO_DISPLAY;
-    }
-    if (get_platform_display) {
-        snprintf(
-            application->egl_device,
-            sizeof(application->egl_device),
-            "%s",
-            "surfaceless-default"
-        );
-        return get_platform_display(
-            EGL_PLATFORM_SURFACELESS_MESA,
-            EGL_DEFAULT_DISPLAY,
-            NULL
-        );
-    }
-    snprintf(
-        application->egl_device,
-        sizeof(application->egl_device),
-        "%s",
-        "egl-default"
-    );
-    return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    return uu_egl_choose_device(application->egl_device,
+                                sizeof(application->egl_device));
 }
 
 static void add_modifier(struct modifier_set *set, uint64_t modifier)
@@ -1032,8 +916,9 @@ static void on_state_changed(
             application->ready_sent = true;
             fprintf(
                 stderr,
-                "cursor-dmabuf-ready streams=%" PRIu32 "\n",
-                application->n_streams
+                "cursor-stream-ready streams=%" PRIu32 " transport=%s\n",
+                application->n_streams,
+                uu_capture_cpu() ? "shared-memory" : "dmabuf"
             );
             fflush(stderr);
         }
@@ -1057,6 +942,8 @@ static void on_state_changed(
             pw_stream_state_as_string(old)
         );
     }
+    if (error && strstr(error, "no more input formats"))
+        stream_data->application->device_failed = true;
     stream_data->application->failed = true;
     pw_main_loop_quit(stream_data->application->loop);
 }
@@ -1115,7 +1002,8 @@ static void on_param_changed(
         NULL,
         SPA_FORMAT_VIDEO_modifier
     );
-    if (!modifier_property) {
+    if (!uu_capture_cpu() && !modifier_property) {
+        stream_data->application->device_failed = true;
         pw_stream_set_error(
             stream_data->stream,
             -EINVAL,
@@ -1123,7 +1011,7 @@ static void on_param_changed(
         );
         return;
     }
-    if (modifier_property->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) {
+    if (modifier_property && (modifier_property->flags & SPA_POD_PROP_FLAG_DONT_FIXATE)) {
         return;
     }
     params[0] = spa_pod_builder_add_object(
@@ -1150,7 +1038,7 @@ static void on_param_changed(
         SPA_PARAM_BUFFERS_stride,
         SPA_POD_Int((int32_t)(width * 4u)),
         SPA_PARAM_BUFFERS_dataType,
-        SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)
+        SPA_POD_CHOICE_FLAGS_Int(1u << (uu_capture_cpu() ? SPA_DATA_MemFd : SPA_DATA_DmaBuf))
     );
     params[1] = spa_pod_builder_add_object(
         &builder,
@@ -1201,6 +1089,8 @@ static void on_core_error(
         result,
         message ? message : "unknown error"
     );
+    if (message && strstr(message, "no more input formats"))
+        application->device_failed = true;
     application->failed = true;
     pw_main_loop_quit(application->loop);
 }
@@ -1239,22 +1129,25 @@ static const struct spa_pod *build_cursor_format(
         SPA_POD_Id(format),
         0
     );
-    spa_pod_builder_prop(
-        builder,
-        SPA_FORMAT_VIDEO_modifier,
-        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE
-    );
-    spa_pod_builder_push_choice(
-        builder,
-        &modifier_frame,
-        SPA_CHOICE_Enum,
-        0
-    );
-    spa_pod_builder_long(builder, modifiers->values[0]);
-    for (index = 0; index < modifiers->count; ++index) {
-        spa_pod_builder_long(builder, modifiers->values[index]);
+    if (!uu_capture_cpu()) {
+        spa_pod_builder_prop(
+            builder,
+            SPA_FORMAT_VIDEO_modifier,
+            SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE
+        );
+        spa_pod_builder_push_choice(
+            builder,
+            &modifier_frame,
+            SPA_CHOICE_Enum,
+            0
+        );
+        spa_pod_builder_long(builder, modifiers->values[0]);
+        for (index = 0; index < modifiers->count; ++index) {
+            spa_pod_builder_long(builder, modifiers->values[index]);
+        }
+        spa_pod_builder_pop(builder, &modifier_frame);
     }
-    spa_pod_builder_pop(builder, &modifier_frame);
+
     /* Scaled stage views offer physical-pixel buffers only. */
     spa_pod_builder_add(
         builder,
@@ -1496,6 +1389,9 @@ int main(int argc, char **argv)
     int index;
     int result = 1;
 
+    if (argc == 2 && strcmp(argv[1], "--list-egl-devices") == 0) {
+        return uu_egl_list_devices();
+    }
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
     }
@@ -1551,7 +1447,8 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!initialize_modifier_query(&application)) {
+    if (!uu_capture_cpu() && !initialize_modifier_query(&application)) {
+        result = UU_CAPTURE_DEVICE_FAILURE;
         goto cleanup;
     }
     pw_init(&argc, &argv);
@@ -1625,7 +1522,7 @@ int main(int argc, char **argv)
         );
         application.failed = true;
     }
-    result = application.failed ? 1 : 0;
+    result = application.failed ? (application.device_failed ? UU_CAPTURE_DEVICE_FAILURE : 1) : 0;
 
 cleanup:
     if (application.ready_fd >= 0) {

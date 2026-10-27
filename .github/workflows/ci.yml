@@ -29,9 +29,13 @@ jobs:
             gir1.2-appindicator3-0.1 \
             gir1.2-gtk-3.0 \
             libegl1 \
+            libegl-dev \
             libgles2 \
+            libgles-dev \
+            libdrm-dev \
             libglib2.0-dev \
             libpipewire-0.3-0 \
+            libpipewire-0.3-dev \
             libx11-6 \
             libxml2-utils \
             lintian \

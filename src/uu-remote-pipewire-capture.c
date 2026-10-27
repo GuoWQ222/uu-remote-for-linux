@@ -1,11 +1,13 @@
 /*
- * Native PipeWire DMA-BUF screen capture for the Wayland bridge.
+ * Native PipeWire screen capture for the Wayland bridge.
  *
  * This helper negotiates SPA_DATA_DmaBuf directly, imports each producer
  * buffer into EGL, reads it into one of three independent staging slots, and
  * queues the PipeWire buffer back before notifying the Python consumer.  The
- * Python bridge therefore never maps compositor-owned video buffers and does
- * not depend on a second media framework or a CPU-copy fallback.
+ * CPU mode instead negotiates linear MemFd buffers and copies/scales them
+ * without EGL. Both modes release producer buffers before notifying Python.
+ * The Python bridge never maps compositor-owned video buffers or depends on
+ * a second media framework.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -22,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <drm_fourcc.h>
@@ -109,6 +112,8 @@ struct application {
     uint64_t frames;
     uint64_t dropped;
     bool failed;
+    bool device_failed;
+    bool cpu_capture;
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
@@ -184,129 +189,12 @@ static bool has_extension(const char *extensions, const char *needle)
     return false;
 }
 
-static bool is_nvidia_render_node(const char *path)
-{
-    const char *name;
-    char vendor_path[PATH_MAX];
-    char vendor[32];
-    FILE *handle;
-
-    if (!path || !path[0]) {
-        return false;
-    }
-    name = strrchr(path, '/');
-    name = name ? name + 1 : path;
-    if (snprintf(
-            vendor_path,
-            sizeof(vendor_path),
-            "/sys/class/drm/%s/device/vendor",
-            name
-        ) < 0) {
-        return false;
-    }
-    handle = fopen(vendor_path, "r");
-    if (!handle) {
-        return false;
-    }
-    vendor[0] = '\0';
-    if (!fgets(vendor, sizeof(vendor), handle)) {
-        fclose(handle);
-        return false;
-    }
-    fclose(handle);
-    return strncmp(vendor, "0x10de", 6) == 0;
-}
+#include "uu-remote-egl-device.h"
 
 static EGLDisplay choose_egl_display(struct application *application)
 {
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
-    PFNEGLQUERYDEVICESEXTPROC query_devices;
-    PFNEGLQUERYDEVICESTRINGEXTPROC query_device_string;
-    EGLDeviceEXT devices[16];
-    EGLint count = 0;
-    EGLint index;
-    EGLDeviceEXT selected = EGL_NO_DEVICE_EXT;
-    const char *selected_path = NULL;
-    const char *preferred = getenv("UU_REMOTE_EGL_DEVICE");
-
-    get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
-        eglGetProcAddress("eglGetPlatformDisplayEXT");
-    query_devices = (PFNEGLQUERYDEVICESEXTPROC)
-        eglGetProcAddress("eglQueryDevicesEXT");
-    query_device_string = (PFNEGLQUERYDEVICESTRINGEXTPROC)
-        eglGetProcAddress("eglQueryDeviceStringEXT");
-    if (get_platform_display && query_devices && query_device_string &&
-        query_devices(16, devices, &count)) {
-        for (index = 0; index < count; ++index) {
-            const char *path = query_device_string(
-                devices[index],
-                EGL_DRM_RENDER_NODE_FILE_EXT
-            );
-
-            if (!path) {
-                path = query_device_string(
-                    devices[index],
-                    EGL_DRM_DEVICE_FILE_EXT
-                );
-            }
-            if (preferred && *preferred) {
-                if (path && strcmp(path, preferred) == 0) {
-                    selected = devices[index];
-                    selected_path = path;
-                    break;
-                }
-                continue;
-            }
-            if (!selected && path) {
-                selected = devices[index];
-                selected_path = path;
-            }
-            if (is_nvidia_render_node(path)) {
-                selected = devices[index];
-                selected_path = path;
-                break;
-            }
-        }
-        if (selected) {
-            if (selected_path) {
-                snprintf(
-                    application->egl_device,
-                    sizeof(application->egl_device),
-                    "%s",
-                    selected_path
-                );
-            }
-            return get_platform_display(
-                EGL_PLATFORM_DEVICE_EXT,
-                selected,
-                NULL
-            );
-        }
-    }
-    if (preferred && *preferred) {
-        fprintf(stderr, "requested EGL device unavailable: %s\n", preferred);
-        return EGL_NO_DISPLAY;
-    }
-    if (get_platform_display) {
-        snprintf(
-            application->egl_device,
-            sizeof(application->egl_device),
-            "%s",
-            "surfaceless-default"
-        );
-        return get_platform_display(
-            EGL_PLATFORM_SURFACELESS_MESA,
-            EGL_DEFAULT_DISPLAY,
-            NULL
-        );
-    }
-    snprintf(
-        application->egl_device,
-        sizeof(application->egl_device),
-        "%s",
-        "egl-default"
-    );
-    return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    return uu_egl_choose_device(application->egl_device,
+                                sizeof(application->egl_device));
 }
 
 static void destroy_image_cache(
@@ -705,6 +593,7 @@ static bool ensure_scale_pipeline(struct application *application)
         glDeleteShader(fragment_shader);
     }
     if (linked != GL_TRUE) {
+        application->device_failed = true;
         fprintf(stderr, "native capture scale program failed to link\n");
         destroy_scale_pipeline(application);
         return false;
@@ -749,15 +638,18 @@ static bool ensure_scale_pipeline(struct application *application)
         application->scale_texture,
         0
     );
+    GLenum framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    GLenum error = glGetError();
     if (
         application->scale_position < 0 ||
         application->scale_texcoord < 0 ||
         application->scale_source < 0 ||
         application->scale_step < 0 ||
-        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
-        glGetError() != GL_NO_ERROR
+        framebuffer_status != GL_FRAMEBUFFER_COMPLETE || error != GL_NO_ERROR
     ) {
-        fprintf(stderr, "native capture scale target is incomplete\n");
+        fprintf(stderr, "native capture scale target failed device=%s framebuffer=0x%x gl_error=0x%x\n",
+                application->egl_device, framebuffer_status, error);
+        application->device_failed = true;
         destroy_scale_pipeline(application);
         return false;
     }
@@ -815,8 +707,11 @@ static bool render_scaled(struct application *application, GLuint texture)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)application->scale_position);
     glDisableVertexAttribArray((GLuint)application->scale_texcoord);
-    if (glGetError() != GL_NO_ERROR) {
-        fprintf(stderr, "native capture GPU downscale failed\n");
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        fprintf(stderr, "native capture GPU downscale failed device=%s gl_error=0x%x\n",
+                application->egl_device, error);
+        application->device_failed = true;
         return false;
     }
     return true;
@@ -884,6 +779,7 @@ static struct image_cache *get_image_cache(
         attributes
     );
     if (cache->image == EGL_NO_IMAGE_KHR) {
+        application->device_failed = true;
         fprintf(
             stderr,
             "EGL DMA-BUF import failed fd=%d modifier=%" PRIu64
@@ -902,6 +798,14 @@ static struct image_cache *get_image_cache(
         GL_TEXTURE_2D,
         (GLeglImageOES)cache->image
     );
+    GLenum texture_error = glGetError();
+    if (texture_error != GL_NO_ERROR) {
+        fprintf(stderr, "native capture texture binding failed device=%s gl_error=0x%x modifier=%" PRIu64 "\n",
+                application->egl_device, texture_error, application->modifier);
+        application->device_failed = true;
+        destroy_image_cache(application, cache);
+        return NULL;
+    }
     if (!scaling_required(application)) {
         glGenFramebuffers(1, &cache->framebuffer);
         glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
@@ -917,6 +821,7 @@ static struct image_cache *get_image_cache(
             GL_FRAMEBUFFER_COMPLETE
         ) {
             fprintf(stderr, "imported DMA-BUF framebuffer is incomplete\n");
+            application->device_failed = true;
             destroy_image_cache(application, cache);
             return NULL;
         }
@@ -986,8 +891,11 @@ static bool read_dma_buf(
             ? (void *)destination
             : (void *)application->rgba_scratch
     );
-    if (glGetError() != GL_NO_ERROR) {
-        fprintf(stderr, "DMA-BUF glReadPixels failed\n");
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        fprintf(stderr, "DMA-BUF glReadPixels failed device=%s gl_error=0x%x\n",
+                application->egl_device, error);
+        application->device_failed = true;
         return false;
     }
     glFinish();
@@ -998,6 +906,79 @@ static bool read_dma_buf(
             (size_t)application->width * application->height
         );
     }
+    return true;
+}
+
+/* CPU mode negotiates linear MemFd buffers, never maps a DMA-BUF. Copy (or
+ * box-downscale) while the producer buffer is held, then return it normally.
+ */
+static bool read_shared_frame(struct application *application,
+                              const struct spa_data *data,
+                              unsigned char *destination)
+{
+    const struct spa_chunk *chunk = data->chunk;
+    struct stat status;
+    uint32_t width = application->source_width;
+    uint32_t height = application->source_height;
+    uint64_t stride = chunk && chunk->stride > 0
+        ? (uint32_t)chunk->stride : (uint64_t)width * 4u;
+    uint64_t offset = (uint64_t)data->mapoffset + (chunk ? chunk->offset : 0);
+    uint64_t row_bytes = (uint64_t)width * 4u;
+    uint64_t payload = (height ? height - 1u : 0) * stride + row_bytes;
+    uint64_t end = offset + payload;
+
+    if (data->type != SPA_DATA_MemFd || !chunk || chunk->stride < 0 ||
+        !width || !height ||
+        !application->width || !application->height || stride < row_bytes ||
+        chunk->offset > data->maxsize || payload > data->maxsize - chunk->offset ||
+        payload > chunk->size ||
+        end > SIZE_MAX || end > INT32_MAX || fstat(data->fd, &status) < 0 ||
+        status.st_size < 0 || (uint64_t)status.st_size < end) {
+        fprintf(stderr, "CPU capture received an invalid/short shared-memory frame\n");
+        return false;
+    }
+    unsigned char *mapping = mmap(NULL, (size_t)end, PROT_READ, MAP_SHARED, data->fd, 0);
+    if (mapping == MAP_FAILED) {
+        fprintf(stderr, "CPU capture shared-memory mapping failed: %m\n");
+        return false;
+    }
+    const unsigned char *source = mapping + offset;
+    if (!scaling_required(application)) {
+        for (uint32_t y = 0; y < height; ++y) {
+            unsigned char *output = destination + (size_t)y * row_bytes;
+            memcpy(output, source + y * stride, (size_t)row_bytes);
+            if (application->drm_format == DRM_FORMAT_XRGB8888)
+                for (uint32_t x = 0; x < width; ++x)
+                    output[x * 4u + 3u] = 255;
+        }
+        munmap(mapping, (size_t)end);
+        return true;
+    }
+    for (uint32_t y = 0; y < application->height; ++y) {
+        uint32_t top = (uint64_t)y * height / application->height;
+        uint32_t bottom = (uint64_t)(y + 1u) * height / application->height;
+        if (bottom <= top) bottom = top + 1u;
+        for (uint32_t x = 0; x < application->width; ++x) {
+            uint32_t left = (uint64_t)x * width / application->width;
+            uint32_t right = (uint64_t)(x + 1u) * width / application->width;
+            if (right <= left) right = left + 1u;
+            uint64_t sums[4] = {0};
+            uint64_t count = (uint64_t)(right - left) * (bottom - top);
+            for (uint32_t sy = top; sy < bottom; ++sy) {
+                for (uint32_t sx = left; sx < right; ++sx) {
+                    const unsigned char *pixel = source + sy * stride + sx * 4u;
+                    for (unsigned int channel = 0; channel < 4; ++channel)
+                        sums[channel] += pixel[channel];
+                }
+            }
+            unsigned char *output = destination + ((size_t)y * application->width + x) * 4u;
+            for (unsigned int channel = 0; channel < 4; ++channel)
+                output[channel] = (unsigned char)((sums[channel] + count / 2u) / count);
+            if (application->drm_format == DRM_FORMAT_XRGB8888)
+                output[3] = 255;
+        }
+    }
+    munmap(mapping, (size_t)end);
     return true;
 }
 
@@ -1059,7 +1040,7 @@ static void on_process(void *userdata)
     }
     buffer = latest->buffer;
     if (!buffer || buffer->n_datas != 1 ||
-        buffer->datas[0].type != SPA_DATA_DmaBuf ||
+        buffer->datas[0].type != (application->cpu_capture ? SPA_DATA_MemFd : SPA_DATA_DmaBuf) ||
         buffer->datas[0].fd < 0 || !buffer->datas[0].chunk ||
         buffer->datas[0].chunk->size == 0 ||
         (buffer->datas[0].chunk->flags & SPA_CHUNK_FLAG_CORRUPTED)) {
@@ -1073,7 +1054,7 @@ static void on_process(void *userdata)
         pw_stream_queue_buffer(application->stream, latest);
         return;
     }
-    ok = read_dma_buf(
+    ok = (application->cpu_capture ? read_shared_frame : read_dma_buf)(
         application,
         &buffer->datas[0],
         application->stage + (size_t)slot * application->frame_size
@@ -1086,11 +1067,12 @@ static void on_process(void *userdata)
     pw_stream_queue_buffer(application->stream, latest);
     if (!ok) {
         application->slot_free[slot] = true;
+        application->device_failed = true;
         application->failed = true;
         pw_stream_set_error(
             application->stream,
             -EIO,
-            "DMA-BUF EGL import/readback failed"
+            "capture device import/readback failed"
         );
         return;
     }
@@ -1134,6 +1116,8 @@ static void on_state_changed(
             application->node,
             error ? error : pw_stream_state_as_string(state)
         );
+        if (error && strstr(error, "no more input formats"))
+            application->device_failed = true;
         application->failed = true;
         pw_main_loop_quit(application->loop);
     }
@@ -1232,7 +1216,8 @@ static void on_param_changed(
         NULL,
         SPA_FORMAT_VIDEO_modifier
     );
-    if (!modifier_property) {
+    if (!application->cpu_capture && !modifier_property) {
+        application->device_failed = true;
         pw_stream_set_error(
             application->stream,
             -EINVAL,
@@ -1240,7 +1225,7 @@ static void on_param_changed(
         );
         return;
     }
-    if (modifier_property->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) {
+    if (modifier_property && (modifier_property->flags & SPA_POD_PROP_FLAG_DONT_FIXATE)) {
         /*
          * This is the first half of PipeWire's modifier handshake.  Mutter
          * receives the intersected Choice, picks a modifier supported by its
@@ -1256,21 +1241,25 @@ static void on_param_changed(
         );
         return;
     }
-    modifier_value = spa_pod_get_values(
-        &modifier_property->value,
-        &modifier_values,
-        &modifier_choice
-    );
-    if (modifier_values != 1 || modifier_choice != SPA_CHOICE_None ||
-        spa_pod_get_long(modifier_value, &modifier) < 0) {
-        pw_stream_set_error(
-            application->stream,
-            -EINVAL,
-            "PipeWire negotiated an invalid DMA-BUF modifier"
+    if (!application->cpu_capture) {
+        modifier_value = spa_pod_get_values(
+            &modifier_property->value,
+            &modifier_values,
+            &modifier_choice
         );
-        return;
+        if (modifier_values != 1 || modifier_choice != SPA_CHOICE_None ||
+            spa_pod_get_long(modifier_value, &modifier) < 0) {
+            application->device_failed = true;
+            pw_stream_set_error(
+                application->stream,
+                -EINVAL,
+                "PipeWire negotiated an invalid DMA-BUF modifier"
+            );
+            return;
+        }
+        application->modifier = (uint64_t)modifier;
     }
-    application->modifier = (uint64_t)modifier;
+
     params[0] = spa_pod_builder_add_object(
         &builder,
         SPA_TYPE_OBJECT_ParamBuffers,
@@ -1286,7 +1275,7 @@ static void on_param_changed(
         SPA_PARAM_BUFFERS_stride,
         SPA_POD_Int((int32_t)application->stride),
         SPA_PARAM_BUFFERS_dataType,
-        SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)
+        SPA_POD_CHOICE_FLAGS_Int(1u << (application->cpu_capture ? SPA_DATA_MemFd : SPA_DATA_DmaBuf))
     );
     params[1] = spa_pod_builder_add_object(
         &builder,
@@ -1357,6 +1346,8 @@ static void on_core_error(
         result,
         message ? message : "unknown error"
     );
+    if (message && strstr(message, "no more input formats"))
+        application->device_failed = true;
     application->failed = true;
     pw_main_loop_quit(application->loop);
 }
@@ -1406,23 +1397,26 @@ static const struct spa_pod *build_capture_format(
         SPA_POD_Id(format),
         0
     );
-    spa_pod_builder_prop(
-        builder,
-        SPA_FORMAT_VIDEO_modifier,
-        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE
-    );
-    spa_pod_builder_push_choice(
-        builder,
-        &modifier_frame,
-        SPA_CHOICE_Enum,
-        0
-    );
-    /* Choice value zero is the preferred/default value and is repeated. */
-    spa_pod_builder_long(builder, modifiers->values[0]);
-    for (index = 0; index < modifiers->count; ++index) {
-        spa_pod_builder_long(builder, modifiers->values[index]);
+    if (!uu_capture_cpu()) {
+        spa_pod_builder_prop(
+            builder,
+            SPA_FORMAT_VIDEO_modifier,
+            SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE
+        );
+        spa_pod_builder_push_choice(
+            builder,
+            &modifier_frame,
+            SPA_CHOICE_Enum,
+            0
+        );
+        /* Choice value zero is the preferred/default value and is repeated. */
+        spa_pod_builder_long(builder, modifiers->values[0]);
+        for (index = 0; index < modifiers->count; ++index) {
+            spa_pod_builder_long(builder, modifiers->values[index]);
+        }
+        spa_pod_builder_pop(builder, &modifier_frame);
     }
-    spa_pod_builder_pop(builder, &modifier_frame);
+
     /*
      * Prefer the Portal's logical size but accept the producer's own: with
      * scaled stage views Mutter offers physical-pixel buffers only.
@@ -1645,6 +1639,9 @@ int main(int argc, char **argv)
     uint32_t index;
 
     memset(&application, 0, sizeof(application));
+    if (argc == 2 && strcmp(argv[1], "--list-egl-devices") == 0) {
+        return uu_egl_list_devices();
+    }
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
     }
@@ -1712,11 +1709,14 @@ int main(int argc, char **argv)
         application.slot_free[index] = true;
     }
     application.modifier = DRM_FORMAT_MOD_INVALID;
-    if (!initialize_egl(&application)) {
+    application.cpu_capture = uu_capture_cpu();
+    if (!application.cpu_capture && !initialize_egl(&application)) {
         destroy_egl(&application);
         munmap(application.stage, application.stage_size);
-        return 68;
+        return UU_CAPTURE_DEVICE_FAILURE;
     }
+    if (application.cpu_capture)
+        fprintf(stderr, "native capture device=cpu transport=shared-memory\n");
 
     memset(&action, 0, sizeof(action));
     action.sa_handler = quit_signal;
@@ -1784,5 +1784,5 @@ int main(int argc, char **argv)
     signal_application = NULL;
     destroy_egl(&application);
     munmap(application.stage, application.stage_size);
-    return application.failed ? 1 : 0;
+    return application.failed ? (application.device_failed ? UU_CAPTURE_DEVICE_FAILURE : 1) : 0;
 }

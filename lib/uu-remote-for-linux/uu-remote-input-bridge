@@ -105,6 +105,10 @@ CAPTURE_START_TIMEOUT_SECONDS = 10
 CURSOR_START_TIMEOUT_SECONDS = 5
 CAPTURE_PIPEWIRE_BUFFERS = 3
 CAPTURE_TRANSPORT_DMABUF = "dmabuf-native"
+CAPTURE_TRANSPORT_CPU = "shared-memory-cpu"
+CAPTURE_DEVICE_FAILURE = 68
+CAPTURE_DEVICE_LIMIT = 16
+CAPTURE_SELECTION_TIMEOUT_SECONDS = 60
 CAPTURE_NATIVE_STAGE_SLOTS = 3
 CAPTURE_NATIVE_NOTIFICATION_MAGIC = 0x43445555
 CAPTURE_NATIVE_NOTIFICATION = struct.Struct("<IIIIQII")
@@ -1004,6 +1008,14 @@ class WaylandCaptureStartupError(RuntimeError):
     """Portal authorization succeeded, but its capture transport did not."""
 
 
+class CaptureDeviceError(RuntimeError):
+    """A device/format negotiation or actual-frame compatibility failure."""
+
+
+class CaptureSelectionError(WaylandCaptureStartupError):
+    """All bounded attempts failed; require an explicit restart, not a loop."""
+
+
 def selected_portal_cursor_mode() -> int:
     name = os.environ.get(
         "UU_REMOTE_WAYLAND_CURSOR_MODE", "metadata"
@@ -1176,6 +1188,9 @@ class WaylandPortalBackend:
     def _start_capture_or_raise(self) -> None:
         try:
             self._start_capture_bridge()
+        except (CaptureSelectionError, PortalRequestError):
+            self.close()
+            raise
         except Exception as error:
             self.close()
             cleanup_detail = (
@@ -1757,17 +1772,21 @@ class WaylandPortalBackend:
                 stderr=subprocess.STDOUT,
                 close_fds=True,
                 pass_fds=(descriptor, ready_write),
+                env=self._capture_helper_environment(),
             )
             os.close(ready_write)
             ready_write = -1
             poller = select.poll()
             poller.register(ready_read, select.POLLIN | select.POLLHUP)
-            deadline = time.monotonic() + CURSOR_START_TIMEOUT_SECONDS
+            deadline = min(time.monotonic() + CURSOR_START_TIMEOUT_SECONDS,
+                           getattr(self, "capture_attempt_deadline", float("inf")))
             while time.monotonic() < deadline:
                 process = self.cursor_helper_process
                 if process.poll() is not None:
-                    raise RuntimeError(
-                        "Wayland 动态光标桥在建立 DMA-BUF 连接前停止："
+                    error_type = (CaptureDeviceError if process.returncode == CAPTURE_DEVICE_FAILURE
+                                  else RuntimeError)
+                    raise error_type(
+                        "Wayland 动态光标桥在建立画面流连接前停止："
                         + self._process_exit_detail(int(process.returncode))
                     )
                 remaining_ms = max(
@@ -1777,12 +1796,18 @@ class WaylandPortalBackend:
                 if poller.poll(min(remaining_ms, 100)):
                     if os.read(ready_read, 1) == b"R":
                         break
-                    raise RuntimeError(
-                        "Wayland 动态光标桥未确认 DMA-BUF 连接"
+                    try:
+                        process.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    error_type = (CaptureDeviceError if process.poll() == CAPTURE_DEVICE_FAILURE
+                                  else RuntimeError)
+                    raise error_type(
+                        "Wayland 动态光标桥未确认画面流连接"
                     )
             else:
-                raise RuntimeError(
-                    "Wayland 动态光标桥在 5 秒内未建立 DMA-BUF 连接"
+                raise CaptureDeviceError(
+                    "Wayland 动态光标桥未在期限内建立画面流连接"
                 )
         finally:
             try:
@@ -2013,6 +2038,7 @@ class WaylandPortalBackend:
                         notify_write,
                         release_read,
                     ),
+                    env=self._capture_helper_environment(),
                 )
             except Exception:
                 stage_map.close()
@@ -2187,14 +2213,18 @@ class WaylandPortalBackend:
             struct.pack_into("<I", self.capture_map, 36, 0)
 
     def _start_capture_pipeline(self) -> None:
-        self._reset_capture_attempt()
+        self._reset_capture_attempt(preserve_sequence=bool(self.capture_frames))
+        for stats in self.capture_stream_stats:
+            stats["capture_device"] = getattr(self, "capture_device", "automatic")
+            stats["transport"] = self._capture_transport_name()
         if self.capture_write_stream is None:
             raise RuntimeError("Wayland 画面回调尚未初始化")
         if self.fake_video:
             self._start_fake_capture_pipeline()
         else:
             self._start_native_capture_pipeline()
-        deadline = time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS
+        deadline = min(time.monotonic() + CAPTURE_START_TIMEOUT_SECONDS,
+                       getattr(self, "capture_attempt_deadline", float("inf")))
         while (
             any(int(stats["frames"]) == 0 for stats in self.capture_stream_stats)
             and time.monotonic() < deadline
@@ -2205,8 +2235,10 @@ class WaylandPortalBackend:
                 if process.poll() is not None
             ]
             if stopped:
-                raise RuntimeError(
-                    "原生 DMA-BUF 捕获辅助进程提前退出："
+                error_type = (CaptureDeviceError if CAPTURE_DEVICE_FAILURE in stopped
+                              else RuntimeError)
+                raise error_type(
+                    "原生捕获辅助进程提前退出："
                     + ",".join(str(value) for value in stopped)
                 )
             if self.capture_callback_error:
@@ -2218,11 +2250,127 @@ class WaylandPortalBackend:
             if int(stats["frames"]) == 0
         ]
         if missing:
-            raise RuntimeError(
-                "Wayland Portal 在 10 秒内未产生全部屏幕画面帧："
+            raise CaptureDeviceError(
+                "Wayland Portal 未在期限内产生全部屏幕画面帧："
                 + ",".join(missing)
             )
-        self.capture_transport = CAPTURE_TRANSPORT_DMABUF
+        # A frame notification is only emitted after import, optional scale,
+        # readback and slot publication. Static/all-black screens are valid.
+        stopped = [p.returncode for p in self.capture_native_processes if p.poll() is not None]
+        if stopped:
+            error_type = CaptureDeviceError if CAPTURE_DEVICE_FAILURE in stopped else RuntimeError
+            raise error_type(f"capture helper exited during validation: {stopped}")
+        self.capture_transport = self._capture_transport_name()
+
+    def _capture_transport_name(self) -> str:
+        return (CAPTURE_TRANSPORT_CPU if getattr(self, "capture_device", "") == "cpu"
+                else CAPTURE_TRANSPORT_DMABUF)
+
+    def _capture_helper_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        device = getattr(self, "capture_device", env.get("UU_REMOTE_EGL_DEVICE", ""))
+        env["UU_REMOTE_CAPTURE_MODE"] = "cpu" if device == "cpu" else "auto"
+        env["UU_REMOTE_EGL_DEVICE"] = "" if device == "cpu" else device
+        return env
+
+    def _capture_candidates(self) -> list[str]:
+        mode = os.environ.get("UU_REMOTE_CAPTURE_MODE", "auto").strip()
+        preferred = os.environ.get("UU_REMOTE_EGL_DEVICE", "").strip()
+        if mode not in ("auto", "cpu"):
+            raise CaptureSelectionError("UU_REMOTE_CAPTURE_MODE must be auto or cpu")
+        if mode == "cpu":
+            if preferred:
+                raise CaptureSelectionError("CPU mode conflicts with an explicit EGL device")
+            return ["cpu"]
+        if preferred:
+            return [preferred]
+        result = subprocess.run([str(self.capture_helper_path), "--list-egl-devices"],
+                                capture_output=True, text=True, timeout=3, check=True)
+        devices = list(dict.fromkeys(result.stdout.splitlines()))
+        if len(devices) > CAPTURE_DEVICE_LIMIT or any(
+            not d.startswith("/") or len(d) > 4096 or "\x00" in d for d in devices
+        ):
+            raise CaptureSelectionError("Capture helper returned an invalid EGL device list")
+        # Empty enumeration retains the surfaceless/default EGL attempt.
+        return (devices or [""]) + ["cpu"]
+
+    def _check_capture_authorization(self) -> None:
+        try:
+            self.connection.call_sync(
+                PORTAL_BUS_NAME, self.session_handle, "org.freedesktop.DBus.Properties",
+                "GetAll", self.GLib.Variant("(s)", (PORTAL_SESSION,)), None,
+                self.Gio.DBusCallFlags.NONE, 2000, None,
+            )
+        except self.GLib.Error as error:
+            # No reauthorization and no GPU/CPU retries after permission loss.
+            raise PortalRequestError(f"Portal session unavailable: {error}") from error
+
+    def _stop_device_attempt(self) -> None:
+        process = self.cursor_helper_process
+        self.cursor_helper_process = None
+        try:
+            self._stop_capture_pipeline()
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+    def _start_compatible_capture(self, recover: bool = False) -> None:
+        self._check_capture_authorization()
+        if not hasattr(self, "capture_device_candidates"):
+            self.capture_device_candidates = self._capture_candidates()
+            self.capture_device_attempted: list[str] = []
+            self.capture_device_failures: list[str] = []
+        if recover:
+            self._stop_device_attempt()
+        self.capture_transport = "inactive"
+        deadline = time.monotonic() + CAPTURE_SELECTION_TIMEOUT_SECONDS
+        pending = [d for d in self.capture_device_candidates if d not in self.capture_device_attempted]
+        for index, device in enumerate(pending):
+            self._check_capture_authorization()
+            now = time.monotonic()
+            # Divide the remaining budget, reserving a real CPU attempt at the
+            # end even when several GPU drivers stall. Every device is tried
+            # at most once within this authorized capture session.
+            budget = min(CAPTURE_START_TIMEOUT_SECONDS + CURSOR_START_TIMEOUT_SECONDS,
+                         (deadline - now) / (len(pending) - index))
+            if budget <= 0:
+                break
+            self.capture_attempt_deadline = now + budget
+            self.capture_device = device
+            self.capture_device_attempted.append(device)
+            self.capture_state = "starting"
+            print(f"capture-device-try device={device or 'egl-default'}", file=sys.stderr, flush=True)
+            try:
+                if self.portal_cursor_mode == PORTAL_CURSOR_METADATA:
+                    # Mutter can send position-only metadata after relinking.
+                    # Keep this session's last valid bitmap until a new shape
+                    # arrives; discard any previous session's file initially.
+                    self._start_cursor_bridge(reset_cursor=(
+                        not recover and len(self.capture_device_attempted) == 1
+                    ))
+                else:
+                    self.cursor_path.unlink(missing_ok=True)
+                self._start_capture_pipeline()
+            except CaptureDeviceError as error:
+                reason = f"{device or 'egl-default'}: {error}"
+                self.capture_device_failures.append(reason)
+                print(f"capture-device-rejected {reason}", file=sys.stderr, flush=True)
+                self._stop_device_attempt()
+                continue
+            self.capture_state = "active"
+            del self.capture_attempt_deadline
+            print(f"capture-device-validated device={device or 'egl-default'} "
+                  f"transport={self.capture_transport} streams={len(self.streams)}",
+                  file=sys.stderr, flush=True)
+            return
+        raise CaptureSelectionError("No compatible capture device; " +
+                                    "; ".join(self.capture_device_failures))
 
     def _start_capture_bridge(self) -> None:
         self.capture_state = "starting"
@@ -2447,28 +2595,36 @@ class WaylandPortalBackend:
                 return False
         self.capture_write_stream = write_stream
         # The cursor consumer deliberately owns the first link.  Its native
-        # helper now negotiates a three-buffer DMA-BUF pool and waits until all
+        # helper negotiates a three-buffer pool and waits until all
         # streams are active before video joins, so Mutter allocates both the
         # cursor metadata and zero-copy buffers in the one shared producer.
-        if getattr(
-            self, "portal_cursor_mode", PORTAL_CURSOR_METADATA
-        ) == PORTAL_CURSOR_METADATA:
-            self._start_cursor_bridge()
+        if not self.fake_trace:
+            self._start_compatible_capture()
         else:
-            self.cursor_path.unlink(missing_ok=True)
-        self._start_capture_pipeline()
+            if getattr(self, "portal_cursor_mode", PORTAL_CURSOR_METADATA) == PORTAL_CURSOR_METADATA:
+                self._start_cursor_bridge()
+            self._start_capture_pipeline()
         self.capture_state = "active"
 
     def ensure_healthy(self) -> None:
         if self.fake_trace:
             return
+        # Check helper exit codes before reader errors: a device failure may
+        # close its release pipe while the reader is returning a staging slot.
+        if hasattr(self, "capture_device_candidates"):
+            processes = list(self.capture_native_processes)
+            if self.cursor_helper_process is not None:
+                processes.append(self.cursor_helper_process)
+            if any(p.poll() == CAPTURE_DEVICE_FAILURE for p in processes):
+                self._start_compatible_capture(recover=True)
+                return
         if self.capture_callback_error:
             raise RuntimeError(
                 "Wayland 原生 DMA-BUF 共享帧回调失败："
                 + self.capture_callback_error
             )
         transport_error = ""
-        if self.capture_transport != CAPTURE_TRANSPORT_DMABUF:
+        if self.capture_transport not in (CAPTURE_TRANSPORT_DMABUF, CAPTURE_TRANSPORT_CPU):
             transport_error = "Wayland 原生 DMA-BUF 捕获未启动"
         elif len(self.capture_native_processes) != len(self.streams):
             transport_error = "原生 DMA-BUF 捕获辅助进程数量不完整"
@@ -4064,7 +4220,8 @@ def watch(
         # exit non-zero so Restart=on-failure can rebuild the Portal session
         # and shared-frame inode.  Initial authorization failures still exit
         # cleanly, preventing a denied share dialog from reopening in a loop.
-        restartable = (
+        # Exhausted device selection and lost permission also need a user restart.
+        restartable = not isinstance(error, (CaptureSelectionError, PortalRequestError)) and (
             selected_backend() != "wayland"
             or backend is not None
             or isinstance(error, WaylandCaptureStartupError)
